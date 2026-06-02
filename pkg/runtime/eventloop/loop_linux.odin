@@ -81,7 +81,7 @@ platform_wakeup :: proc(loop: ^Loop) {
 platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	fd := linux.Fd(watcher.fd)
 	if loop.platform.use_uring {
-		mask: linux.EPoll_Flags = {.IN} if watcher.mode == .Read else {.OUT}
+		mask: linux.EPoll_Event_Set = {.IN} if watcher.mode == .Read else {.OUT}
 		return arm_uring_poll(loop, u64(watcher.fd), u64(uintptr(watcher)), mask)
 	}
 
@@ -118,7 +118,7 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 		// Виправлено: передаємо raw_data(events), довжину як i32, та кастимо результат n_res
 		n_res, _ := linux.epoll_wait(
 			loop.platform.epoll_fd,
-			raw_data(events),
+			raw_data(events[:]),
 			i32(len(events)),
 			-1,
 		)
@@ -131,7 +131,7 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 		// Виправлено: додано пропущений аргумент i32(len(events)) (maxevents) та raw_data(events)
 		n_res, _ := linux.epoll_pwait2(
 			loop.platform.epoll_fd,
-			raw_data(events),
+			raw_data(events[:]),
 			i32(len(events)),
 			&ts,
 			nil,
@@ -209,16 +209,14 @@ drain_uring_completions :: proc(loop: ^Loop) {
 			if watcher != nil && watcher.callback != nil {
 				watcher.callback(loop, watcher.user_data)
 
-				// Виправлено: заміна типу на linux.EPoll_Flags
-				mask: linux.EPoll_Flags = {.IN} if watcher.mode == .Read else {.OUT}
+				mask: linux.EPoll_Event_Set = {.IN} if watcher.mode == .Read else {.OUT}
 				arm_uring_poll(loop, u64(watcher.fd), cqe.user_data, mask)
 			}
 		}
 	}
 }
 
-// Виправлено: сигнатура тепер приймає linux.EPoll_Flags замість Poll_Flags
-arm_uring_poll :: proc(loop: ^Loop, fd: u64, user_data: u64, mask: linux.EPoll_Flags) -> bool {
+arm_uring_poll :: proc(loop: ^Loop, fd: u64, user_data: u64, mask: linux.EPoll_Event_Set) -> bool {
 	sqe, ok := uring.get_sqe(&loop.platform.ring)
 	if !ok do return false
 

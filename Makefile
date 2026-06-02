@@ -3,6 +3,16 @@ LAVA ?= bin/lava
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
+# Set JSC_GTK6=1 to link against javascriptcoregtk-6.0 instead of the default 4.1
+# (Linux only). The resulting -define flag is also exported to scripts/build.sh.
+JSC_GTK6 ?= 0
+ifeq ($(JSC_GTK6),1)
+ODIN_DEFINES := -define:JSC_GTK6=true
+else
+ODIN_DEFINES :=
+endif
+export ODIN_DEFINES
+
 .PHONY: help build run eval check check-cli check-runtime check-jsc check-native test test-report test-report-html test-odin test-eventloop-odin test-node test-node-lava test-sqlite-node test-eventloop-node fmt clean
 
 help:
@@ -39,13 +49,13 @@ eval: build
 	$(LAVA) eval "$(SOURCE)"
 
 check: check-cli check-runtime
-	$(ODIN) check pkg/jsc -no-entry-point
+	$(ODIN) check pkg/jsc -no-entry-point $(ODIN_DEFINES)
 
 check-cli:
-	$(ODIN) check cmd/lava -collection:lava=.
+	$(ODIN) check cmd/lava -collection:lava=. $(ODIN_DEFINES)
 
 check-runtime:
-	$(ODIN) check pkg/runtime -no-entry-point -collection:lava=.
+	$(ODIN) check pkg/runtime -no-entry-point -collection:lava=. $(ODIN_DEFINES)
 	$(ODIN) check pkg/runtime/eventloop -no-entry-point
 	$(ODIN) check pkg/std/sqlite -no-entry-point
 
@@ -64,7 +74,7 @@ test-report-html: build
 	./scripts/report-node-vs-lava.sh
 
 test-odin:
-	$(ODIN) test cmd/lava -collection:lava=.
+	$(ODIN) test cmd/lava -collection:lava=. $(ODIN_DEFINES)
 
 test-eventloop-odin:
 	$(ODIN) test pkg/runtime/eventloop

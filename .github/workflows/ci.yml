@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# Cancel superseded runs on the same ref (e.g. new pushes to a PR).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Two things may need tuning over time:
+#   1. The Odin/LLVM version below (setup-odin inputs) as the project tracks
+#      newer Odin dev builds.
+#   2. Windows cannot link/run because the WebKit Windows port's
+#      JavaScriptCore.lib/.dll is not available on GitHub runners. The Windows
+#      job therefore type-checks, validates Windows codegen (-build-mode:obj),
+#      and runs the JSC-free event-loop unit tests — everything except the final
+#      JSC link.
+
+jobs:
+  linux:
+    name: Linux (full build + tests)
+    runs-on: ubuntu-latest
+    # Build against the javascriptcoregtk-6.0 backend (see pkg/jsc/bindings_linux.odin).
+    env:
+      JSC_GTK6: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JavaScriptCoreGTK (6.0)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjavascriptcoregtk-6.0-dev pkg-config
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          nightly: true
+          llvm-version: "18"
+
+      - name: Type-check
+        run: make check
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+  macos:
+    name: macOS (full build + tests)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          nightly: true
+          llvm-version: "18"
+
+      - name: Type-check
+        run: make check
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+  windows:
+    name: Windows (type-check + codegen + eventloop tests)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          nightly: true
+          llvm-version: "18"
+
+      # Type-check every package natively for the Windows target. This exercises
+      # pkg/jsc/bindings_windows.odin and the IOCP event-loop backend.
+      - name: Type-check
+        run: |
+          odin check cmd/lava -collection:lava=.
+          odin check pkg/runtime -no-entry-point -collection:lava=.
+          odin check pkg/runtime/eventloop -no-entry-point
+          odin check pkg/std/sqlite -no-entry-point
+          odin check pkg/jsc -no-entry-point
+
+      # The event-loop core has no JavaScriptCore dependency, so it links and
+      # runs for real on Windows (IOCP backend included).
+      - name: Event-loop unit tests
+        run: odin test pkg/runtime/eventloop
+
+      # Full Windows codegen of the JSC-using runtime + CLI. Stops before the
+      # link step (which would need JavaScriptCore.lib), proving every Windows
+      # source path compiles.
+      - name: Windows codegen (no link)
+        run: |
+          mkdir -p build
+          odin build cmd/lava -collection:lava=. -build-mode:obj -out:build/lava.obj

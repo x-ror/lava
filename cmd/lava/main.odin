@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import lava_runtime "lava:pkg/runtime"
+import eventloop "lava:pkg/runtime/eventloop"
 
 VERSION :: "0.1.0-dev"
 
@@ -31,7 +32,8 @@ main :: proc() {
 }
 
 print_help :: proc() {
-	fmt.println(`Lava - an Odin and JavaScriptCore runtime toolkit
+	fmt.println(
+		`Lava - an Odin and JavaScriptCore runtime toolkit
 
 Usage:
   lava eval <source>    Evaluate JavaScript source
@@ -40,7 +42,8 @@ Usage:
   lava --help           Print help
 
 The CLI is initialized. JSC evaluation will be wired in once the local
-JavaScriptCore development package is available.`)
+JavaScriptCore development package is available.`,
+	)
 }
 
 eval_command :: proc(args: []string) {
@@ -49,7 +52,8 @@ eval_command :: proc(args: []string) {
 		os.exit(2)
 	}
 
-	result := lava_runtime.eval(args[0])
+	loop := eventloop.init()
+	result := lava_runtime.eval(args[0], "<eval>", &loop)
 	print_result(result)
 	exit_code := result.exit_code
 	lava_runtime.result_destroy(&result)
@@ -62,7 +66,8 @@ run_command :: proc(args: []string) {
 		os.exit(2)
 	}
 
-	result := lava_runtime.run_file(args[0])
+	loop := eventloop.init()
+	result := lava_runtime.run_file(args[0], &loop)
 	print_result(result)
 	exit_code := result.exit_code
 	lava_runtime.result_destroy(&result)

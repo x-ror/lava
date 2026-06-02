@@ -22,6 +22,21 @@ JSType :: enum c.int {
 	Symbol,
 }
 
+// Order matches JavaScriptCore's JSTypedArrayType (JSTypedArray.h).
+JSTypedArrayType :: enum c.int {
+	Int8Array,
+	Int16Array,
+	Int32Array,
+	Uint8Array,
+	Uint8ClampedArray,
+	Uint16Array,
+	Uint32Array,
+	Float32Array,
+	Float64Array,
+	ArrayBuffer,
+	None,
+}
+
 JSClassAttributes :: enum c.uint {
 	None                 = 0,
 	NoAutomaticPrototype = 1 << 0,
@@ -84,11 +99,7 @@ JSClassDefinition :: struct {
 		property_name: JSStringRef,
 		exception: ^JSValueRef,
 	) -> b32,
-	get_property_names:  proc "c" (
-		ctx: JSContextRef,
-		object: JSObjectRef,
-		property_names: rawptr,
-	),
+	get_property_names:  proc "c" (ctx: JSContextRef, object: JSObjectRef, property_names: rawptr),
 	call_as_function:    JSObjectCallAsFunctionCallback,
 	call_as_constructor: JSObjectCallAsConstructorCallback,
 	has_instance:        proc "c" (

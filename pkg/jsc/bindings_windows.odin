@@ -1,9 +1,16 @@
-#+build darwin
+#+build windows
 package jsc
 
 import "core:c"
 
-foreign import jsc_lib "system:JavaScriptCore.framework"
+// Links against the WebKit Windows port's JavaScriptCore import library.
+//
+// The WebKit Windows build ships `JavaScriptCore.dll` plus the `JavaScriptCore.lib`
+// import library. Make that .lib visible to the linker (via the `LIB` environment
+// variable or `-extra-linker-flags:"/LIBPATH:<dir>"`) and keep `JavaScriptCore.dll`
+// next to `lava.exe` (or on `PATH`) at runtime. If your build uses a different
+// import-library name, edit the path below.
+foreign import jsc_lib "system:JavaScriptCore.lib"
 
 @(default_calling_convention = "c")
 foreign jsc_lib {
@@ -71,7 +78,6 @@ foreign jsc_lib {
 	JSValueProtect :: proc(ctx: JSContextRef, value: JSValueRef) ---
 	JSValueUnprotect :: proc(ctx: JSContextRef, value: JSValueRef) ---
 
-	// Typed Arrays (ES2015+)
 	JSValueIsTypedArray :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
 	JSObjectMakeTypedArrayWithBytesNoCopy :: proc(ctx: JSContextRef, array_type: JSTypedArrayType, bytes: rawptr, byte_length: c.size_t, byte_deallocator: proc "c" (bytes: rawptr, deallocator_context: rawptr), deallocator_context: rawptr, exception: ^JSValueRef) -> JSObjectRef ---
 	JSObjectGetTypedArrayLength :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
@@ -79,7 +85,6 @@ foreign jsc_lib {
 	JSObjectGetTypedArrayByteLength :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
 	JSObjectGetTypedArrayByteOffset :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
 
-	// ArrayBuffer
 	JSObjectMakeArrayBufferWithBytesNoCopy :: proc(ctx: JSContextRef, bytes: rawptr, byte_length: c.size_t, byte_deallocator: proc "c" (bytes: rawptr, deallocator_context: rawptr), deallocator_context: rawptr, exception: ^JSValueRef) -> JSObjectRef ---
 	JSObjectGetArrayBufferBytesPtr :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---
 	JSObjectGetArrayBufferByteLength :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
