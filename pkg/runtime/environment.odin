@@ -284,6 +284,15 @@ native_require_cb :: proc "c" (
 		return cached
 	}
 
+	// 0. JS-implemented built-ins (util, events, assert, buffer, and their
+	// node:-prefixed / assert-strict aliases). The resolver returns undefined
+	// for anything it does not own, so we fall through to the native builtins
+	// and the filesystem below.
+	if builtin := require_builtin(ctx, args[0]); builtin != nil {
+		module_cache_put(ctx, state, specifier, builtin)
+		return builtin
+	}
+
 	// 1. Обробка вбудованого модуля node:path
 	if specifier == "node:path" {
 		path_obj := jsc.JSObjectMake(ctx, nil, nil)
@@ -305,19 +314,6 @@ native_require_cb :: proc "c" (
 		inject_native_function(ctx, fs_obj, "existsSync", fs_exists_sync_cb)
 
 		value := cast(jsc.JSValueRef)fs_obj
-		module_cache_put(ctx, state, specifier, value)
-		return value
-	}
-
-	// 2. Обробка вбудованого модуля node:assert/strict
-	if specifier == "node:assert/strict" {
-		assert_obj := jsc.JSObjectMake(ctx, nil, nil)
-
-		inject_native_function(ctx, assert_obj, "equal", noop_cb)
-		inject_native_function(ctx, assert_obj, "deepEqual", noop_cb)
-		inject_native_function(ctx, assert_obj, "match", noop_cb)
-
-		value := cast(jsc.JSValueRef)assert_obj
 		module_cache_put(ctx, state, specifier, value)
 		return value
 	}

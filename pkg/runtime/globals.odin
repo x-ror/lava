@@ -11,8 +11,9 @@ import eventloop "lava:pkg/runtime/eventloop"
 // object's private data slot (see make_global_class) instead of being exposed
 // to JavaScript, so user code can neither read nor corrupt the loop pointer.
 Runtime_State :: struct {
-	loop:         ^eventloop.Loop,
-	module_cache: map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
+	loop:            ^eventloop.Loop,
+	module_cache:    map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
+	builtin_require: jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
 }
 
 // JS_Callback bridges a JS function into an event-loop Callback. The function
@@ -60,6 +61,7 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 		delete(key)
 	}
 	delete(state.module_cache)
+	if state.builtin_require != nil do jsc.JSValueUnprotect(ctx, state.builtin_require)
 	free(state)
 }
 
@@ -293,24 +295,26 @@ process_next_tick_cb :: proc "c" (
 }
 
 // --- console ---
+//
+// The full `console` surface (util.format `%s/%d/%j` substitution, group
+// indentation, `table`, `time`/`count`, `assert`/`trace`/`dir`, …) is
+// implemented in JavaScript — see CONSOLE_PRELUDE / install_console — exactly
+// as Node implements lib/internal/console. The native layer only exposes two
+// raw write primitives so stdout and stderr stay under Odin's control.
 
-console_write :: proc(
+console_raw_write :: proc(
 	fd: ^os.File,
 	ctx: jsc.JSContextRef,
 	argument_count: c.size_t,
 	arguments: [^]jsc.JSValueRef,
 ) {
-	count := int(argument_count)
-	for i in 0 ..< count {
-		if i > 0 do os.write_string(fd, " ")
-		text, allocated := jsc_value_to_string_or_default(ctx, arguments[i])
-		os.write_string(fd, text)
-		if allocated do delete(text, context.allocator)
-	}
-	os.write_string(fd, "\n")
+	if argument_count < 1 do return
+	text, allocated := jsc_value_to_string_or_default(ctx, arguments[0])
+	os.write_string(fd, text)
+	if allocated do delete(text, context.allocator)
 }
 
-console_log_cb :: proc "c" (
+console_stdout_write_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
 	this_object: jsc.JSObjectRef,
@@ -319,11 +323,11 @@ console_log_cb :: proc "c" (
 	exception: ^jsc.JSValueRef,
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
-	console_write(os.stdout, ctx, argument_count, arguments)
+	console_raw_write(os.stdout, ctx, argument_count, arguments)
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
-console_error_cb :: proc "c" (
+console_stderr_write_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
 	this_object: jsc.JSObjectRef,
@@ -332,7 +336,7 @@ console_error_cb :: proc "c" (
 	exception: ^jsc.JSValueRef,
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
-	console_write(os.stderr, ctx, argument_count, arguments)
+	console_raw_write(os.stderr, ctx, argument_count, arguments)
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
@@ -385,15 +389,159 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 	inject_native_function(ctx, global, "clearImmediate", clear_timer_cb)
 	inject_native_function(ctx, global, "queueMicrotask", queue_microtask_cb)
 
-	console := jsc.JSObjectMake(ctx, nil, nil)
-	inject_native_function(ctx, console, "log", console_log_cb)
-	inject_native_function(ctx, console, "info", console_log_cb)
-	inject_native_function(ctx, console, "debug", console_log_cb)
-	inject_native_function(ctx, console, "error", console_error_cb)
-	inject_native_function(ctx, console, "warn", console_error_cb)
-	set_named(ctx, global, "console", cast(jsc.JSValueRef)console)
+	install_console(ctx, global)
+	install_internal_modules(ctx, global)
 
 	install_process(ctx, global)
+}
+
+// install_internal_modules evaluates the JS built-in modules (util, events,
+// assert, buffer) to factory functions, hands them to the loader, and stores
+// the resulting resolver on Runtime_State. native_require_cb consults that
+// resolver before hitting the filesystem. The loader also eagerly instantiates
+// modules that install globals (Buffer), so those exist without a require.
+install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
+	state := get_state_from_ctx(ctx)
+	if state == nil do return
+
+	Module :: struct {
+		name:   string,
+		source: string,
+	}
+	modules := [?]Module {
+		{"util", INTERNAL_UTIL},
+		{"events", INTERNAL_EVENTS},
+		{"assert", INTERNAL_ASSERT},
+		{"buffer", INTERNAL_BUFFER},
+		{"crypto", INTERNAL_CRYPTO},
+		{"fetch", INTERNAL_FETCH},
+	}
+
+	factories := jsc.JSObjectMake(ctx, nil, nil)
+	for m in modules {
+		factory := eval_internal(ctx, m.name, m.source)
+		if factory == nil do continue
+		set_named(ctx, factories, m.name, factory)
+	}
+
+	loader := eval_internal(ctx, "internal:loader", INTERNAL_LOADER)
+	if loader == nil || !jsc.JSValueIsObject(ctx, loader) do return
+
+	args := [1]jsc.JSValueRef{cast(jsc.JSValueRef)factories}
+	exception: jsc.JSValueRef
+	resolver := jsc.JSObjectCallAsFunction(
+		ctx,
+		cast(jsc.JSObjectRef)loader,
+		nil,
+		1,
+		raw_data(args[:]),
+		&exception,
+	)
+	if exception != nil {
+		report_internal_exception(ctx, "internal:loader", exception)
+		return
+	}
+	if resolver == nil || !jsc.JSValueIsObject(ctx, resolver) do return
+
+	jsc.JSValueProtect(ctx, resolver)
+	state.builtin_require = resolver
+}
+
+// require_builtin asks the JS resolver for an internal module by specifier.
+// Returns nil when the resolver is absent or the module is unknown (the latter
+// surfaces as `undefined`, which the caller treats as "not a builtin").
+require_builtin :: proc(ctx: jsc.JSContextRef, specifier: jsc.JSValueRef) -> jsc.JSValueRef {
+	state := get_state_from_ctx(ctx)
+	if state == nil || state.builtin_require == nil do return nil
+	args := [1]jsc.JSValueRef{specifier}
+	exception: jsc.JSValueRef
+	result := jsc.JSObjectCallAsFunction(
+		ctx,
+		cast(jsc.JSObjectRef)state.builtin_require,
+		nil,
+		1,
+		raw_data(args[:]),
+		&exception,
+	)
+	if exception != nil do return nil
+	if result == nil || jsc.JSValueIsUndefined(ctx, result) do return nil
+	return result
+}
+
+// install_console builds the full `console` object. CONSOLE_PRELUDE evaluates
+// to a factory function `(out, err) => { … }`; we call it with the two native
+// write primitives passed directly as arguments. The primitives are therefore
+// never exposed on globalThis — no transient leak for user code to capture, and
+// no `delete` that would push the global object into JSC's dictionary mode. The
+// only property the prelude adds to globalThis is `console` itself.
+install_console :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
+	out_fn := make_native_function(ctx, "__lava_write_out", console_stdout_write_cb)
+	err_fn := make_native_function(ctx, "__lava_write_err", console_stderr_write_cb)
+	if out_fn == nil || err_fn == nil do return
+
+	factory := eval_internal(ctx, "lava:console", CONSOLE_PRELUDE)
+	if factory == nil || !jsc.JSValueIsObject(ctx, factory) do return
+
+	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)out_fn, cast(jsc.JSValueRef)err_fn}
+	exception: jsc.JSValueRef
+	jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)factory, nil, 2, raw_data(args[:]), &exception)
+	if exception != nil do report_internal_exception(ctx, "lava:console", exception)
+}
+
+// make_native_function wraps an Odin callback as a standalone JS function value
+// without binding it to any object — the caller decides where (if anywhere) it
+// is reachable from.
+make_native_function :: proc(
+	ctx: jsc.JSContextRef,
+	name: string,
+	callback: jsc.JSObjectCallAsFunctionCallback,
+) -> jsc.JSObjectRef {
+	c_name, err := strings.clone_to_cstring(name, context.temp_allocator)
+	if err != nil do return nil
+	js_name := jsc.JSStringCreateWithUTF8CString(c_name)
+	defer jsc.JSStringRelease(js_name)
+	return jsc.JSObjectMakeFunctionWithCallback(ctx, js_name, callback)
+}
+
+// eval_internal runs a trusted, lava-provided JS snippet (a prelude) and returns
+// its value. Any exception is reported to stderr rather than surfaced to user
+// code; nil is returned in that case.
+eval_internal :: proc(
+	ctx: jsc.JSContextRef,
+	name: string,
+	source: string,
+) -> jsc.JSValueRef {
+	c_source, source_err := strings.clone_to_cstring(source, context.temp_allocator)
+	if source_err != nil do return nil
+	js_source := jsc.JSStringCreateWithUTF8CString(c_source)
+	defer jsc.JSStringRelease(js_source)
+
+	c_name, name_err := strings.clone_to_cstring(name, context.temp_allocator)
+	if name_err != nil do return nil
+	js_name := jsc.JSStringCreateWithUTF8CString(c_name)
+	defer jsc.JSStringRelease(js_name)
+
+	exception: jsc.JSValueRef
+	value := jsc.JSEvaluateScript(ctx, js_source, nil, js_name, 1, &exception)
+	if exception != nil {
+		report_internal_exception(ctx, name, exception)
+		return nil
+	}
+	return value
+}
+
+report_internal_exception :: proc(
+	ctx: jsc.JSContextRef,
+	name: string,
+	exception: jsc.JSValueRef,
+) {
+	msg, allocated := jsc_value_to_string_or_default(ctx, exception)
+	os.write_string(os.stderr, "lava: failed to initialize ")
+	os.write_string(os.stderr, name)
+	os.write_string(os.stderr, ": ")
+	os.write_string(os.stderr, msg)
+	os.write_string(os.stderr, "\n")
+	if allocated do delete(msg, context.allocator)
 }
 
 install_process :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
@@ -463,3 +611,20 @@ build_env_object :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	}
 	return object
 }
+
+// CONSOLE_PRELUDE evaluates to a factory function which, given the two native
+// write primitives (stdout, stderr), builds the Node `console` object and
+// installs it on globalThis. Implemented in JS (like Node) so util.format
+// substitution, value inspection, grouping and table rendering stay simple. The
+// primitives arrive as arguments, so they are never visible on globalThis.
+CONSOLE_PRELUDE :: #load("js/console.js", string)
+
+// Internal built-in modules, embedded at compile time. Each evaluates to a
+// factory `(require, module, exports) => exports?`; the loader wires them up.
+INTERNAL_LOADER :: #load("js/internal/loader.js", string)
+INTERNAL_UTIL :: #load("js/internal/util.js", string)
+INTERNAL_EVENTS :: #load("js/internal/events.js", string)
+INTERNAL_ASSERT :: #load("js/internal/assert.js", string)
+INTERNAL_BUFFER :: #load("js/internal/buffer.js", string)
+INTERNAL_CRYPTO :: #load("js/internal/crypto.js", string)
+INTERNAL_FETCH :: #load("js/internal/fetch.js", string)

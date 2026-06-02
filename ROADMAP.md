@@ -13,6 +13,13 @@ The original runtime plan (PR #1) is complete:
       (`argv`/`env`/`platform`/`version`/`pid`/`nextTick`/`exit`/`cwd`),
       `setTimeout`/`setInterval`/`setImmediate` + `clear*`, `queueMicrotask`,
       `globalThis` (`pkg/runtime/globals.odin`).
+- [x] **Full `console` surface** — `log`/`info`/`debug`/`error`/`warn`,
+      `dir`/`trace`/`assert`, `count`/`countReset`,
+      `group`/`groupCollapsed`/`groupEnd`, `time`/`timeEnd`/`timeLog`,
+      `table`, `clear`, `Console`, plus `util.format` (`%s/%d/%i/%f/%j/%o/%O/%c`)
+      substitution and value inspection. Backed by two native write primitives;
+      the rest is a JS prelude (`CONSOLE_PRELUDE` in `pkg/runtime/globals.odin`),
+      matching Node's console output on the compat cases.
 - [x] **CLI drives the loop** — `lava run`/`eval` create an `eventloop.Loop` and
       run it to idle (`cmd/lava/main.odin`).
 - [x] **Loop pointer is private** — stored in the global object's private data
@@ -32,10 +39,31 @@ The original runtime plan (PR #1) is complete:
 
 ## Remaining
 
-Tracked against the `tests/node-compat/cases` oracle. Through Lava today:
-`00-commonjs` and `02-fs-path` pass; the rest are blocked on the items below.
+Tracked against the `tests/node-compat/cases` oracle. Through Lava today
+**8 of 9 cases pass** (`00`,`02`–`08`); only `01-esm` remains, blocked on the
+ESM loader below.
 
-### High priority (unblocks async + the compat suite)
+### Internal JS module layer (done in this batch)
+
+Built-ins now live as embedded JS factories under `pkg/runtime/js/internal/`,
+wired by a small loader (`loader.js`) that native `require()` consults before
+the filesystem (`require_builtin` in `globals.odin`). Minimal, original
+implementations — no `primordials`, no `internalBinding` coupling.
+
+- [x] **internal module loader** — lazy, cached, `node:`-prefix aware, eager for
+      modules that install globals (Buffer, fetch).
+- [x] **`util`** — `inspect` / `format` / `formatWithOptions`.
+- [x] **`events` (EventEmitter)** + static `once` — _(passes `06-events`)_
+- [x] **`node:assert`** real strict assertions (`AssertionError`, deep compare)
+      — replaced the dangerous no-op.
+- [x] **`Buffer` global** — `from`/`alloc`/`concat`/`copy`/`toString` over
+      `Uint8Array` with hand-rolled utf8/hex/base64 — _(passes `03-buffer`)_
+- [x] **`node:crypto`** subset — pure-JS `createHash('sha256')`, `randomUUID`,
+      `randomBytes` — _(passes `07-crypto`)_
+- [x] **`fetch` / `Response` / `Headers` / `Request`** globals — body + headers
+      machinery is real; network transport is stubbed — _(passes `08-fetch`)_
+
+### High priority (the Odin / native part)
 
 - [ ] **Promise ↔ event-loop integration.** JSC drains its own promise
       microtask queue at the end of `JSEvaluateScript`, so `Promise.then` runs
@@ -43,20 +71,18 @@ Tracked against the `tests/node-compat/cases` oracle. Through Lava today:
       `JSObjectMakeDeferredPromise` and route promise jobs through our
       next-tick/microtask queues. _(originally the "+ DeferredPromise" half of
       plan item 1)_
-- [ ] **`Buffer` global** — real `Buffer.from`/`alloc`/`concat`, etc.
-      `readFileSync` currently returns a bare `Uint8Array`. _(blocks `03-buffer`)_
-- [ ] **`node:assert` is a no-op** (`equal`/`deepEqual`/`match` do nothing) —
-      `pkg/runtime/environment.odin`. Implement real assertions; dangerous for a
-      test-runner target until then.
+- [ ] **ESM** — only CommonJS `require` works; no `.mjs` / `import` /
+      `import.meta` / `node:url` `fileURLToPath` _(blocks `01-esm`, the last
+      failing case)_
+- [ ] **Native CSPRNG** — `crypto.randomBytes`/`randomUUID` currently use
+      `Math.random` (format-correct, NOT secure). Wire an OS entropy binding.
+- [ ] **Real network transport for `fetch()`** — Response/Headers exist; the
+      transport rejects until sockets are bound.
 
 ### Medium priority (more of the Node surface)
 
-- [ ] **`events` (EventEmitter)** — _(blocks `06-events`)_
-- [ ] **`node:crypto`** subset — _(blocks `07-crypto`)_
-- [ ] **`fetch` / `TextEncoder` / `TextDecoder` / `structuredClone`** —
-      _(blocks `08-fetch`)_
-- [ ] **ESM** — only CommonJS `require` works; no `.mjs` / `import`
-      _(blocks `01-esm`)_
+- [ ] **`TextEncoder` / `TextDecoder` / `structuredClone`** globals (pure JS;
+      reuse the buffer utf8 codec).
 - [ ] **More `node:path`** — `resolve`, `relative`, `normalize`, `dirname`,
       `sep`, `posix`/`win32` namespaces (only `basename`/`join`/`extname`/
       `isAbsolute` today).
