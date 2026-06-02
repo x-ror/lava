@@ -1,9 +1,9 @@
 bin/
 build/
+reports/
 *.bin
 *.exe
 *.o
 *.so
 *.dylib
 *.dll
-

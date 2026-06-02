@@ -1,8 +1,8 @@
 # Node Compatibility Tests
 
-These files are a small behavior corpus for Node-style runtime support. Today,
-the runner executes them with Node as the oracle. Once Lava can evaluate
-JavaScript through JSC, run the same corpus through Lava with:
+These files are a Node 22+ behavior corpus for modern Node-style runtime
+support. Today, the runner executes them with Node as the oracle. Once Lava can
+evaluate JavaScript through JSC, run the same corpus through Lava with:
 
 ```sh
 RUN_LAVA=1 make test-node
@@ -19,4 +19,3 @@ The cases intentionally cover APIs users expect from a Bun/Node-like runtime:
 - `events`
 - `crypto`
 - `fetch`
-

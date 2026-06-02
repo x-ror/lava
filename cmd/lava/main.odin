@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import lava_runtime "lava:pkg/runtime"
 
 VERSION :: "0.1.0-dev"
 
@@ -48,8 +49,11 @@ eval_command :: proc(args: []string) {
 		os.exit(2)
 	}
 
-	fmt.println("JSC runtime is not linked yet.")
-	fmt.printfln("queued source: %s", args[0])
+	result := lava_runtime.eval(args[0])
+	print_result(result)
+	exit_code := result.exit_code
+	lava_runtime.result_destroy(&result)
+	os.exit(exit_code)
 }
 
 run_command :: proc(args: []string) {
@@ -58,13 +62,20 @@ run_command :: proc(args: []string) {
 		os.exit(2)
 	}
 
-	data, err := os.read_entire_file(args[0], context.allocator)
-	if err != os.ERROR_NONE {
-		fmt.eprintfln("could not read %s: %v", args[0], err)
-		os.exit(1)
-	}
-	defer delete(data)
+	result := lava_runtime.run_file(args[0])
+	print_result(result)
+	exit_code := result.exit_code
+	lava_runtime.result_destroy(&result)
+	os.exit(exit_code)
+}
 
-	fmt.println("JSC runtime is not linked yet.")
-	fmt.printfln("queued file: %s (%d bytes)", args[0], len(data))
+print_result :: proc(result: lava_runtime.Result) {
+	if lava_runtime.is_success(result) {
+		if len(result.message) > 0 {
+			fmt.println(result.message)
+		}
+		return
+	}
+
+	fmt.eprintln(result.message)
 }
