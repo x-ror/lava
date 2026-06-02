@@ -29,7 +29,6 @@ The original runtime plan (PR #1) is complete:
 - [x] **CI** — `.github/workflows/ci.yml`: full check/build/test on Linux
       (`javascriptcoregtk-6.0`) and macOS; type-check + codegen + JSC-free
       event-loop tests on Windows.
-- [x] **`JSC_GTK6` build toggle** threaded through the Makefile + `scripts/build.sh`.
 
 ## Remaining
 

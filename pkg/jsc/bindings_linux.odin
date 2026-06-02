@@ -3,13 +3,9 @@ package jsc
 
 import "core:c"
 
-// Links against whichever GTK JavaScriptCore version is installed.
-// Build with: $(pkg-config --libs javascriptcoregtk-6.0) or -4.1 variant.
-when #config(JSC_GTK6, false) {
-	foreign import jsc_lib "system:javascriptcoregtk-6.0"
-} else {
-	foreign import jsc_lib "system:javascriptcoregtk-4.1"
-}
+// Links against the GTK JavaScriptCore library.
+// Build with: $(pkg-config --libs javascriptcoregtk-6.0).
+foreign import jsc_lib "system:javascriptcoregtk-6.0"
 
 @(default_calling_convention = "c")
 foreign jsc_lib {

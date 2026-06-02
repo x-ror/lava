@@ -14,10 +14,7 @@ Compatibility targets modern Node.js 22+ behavior rather than legacy Node APIs.
 - Odin
 - JavaScriptCore development headers and libraries
 
-On Linux, the JSC package is commonly exposed through `pkg-config` as one of:
-
-- `javascriptcoregtk-4.1`
-- `javascriptcoregtk-6.0`
+On Linux, the JSC package is exposed through `pkg-config` as `javascriptcoregtk-6.0`.
 
 On macOS, JSC is provided by the `JavaScriptCore` framework.
 

@@ -14,16 +14,7 @@ check_pkg() {
 	fi
 }
 
-if pkg-config --exists javascriptcoregtk-4.1; then
-	printf 'javascriptcoregtk-4.1 '
-	pkg-config --modversion javascriptcoregtk-4.1
-elif pkg-config --exists javascriptcoregtk-6.0; then
-	printf 'javascriptcoregtk-6.0 '
-	pkg-config --modversion javascriptcoregtk-6.0
-else
-	printf '%s\n' 'missing: javascriptcoregtk-4.1 or javascriptcoregtk-6.0'
-	missing=1
-fi
+check_pkg javascriptcoregtk-6.0
 
 if [ "$missing" -ne 0 ]; then
 	printf '%s\n' 'Install the missing development package before enabling native JSC runtime execution.'

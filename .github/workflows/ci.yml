@@ -23,9 +23,6 @@ jobs:
   linux:
     name: Linux (full build + tests)
     runs-on: ubuntu-latest
-    # Build against the javascriptcoregtk-6.0 backend (see pkg/jsc/bindings_linux.odin).
-    env:
-      JSC_GTK6: "1"
     steps:
       - uses: actions/checkout@v4
 
