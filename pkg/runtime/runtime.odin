@@ -53,11 +53,25 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 		}
 	}
 
-	ctx := jsc.JSGlobalContextCreate(nil)
+	// A custom global class gives the global object a private-data slot, where we
+	// stash Runtime_State (loop + module cache) out of reach of user JavaScript.
+	global_class := make_global_class()
+	ctx := jsc.JSGlobalContextCreate(global_class)
 	if ctx == nil {
+		jsc.JSClassRelease(global_class)
 		return native_runtime_unavailable()
 	}
+	defer jsc.JSClassRelease(global_class)
 	defer jsc.JSGlobalContextRelease(ctx)
+
+	state := new_runtime_state(loop)
+	jsc.JSObjectSetPrivate(
+		jsc.JSContextGetGlobalObject(cast(jsc.JSContextRef)ctx),
+		cast(rawptr)state,
+	)
+	// Runs before the context is released (defers execute in reverse order), so
+	// JSValueUnprotect on cached modules still has a live context.
+	defer destroy_runtime_state(cast(jsc.JSContextRef)ctx, state)
 
 	setup_module_environment(cast(jsc.JSContextRef)ctx, source_name, loop)
 
@@ -180,7 +194,10 @@ value_to_string :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> (string
 		return "", false
 	}
 
-	buffer := make([]byte, max_size, context.temp_allocator)
+	// Allocate the result buffer directly (one allocation instead of a temp
+	// buffer plus a clone). JSStringGetUTF8CString writes a NUL-terminated
+	// string, so the JS string occupies buffer[:written-1].
+	buffer := make([]byte, max_size, context.allocator)
 	written := int(
 		jsc.JSStringGetUTF8CString(
 			js_string,
@@ -189,12 +206,9 @@ value_to_string :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> (string
 		),
 	)
 	if written <= 1 {
+		delete(buffer)
 		return "", false
 	}
 
-	result, err := strings.clone_from_bytes(buffer[:written - 1], context.allocator)
-	if err != nil {
-		return "JavaScript string allocation failed", false
-	}
-	return result, true
+	return string(buffer[:written - 1]), true
 }
