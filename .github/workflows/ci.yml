@@ -42,7 +42,6 @@ jobs:
         uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          nightly: true
           llvm-version: "18"
 
       - name: Type-check
@@ -68,7 +67,6 @@ jobs:
         uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          nightly: true
           llvm-version: "18"
 
       - name: Type-check
@@ -97,7 +95,6 @@ jobs:
         uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          nightly: true
           llvm-version: "18"
 
       # Type-check every package natively for the Windows target. This exercises
