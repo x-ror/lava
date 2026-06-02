@@ -35,8 +35,7 @@ platform_wakeup :: proc(loop: ^Loop) {
 }
 
 platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
-	// Конвертуємо дескриптор вочера у системний HANDLE Windows
-	handle := windows.HANDLE(uintptr(watcher.fd))
+	handle := windows.HANDLE(watcher.fd)
 
 	// Прив'язуємо хендл сокету/файлу до порту IOCP.
 	// Передаємо вказівник на IO_Watcher як CompletionKey — ядро поверне його нам при завершенні операції.
@@ -58,26 +57,27 @@ platform_unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 }
 
 platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
-	bytes_transferred: windows.DWORD
-	completion_key: windows.ULONG_PTR
-	overlapped: ^windows.OVERLAPPED
+	entries: [32]windows.OVERLAPPED_ENTRY
+	removed: windows.c_ulong
 
-	timeout := windows.DWORD(windows.INFINITE if timeout_ms < 0 else timeout_ms)
+	timeout := windows.INFINITE if timeout_ms < 0 else windows.DWORD(timeout_ms)
 
-	ok := windows.GetQueuedCompletionStatus(
+	ok := windows.GetQueuedCompletionStatusEx(
 		loop.platform.iocp,
-		&bytes_transferred,
-		&completion_key,
-		&overlapped,
+		&entries[0],
+		len(entries),
+		&removed,
 		timeout,
+		false,
 	)
+	if !ok || removed == 0 do return
 
-	if !ok && overlapped == nil do return
-	if completion_key == WAKEUP_KEY do return
+	for i in 0 ..< int(removed) {
+		key := entries[i].lpCompletionKey
+		if key == WAKEUP_KEY || key == 0 do continue
 
-	if completion_key != 0 {
-		watcher := cast(^IO_Watcher)uintptr(completion_key)
-		if watcher != nil && watcher.callback != nil {
+		watcher := cast(^IO_Watcher)uintptr(key)
+		if watcher.callback != nil {
 			watcher.callback(loop, watcher.user_data)
 		}
 	}

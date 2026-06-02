@@ -1,0 +1,87 @@
+#+build darwin
+package jsc
+
+import "core:c"
+
+foreign import jsc_lib "system:JavaScriptCore.framework"
+
+@(default_calling_convention = "c")
+foreign jsc_lib {
+	JSGlobalContextCreate              :: proc(global_object_class: JSClassRef) -> JSGlobalContextRef ---
+	JSGlobalContextRelease             :: proc(ctx: JSGlobalContextRef) ---
+
+	JSStringCreateWithUTF8CString      :: proc(string: cstring) -> JSStringRef ---
+	JSStringGetMaximumUTF8CStringSize  :: proc(string: JSStringRef) -> c.size_t ---
+	JSStringGetUTF8CString             :: proc(string: JSStringRef, buffer: [^]byte, buffer_size: c.size_t) -> c.size_t ---
+	JSStringRelease                    :: proc(string: JSStringRef) ---
+	JSStringIsEqualToUTF8CString       :: proc(a: JSStringRef, b: cstring) -> b32 ---
+
+	JSValueMakeUndefined               :: proc(ctx: JSContextRef) -> JSValueRef ---
+	JSValueMakeNull                    :: proc(ctx: JSContextRef) -> JSValueRef ---
+	JSValueMakeBoolean                 :: proc(ctx: JSContextRef, boolean: b32) -> JSValueRef ---
+	JSValueMakeNumber                  :: proc(ctx: JSContextRef, number: f64) -> JSValueRef ---
+	JSValueMakeString                  :: proc(ctx: JSContextRef, string: JSStringRef) -> JSValueRef ---
+
+	JSValueGetType                     :: proc(ctx: JSContextRef, value: JSValueRef) -> JSType ---
+	JSValueIsUndefined                 :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueIsNull                      :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueIsBoolean                   :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueIsNumber                    :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueIsString                    :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueIsObject                    :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueIsArray                     :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueIsStrictEqual               :: proc(ctx: JSContextRef, a: JSValueRef, b: JSValueRef) -> b32 ---
+
+	JSValueToBoolean                   :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueToNumber                    :: proc(ctx: JSContextRef, value: JSValueRef, exception: ^JSValueRef) -> f64 ---
+	JSValueToStringCopy                :: proc(ctx: JSContextRef, value: JSValueRef, exception: ^JSValueRef) -> JSStringRef ---
+
+	JSContextGetGlobalObject           :: proc(ctx: JSContextRef) -> JSObjectRef ---
+
+	JSObjectMake                       :: proc(ctx: JSContextRef, js_class: JSClassRef, data: rawptr) -> JSObjectRef ---
+	JSObjectMakeFunctionWithCallback   :: proc(ctx: JSContextRef, name: JSStringRef, call_as_function: JSObjectCallAsFunctionCallback) -> JSObjectRef ---
+	JSObjectMakeArray                  :: proc(ctx: JSContextRef, argument_count: c.size_t, arguments: [^]JSValueRef, exception: ^JSValueRef) -> JSObjectRef ---
+	JSObjectMakeError                  :: proc(ctx: JSContextRef, argument_count: c.size_t, arguments: [^]JSValueRef, exception: ^JSValueRef) -> JSObjectRef ---
+
+	JSObjectGetProperty                :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef, exception: ^JSValueRef) -> JSValueRef ---
+	JSObjectSetProperty                :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef, value: JSValueRef, attributes: JSPropertyAttributes, exception: ^JSValueRef) ---
+	JSObjectHasProperty                :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef) -> b32 ---
+	JSObjectDeleteProperty             :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef, exception: ^JSValueRef) -> b32 ---
+	JSObjectGetPropertyAtIndex         :: proc(ctx: JSContextRef, object: JSObjectRef, property_index: c.uint, exception: ^JSValueRef) -> JSValueRef ---
+	JSObjectSetPropertyAtIndex         :: proc(ctx: JSContextRef, object: JSObjectRef, property_index: c.uint, value: JSValueRef, exception: ^JSValueRef) ---
+
+	JSObjectCallAsFunction             :: proc(ctx: JSContextRef, object: JSObjectRef, this_object: JSObjectRef, argument_count: c.size_t, arguments: [^]JSValueRef, exception: ^JSValueRef) -> JSValueRef ---
+	JSObjectCallAsConstructor          :: proc(ctx: JSContextRef, object: JSObjectRef, argument_count: c.size_t, arguments: [^]JSValueRef, exception: ^JSValueRef) -> JSObjectRef ---
+	JSObjectIsFunction                 :: proc(ctx: JSContextRef, object: JSObjectRef) -> b32 ---
+	JSObjectIsConstructor              :: proc(ctx: JSContextRef, object: JSObjectRef) -> b32 ---
+
+	JSObjectGetPrivate                 :: proc(object: JSObjectRef) -> rawptr ---
+	JSObjectSetPrivate                 :: proc(object: JSObjectRef, data: rawptr) -> b32 ---
+
+	JSClassCreate                      :: proc(definition: ^JSClassDefinition) -> JSClassRef ---
+	JSClassRetain                      :: proc(js_class: JSClassRef) -> JSClassRef ---
+	JSClassRelease                     :: proc(js_class: JSClassRef) ---
+
+	JSEvaluateScript                   :: proc(ctx: JSContextRef, script: JSStringRef, this_object: JSObjectRef, source_url: JSStringRef, starting_line_number: c.int, exception: ^JSValueRef) -> JSValueRef ---
+	JSCheckScriptSyntax                :: proc(ctx: JSContextRef, script: JSStringRef, source_url: JSStringRef, starting_line_number: c.int, exception: ^JSValueRef) -> b32 ---
+	JSGarbageCollect                   :: proc(ctx: JSContextRef) ---
+
+	// Typed Arrays (ES2015+)
+	JSValueIsTypedArray                :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSObjectGetTypedArrayLength        :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
+	JSObjectGetTypedArrayBytesPtr      :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---
+	JSObjectGetTypedArrayByteLength    :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
+	JSObjectGetTypedArrayByteOffset    :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
+
+	// ArrayBuffer
+	JSObjectMakeArrayBufferWithBytesNoCopy :: proc(
+		ctx: JSContextRef,
+		bytes: rawptr,
+		byte_length: c.size_t,
+		byte_deallocator: proc "c" (bytes: rawptr, deallocator_context: rawptr),
+		deallocator_context: rawptr,
+		exception: ^JSValueRef,
+	) -> JSObjectRef ---
+	JSObjectGetArrayBufferBytesPtr     :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---
+	JSObjectGetArrayBufferByteLength   :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
+}

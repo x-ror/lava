@@ -10,6 +10,13 @@ Backend :: enum {
 	Native,
 }
 
+// Node.js event loop phases (in order):
+// 1. next_tick  — process.nextTick queue (highest priority microtasks)
+// 2. microtasks — Promise callbacks / queueMicrotask
+// 3. timers     — setTimeout / setInterval
+// 4. poll       — I/O events (blocks here if nothing pending)
+// 5. check      — setImmediate
+// 6. close      — close callbacks (socket.on('close', ...))
 Phase :: enum {
 	Next_Tick,
 	Microtasks,
@@ -36,6 +43,7 @@ Timer :: struct {
 	repeating: bool,
 	seq:       u64,
 	cancelled: bool,
+	unreffed:  bool, // if true, does not keep loop alive (like timer.unref() in Node)
 }
 
 Loop :: struct {
@@ -46,11 +54,10 @@ Loop :: struct {
 	next_ticks:      [dynamic]Task,
 	microtasks:      [dynamic]Task,
 	immediates:      [dynamic]Task,
+	close_callbacks: [dynamic]Task,
 	timers:          [dynamic]Timer,
 	cancelled_ids:   map[Timer_ID]bool,
 	running_id:      Timer_ID,
-	allocator:       mem.Allocator,
-	platform:        Platform_Loop,
 	active_io_count: int,
 	allocator:       mem.Allocator,
 	platform:        Platform_Loop,
@@ -61,8 +68,9 @@ Poll_Mode :: enum {
 	Write,
 }
 
+// fd is platform-agnostic here; cast to the right type in platform code
 IO_Watcher :: struct {
-	fd:        linux.Fd,
+	fd:        uintptr,
 	mode:      Poll_Mode,
 	callback:  Callback,
 	user_data: rawptr,
@@ -88,6 +96,7 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.next_ticks)
 	delete(loop.microtasks)
 	delete(loop.immediates)
+	delete(loop.close_callbacks)
 	delete(loop.timers)
 	delete(loop.cancelled_ids)
 	loop^ = Loop{}
@@ -100,7 +109,6 @@ backend_name :: proc(loop: ^Loop) -> string {
 	case .Unavailable:
 		return "unavailable"
 	}
-
 	return "unavailable"
 }
 
@@ -108,11 +116,14 @@ now :: proc(loop: ^Loop) -> u64 {
 	return loop.now_ms
 }
 
+// Returns the number of items keeping the loop alive.
+// Unreffed timers are excluded (matching Node.js timer.unref() semantics).
 pending_count :: proc(loop: ^Loop) -> int {
 	return(
 		len(loop.next_ticks) +
 		len(loop.microtasks) +
 		active_immediate_count(loop) +
+		active_close_count(loop) +
 		active_timer_count(loop) +
 		loop.active_io_count \
 	)
@@ -120,8 +131,8 @@ pending_count :: proc(loop: ^Loop) -> int {
 
 active_timer_count :: proc(loop: ^Loop) -> int {
 	count := 0
-	for timer in loop.timers {
-		if !timer.cancelled && !is_cancel_requested(loop, timer.id) {
+	for &timer in loop.timers {
+		if !timer.cancelled && !is_cancel_requested(loop, timer.id) && !timer.unreffed {
 			count += 1
 		}
 	}
@@ -130,8 +141,18 @@ active_timer_count :: proc(loop: ^Loop) -> int {
 
 active_immediate_count :: proc(loop: ^Loop) -> int {
 	count := 0
-	for immediate in loop.immediates {
+	for &immediate in loop.immediates {
 		if !immediate.cancelled && !is_cancel_requested(loop, immediate.id) {
+			count += 1
+		}
+	}
+	return count
+}
+
+active_close_count :: proc(loop: ^Loop) -> int {
+	count := 0
+	for &cb in loop.close_callbacks {
+		if !cb.cancelled {
 			count += 1
 		}
 	}
@@ -142,11 +163,12 @@ has_pending_work :: proc(loop: ^Loop) -> bool {
 	return pending_count(loop) > 0
 }
 
+// --- Scheduling APIs ---
+
 queue_next_tick :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) {
 	if callback == nil {
 		return
 	}
-
 	append(
 		&loop.next_ticks,
 		Task{callback = callback, user_data = user_data, seq = next_sequence(loop)},
@@ -157,7 +179,6 @@ queue_microtask :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil
 	if callback == nil {
 		return
 	}
-
 	append(
 		&loop.microtasks,
 		Task{callback = callback, user_data = user_data, seq = next_sequence(loop)},
@@ -186,13 +207,45 @@ set_immediate :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) 
 	if callback == nil {
 		return 0
 	}
-
 	id := next_handle_id(loop)
 	append(
 		&loop.immediates,
 		Task{id = id, callback = callback, user_data = user_data, seq = next_sequence(loop)},
 	)
 	return id
+}
+
+// queue_close_callback registers a close-phase callback (e.g. socket.on('close',...)).
+// These run at the end of each loop iteration, after check phase.
+queue_close_callback :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) {
+	if callback == nil {
+		return
+	}
+	id := next_handle_id(loop)
+	append(
+		&loop.close_callbacks,
+		Task{id = id, callback = callback, user_data = user_data, seq = next_sequence(loop)},
+	)
+}
+
+// timer_ref marks a timer as ref'd (default). Ref'd timers keep the loop alive.
+timer_ref :: proc(loop: ^Loop, id: Timer_ID) {
+	for &timer in loop.timers {
+		if timer.id == id {
+			timer.unreffed = false
+			return
+		}
+	}
+}
+
+// timer_unref marks a timer so it no longer keeps the loop alive (Node's timer.unref()).
+timer_unref :: proc(loop: ^Loop, id: Timer_ID) {
+	for &timer in loop.timers {
+		if timer.id == id {
+			timer.unreffed = true
+			return
+		}
+	}
 }
 
 set_timer :: proc(
@@ -241,6 +294,7 @@ clear_timeout :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 		}
 	}
 
+	// Support cancelling the currently-running callback
 	if loop.running_id == id {
 		append_cancel_request(loop, id)
 		return true
@@ -261,21 +315,34 @@ advance_time :: proc(loop: ^Loop, delta_ms: u64) {
 	loop.now_ms += delta_ms
 }
 
+// --- Microtask checkpoint ---
+// Node.js: after every timer/immediate callback, drain next_tick first, then
+// microtasks. Newly queued next_ticks are processed before existing microtasks.
 drain_microtasks :: proc(loop: ^Loop) {
-	for len(loop.next_ticks) > 0 || len(loop.microtasks) > 0 {
-		drain_task_queue(loop, &loop.next_ticks)
+	for {
+		// Always drain all next_ticks before touching microtasks
+		for len(loop.next_ticks) > 0 {
+			drain_task_queue(loop, &loop.next_ticks)
+		}
+		if len(loop.microtasks) == 0 {
+			break
+		}
 		drain_task_queue(loop, &loop.microtasks)
 	}
 }
 
+// --- Main loop tick ---
 run_once :: proc(loop: ^Loop) -> bool {
 	did_work := false
 
+	// Phase 1 & 2: next_tick + microtasks (before anything else)
 	if len(loop.next_ticks) > 0 || len(loop.microtasks) > 0 {
 		did_work = true
 	}
 	drain_microtasks(loop)
 
+	// Phase 3: timers
+	// sequence_limit ensures timers scheduled *during* this phase run next iteration
 	timer_phase_sequence_limit := loop.next_sequence
 	for {
 		index := next_due_timer_index(loop, timer_phase_sequence_limit)
@@ -302,13 +369,25 @@ run_once :: proc(loop: ^Loop) -> bool {
 		}
 	}
 
-	if !did_work && len(loop.immediates) == 0 {
+	// Phase 4: poll — block for I/O only when there is nothing else to do
+	// (no immediates, no close callbacks, no pending microtasks)
+	has_nothing_to_do :=
+		!did_work &&
+		active_immediate_count(loop) == 0 &&
+		active_close_count(loop) == 0 &&
+		len(loop.next_ticks) == 0 &&
+		len(loop.microtasks) == 0
+
+	if has_nothing_to_do {
 		timeout_ms := get_next_timer_timeout(loop)
 		if timeout_ms != 0 {
 			platform_poll(loop, timeout_ms)
+			// After poll, update the clock so newly-due timers fire this tick
+			// (only when we slept and woke up naturally from a timer timeout)
 		}
 	}
 
+	// Phase 5: check — setImmediate
 	immediate_phase_sequence_limit := loop.next_sequence
 	for {
 		index := next_immediate_index(loop, immediate_phase_sequence_limit)
@@ -329,17 +408,39 @@ run_once :: proc(loop: ^Loop) -> bool {
 		drain_microtasks(loop)
 	}
 
+	// Phase 6: close callbacks
+	close_phase_sequence_limit := loop.next_sequence
+	for {
+		index := next_close_index(loop, close_phase_sequence_limit)
+		if index < 0 {
+			break
+		}
+
+		cb := loop.close_callbacks[index]
+		ordered_remove(&loop.close_callbacks, index)
+		if cb.cancelled {
+			continue
+		}
+
+		did_work = true
+		cb.callback(loop, cb.user_data)
+		drain_microtasks(loop)
+	}
+
 	discard_cancelled_timers(loop)
 	discard_cancelled_immediates(loop)
 	clear(&loop.cancelled_ids)
 	return did_work
 }
 
+// run_next advances time to the next due timer if there is no immediate work,
+// then calls run_once. Used for test/simulation drivers.
 run_next :: proc(loop: ^Loop) -> bool {
 	if len(loop.next_ticks) > 0 ||
 	   len(loop.microtasks) > 0 ||
 	   has_due_timer(loop) ||
-	   active_immediate_count(loop) > 0 {
+	   active_immediate_count(loop) > 0 ||
+	   active_close_count(loop) > 0 {
 		return run_once(loop)
 	}
 
@@ -369,6 +470,8 @@ run_until_idle :: proc(loop: ^Loop, max_iterations := 1024) -> bool {
 	return did_work
 }
 
+// get_next_timer_timeout returns milliseconds until the next timer fires.
+// Returns 0 if a timer is already due, -1 if there are no timers.
 get_next_timer_timeout :: proc(loop: ^Loop) -> int {
 	next_due, ok := next_timer_due(loop)
 	if !ok {
@@ -379,6 +482,8 @@ get_next_timer_timeout :: proc(loop: ^Loop) -> int {
 	}
 	return int(next_due - loop.now_ms)
 }
+
+// --- Internal helpers ---
 
 drain_task_queue :: proc(loop: ^Loop, queue: ^[dynamic]Task) {
 	if len(queue^) == 0 {
@@ -417,24 +522,25 @@ is_cancel_requested :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 	if id == 0 {
 		return false
 	}
-	_, ok := loop.cancelled_ids[id]
-	return ok
+	return loop.cancelled_ids[id]
 }
 
+// insert_timer inserts into the sorted timers slice (sorted by due_ms, then seq).
 insert_timer :: proc(loop: ^Loop, timer: Timer) {
+	insert_at := len(loop.timers)
 	for i in 0 ..< len(loop.timers) {
 		other := loop.timers[i]
 		if timer.due_ms < other.due_ms || (timer.due_ms == other.due_ms && timer.seq < other.seq) {
-			append(&loop.timers, timer)
-			for j := len(loop.timers) - 1; j > i; j -= 1 {
-				loop.timers[j] = loop.timers[j - 1]
-			}
-			loop.timers[i] = timer
-			return
+			insert_at = i
+			break
 		}
 	}
 
-	append(&loop.timers, timer)
+	append(&loop.timers, Timer{}) // grow by one
+	for j := len(loop.timers) - 1; j > insert_at; j -= 1 {
+		loop.timers[j] = loop.timers[j - 1]
+	}
+	loop.timers[insert_at] = timer
 }
 
 has_due_timer :: proc(loop: ^Loop) -> bool {
@@ -464,6 +570,20 @@ next_immediate_index :: proc(loop: ^Loop, sequence_limit: u64) -> int {
 			continue
 		}
 		if immediate.seq >= sequence_limit {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+next_close_index :: proc(loop: ^Loop, sequence_limit: u64) -> int {
+	for i in 0 ..< len(loop.close_callbacks) {
+		cb := loop.close_callbacks[i]
+		if cb.cancelled {
+			continue
+		}
+		if cb.seq >= sequence_limit {
 			continue
 		}
 		return i
@@ -502,6 +622,8 @@ discard_cancelled_immediates :: proc(loop: ^Loop) {
 	}
 }
 
+// --- I/O watcher API ---
+
 watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	if watcher == nil || watcher.callback == nil do return false
 	if platform_watch_fd(loop, watcher) {
@@ -520,7 +642,7 @@ unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	return false
 }
 
-// Allows background worker threads to instantly kick the event loop out of its sleep state
+// wakeup allows background worker threads to instantly kick the loop out of sleep.
 wakeup :: proc(loop: ^Loop) {
 	platform_wakeup(loop)
 }

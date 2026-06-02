@@ -79,8 +79,8 @@ platform_wakeup :: proc(loop: ^Loop) {
 }
 
 platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
+	fd := linux.Fd(watcher.fd)
 	if loop.platform.use_uring {
-		// Виправлено: linux.Poll_Flags змінено на linux.EPoll_Flags
 		mask: linux.EPoll_Flags = {.IN} if watcher.mode == .Read else {.OUT}
 		return arm_uring_poll(loop, u64(watcher.fd), u64(uintptr(watcher)), mask)
 	}
@@ -89,7 +89,7 @@ platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	ev.events = {.IN} if watcher.mode == .Read else {.OUT}
 	ev.data.ptr = watcher
 
-	err := linux.epoll_ctl(loop.platform.epoll_fd, .ADD, watcher.fd, &ev)
+	err := linux.epoll_ctl(loop.platform.epoll_fd, .ADD, fd, &ev)
 	return err == nil
 }
 
@@ -98,7 +98,8 @@ platform_unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 		return true
 	}
 
-	err := linux.epoll_ctl(loop.platform.epoll_fd, .DEL, watcher.fd, nil)
+	fd := linux.Fd(watcher.fd)
+	err := linux.epoll_ctl(loop.platform.epoll_fd, .DEL, fd, nil)
 	return err == nil
 }
 

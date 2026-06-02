@@ -245,3 +245,86 @@ timer_scheduled_by_timer_waits_for_next_turn :: proc(t: ^testing.T) {
 	expect_events(t, rec.events[:], []int{1, 3})
 	testing.expect_value(t, pending_count(&loop), 0)
 }
+
+@(test)
+close_callbacks_run_after_immediates :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// setImmediate (check phase) must fire before close callbacks
+	set_immediate(&loop, record_2, &rec)
+	queue_close_callback(&loop, record_3, &rec)
+	queue_microtask(&loop, record, &rec)
+
+	testing.expect(t, run_once(&loop))
+	// order: microtask(1) → immediate/check(2) → close(3)
+	expect_events(t, rec.events[:], []int{1, 2, 3})
+}
+
+@(test)
+unreffed_timer_does_not_keep_loop_alive :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	id := set_timeout(&loop, record, 100, &rec)
+	timer_unref(&loop, id)
+
+	// Loop should be considered idle because the only timer is unreffed
+	testing.expect_value(t, pending_count(&loop), 0)
+	testing.expect(t, !has_pending_work(&loop))
+}
+
+@(test)
+refd_timer_keeps_loop_alive :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	id := set_timeout(&loop, record, 100, &rec)
+	timer_unref(&loop, id)
+	timer_ref(&loop, id)
+
+	testing.expect_value(t, pending_count(&loop), 1)
+	testing.expect(t, has_pending_work(&loop))
+}
+
+@(test)
+next_tick_queued_inside_next_tick_runs_before_microtasks :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// next_tick queues another next_tick; that must run before any microtask
+	queue_next_tick(&loop, record_and_queue_next_tick, &rec)
+	queue_microtask(&loop, record_3, &rec)
+
+	testing.expect(t, run_once(&loop))
+	// record(1) fires, queues next_tick(2); next_tick(2) fires; then microtask(3)
+	expect_events(t, rec.events[:], []int{1, 2, 3})
+}
+
+@(test)
+microtasks_drain_between_immediate_callbacks :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	set_immediate(&loop, record_and_queue_microtask, &rec)
+	set_immediate(&loop, record_3, &rec)
+
+	testing.expect(t, run_once(&loop))
+	// immediate(1) fires → queues microtask(2); microtask(2) drains; then immediate(3)
+	expect_events(t, rec.events[:], []int{1, 2, 3})
+}
