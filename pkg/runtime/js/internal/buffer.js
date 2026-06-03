@@ -1,112 +1,35 @@
-// node:buffer — Buffer implemented as a Uint8Array subclass. Encodings are
-// done by hand because JSC's bare context has no TextEncoder/TextDecoder.
-// Also installs the global `Buffer` (Node exposes it without a require).
-(function (require, module) {
+// node:buffer — Buffer implemented as a Uint8Array subclass. The hex/base64/utf8
+// codecs are backed by Odin (pkg/runtime/buffer.odin) via the `native` bindings
+// (fourth factory arg) and are the sole implementation — no JS fallback.
+// ascii/latin1 stay pure JS. Also installs the global `Buffer` (Node exposes it
+// without a require).
+(function (require, module, exports, native) {
 	"use strict";
 
-	function utf8Encode(str) {
-		var bytes = [];
-		for (var i = 0; i < str.length; i++) {
-			var c = str.charCodeAt(i);
-			if (c < 0x80) {
-				bytes.push(c);
-			} else if (c < 0x800) {
-				bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-			} else if (c >= 0xd800 && c <= 0xdbff) {
-				var c2 = str.charCodeAt(i + 1);
-				if (c2 >= 0xdc00 && c2 <= 0xdfff) {
-					var cp = ((c - 0xd800) << 10) + (c2 - 0xdc00) + 0x10000;
-					bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
-					i++;
-				} else {
-					bytes.push(0xef, 0xbf, 0xbd);
-				}
-			} else if (c >= 0xdc00 && c <= 0xdfff) {
-				bytes.push(0xef, 0xbf, 0xbd);
-			} else {
-				bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-			}
-		}
-		return bytes;
-	}
+	// Every codec is Odin-backed (pkg/runtime/buffer.odin); the loader supplies
+	// `native` for every real instantiation. A missing binding means the module
+	// is mis-wired — fail loudly here instead of shipping a slow JS shadow.
+	if (!native) throw new Error("node:buffer requires native codec bindings");
 
-	function utf8Decode(buf, start, end) {
-		var out = "";
-		var i = start;
-		while (i < end) {
-			var b = buf[i++];
-			if (b < 0x80) {
-				out += String.fromCharCode(b);
-			} else if (b >= 0xc0 && b < 0xe0) {
-				out += String.fromCharCode(((b & 0x1f) << 6) | (buf[i++] & 0x3f));
-			} else if (b >= 0xe0 && b < 0xf0) {
-				out += String.fromCharCode(((b & 0x0f) << 12) | ((buf[i++] & 0x3f) << 6) | (buf[i++] & 0x3f));
-			} else if (b >= 0xf0) {
-				var cp = ((b & 0x07) << 18) | ((buf[i++] & 0x3f) << 12) | ((buf[i++] & 0x3f) << 6) | (buf[i++] & 0x3f);
-				cp -= 0x10000;
-				out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-			} else {
-				out += "�";
-			}
-		}
-		return out;
-	}
+	var utf8Encode = native.utf8Encode; // (string) -> Uint8Array
+	var utf8Decode = native.utf8Decode; // (Uint8Array) -> string
+	var hexEncode = native.hexEncode; // (Uint8Array) -> string
+	var hexDecode = native.hexDecode; // (string) -> Uint8Array
+	var base64Encode = native.base64Encode; // (Uint8Array) -> string
 
-	function hexEncode(buf, start, end) {
-		var s = "";
-		for (var i = start; i < end; i++) {
-			var h = buf[i].toString(16);
-			s += h.length === 1 ? "0" + h : h;
-		}
-		return s;
-	}
-
-	function hexDecode(str) {
-		var bytes = [];
-		for (var i = 0; i + 1 < str.length; i += 2) {
-			var byte = parseInt(str.substr(i, 2), 16);
-			if (isNaN(byte)) break;
-			bytes.push(byte);
-		}
-		return bytes;
-	}
-
-	var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-	function base64Encode(buf) {
-		var s = "";
-		var i;
-		for (i = 0; i + 2 < buf.length; i += 3) {
-			var n = (buf[i] << 16) | (buf[i + 1] << 8) | buf[i + 2];
-			s += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + B64[(n >> 6) & 63] + B64[n & 63];
-		}
-		var rem = buf.length - i;
-		if (rem === 1) {
-			var n1 = buf[i] << 16;
-			s += B64[(n1 >> 18) & 63] + B64[(n1 >> 12) & 63] + "==";
-		} else if (rem === 2) {
-			var n2 = (buf[i] << 16) | (buf[i + 1] << 8);
-			s += B64[(n2 >> 18) & 63] + B64[(n2 >> 12) & 63] + B64[(n2 >> 6) & 63] + "=";
-		}
-		return s;
+	// core:encoding/base64 expects clean, padded standard base64; Node is lenient
+	// (ignores stray chars, tolerates missing padding). Normalize before handing
+	// the string to the strict native decoder so we match Node's leniency.
+	function normalizeBase64(str) {
+		str = String(str).replace(/[^A-Za-z0-9+/]/g, "");
+		if (str.length % 4 === 1) str = str.slice(0, str.length - 1); // a lone char is meaningless
+		while (str.length % 4 !== 0) str += "=";
+		return str;
 	}
 
 	function base64Decode(str) {
-		str = str.replace(/[^A-Za-z0-9+/]/g, "");
-		var bytes = [];
-		for (var i = 0; i + 3 < str.length; i += 4) {
-			var n = (B64.indexOf(str[i]) << 18) | (B64.indexOf(str[i + 1]) << 12) | (B64.indexOf(str[i + 2]) << 6) | B64.indexOf(str[i + 3]);
-			bytes.push((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff);
-		}
-		var rem = str.length % 4;
-		if (rem === 2) {
-			var a = (B64.indexOf(str[str.length - 2]) << 18) | (B64.indexOf(str[str.length - 1]) << 12);
-			bytes.push((a >> 16) & 0xff);
-		} else if (rem === 3) {
-			var b = (B64.indexOf(str[str.length - 3]) << 18) | (B64.indexOf(str[str.length - 2]) << 12) | (B64.indexOf(str[str.length - 1]) << 6);
-			bytes.push((b >> 16) & 0xff, (b >> 8) & 0xff);
-		}
-		return bytes;
+		var norm = normalizeBase64(str);
+		return norm ? native.base64Decode(norm) : new Uint8Array(0);
 	}
 
 	function strToBytes(str, encoding) {
@@ -127,8 +50,8 @@
 			encoding = (encoding || "utf8").toLowerCase();
 			start = start || 0;
 			end = end === undefined ? this.length : end;
-			if (encoding === "utf8" || encoding === "utf-8") return utf8Decode(this, start, end);
-			if (encoding === "hex") return hexEncode(this, start, end);
+			if (encoding === "utf8" || encoding === "utf-8") return utf8Decode(this.subarray(start, end));
+			if (encoding === "hex") return hexEncode(this.subarray(start, end));
 			if (encoding === "base64") return base64Encode(this.subarray(start, end));
 			if (encoding === "ascii" || encoding === "latin1" || encoding === "binary") {
 				var s = "";

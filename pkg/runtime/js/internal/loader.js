@@ -4,10 +4,11 @@
 // `node:` prefix, and lets internal modules require one another (with the usual
 // CommonJS partial-exports behavior on cycles). The resolver is what native
 // `require()` consults before touching the filesystem.
-(function (factories) {
+(function (factories, natives) {
 	"use strict";
 
 	var cache = Object.create(null);
+	natives = natives || Object.create(null);
 
 	function normalize(name) {
 		var key = name.indexOf("node:") === 0 ? name.slice(5) : name;
@@ -25,7 +26,9 @@
 		// Seed the cache before running the factory so a require cycle resolves
 		// to the partially-built exports object instead of looping forever.
 		cache[key] = module.exports;
-		var result = factory(req, module, module.exports);
+		// natives[key] (or undefined) carries any Odin-backed primitives for this
+		// module — e.g. crypto's CSPRNG and one-shot hash/hmac/pbkdf2.
+		var result = factory(req, module, module.exports, natives[key]);
 		cache[key] = result !== undefined ? result : module.exports;
 		return cache[key];
 	}

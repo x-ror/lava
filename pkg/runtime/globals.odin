@@ -427,13 +427,20 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	loader := eval_internal(ctx, "internal:loader", INTERNAL_LOADER)
 	if loader == nil || !jsc.JSValueIsObject(ctx, loader) do return
 
-	args := [1]jsc.JSValueRef{cast(jsc.JSValueRef)factories}
+	// Native primitives keyed by module name. The loader passes natives[key] to
+	// each factory as its fourth argument, so a module receives its Odin-backed
+	// bindings without anything landing on globalThis (cf. install_console).
+	natives := jsc.JSObjectMake(ctx, nil, nil)
+	set_named(ctx, natives, "crypto", cast(jsc.JSValueRef)make_crypto_bindings(ctx))
+	set_named(ctx, natives, "buffer", cast(jsc.JSValueRef)make_buffer_bindings(ctx))
+
+	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef
 	resolver := jsc.JSObjectCallAsFunction(
 		ctx,
 		cast(jsc.JSObjectRef)loader,
 		nil,
-		1,
+		2,
 		raw_data(args[:]),
 		&exception,
 	)
