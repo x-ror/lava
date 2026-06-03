@@ -14,6 +14,11 @@ Runtime_State :: struct {
 	loop:            ^eventloop.Loop,
 	module_cache:    map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
 	builtin_require: jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
+	// Set when an uncaught exception escapes an async callback or a promise
+	// rejects with no handler. The process then exits non-zero even though the
+	// initial JSEvaluateScript returned cleanly (see resolve_exit_code).
+	async_failed:      bool,
+	rejection_handler: jsc.JSValueRef, // GC-protected fn registered with JSC; unprotected on destroy
 }
 
 // JS_Callback bridges a JS function into an event-loop Callback. The function
@@ -62,6 +67,7 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	}
 	delete(state.module_cache)
 	if state.builtin_require != nil do jsc.JSValueUnprotect(ctx, state.builtin_require)
+	if state.rejection_handler != nil do jsc.JSValueUnprotect(ctx, state.rejection_handler)
 	free(state)
 }
 
@@ -132,6 +138,7 @@ js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	jsc.JSObjectCallAsFunction(cb.ctx, cb.func, nil, 0, nil, &exception)
 	if exception != nil {
 		report_uncaught(cb.ctx, exception)
+		mark_async_failed(cb.ctx)
 	}
 
 	// Non-repeating callbacks (setTimeout/setImmediate/microtasks) fire once;
@@ -150,6 +157,63 @@ report_uncaught :: proc(ctx: jsc.JSContextRef, exception: jsc.JSValueRef) {
 	os.write_string(os.stderr, "Uncaught ")
 	os.write_string(os.stderr, msg)
 	os.write_string(os.stderr, "\n")
+}
+
+// mark_async_failed records that the process should exit non-zero because an
+// async callback threw or a promise rejected without a handler. resolve_exit_code
+// reads it once the loop drains.
+mark_async_failed :: proc(ctx: jsc.JSContextRef) {
+	if state := get_state_from_ctx(ctx); state != nil {
+		state.async_failed = true
+	}
+}
+
+// unhandled_rejection_cb is registered with JavaScriptCore via
+// JSGlobalContextSetUnhandledRejectionCallback. JSC invokes it as
+// handler(promise, reason) at a microtask checkpoint when a rejected promise has
+// no handler, matching Node's default --unhandled-rejections=throw behavior.
+unhandled_rejection_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	reason := jsc.JSValueMakeUndefined(ctx)
+	if argument_count >= 2 do reason = arguments[1]
+	msg, allocated := jsc_value_to_string_or_default(ctx, reason)
+	defer if allocated do delete(msg, context.allocator)
+	os.write_string(os.stderr, "Uncaught (in promise) ")
+	os.write_string(os.stderr, msg)
+	os.write_string(os.stderr, "\n")
+	mark_async_failed(ctx)
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// install_rejection_tracker registers unhandled_rejection_cb with the context so
+// unhandled promise rejections surface to stderr and the exit code.
+install_rejection_tracker :: proc(ctx: jsc.JSContextRef) {
+	name := jsc.JSStringCreateWithUTF8CString("unhandledRejection")
+	defer jsc.JSStringRelease(name)
+	handler := jsc.JSObjectMakeFunctionWithCallback(ctx, name, unhandled_rejection_cb)
+	if handler == nil do return
+	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)handler)
+	if state := get_state_from_ctx(ctx); state != nil {
+		state.rejection_handler = cast(jsc.JSValueRef)handler
+	}
+	jsc.JSGlobalContextSetUnhandledRejectionCallback(cast(jsc.JSGlobalContextRef)ctx, handler, nil)
+}
+
+// get_named reads object[name], returning nil on allocation failure. Mirror of
+// set_named; used to read process.exitCode when resolving the exit code.
+get_named :: proc(ctx: jsc.JSContextRef, object: jsc.JSObjectRef, name: string) -> jsc.JSValueRef {
+	c_name, err := strings.clone_to_cstring(name, context.temp_allocator)
+	if err != nil do return nil
+	js_name := jsc.JSStringCreateWithUTF8CString(c_name)
+	defer jsc.JSStringRelease(js_name)
+	return jsc.JSObjectGetProperty(ctx, object, js_name, nil)
 }
 
 // callback_arg returns the argument as a callable function object, or nil.
@@ -393,6 +457,7 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 	install_internal_modules(ctx, global)
 
 	install_process(ctx, global)
+	install_rejection_tracker(ctx)
 }
 
 // install_internal_modules evaluates the JS built-in modules (util, events,
