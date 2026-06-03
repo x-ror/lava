@@ -38,6 +38,7 @@
 	// them explicitly.
 	req("buffer");
 	req("fetch");
+	req("abort");
 
 	return req;
 })
