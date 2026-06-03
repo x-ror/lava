@@ -53,7 +53,7 @@ eval_command :: proc(args: []string) {
 	}
 
 	loop := eventloop.init()
-	result := lava_runtime.eval(args[0], "<eval>", &loop)
+	result := lava_runtime.eval(args[0], "<eval>", &loop, true)
 	print_result(result)
 	exit_code := result.exit_code
 	lava_runtime.result_destroy(&result)
