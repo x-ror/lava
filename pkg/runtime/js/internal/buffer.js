@@ -543,13 +543,96 @@
 		return Buffer.from(Buffer.from(source).toString(fromEnc), toEnc);
 	}
 
+	// --- Blob / File (Web platform classes also exported from node:buffer) ----
+
+	function blobPartToBytes(part) {
+		if (part instanceof Blob) return part._bytes;
+		if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
+		if (ArrayBuffer.isView(part)) {
+			return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+		}
+		return new Uint8Array(Buffer.from(String(part), "utf8"));
+	}
+
+	function normalizeBlobType(options) {
+		if (!options || options.type === undefined) return "";
+		var type = String(options.type);
+		for (var i = 0; i < type.length; i++) {
+			var code = type.charCodeAt(i);
+			if (code < 0x20 || code > 0x7e) return ""; // Node drops types with non-printable chars
+		}
+		return type.toLowerCase();
+	}
+
+	function Blob(parts, options) {
+		if (!(this instanceof Blob)) throw new TypeError("Constructor Blob requires 'new'");
+		var chunks = [], total = 0;
+		if (parts !== undefined && parts !== null) {
+			if (typeof parts !== "object" || typeof parts[Symbol.iterator] !== "function") {
+				throw new TypeError("The \"parts\" argument must be an iterable object");
+			}
+			var list = Array.from(parts);
+			for (var i = 0; i < list.length; i++) {
+				var bytes = blobPartToBytes(list[i]);
+				chunks.push(bytes);
+				total += bytes.length;
+			}
+		}
+		var merged = new Uint8Array(total), off = 0;
+		for (var j = 0; j < chunks.length; j++) { merged.set(chunks[j], off); off += chunks[j].length; }
+		Object.defineProperty(this, "_bytes", { value: merged });
+		Object.defineProperty(this, "_type", { value: normalizeBlobType(options) });
+	}
+	Object.defineProperty(Blob.prototype, "size", { get: function () { return this._bytes.length; }, configurable: true });
+	Object.defineProperty(Blob.prototype, "type", { get: function () { return this._type; }, configurable: true });
+	Blob.prototype.arrayBuffer = function () {
+		var b = this._bytes;
+		return Promise.resolve(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
+	};
+	Blob.prototype.bytes = function () { return Promise.resolve(new Uint8Array(this._bytes)); };
+	Blob.prototype.text = function () { return Promise.resolve(Buffer.from(this._bytes).toString("utf8")); };
+	Blob.prototype.slice = function (start, end, contentType) {
+		var len = this._bytes.length;
+		var s = start === undefined ? 0 : start < 0 ? Math.max(len + start, 0) : Math.min(start, len);
+		var e = end === undefined ? len : end < 0 ? Math.max(len + end, 0) : Math.min(end, len);
+		var sub = this._bytes.subarray(s, Math.max(e, s));
+		return new Blob([sub], contentType === undefined ? undefined : { type: contentType });
+	};
+	Blob.prototype.toString = function () { return "[object Blob]"; };
+
+	function File(parts, name, options) {
+		if (!(this instanceof File)) throw new TypeError("Constructor File requires 'new'");
+		if (arguments.length < 2) throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + " present.");
+		Blob.call(this, parts, options);
+		Object.defineProperty(this, "_name", { value: String(name) });
+		var lm = options && options.lastModified !== undefined ? Number(options.lastModified) : Date.now();
+		Object.defineProperty(this, "_lastModified", { value: lm });
+	}
+	File.prototype = Object.create(Blob.prototype);
+	File.prototype.constructor = File;
+	Object.defineProperty(File.prototype, "name", { get: function () { return this._name; }, configurable: true });
+	Object.defineProperty(File.prototype, "lastModified", { get: function () { return this._lastModified; }, configurable: true });
+
+	if (typeof Symbol !== "undefined" && Symbol.toStringTag) {
+		Object.defineProperty(Blob.prototype, Symbol.toStringTag, { value: "Blob", configurable: true });
+		Object.defineProperty(File.prototype, Symbol.toStringTag, { value: "File", configurable: true });
+	}
+
 	if (typeof globalThis.Buffer === "undefined") {
 		globalThis.Buffer = Buffer;
+	}
+	if (typeof globalThis.Blob === "undefined") {
+		globalThis.Blob = Blob;
+	}
+	if (typeof globalThis.File === "undefined") {
+		globalThis.File = File;
 	}
 
 	var exported = {
 		Buffer: Buffer,
 		SlowBuffer: SlowBuffer,
+		Blob: Blob,
+		File: File,
 		kMaxLength: K_MAX_LENGTH,
 		kStringMaxLength: K_STRING_MAX_LENGTH,
 		constants: { MAX_LENGTH: K_MAX_LENGTH, MAX_STRING_LENGTH: K_STRING_MAX_LENGTH },
