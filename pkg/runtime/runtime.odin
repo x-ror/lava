@@ -40,7 +40,11 @@ result_destroy :: proc(res: ^Result) {
 	res^ = Result{}
 }
 
-eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = nil) -> Result {
+// echo_result mirrors REPL behavior: when true (the `lava eval` path) the
+// script's completion value is returned for printing. `lava run` passes false so
+// running a file never echoes a trailing expression value, matching `node file`
+// (and avoiding JSC-version-dependent completion values like `[object Promise]`).
+eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = nil, echo_result := false) -> Result {
 	if len(source) == 0 {
 		return Result{status = .Invalid_Input, exit_code = 2, message = "empty JavaScript source"}
 	}
@@ -133,7 +137,7 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 
 	exit_code := resolve_exit_code(cast(jsc.JSContextRef)ctx, state)
 
-	if value == nil || jsc.JSValueIsUndefined(cast(jsc.JSContextRef)ctx, value) {
+	if !echo_result || value == nil || jsc.JSValueIsUndefined(cast(jsc.JSContextRef)ctx, value) {
 		return Result{status = .Ok, exit_code = exit_code}
 	}
 
