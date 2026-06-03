@@ -11,6 +11,7 @@ foreign jsc_lib {
 	JSGlobalContextRelease :: proc(ctx: JSGlobalContextRef) ---
 
 	JSStringCreateWithUTF8CString :: proc(string: cstring) -> JSStringRef ---
+	JSStringCreateWithCharacters :: proc(chars: [^]JSChar, num_chars: c.size_t) -> JSStringRef ---
 	JSStringGetMaximumUTF8CStringSize :: proc(string: JSStringRef) -> c.size_t ---
 	JSStringGetUTF8CString :: proc(string: JSStringRef, buffer: [^]byte, buffer_size: c.size_t) -> c.size_t ---
 	JSStringRelease :: proc(string: JSStringRef) ---
@@ -72,7 +73,7 @@ foreign jsc_lib {
 	JSValueUnprotect :: proc(ctx: JSContextRef, value: JSValueRef) ---
 
 	// Typed Arrays (ES2015+)
-	JSValueIsTypedArray :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueGetTypedArrayType :: proc(ctx: JSContextRef, value: JSValueRef, exception: ^JSValueRef) -> JSTypedArrayType ---
 	JSObjectMakeTypedArrayWithBytesNoCopy :: proc(ctx: JSContextRef, array_type: JSTypedArrayType, bytes: rawptr, byte_length: c.size_t, byte_deallocator: proc "c" (bytes: rawptr, deallocator_context: rawptr), deallocator_context: rawptr, exception: ^JSValueRef) -> JSObjectRef ---
 	JSObjectGetTypedArrayLength :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
 	JSObjectGetTypedArrayBytesPtr :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---

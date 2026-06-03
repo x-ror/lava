@@ -57,9 +57,11 @@ implementations — no `primordials`, no `internalBinding` coupling.
 - [x] **`node:assert`** real strict assertions (`AssertionError`, deep compare)
       — replaced the dangerous no-op.
 - [x] **`Buffer` global** — `from`/`alloc`/`concat`/`copy`/`toString` over
-      `Uint8Array` with hand-rolled utf8/hex/base64 — _(passes `03-buffer`)_
-- [x] **`node:crypto`** subset — pure-JS `createHash('sha256')`, `randomUUID`,
-      `randomBytes` — _(passes `07-crypto`)_
+      `Uint8Array`; utf8/hex/base64 codecs backed by Odin (`pkg/runtime/buffer.odin`,
+      `core:encoding`) as the sole impl — _(passes `03-buffer`)_
+- [x] **`node:crypto`** — `createHash`/`createHmac` (md5/sha1/sha2/sha3),
+      `randomBytes`/`randomUUID`/`randomFill*`, `pbkdf2`/`pbkdf2Sync`, all backed
+      by Odin `core:crypto` (`pkg/runtime/crypto.odin`) — _(passes `07-crypto`)_
 - [x] **`fetch` / `Response` / `Headers` / `Request`** globals — body + headers
       machinery is real; network transport is stubbed — _(passes `08-fetch`)_
 
@@ -74,8 +76,8 @@ implementations — no `primordials`, no `internalBinding` coupling.
 - [ ] **ESM** — only CommonJS `require` works; no `.mjs` / `import` /
       `import.meta` / `node:url` `fileURLToPath` _(blocks `01-esm`, the last
       failing case)_
-- [ ] **Native CSPRNG** — `crypto.randomBytes`/`randomUUID` currently use
-      `Math.random` (format-correct, NOT secure). Wire an OS entropy binding.
+- [x] **Native CSPRNG** — `crypto.randomBytes`/`randomUUID`/`randomFill*` now
+      draw from the OS CSPRNG via `crypto.rand_bytes`, replacing `Math.random`.
 - [ ] **Real network transport for `fetch()`** — Response/Headers exist; the
       transport rejects until sockets are bound.
 
