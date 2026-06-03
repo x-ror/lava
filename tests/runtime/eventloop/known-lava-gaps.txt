@@ -1,0 +1,13 @@
+# Relative paths skipped by `make test-eventloop-lava`.
+# Each entry is a real Lava gap to fix, not a permanent exclusion — remove the
+# line once the underlying behavior matches Node.
+#
+# 01-nexttick-and-microtasks: process.nextTick must drain fully before the
+#   Promise microtask queue (Node orders nextTick callbacks ahead of promise
+#   jobs). Lava currently runs JSC's promise jobs first, so the observed order
+#   is [promise, nextTick, queueMicrotask] instead of [nextTick, promise, ...].
+#
+# 08-io-before-immediate: fs.readFile (async callback form) is not implemented
+#   yet; only fs.readFileSync exists.
+tests/runtime/eventloop/cases/01-nexttick-and-microtasks.js
+tests/runtime/eventloop/cases/08-io-before-immediate.js

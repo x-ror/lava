@@ -50,6 +50,9 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Test (Lava behavior)
+        run: make test-lava
+
   macos:
     name: macOS (full build + tests)
     runs-on: macos-latest
@@ -74,6 +77,9 @@ jobs:
 
       - name: Test
         run: make test
+
+      - name: Test (Lava behavior)
+        run: make test-lava
 
   windows:
     name: Windows (type-check + codegen + eventloop tests)
