@@ -39,6 +39,7 @@
 	req("buffer");
 	req("fetch");
 	req("abort");
+	req("encoding");
 
 	return req;
 })

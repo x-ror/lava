@@ -20,6 +20,7 @@ The cases intentionally cover APIs users expect from a Bun/Node-like runtime:
 - `crypto`
 - `fetch`
 - `AbortController` / `AbortSignal` and `node:timers/promises`
+- `TextEncoder` / `TextDecoder`
 
 Active compatibility tests live in two places:
 
