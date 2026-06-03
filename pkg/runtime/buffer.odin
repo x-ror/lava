@@ -98,7 +98,7 @@ buffer_base64_decode_cb :: proc "c" (
 	defer if alloc do delete(str, context.allocator)
 	if len(str) == 0 do return make_uint8_array(ctx, nil)
 
-	decoded, err := base64.decode(str, base64.DEC_TABLE, nil, context.allocator)
+	decoded, err := base64.decode(str, base64.DEC_TABLE)
 	if err != nil do return make_uint8_array(ctx, nil)
 	return make_uint8_array(ctx, decoded)
 }
