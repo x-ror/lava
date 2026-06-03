@@ -482,6 +482,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"fetch", INTERNAL_FETCH},
 		{"abort", INTERNAL_ABORT},
 		{"timers/promises", INTERNAL_TIMERS_PROMISES},
+		{"encoding", INTERNAL_ENCODING},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -704,3 +705,4 @@ INTERNAL_CRYPTO :: #load("js/internal/crypto.js", string)
 INTERNAL_FETCH :: #load("js/internal/fetch.js", string)
 INTERNAL_ABORT :: #load("js/internal/abort.js", string)
 INTERNAL_TIMERS_PROMISES :: #load("js/internal/timers_promises.js", string)
+INTERNAL_ENCODING :: #load("js/internal/encoding.js", string)
