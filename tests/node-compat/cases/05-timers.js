@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 
-(async () => {
+async function main() {
 	const events = [];
 
 	queueMicrotask(() => {
@@ -15,4 +15,9 @@ const assert = require('node:assert/strict');
 	});
 
 	assert.deepEqual(events, ['microtask', 'timeout']);
-})();
+}
+
+main().catch((error) => {
+	console.error(error);
+	process.exit(1);
+});

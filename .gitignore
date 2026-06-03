@@ -1,6 +1,10 @@
 bin/
 build/
 reports/
+
+# Raw upstream test corpus vendored only as copy-source for clean-room ports;
+# the adapted tests live under tests/node-compat/. Do not commit (~25M).
+tests/vendor/
 *.bin
 *.exe
 *.o

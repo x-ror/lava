@@ -48,14 +48,14 @@ crypto_algorithm :: proc(name: string) -> (hash.Algorithm, bool) {
 	return .Invalid, false
 }
 
-// typed_array_view borrows the backing store of a Uint8Array (or Buffer, which
-// subclasses it) as an Odin slice. The slice aliases JavaScriptCore-owned
-// memory: valid only for the duration of the native call, never stored or
-// freed. A zero-length array yields an empty slice (ok=true).
+// typed_array_view borrows the backing store of a TypedArray or DataView as an
+// Odin byte slice. The slice aliases JavaScriptCore-owned memory: valid only
+// for the duration of the native call, never stored or freed. A zero-length
+// array yields an empty slice (ok=true).
 typed_array_view :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> ([]byte, bool) {
 	if jsc.JSValueGetTypedArrayType(ctx, value, nil) == .None do return nil, false
 	obj := cast(jsc.JSObjectRef)value
-	n := int(jsc.JSObjectGetTypedArrayLength(ctx, obj, nil))
+	n := int(jsc.JSObjectGetTypedArrayByteLength(ctx, obj, nil))
 	if n == 0 do return nil, true
 	ptr := jsc.JSObjectGetTypedArrayBytesPtr(ctx, obj, nil)
 	if ptr == nil do return nil, false
