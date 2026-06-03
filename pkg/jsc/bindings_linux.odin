@@ -11,6 +11,10 @@ foreign import jsc_lib "system:javascriptcoregtk-6.0"
 foreign jsc_lib {
 	JSGlobalContextCreate :: proc(global_object_class: JSClassRef) -> JSGlobalContextRef ---
 	JSGlobalContextRelease :: proc(ctx: JSGlobalContextRef) ---
+	// Exported by libjavascriptcoregtk (declared in WebKit's JSContextRefPrivate.h,
+	// not the public C API headers). The handler is invoked as fn(promise, reason)
+	// when a promise rejects with no handler at a microtask checkpoint.
+	JSGlobalContextSetUnhandledRejectionCallback :: proc(ctx: JSGlobalContextRef, function: JSObjectRef, exception: ^JSValueRef) ---
 
 	JSStringCreateWithUTF8CString :: proc(string: cstring) -> JSStringRef ---
 	JSStringCreateWithCharacters :: proc(chars: [^]JSChar, num_chars: c.size_t) -> JSStringRef ---

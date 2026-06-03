@@ -131,12 +131,34 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 		eventloop.run_until_idle(loop)
 	}
 
+	exit_code := resolve_exit_code(cast(jsc.JSContextRef)ctx, state)
+
 	if value == nil || jsc.JSValueIsUndefined(cast(jsc.JSContextRef)ctx, value) {
-		return Result{status = .Ok, exit_code = 0}
+		return Result{status = .Ok, exit_code = exit_code}
 	}
 
 	msg, allocated := value_to_string(cast(jsc.JSContextRef)ctx, value)
-	return Result{status = .Ok, exit_code = 0, message = msg, is_allocated = allocated}
+	return Result{status = .Ok, exit_code = exit_code, message = msg, is_allocated = allocated}
+}
+
+// resolve_exit_code computes the final process exit code after the event loop
+// drains. An uncaught async exception or an unhandled promise rejection forces a
+// non-zero exit; otherwise a script-assigned process.exitCode is honored, matching
+// Node. (process.exit() is handled separately and terminates immediately.)
+resolve_exit_code :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) -> int {
+	if state != nil && state.async_failed do return 1
+	return process_exit_code(ctx)
+}
+
+process_exit_code :: proc(ctx: jsc.JSContextRef) -> int {
+	global := jsc.JSContextGetGlobalObject(ctx)
+	process := get_named(ctx, global, "process")
+	if process == nil || !jsc.JSValueIsObject(ctx, process) do return 0
+	code := get_named(ctx, cast(jsc.JSObjectRef)process, "exitCode")
+	if code == nil || jsc.JSValueIsUndefined(ctx, code) || jsc.JSValueIsNull(ctx, code) do return 0
+	n := jsc.JSValueToNumber(ctx, code, nil)
+	if n != n do return 0 // NaN guard (e.g. exitCode set to a non-numeric value)
+	return int(n)
 }
 
 run_file :: proc(path: string, loop: ^eventloop.Loop = nil) -> Result {
