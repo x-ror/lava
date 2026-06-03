@@ -19,6 +19,7 @@ The cases intentionally cover APIs users expect from a Bun/Node-like runtime:
 - `events`
 - `crypto`
 - `fetch`
+- `AbortController` / `AbortSignal` and `node:timers/promises`
 
 Active compatibility tests live in two places:
 

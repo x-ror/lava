@@ -166,7 +166,47 @@
 		}
 	}
 
+	// classExtendsError reports whether `fn` is an Error constructor (Error itself
+	// or a subclass), so `throws(fn, TypeError)` does an instanceof check.
+	function classExtendsError(fn) {
+		if (typeof fn !== "function") return false;
+		if (fn === Error) return true;
+		return fn.prototype != null && fn.prototype instanceof Error;
+	}
+
+	// expectedMatches checks a thrown/rejected value against the Node matcher
+	// forms: RegExp (vs the message), an Error constructor (instanceof), a
+	// validation function (truthy return), or a plain object (each property must
+	// deep-equal, with RegExp values tested against the stringified property).
+	function expectedMatches(actual, expected) {
+		if (expected instanceof RegExp) {
+			return expected.test(String(actual && actual.message !== undefined ? actual.message : actual));
+		}
+		if (classExtendsError(expected)) {
+			return actual instanceof expected;
+		}
+		if (typeof expected === "function") {
+			return !!expected(actual);
+		}
+		if (expected && typeof expected === "object") {
+			var keys = Object.keys(expected);
+			for (var i = 0; i < keys.length; i++) {
+				var key = keys[i];
+				var exp = expected[key];
+				var act = actual == null ? undefined : actual[key];
+				if (exp instanceof RegExp) {
+					if (!exp.test(String(act))) return false;
+				} else if (!isDeepStrictEqual(act, exp)) {
+					return false;
+				}
+			}
+			return true;
+		}
+		return true; // no/unknown expectation: only "did it throw" matters
+	}
+
 	function throws(fn, expected, message) {
+		if (typeof expected === "string") { message = expected; expected = undefined; }
 		var threw = false;
 		var actual;
 		try { fn(); } catch (e) { threw = true; actual = e; }
@@ -176,10 +216,8 @@
 				operator: "throws", stackStartFn: throws,
 			});
 		}
-		if (expected instanceof RegExp) {
-			if (!expected.test(String(actual && actual.message !== undefined ? actual.message : actual))) {
-				throw actual;
-			}
+		if (expected !== undefined && expected !== null && !expectedMatches(actual, expected)) {
+			throw actual;
 		}
 	}
 
@@ -190,6 +228,38 @@
 				operator: "doesNotThrow", stackStartFn: doesNotThrow,
 			});
 		}
+	}
+
+	function settle(promiseOrFn) {
+		if (typeof promiseOrFn === "function") return Promise.resolve().then(promiseOrFn);
+		return Promise.resolve(promiseOrFn);
+	}
+
+	function rejects(promiseOrFn, expected, message) {
+		if (typeof expected === "string") { message = expected; expected = undefined; }
+		return settle(promiseOrFn).then(
+			function () {
+				throw AssertionError({
+					message: message || "Missing expected rejection.",
+					operator: "rejects", stackStartFn: rejects,
+				});
+			},
+			function (actual) {
+				if (expected !== undefined && expected !== null && !expectedMatches(actual, expected)) {
+					throw actual;
+				}
+			},
+		);
+	}
+
+	function doesNotReject(promiseOrFn, expected, message) {
+		if (typeof expected === "string") { message = expected; expected = undefined; }
+		return settle(promiseOrFn).then(undefined, function (actual) {
+			throw AssertionError({
+				message: (message ? message + ": " : "") + "Got unwanted rejection.\n" + inspect(actual),
+				operator: "doesNotReject", stackStartFn: doesNotReject,
+			});
+		});
 	}
 
 	function ifError(value) {
@@ -216,6 +286,8 @@
 	assert.doesNotMatch = doesNotMatch;
 	assert.throws = throws;
 	assert.doesNotThrow = doesNotThrow;
+	assert.rejects = rejects;
+	assert.doesNotReject = doesNotReject;
 	assert.ifError = ifError;
 	assert.strict = assert;
 
