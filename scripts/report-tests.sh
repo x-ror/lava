@@ -46,7 +46,7 @@ printf 'report: %s\n\n' "$REPORT_FILE"
 
 run_suite odin-cli odin test "$ROOT_DIR/cmd/lava" -collection:lava="$ROOT_DIR"
 run_suite odin-eventloop odin test "$ROOT_DIR/pkg/runtime/eventloop"
-run_suite node-compat "$ROOT_DIR/scripts/run-node-compat.sh"
+run_suite node-compat "$ROOT_DIR/scripts/run-node-compat-all.sh"
 run_suite node-sqlite node "$ROOT_DIR/tests/std/sqlite/cases/00-basic.js"
 run_suite node-eventloop "$ROOT_DIR/scripts/run-eventloop-oracle.sh"
 

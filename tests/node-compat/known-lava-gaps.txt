@@ -1,0 +1,10 @@
+# Relative paths skipped by `make test-compat-lava`.
+# Keep this list small and remove entries as Lava gains support.
+#
+# Runtime note (not a skip): Lava does not surface unhandled promise
+# rejections and does not honor process.exitCode. Async cases must end with
+# `main().catch((e) => { console.error(e); process.exit(1); })` so a failed
+# assertion actually exits non-zero under Lava; otherwise the failure path is
+# silently swallowed and the case would falsely pass the node-vs-lava compare.
+tests/node-compat/cases/01-esm.mjs
+

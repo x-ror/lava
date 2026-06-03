@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const {EventEmitter, once} = require('node:events');
 
-(async () => {
+async function main() {
 	const emitter = new EventEmitter();
 	const seen = [];
 
@@ -19,4 +19,9 @@ const {EventEmitter, once} = require('node:events');
 	const [value] = await oncePromise;
 
 	assert.equal(value, 'ok');
-})();
+}
+
+main().catch((error) => {
+	console.error(error);
+	process.exit(1);
+});

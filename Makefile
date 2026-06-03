@@ -3,7 +3,7 @@ LAVA ?= bin/lava
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help build run eval check check-cli check-runtime check-jsc check-native test test-report test-report-html test-odin test-eventloop-odin test-node test-node-lava test-sqlite-node test-eventloop-node fmt clean
+.PHONY: help build run eval check check-cli check-runtime check-jsc check-native test test-report test-report-html api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-node test-eventloop-node fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -14,19 +14,28 @@ help:
 	@printf '%s\n' '  make check              Type-check Odin packages'
 	@printf '%s\n' '  make check-cli          Type-check the CLI package'
 	@printf '%s\n' '  make check-runtime      Type-check runtime packages'
-	@printf '%s\n' '  make check-jsc          Check for JavaScriptCore development files'
-	@printf '%s\n' '  make check-native       Check for JavaScriptCore development files'
+	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
+	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
 	@printf '%s\n' '  make test               Run Odin and Node compatibility tests'
 	@printf '%s\n' '  make test-report        Run tests and write benchmark report'
 	@printf '%s\n' '  make test-report-html   Write Node.js vs Lava HTML compatibility report'
+	@printf '%s\n' '  make api-surface        Report Buffer/Crypto API surface differences vs Node'
+	@printf '%s\n' '  make vendor-bun-report  Summarize vendored Bun node compatibility corpus'
+	@printf '%s\n' '  make bun-buffer-report  List vendored Bun buffer tests and adapted ports'
+	@printf '%s\n' '  make test-compat        Run all active Node compatibility tests with Node'
+	@printf '%s\n' '  make test-compat-lava   Build and compare active compatibility tests through Lava, skipping known gaps'
+	@printf '%s\n' '  make test-compat-lava-strict Build and compare active compatibility tests through Lava without skips'
 	@printf '%s\n' '  make test-odin          Run Odin tests for the CLI package'
 	@printf '%s\n' '  make test-eventloop-odin Run Odin event-loop core tests'
-	@printf '%s\n' '  make test-node          Run Node compatibility cases with Node as oracle'
-	@printf '%s\n' '  make test-node-lava     Run Node compatibility cases through Lava too'
 	@printf '%s\n' '  make test-sqlite-node   Run SQLite std tests with Node as oracle'
 	@printf '%s\n' '  make test-eventloop-node Run event-loop ordering tests with Node as oracle'
 	@printf '%s\n' '  make fmt                Strip optional semicolons in Odin sources'
 	@printf '%s\n' '  make clean              Remove build artifacts'
+	@printf '%s\n' ''
+	@printf '%s\n' 'Env knobs (for scripts/run-node-compat-all.sh):'
+	@printf '%s\n' '  RUN_LAVA=1              Compare each case Node-vs-Lava instead of Node-only'
+	@printf '%s\n' '  SKIP_KNOWN_LAVA_GAPS=1  Skip paths listed in tests/node-compat/known-lava-gaps.txt'
+	@printf '%s\n' '  NODE_BIN=/path/to/node  Override the Node oracle binary'
 
 build:
 	./scripts/build.sh
@@ -55,7 +64,7 @@ check-jsc:
 check-native:
 	./scripts/check-native-deps.sh
 
-test: test-odin test-eventloop-odin test-node test-sqlite-node test-eventloop-node
+test: test-odin test-eventloop-odin test-compat test-sqlite-node test-eventloop-node
 
 test-report:
 	./scripts/report-tests.sh
@@ -63,17 +72,29 @@ test-report:
 test-report-html: build
 	./scripts/report-node-vs-lava.sh
 
+api-surface: build
+	./scripts/report-api-surface.sh
+
+vendor-bun-report:
+	./scripts/report-vendored-bun.sh
+
+bun-buffer-report:
+	./scripts/report-bun-buffer-tests.sh
+
+test-compat:
+	./scripts/run-node-compat-all.sh
+
+test-compat-lava: build
+	RUN_LAVA=1 SKIP_KNOWN_LAVA_GAPS=1 ./scripts/run-node-compat-all.sh
+
+test-compat-lava-strict: build
+	RUN_LAVA=1 ./scripts/run-node-compat-all.sh
+
 test-odin:
 	$(ODIN) test cmd/lava -collection:lava=.
 
 test-eventloop-odin:
 	$(ODIN) test pkg/runtime/eventloop
-
-test-node:
-	./scripts/run-node-compat.sh
-
-test-node-lava: build
-	RUN_LAVA=1 ./scripts/run-node-compat.sh
 
 test-sqlite-node:
 	node tests/std/sqlite/cases/00-basic.js
