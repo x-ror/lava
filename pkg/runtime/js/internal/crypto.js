@@ -101,6 +101,7 @@
 	function randomFill(buffer, offset, size, callback) {
 		if (typeof offset === "function") { callback = offset; offset = undefined; size = undefined; }
 		else if (typeof size === "function") { callback = size; size = undefined; }
+		if (typeof callback !== "function") throw new TypeError("Callback must be a function");
 		setImmediate(function () { callback(null, randomFillSync(buffer, offset, size)); });
 	}
 
@@ -121,11 +122,13 @@
 	// --- key derivation ------------------------------------------------------
 
 	function pbkdf2Sync(password, salt, iterations, keylen, digest) {
+		if (typeof digest !== "string") throw new TypeError("The \"digest\" argument must be of type string");
 		var out = native.pbkdf2(normalizeAlgo(digest), toU8(password), toU8(salt), iterations >>> 0, keylen);
 		return Buffer.from(out);
 	}
 
 	function pbkdf2(password, salt, iterations, keylen, digest, callback) {
+		if (typeof callback !== "function") throw new TypeError("Callback must be a function");
 		setImmediate(function () {
 			var key;
 			try {
