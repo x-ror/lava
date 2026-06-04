@@ -27,12 +27,15 @@
 // timer path, Lava reports and keeps draining rather than halting the process
 // the instant a callback throws; the process still exits non-zero.)
 //
-// Hardening: the few intrinsics the scheduler relies on (Promise.resolve,
-// Promise.prototype.then, Array.prototype.slice, Function.prototype.apply) are
-// captured here at install time — before any user code runs — so user code that
-// later reassigns e.g. Promise.resolve cannot silently break scheduling. (The
-// runtime otherwise avoids primordials; the scheduler is special because every
-// async API depends on it.)
+// Hardening: every intrinsic the scheduler relies on is captured at install
+// time — before any user code runs — so reassigning them afterwards cannot
+// silently break scheduling. Function.prototype.bind/call are captured to build
+// an uncurryThis helper, which then captures Promise.resolve, Promise.prototype
+// .then, and Array.prototype.slice as standalone functions invoked via [[Call]]
+// (not through the user-mutable .call); Reflect.apply is captured for callback
+// invocation; and the nextTick queue is stored/advanced by index rather than via
+// Array.prototype.push/shift. (The runtime otherwise avoids primordials; the
+// scheduler is special because every async API depends on it.)
 //
 // KNOWN LIMITATION: a nextTick registered *after* a promise/microtask within the
 // same turn does not preempt that already-queued promise job (Node's absolute
@@ -46,30 +49,35 @@
 
 	// Intrinsics captured at install time (see "Hardening" above).
 	var PromiseCtor = Promise;
-	var promiseResolve = Promise.resolve;
-	var promiseThen = Promise.prototype.then;
-	var arraySlice = Array.prototype.slice;
-	var functionApply = Function.prototype.apply;
-	var resolved = promiseResolve.call(PromiseCtor);
+	var bind = Function.prototype.bind;
+	var call = Function.prototype.call;
+	var uncurryThis = bind.bind(call);
+	var promiseResolve = uncurryThis(Promise.resolve);
+	var promiseThen = uncurryThis(Promise.prototype.then);
+	var arraySlice = uncurryThis(Array.prototype.slice);
+	var functionApply = Reflect.apply;
 	var EMPTY = [];
+	var resolved = promiseResolve(PromiseCtor);
 
 	// schedule(fn) enqueues fn as a JSC microtask, in FIFO with promise jobs, via
 	// a reaction on a pre-resolved promise. fn must not throw (callers guard).
 	function schedule(fn) {
-		promiseThen.call(resolved, fn);
+		promiseThen(resolved, fn);
 	}
 
 	// runGuarded calls fn(...args) and turns any throw into an uncaught exception
 	// report rather than letting it reject the scheduling promise.
 	function runGuarded(fn, args) {
 		try {
-			functionApply.call(fn, undefined, args);
+			functionApply(fn, undefined, args);
 		} catch (error) {
 			reportUncaught(error);
 		}
 	}
 
 	var queue = []; // pending nextTick tasks: { fn, args }
+	var head = 0;
+	var tail = 0;
 	var armed = false; // a drain microtask is scheduled but has not yet run
 	var draining = false; // currently inside drain()
 
@@ -78,13 +86,18 @@
 		if (draining) return; // re-entrancy guard (shouldn't happen, but be safe)
 		draining = true;
 		try {
-			// shift() one at a time so nextTicks queued *during* the drain (including
-			// nested ones) are flushed in this same pass, ahead of any promise job. A
-			// throwing callback is reported but does not abort the remaining queue.
-			while (queue.length > 0) {
-				var task = queue.shift();
+			// Advance by index so nextTicks queued *during* the drain (including nested
+			// ones) are flushed in this same pass, ahead of any promise job. Avoid
+			// Array.prototype methods here: userland may have replaced them.
+			while (head < tail) {
+				var task = queue[head];
+				queue[head] = undefined;
+				head = head + 1;
 				runGuarded(task.fn, task.args);
 			}
+			head = 0;
+			tail = 0;
+			queue.length = 0;
 		} finally {
 			draining = false;
 		}
@@ -94,8 +107,9 @@
 		if (typeof callback !== "function") {
 			throw new TypeError('The "callback" argument must be of type function. Received ' + typeof callback);
 		}
-		var args = arguments.length > 1 ? arraySlice.call(arguments, 1) : EMPTY;
-		queue.push({ fn: callback, args: args });
+		var args = arguments.length > 1 ? arraySlice(arguments, 1) : EMPTY;
+		queue[tail] = { fn: callback, args: args };
+		tail = tail + 1;
 		// Arm a single drain reaction for the batch. Already-armed or mid-drain: the
 		// existing drain/while-loop will pick this task up.
 		if (!armed && !draining) {
