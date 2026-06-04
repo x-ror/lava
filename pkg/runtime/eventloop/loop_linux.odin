@@ -81,8 +81,8 @@ platform_wakeup :: proc(loop: ^Loop) {
 platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	fd := linux.Fd(watcher.fd)
 	if loop.platform.use_uring {
-		mask: linux.EPoll_Event_Set = {.IN} if watcher.mode == .Read else {.OUT}
-		return arm_uring_poll(loop, u64(watcher.fd), u64(uintptr(watcher)), mask)
+		events: linux.Fd_Poll_Events = {.IN} if watcher.mode == .Read else {.OUT}
+		return arm_uring_poll(loop, u64(watcher.fd), u64(uintptr(watcher)), events)
 	}
 
 	ev: linux.EPoll_Event
@@ -144,7 +144,6 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 	for i in 0 ..< n {
 		ev := events[i]
 
-		// Виправлено: пряме порівняння без касту до i32, оскільки обидва типи є linux.Fd
 		if ev.data.fd == loop.platform.event_fd {
 			val: u64
 			buf := mem.ptr_to_bytes(&val, size_of(val))
@@ -155,6 +154,7 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 		// Обробка мережевого сокету / дескриптора файлу
 		watcher := cast(^IO_Watcher)ev.data.ptr
 		if watcher != nil && watcher.callback != nil {
+			loop.io_events += 1
 			watcher.callback(loop, watcher.user_data)
 		}
 	}
@@ -207,22 +207,42 @@ drain_uring_completions :: proc(loop: ^Loop) {
 			// Подія від зареєстрованого асинхронного вочера сокетів
 			watcher := cast(^IO_Watcher)uintptr(cqe.user_data)
 			if watcher != nil && watcher.callback != nil {
+				loop.io_events += 1
 				watcher.callback(loop, watcher.user_data)
 
-				mask: linux.EPoll_Event_Set = {.IN} if watcher.mode == .Read else {.OUT}
-				arm_uring_poll(loop, u64(watcher.fd), cqe.user_data, mask)
+				// The callback may have torn the watcher down (callback cleared)
+				// when the request finished; only re-arm if it is still active.
+				if watcher.callback != nil {
+					events: linux.Fd_Poll_Events = {.IN} if watcher.mode == .Read else {.OUT}
+					// If the SQ ring is momentarily full, submit to free slots and
+					// retry once rather than silently dropping the re-arm (which
+					// would strand the fd with no kernel poll).
+					if !arm_uring_poll(loop, u64(watcher.fd), cqe.user_data, events) {
+						uring.submit(&loop.platform.ring, 0, nil)
+						arm_uring_poll(loop, u64(watcher.fd), cqe.user_data, events)
+					}
+				}
 			}
 		}
 	}
 }
 
-arm_uring_poll :: proc(loop: ^Loop, fd: u64, user_data: u64, mask: linux.EPoll_Event_Set) -> bool {
+arm_uring_poll :: proc(loop: ^Loop, fd: u64, user_data: u64, events: linux.Fd_Poll_Events) -> bool {
 	sqe, ok := uring.get_sqe(&loop.platform.ring)
 	if !ok do return false
 
+	// Clear any stale state from a prior use of this SQE slot — get_sqe recycles
+	// ring entries and does not zero them.
+	sqe^ = {}
 	sqe.opcode = .POLL_ADD
-	sqe.fd = cast(linux.Fd)fd // Виправлено: явний cast до distinct типу linux.Fd
+	sqe.fd = cast(linux.Fd)fd // явний cast до distinct типу linux.Fd
 	sqe.user_data = user_data
-	sqe.addr = u64(transmute(u32)mask)
+	// POLL_ADD reads the interest mask from poll_events; writing it to addr (the
+	// previous behavior) left poll_events zero, so the poll never completed.
+	sqe.poll_events = events
+	// Flush the SQE into the kernel now (non-blocking, wait_nr=0). Submission must
+	// not depend on a later platform_poll call: when a due timer keeps the poll
+	// phase from running, a re-arm staged but never submitted would strand the fd.
+	uring.submit(&loop.platform.ring, 0, nil)
 	return true
 }

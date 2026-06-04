@@ -63,7 +63,13 @@ implementations — no `primordials`, no `internalBinding` coupling.
       `randomBytes`/`randomUUID`/`randomFill*`, `pbkdf2`/`pbkdf2Sync`, all backed
       by Odin `core:crypto` (`pkg/runtime/crypto.odin`) — _(passes `07-crypto`)_
 - [x] **`fetch` / `Response` / `Headers` / `Request`** globals — body + headers
-      machinery is real; network transport is stubbed — _(passes `08-fetch`)_
+      machinery is real; the `http://` network transport is now Odin-backed
+      (`pkg/runtime/fetch.odin`, `fetch_linux.odin`): non-blocking
+      connect/write/read on the event-loop `IO_Watcher`, HTTP/1.1 request
+      serialization, and response parsing (Content-Length + chunked). The promise
+      is created in JS (`new Promise` + native success/error callbacks), so no
+      `JSObjectMakeDeferredPromise` binding is needed. _(passes `08-fetch`;
+      end-to-end node-parity via `make test-fetch-smoke`)_
 
 ### High priority (the Odin / native part)
 
@@ -72,14 +78,30 @@ implementations — no `primordials`, no `internalBinding` coupling.
       *before* `process.nextTick` (Node is the reverse). Bind
       `JSObjectMakeDeferredPromise` and route promise jobs through our
       next-tick/microtask queues. _(originally the "+ DeferredPromise" half of
-      plan item 1)_
+      plan item 1; note `fetch` does not need this — it settles a JS-created
+      promise via native callbacks)_
 - [ ] **ESM** — only CommonJS `require` works; no `.mjs` / `import` /
       `import.meta` / `node:url` `fileURLToPath` _(blocks `01-esm`, the last
       failing case)_
 - [x] **Native CSPRNG** — `crypto.randomBytes`/`randomUUID`/`randomFill*` now
       draw from the OS CSPRNG via `crypto.rand_bytes`, replacing `Math.random`.
-- [ ] **Real network transport for `fetch()`** — Response/Headers exist; the
-      transport rejects until sockets are bound.
+- [x] **Real network transport for `fetch()`** — `http://` over non-blocking
+      sockets on the event loop (`pkg/runtime/fetch*.odin`). Implemented for
+      Linux (io_uring/epoll); Darwin/Windows still reject. Follow-ups:
+      **`https://` (TLS)**, async DNS (currently a blocking `getaddrinfo`),
+      streaming bodies, IPv6/`[::1]` hosts, and a cross-platform transport via
+      `core:net` (only the non-blocking `connect` needs a per-OS shim).
+- [x] **Event-loop I/O driving** — fetch was the first real `watch_fd` consumer
+      and exposed several gaps, now fixed (`pkg/runtime/eventloop/`):
+      - io_uring `POLL_ADD` mask is written to `poll_events` (was `addr`, so no
+        fd poll ever fired) and SQEs are submitted at arm time (not only at the
+        next `poll`, which a due timer could skip indefinitely).
+      - `run_until_idle` blocks in `poll` when a socket is the only pending work,
+        and advances the virtual clock on a timer-deadline wake so a timer
+        co-pending with I/O is not dropped.
+      - timer delays are floored at 1ms (Node parity), so a 0ms timer cannot
+        busy-spin and starve pending I/O. Settled requests are reclaimed on the
+        next request (bounded retention), not held until teardown.
 
 ### Medium priority (more of the Node surface)
 

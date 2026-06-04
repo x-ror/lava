@@ -78,6 +78,7 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 
 		watcher := cast(^IO_Watcher)uintptr(key)
 		if watcher.callback != nil {
+			loop.io_events += 1
 			watcher.callback(loop, watcher.user_data)
 		}
 	}
