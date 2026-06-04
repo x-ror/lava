@@ -11,6 +11,26 @@
 		return String(name).toLowerCase();
 	}
 
+	// Header names must be non-empty HTTP tokens (RFC 7230 tchar); values must not
+	// carry CR, LF, or NUL. Node (undici) throws on either — at append/set/get/
+	// has/delete time — so `new Headers(...)` and, because Request builds its
+	// Headers eagerly, `fetch(input, {headers})` reject instead of silently
+	// emitting a header-split or otherwise malformed request. The token class
+	// rejects spaces, ':' (which would forge a second header on the wire), control
+	// chars, and non-ASCII alike. Wire (response) headers arrive pre-framed via
+	// _append and skip this, matching undici.
+	var VALID_HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+	function assertValidHeaderName(name) {
+		if (!VALID_HEADER_NAME.test(name)) {
+			throw new TypeError('Invalid header name: "' + name + '"');
+		}
+	}
+	function assertValidHeaderValue(name, value) {
+		if (/[\r\n\0]/.test(value)) {
+			throw new TypeError('Invalid header value for "' + name + '": "' + value + '"');
+		}
+	}
+
 	class Headers {
 		constructor(init) {
 			this._map = new Map();
@@ -24,17 +44,31 @@
 			}
 		}
 		append(name, value) {
+			var text = String(value);
+			assertValidHeaderName(String(name));
+			assertValidHeaderValue(name, text);
+			this._append(name, text);
+		}
+		// _append stores without validation — for response headers parsed off the
+		// wire, which the transport has already framed line-by-line.
+		_append(name, value) {
 			var key = normalizeName(name);
 			var existing = this._map.get(key);
 			this._map.set(key, existing === undefined ? String(value) : existing + ", " + value);
 		}
-		set(name, value) { this._map.set(normalizeName(name), String(value)); }
+		set(name, value) {
+			var text = String(value);
+			assertValidHeaderName(String(name));
+			assertValidHeaderValue(name, text);
+			this._map.set(normalizeName(name), text);
+		}
 		get(name) {
+			assertValidHeaderName(String(name));
 			var v = this._map.get(normalizeName(name));
 			return v === undefined ? null : v;
 		}
-		has(name) { return this._map.has(normalizeName(name)); }
-		delete(name) { this._map.delete(normalizeName(name)); }
+		has(name) { assertValidHeaderName(String(name)); return this._map.has(normalizeName(name)); }
+		delete(name) { assertValidHeaderName(String(name)); this._map.delete(normalizeName(name)); }
 		forEach(callback, thisArg) {
 			this._map.forEach((value, key) => callback.call(thisArg, value, key, this));
 		}
@@ -131,10 +165,26 @@
 	class Request extends Body {
 		constructor(input, init) {
 			init = init || {};
-			super(init.body);
-			this.url = typeof input === "string" ? input : (input && input.url) || "";
-			this.method = (init.method || "GET").toUpperCase();
-			this.headers = new Headers(init.headers);
+			// When input is another Request, its method/headers/body seed the new
+			// one and init.* overrides them (WHATWG fetch). A string/URL input
+			// contributes only the URL. We treat input as a Request when it carries
+			// a string `url`, so URL objects (which stringify to their href) stay on
+			// the string path.
+			var src = input && typeof input === "object" && typeof input.url === "string" ? input : null;
+			// Per spec, init.body overrides only when present and non-null; a null
+			// or absent init.body keeps the source Request's body.
+			var bodyInit = init.body !== undefined && init.body !== null ? init.body : (src ? src._bodyBytes : init.body);
+			super(bodyInit);
+			this.url = src ? src.url : input == null ? "" : String(input);
+			var method = init.method !== undefined ? init.method : src ? src.method : "GET";
+			this.method = String(method || "GET").toUpperCase();
+			// A GET/HEAD request cannot carry a body, whether that body came from
+			// init or was inherited from a source Request (WHATWG fetch).
+			if ((this.method === "GET" || this.method === "HEAD") && this._bodyBytes !== null) {
+				throw new TypeError("Request with GET/HEAD method cannot have body.");
+			}
+			var headersInit = init.headers !== undefined ? init.headers : src ? src.headers : undefined;
+			this.headers = new Headers(headersInit);
 		}
 	}
 
@@ -163,10 +213,9 @@
 		var headerLines = "";
 		req.headers.forEach(function (value, key) {
 			if (TRANSPORT_OWNED_HEADERS[key]) return; // key is lowercased by normalizeName
-			var text = String(value);
-			// Reject header-injection attempts rather than splitting the request.
-			if (/[\r\n]/.test(key) || /[\r\n]/.test(text)) return;
-			headerLines += key + ": " + text + "\r\n";
+			// Names/values were CR/LF/NUL-validated when set (see Headers.append),
+			// so a header cannot split the request line here.
+			headerLines += key + ": " + String(value) + "\r\n";
 		});
 		// Body bytes are stored byte-exact on the Request (see bodyToBytes).
 		var body = req._bodyBytes;
@@ -175,7 +224,7 @@
 			function onResponse(raw) {
 				var headers = new Headers();
 				var pairs = raw.headers || [];
-				for (var i = 0; i + 1 < pairs.length; i += 2) headers.append(pairs[i], pairs[i + 1]);
+				for (var i = 0; i + 1 < pairs.length; i += 2) headers._append(pairs[i], pairs[i + 1]);
 				resolve(
 					new Response(raw.body, {
 						status: raw.status,
