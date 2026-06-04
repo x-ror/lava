@@ -18,14 +18,56 @@
 // returns — matching Node's "the nextTick queue drains fully before the
 // microtask queue resumes" (see tests/runtime/eventloop SEM cases).
 //
+// Errors: a throw from a nextTick/queueMicrotask callback is an *uncaught
+// exception* in Node (it reaches uncaughtException), NOT an unhandled rejection.
+// We therefore run every callback guarded and route a throw to reportUncaught —
+// the same native reporter the timer path uses (report_uncaught +
+// mark_async_failed) — so the category matches and one throwing callback does
+// not abort the rest of the drain via promise-rejection mechanics. (Like the
+// timer path, Lava reports and keeps draining rather than halting the process
+// the instant a callback throws; the process still exits non-zero.)
+//
+// Hardening: the few intrinsics the scheduler relies on (Promise.resolve,
+// Promise.prototype.then, Array.prototype.slice, Function.prototype.apply) are
+// captured here at install time — before any user code runs — so user code that
+// later reassigns e.g. Promise.resolve cannot silently break scheduling. (The
+// runtime otherwise avoids primordials; the scheduler is special because every
+// async API depends on it.)
+//
 // KNOWN LIMITATION: a nextTick registered *after* a promise/microtask within the
 // same turn does not preempt that already-queued promise job (Node's absolute
 // nextTick priority). Matching that would require suppressing JSC's automatic
-// microtask drain (JSC::VM::DrainMicrotaskDelayScope), which is a C++-ABI symbol
-// absent from Apple's JavaScriptCore.framework and would break the macOS build.
-// Tracked as a follow-up.
-(function (globalThis, process) {
+// microtask drain (JSC::VM::DrainMicrotaskDelayScope), a C++-ABI symbol absent
+// from Apple's JavaScriptCore.framework, so it would break the macOS build.
+// Tracked as a follow-up; see tests/runtime/eventloop/cases/10-* and the
+// known-lava-gaps entry.
+(function (globalThis, process, reportUncaught) {
 	"use strict";
+
+	// Intrinsics captured at install time (see "Hardening" above).
+	var PromiseCtor = Promise;
+	var promiseResolve = Promise.resolve;
+	var promiseThen = Promise.prototype.then;
+	var arraySlice = Array.prototype.slice;
+	var functionApply = Function.prototype.apply;
+	var resolved = promiseResolve.call(PromiseCtor);
+	var EMPTY = [];
+
+	// schedule(fn) enqueues fn as a JSC microtask, in FIFO with promise jobs, via
+	// a reaction on a pre-resolved promise. fn must not throw (callers guard).
+	function schedule(fn) {
+		promiseThen.call(resolved, fn);
+	}
+
+	// runGuarded calls fn(...args) and turns any throw into an uncaught exception
+	// report rather than letting it reject the scheduling promise.
+	function runGuarded(fn, args) {
+		try {
+			functionApply.call(fn, undefined, args);
+		} catch (error) {
+			reportUncaught(error);
+		}
+	}
 
 	var queue = []; // pending nextTick tasks: { fn, args }
 	var armed = false; // a drain microtask is scheduled but has not yet run
@@ -37,10 +79,11 @@
 		draining = true;
 		try {
 			// shift() one at a time so nextTicks queued *during* the drain (including
-			// nested ones) are flushed in this same pass, ahead of any promise job.
+			// nested ones) are flushed in this same pass, ahead of any promise job. A
+			// throwing callback is reported but does not abort the remaining queue.
 			while (queue.length > 0) {
 				var task = queue.shift();
-				task.fn.apply(undefined, task.args);
+				runGuarded(task.fn, task.args);
 			}
 		} finally {
 			draining = false;
@@ -51,13 +94,13 @@
 		if (typeof callback !== "function") {
 			throw new TypeError('The "callback" argument must be of type function. Received ' + typeof callback);
 		}
-		var args = arguments.length > 1 ? Array.prototype.slice.call(arguments, 1) : [];
+		var args = arguments.length > 1 ? arraySlice.call(arguments, 1) : EMPTY;
 		queue.push({ fn: callback, args: args });
 		// Arm a single drain reaction for the batch. Already-armed or mid-drain: the
 		// existing drain/while-loop will pick this task up.
 		if (!armed && !draining) {
 			armed = true;
-			Promise.resolve().then(drain);
+			schedule(drain);
 		}
 	}
 
@@ -65,10 +108,10 @@
 		if (typeof callback !== "function") {
 			throw new TypeError('The "callback" argument must be of type function. Received ' + typeof callback);
 		}
-		// Route through a resolved-promise reaction so the callback shares JSC's
-		// single microtask queue with Promise jobs, in FIFO registration order.
-		Promise.resolve().then(function () {
-			callback();
+		// Share JSC's single microtask queue with promise jobs, in FIFO order; a
+		// throw surfaces as an uncaught exception (Node), not an unhandled rejection.
+		schedule(function () {
+			runGuarded(callback, EMPTY);
 		});
 	}
 
