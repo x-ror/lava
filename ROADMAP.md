@@ -73,13 +73,22 @@ implementations — no `primordials`, no `internalBinding` coupling.
 
 ### High priority (the Odin / native part)
 
-- [ ] **Promise ↔ event-loop integration.** JSC drains its own promise
-      microtask queue at the end of `JSEvaluateScript`, so `Promise.then` runs
-      *before* `process.nextTick` (Node is the reverse). Bind
-      `JSObjectMakeDeferredPromise` and route promise jobs through our
-      next-tick/microtask queues. _(originally the "+ DeferredPromise" half of
-      plan item 1; note `fetch` does not need this — it settles a JS-created
-      promise via native callbacks)_
+- [x] **Promise ↔ event-loop ordering.** JSC drains its own promise microtask
+      queue at every C-API boundary, so `Promise.then` used to run *before*
+      `process.nextTick` (Node is the reverse). `process.nextTick` and
+      `queueMicrotask` now live in a JS shim (`js/internal/microtasks.js`) on top
+      of JSC's queue: both schedule a JSC microtask so `queueMicrotask` shares one
+      FIFO with promise jobs, and `nextTick` funnels each batch through a single
+      drain microtask armed when the batch's first `nextTick` is queued, so it
+      runs ahead of promise jobs queued later in the turn and drains fully
+      (incl. nested). Passes `01-nexttick-and-microtasks` + `09-nexttick-
+      microtask-interleave`. _Residual:_ Node's **absolute** nextTick priority (a
+      nextTick queued *after* a promise in the same turn, or *first* inside a
+      microtask, still preempting it) is not matched — it needs suppressing JSC's
+      automatic microtask drain (`JSC::VM::DrainMicrotaskDelayScope`), a C++-ABI
+      symbol absent from Apple's JavaScriptCore.framework, so it is not portable.
+      Tracked as a follow-up. _(`fetch` never needed this — it settles a
+      JS-created promise via native callbacks.)_
 - [ ] **ESM** — only CommonJS `require` works; no `.mjs` / `import` /
       `import.meta` / `node:url` `fileURLToPath` _(blocks `01-esm`, the last
       failing case)_
