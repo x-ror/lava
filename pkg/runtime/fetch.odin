@@ -153,11 +153,26 @@ parse_http_url :: proc(url: string) -> (host: string, port: int, path: string, s
 		return "", 0, "", "", false
 	}
 
+	// The authority ends at the first '/', '?' or '#'; everything from there is
+	// the request target. A query that sits directly after the authority
+	// (http://host?x=1) must still produce an origin-form "/?x=1", and the
+	// fragment ('#...') is never sent on the wire — build_http_request supplies
+	// the leading '/'.
 	authority := rest
 	path = "/"
-	if slash := strings.index_byte(rest, '/'); slash >= 0 {
-		authority = rest[:slash]
-		path = rest[slash:]
+	auth_end := len(rest)
+	for i in 0 ..< len(rest) {
+		c := rest[i]
+		if c == '/' || c == '?' || c == '#' {
+			auth_end = i
+			break
+		}
+	}
+	if auth_end < len(rest) {
+		authority = rest[:auth_end]
+		target := rest[auth_end:]
+		if hash := strings.index_byte(target, '#'); hash >= 0 do target = target[:hash]
+		path = target if len(target) > 0 else "/"
 	}
 	// Drop any userinfo (user:pass@host).
 	if at := strings.last_index_byte(authority, '@'); at >= 0 {
@@ -189,6 +204,9 @@ build_http_request :: proc(
 	b := strings.builder_make(context.allocator)
 	strings.write_string(&b, method)
 	strings.write_byte(&b, ' ')
+	// Origin-form request target always begins with '/': a query-only path
+	// ("?x=1", from http://host?x=1) gets the slash prepended here.
+	if len(path) == 0 || path[0] != '/' do strings.write_byte(&b, '/')
 	strings.write_string(&b, path)
 	strings.write_string(&b, " HTTP/1.1\r\n")
 
@@ -388,7 +406,14 @@ parse_http_response :: proc(
 
 	switch {
 	case is_chunked:
-		body = dechunk_body(body_raw)
+		decoded, dok := dechunk_body(body_raw)
+		if !dok {
+			// Truncated/malformed chunked stream (e.g. the connection dropped
+			// mid-chunk). Reject rather than resolving with partial bytes; Node
+			// surfaces this as TypeError: terminated.
+			return 0, "", nil, nil, false
+		}
+		body = decoded
 	case content_length >= 0:
 		// A declared Content-Length longer than what arrived means the connection
 		// closed mid-body; surface that as an error rather than a truncated success.
@@ -405,8 +430,12 @@ parse_http_response :: proc(
 }
 
 // dechunk_body decodes a chunked transfer-encoding body into a flat slice on
-// context.allocator. Malformed input stops decoding early (best-effort).
-dechunk_body :: proc(data: []byte) -> []byte {
+// context.allocator. ok is true only when the terminating zero-length chunk is
+// reached; a missing size line, an unparsable size, a chunk that runs past the
+// buffer, or running out of data before the final chunk all mean the stream was
+// truncated/malformed — we free the partial buffer and return ok=false so the
+// caller can reject instead of resolving with partial bytes.
+dechunk_body :: proc(data: []byte) -> (body: []byte, ok: bool) {
 	out := make([dynamic]byte, 0, len(data), context.allocator)
 	i := 0
 	for i < len(data) {
@@ -417,19 +446,36 @@ dechunk_body :: proc(data: []byte) -> []byte {
 				break
 			}
 		}
-		if line_end < 0 do break
+		if line_end < 0 {
+			delete(out)
+			return nil, false
+		}
 
 		size_str := string(data[i:line_end])
 		if semi := strings.index_byte(size_str, ';'); semi >= 0 do size_str = size_str[:semi]
 		size, size_ok := strconv.parse_int(strings.trim_space(size_str), 16)
-		if !size_ok do break
+		if !size_ok {
+			delete(out)
+			return nil, false
+		}
 
 		i = line_end + 2
-		if size == 0 do break // final chunk
-		if i + size > len(data) do break
+		if size == 0 do return out[:], true // final chunk: a clean end of stream
+		if i + size > len(data) {
+			delete(out)
+			return nil, false
+		}
 		append(&out, ..data[i:i + size])
 		i += size
-		if i + 1 < len(data) && data[i] == '\r' && data[i + 1] == '\n' do i += 2
+		// Chunk data is always terminated by CRLF (RFC 7230); its absence means
+		// the stream was cut short, so reject rather than accept partial data.
+		if i + 1 >= len(data) || data[i] != '\r' || data[i + 1] != '\n' {
+			delete(out)
+			return nil, false
+		}
+		i += 2
 	}
-	return out[:]
+	// Ran out of input without ever seeing the zero-length terminator.
+	delete(out)
+	return nil, false
 }
