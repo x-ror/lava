@@ -327,45 +327,10 @@ clear_timer_cb :: proc "c" (
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
-queue_microtask_cb :: proc "c" (
-	ctx: jsc.JSContextRef,
-	function: jsc.JSObjectRef,
-	this_object: jsc.JSObjectRef,
-	argument_count: c.size_t,
-	arguments: [^]jsc.JSValueRef,
-	exception: ^jsc.JSValueRef,
-) -> jsc.JSValueRef {
-	context = runtime.default_context()
-	loop := get_loop_from_ctx(ctx)
-	if loop == nil || argument_count < 1 do return jsc.JSValueMakeUndefined(ctx)
-
-	fn := callback_arg(ctx, arguments[0])
-	if fn == nil do return jsc.JSValueMakeUndefined(ctx)
-
-	cb := make_js_callback(ctx, fn, false)
-	eventloop.queue_microtask(loop, js_callback_trampoline, cb)
-	return jsc.JSValueMakeUndefined(ctx)
-}
-
-process_next_tick_cb :: proc "c" (
-	ctx: jsc.JSContextRef,
-	function: jsc.JSObjectRef,
-	this_object: jsc.JSObjectRef,
-	argument_count: c.size_t,
-	arguments: [^]jsc.JSValueRef,
-	exception: ^jsc.JSValueRef,
-) -> jsc.JSValueRef {
-	context = runtime.default_context()
-	loop := get_loop_from_ctx(ctx)
-	if loop == nil || argument_count < 1 do return jsc.JSValueMakeUndefined(ctx)
-
-	fn := callback_arg(ctx, arguments[0])
-	if fn == nil do return jsc.JSValueMakeUndefined(ctx)
-
-	cb := make_js_callback(ctx, fn, false)
-	eventloop.queue_next_tick(loop, js_callback_trampoline, cb)
-	return jsc.JSValueMakeUndefined(ctx)
-}
+// process.nextTick and queueMicrotask are installed from JS (MICROTASK_PRELUDE)
+// rather than as native callbacks: their Node-matching ordering relative to
+// JSC's promise-job queue is expressed most naturally in JS. See
+// install_microtasks and js/internal/microtasks.js.
 
 // --- console ---
 //
@@ -460,13 +425,31 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 	inject_native_function(ctx, global, "clearTimeout", clear_timer_cb)
 	inject_native_function(ctx, global, "clearInterval", clear_timer_cb)
 	inject_native_function(ctx, global, "clearImmediate", clear_timer_cb)
-	inject_native_function(ctx, global, "queueMicrotask", queue_microtask_cb)
 
 	install_console(ctx, global)
 	install_internal_modules(ctx, global)
 
 	install_process(ctx, global)
+	// process.nextTick + queueMicrotask are a JS shim (needs `process` to exist).
+	install_microtasks(ctx, global)
 	install_rejection_tracker(ctx)
+}
+
+// install_microtasks evaluates MICROTASK_PRELUDE to a factory and calls it with
+// (globalThis, process) so it can install process.nextTick and queueMicrotask
+// with Node-matching ordering. See js/internal/microtasks.js for why these live
+// in JS on top of JSC's promise-job queue rather than the native event loop.
+install_microtasks :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
+	process := get_named(ctx, global, "process")
+	if process == nil || !jsc.JSValueIsObject(ctx, process) do return
+
+	factory := eval_internal(ctx, "lava:microtasks", MICROTASK_PRELUDE)
+	if factory == nil || !jsc.JSValueIsObject(ctx, factory) do return
+
+	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)global, process}
+	exception: jsc.JSValueRef
+	jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)factory, nil, 2, raw_data(args[:]), &exception)
+	if exception != nil do report_internal_exception(ctx, "lava:microtasks", exception)
 }
 
 // install_internal_modules evaluates the JS built-in modules (util, events,
@@ -645,7 +628,6 @@ install_process :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
 	set_named(ctx, process, "argv", cast(jsc.JSValueRef)build_string_array(ctx, os.args))
 	set_named(ctx, process, "env", cast(jsc.JSValueRef)build_env_object(ctx))
 
-	inject_native_function(ctx, process, "nextTick", process_next_tick_cb)
 	inject_native_function(ctx, process, "exit", process_exit_cb)
 	inject_native_function(ctx, process, "cwd", process_cwd_cb)
 
@@ -703,6 +685,10 @@ build_env_object :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 // substitution, value inspection, grouping and table rendering stay simple. The
 // primitives arrive as arguments, so they are never visible on globalThis.
 CONSOLE_PRELUDE :: #load("js/console.js", string)
+
+// process.nextTick / queueMicrotask ordering shim (factory `(globalThis,
+// process) => {}`). Installed after `process` exists; see install_microtasks.
+MICROTASK_PRELUDE :: #load("js/internal/microtasks.js", string)
 
 // Internal built-in modules, embedded at compile time. Each evaluates to a
 // factory `(require, module, exports) => exports?`; the loader wires them up.
