@@ -56,8 +56,55 @@
 		"sha3-224", "sha3-256", "sha3-384", "sha3-512",
 	];
 
+	// TODO(hash-algorithms): Odin already has these primitives; add them to
+	// HASHES once crypto_algorithm() maps them and compatibility tests cover them.
+	var TODO_HASH_ALGORITHMS = [
+		"blake2b512", "blake2s256", "sm3",
+	];
+
+	// TODO(hash-aliases): Node/OpenSSL exposes these digest aliases. Keep them out
+	// of getHashes() until createHash()/createHmac() normalize them successfully.
+	var TODO_HASH_ALIASES = [
+		"RSA-MD5", "md5WithRSAEncryption", "ssl3-md5",
+		"RSA-SHA1", "RSA-SHA1-2", "sha1WithRSAEncryption", "ssl3-sha1",
+		"RSA-SHA224", "sha224WithRSAEncryption",
+		"RSA-SHA256", "sha256WithRSAEncryption",
+		"RSA-SHA384", "sha384WithRSAEncryption",
+		"RSA-SHA512", "sha512WithRSAEncryption",
+		"RSA-SHA512/256", "sha512-256WithRSAEncryption",
+		"RSA-SHA3-224", "id-rsassa-pkcs1-v1_5-with-sha3-224",
+		"RSA-SHA3-256", "id-rsassa-pkcs1-v1_5-with-sha3-256",
+		"RSA-SHA3-384", "id-rsassa-pkcs1-v1_5-with-sha3-384",
+		"RSA-SHA3-512", "id-rsassa-pkcs1-v1_5-with-sha3-512",
+		"RSA-SM3", "sm3WithRSAEncryption",
+	];
+
+	// TODO(hash-unsupported): Node exposes these names, but Odin's current
+	// hash.Algorithm enum does not have matching primitives.
+	var TODO_HASH_UNSUPPORTED = [
+		"ripemd", "ripemd160", "rmd160", "ripemd160WithRSA",
+		"sha512-224", "RSA-SHA512/224", "sha512-224WithRSAEncryption",
+		"md5-sha1", "shake128", "shake256",
+	];
+
 	function getHashes() {
 		return HASHES.slice();
+	}
+
+	function notImplemented(name) {
+		return function () {
+			var err = new Error("node:crypto " + name + " is not implemented in Lava");
+			err.code = "ERR_NOT_IMPLEMENTED";
+			throw err;
+		};
+	}
+
+	function notImplementedConstructor(name) {
+		return function () {
+			var err = new Error("node:crypto " + name + " is not implemented in Lava");
+			err.code = "ERR_NOT_IMPLEMENTED";
+			throw err;
+		};
 	}
 
 	// --- hashing -------------------------------------------------------------
@@ -261,7 +308,66 @@
 		RSA_PSS_SALTLEN_AUTO: -2,
 	};
 
-	module.exports = {
+	// TODO(crypto-api): Templates for Node crypto exports that are not
+	// implemented yet. Keep these throwing until the matching JS surface and, when
+	// needed, Odin native primitive are wired with compatibility tests.
+	var TODO_CRYPTO_CLASSES = {
+		Certificate: notImplementedConstructor("Certificate"),
+		Cipheriv: notImplementedConstructor("Cipheriv"),
+		Decipheriv: notImplementedConstructor("Decipheriv"),
+		DiffieHellman: notImplementedConstructor("DiffieHellman"),
+		DiffieHellmanGroup: notImplementedConstructor("DiffieHellmanGroup"),
+		ECDH: notImplementedConstructor("ECDH"),
+		KeyObject: notImplementedConstructor("KeyObject"),
+		Sign: notImplementedConstructor("Sign"),
+		Verify: notImplementedConstructor("Verify"),
+		X509Certificate: notImplementedConstructor("X509Certificate"),
+	};
+
+	var TODO_CRYPTO_FUNCTIONS = {
+		argon2: notImplemented("argon2"),
+		argon2Sync: notImplemented("argon2Sync"),
+		checkPrime: notImplemented("checkPrime"),
+		checkPrimeSync: notImplemented("checkPrimeSync"),
+		createCipheriv: notImplemented("createCipheriv"),
+		createDecipheriv: notImplemented("createDecipheriv"),
+		createDiffieHellman: notImplemented("createDiffieHellman"),
+		createDiffieHellmanGroup: notImplemented("createDiffieHellmanGroup"),
+		createECDH: notImplemented("createECDH"),
+		createPrivateKey: notImplemented("createPrivateKey"),
+		createPublicKey: notImplemented("createPublicKey"),
+		createSecretKey: notImplemented("createSecretKey"),
+		createSign: notImplemented("createSign"),
+		createVerify: notImplemented("createVerify"),
+		decapsulate: notImplemented("decapsulate"),
+		diffieHellman: notImplemented("diffieHellman"),
+		encapsulate: notImplemented("encapsulate"),
+		generateKey: notImplemented("generateKey"),
+		generateKeyPair: notImplemented("generateKeyPair"),
+		generateKeyPairSync: notImplemented("generateKeyPairSync"),
+		generateKeySync: notImplemented("generateKeySync"),
+		generatePrime: notImplemented("generatePrime"),
+		generatePrimeSync: notImplemented("generatePrimeSync"),
+		getCipherInfo: notImplemented("getCipherInfo"),
+		getCiphers: notImplemented("getCiphers"),
+		getCurves: notImplemented("getCurves"),
+		getDiffieHellman: notImplemented("getDiffieHellman"),
+		getFips: notImplemented("getFips"),
+		privateDecrypt: notImplemented("privateDecrypt"),
+		privateEncrypt: notImplemented("privateEncrypt"),
+		publicDecrypt: notImplemented("publicDecrypt"),
+		publicEncrypt: notImplemented("publicEncrypt"),
+		randomUUIDv7: notImplemented("randomUUIDv7"),
+		scrypt: notImplemented("scrypt"),
+		scryptSync: notImplemented("scryptSync"),
+		secureHeapUsed: notImplemented("secureHeapUsed"),
+		setEngine: notImplemented("setEngine"),
+		setFips: notImplemented("setFips"),
+		sign: notImplemented("sign"),
+		verify: notImplemented("verify"),
+	};
+
+	var exported = {
 		Hash: Hash,
 		Hmac: Hmac,
 		createHash: createHash,
@@ -280,4 +386,48 @@
 		hkdfSync: hkdfSync,
 		constants: constants,
 	};
+
+	Object.keys(TODO_CRYPTO_CLASSES).forEach(function (name) {
+		exported[name] = TODO_CRYPTO_CLASSES[name];
+	});
+	Object.keys(TODO_CRYPTO_FUNCTIONS).forEach(function (name) {
+		exported[name] = TODO_CRYPTO_FUNCTIONS[name];
+	});
+
+	Object.defineProperties(exported, {
+		fips: {
+			get: function () { return 0; },
+			set: function () { throw notImplemented("fips")(); },
+			configurable: true,
+		},
+		getRandomValues: {
+			get: function () { return notImplemented("getRandomValues"); },
+			configurable: true,
+		},
+		prng: {
+			get: function () { return randomBytes; },
+			set: function () { throw notImplemented("prng")(); },
+			configurable: true,
+		},
+		pseudoRandomBytes: {
+			get: function () { return randomBytes; },
+			set: function () { throw notImplemented("pseudoRandomBytes")(); },
+			configurable: true,
+		},
+		rng: {
+			get: function () { return randomBytes; },
+			set: function () { throw notImplemented("rng")(); },
+			configurable: true,
+		},
+		subtle: {
+			get: function () { throw notImplemented("subtle")(); },
+			configurable: true,
+		},
+		webcrypto: {
+			get: function () { throw notImplemented("webcrypto")(); },
+			configurable: true,
+		},
+	});
+
+	module.exports = exported;
 })
