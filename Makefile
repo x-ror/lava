@@ -3,7 +3,7 @@ LAVA ?= bin/lava
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help build run eval check check-cli check-runtime check-jsc check-native test test-lava test-report test-report-html api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-node test-eventloop-node test-eventloop-lava fmt clean
+.PHONY: help build run eval check check-cli check-runtime check-jsc check-native test test-lava test-report test-report-html api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-node test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -31,6 +31,7 @@ help:
 	@printf '%s\n' '  make test-sqlite-node   Run SQLite std tests with Node as oracle'
 	@printf '%s\n' '  make test-eventloop-node Run event-loop ordering tests with Node as oracle'
 	@printf '%s\n' '  make test-eventloop-lava Build and compare event-loop tests through Lava, skipping known gaps'
+	@printf '%s\n' '  make test-fetch-smoke   Compare fetch over a real socket node vs Lava (binds a local port)'
 	@printf '%s\n' '  make fmt                Strip optional semicolons in Odin sources'
 	@printf '%s\n' '  make clean              Remove build artifacts'
 	@printf '%s\n' ''
@@ -106,6 +107,9 @@ test-eventloop-node:
 
 test-eventloop-lava: build
 	RUN_LAVA=1 SKIP_KNOWN_LAVA_GAPS=1 LAVA_BIN="$(LAVA)" ./scripts/run-eventloop-oracle.sh
+
+test-fetch-smoke: build
+	LAVA_BIN="$(LAVA)" ./scripts/run-fetch-smoke.sh
 
 test-lava: test-compat-lava test-eventloop-lava
 

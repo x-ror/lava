@@ -1,8 +1,10 @@
 // Fetch surface — Headers, Request, Response, and a global `fetch`. Installs
 // the WHATWG globals (Node exposes them without a require). This is the pure-JS
-// half: the body/headers machinery is real, but the network transport in
-// fetch() is a stub until the Odin phase wires actual sockets.
-(function (require, module) {
+// half: Headers/Request/Response/Body machinery lives here, exactly as Node
+// keeps it in JS; the actual `http://` network transport is Odin-backed and
+// reached through the `native` bindings (native.request), mirroring how
+// crypto/buffer receive their Odin primitives as the factory's fourth argument.
+(function (require, module, exports, native) {
 	"use strict";
 
 	function normalizeName(name) {
@@ -42,38 +44,56 @@
 		[Symbol.iterator]() { return this._map.entries(); }
 	}
 
-	function consumeBody(body) {
-		if (body === null || body === undefined) return "";
-		if (typeof body === "string") return body;
-		if (typeof Buffer !== "undefined" && body instanceof Buffer) return body.toString("utf8");
-		if (body instanceof Uint8Array) {
-			var s = "";
-			for (var i = 0; i < body.length; i++) s += String.fromCharCode(body[i]);
-			return s;
-		}
-		return String(body);
+	// bodyToBytes normalizes a body init into byte-exact storage (a Uint8Array) or
+	// null. Strings are UTF-8 encoded; Buffer/Uint8Array/ArrayBuffer are kept
+	// byte-for-byte (no latin1 round-trip), so binary request bodies are not
+	// corrupted and so response bytes survive intact for arrayBuffer().
+	function bodyToBytes(body) {
+		if (body === null || body === undefined || body === "") return null;
+		if (body instanceof Uint8Array) return body; // Buffer is a Uint8Array subclass
+		if (body instanceof ArrayBuffer) return new Uint8Array(body);
+		var text = typeof body === "string" ? body : String(body);
+		if (text === "") return null;
+		if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text);
+		var bytes = new Uint8Array(text.length);
+		for (var i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
+		return bytes;
+	}
+
+	// bytesToText UTF-8 decodes stored bytes (matches Node's Body.text(); a latin1
+	// fallback keeps things working if TextDecoder is somehow unavailable).
+	function bytesToText(bytes) {
+		if (bytes === null) return "";
+		if (typeof TextDecoder !== "undefined") return new TextDecoder().decode(bytes);
+		var s = "";
+		for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+		return s;
 	}
 
 	class Body {
 		constructor(body) {
-			this._bodyText = consumeBody(body);
+			this._bodyBytes = bodyToBytes(body); // Uint8Array or null, byte-exact
 			this.bodyUsed = false;
 		}
 		text() {
 			this.bodyUsed = true;
-			return Promise.resolve(this._bodyText);
+			return Promise.resolve(bytesToText(this._bodyBytes));
 		}
 		json() {
 			this.bodyUsed = true;
-			return Promise.resolve(JSON.parse(this._bodyText));
+			// Parse inside the promise chain so invalid JSON rejects rather than
+			// throwing synchronously (WHATWG fetch semantics).
+			return this.text().then(function (text) {
+				return JSON.parse(text);
+			});
 		}
 		arrayBuffer() {
 			this.bodyUsed = true;
-			var text = this._bodyText;
-			var buf = new ArrayBuffer(text.length);
-			var view = new Uint8Array(buf);
-			for (var i = 0; i < text.length; i++) view[i] = text.charCodeAt(i) & 0xff;
-			return Promise.resolve(buf);
+			var bytes = this._bodyBytes;
+			if (bytes === null) return Promise.resolve(new ArrayBuffer(0));
+			var copy = new Uint8Array(bytes.length);
+			copy.set(bytes);
+			return Promise.resolve(copy.buffer);
 		}
 	}
 
@@ -90,7 +110,7 @@
 			this.url = init.url || "";
 		}
 		clone() {
-			return new Response(this._bodyText, {
+			return new Response(this._bodyBytes, {
 				status: this.status,
 				statusText: this.statusText,
 				headers: this.headers,
@@ -118,10 +138,58 @@
 		}
 	}
 
-	// TODO(odin): real network transport. The compat target only checks
-	// `typeof fetch === 'function'`; an actual request rejects for now.
+	// The transport sets these itself from the URL and body length; a caller copy
+	// would otherwise be emitted as a duplicate header on the wire.
+	var TRANSPORT_OWNED_HEADERS = { host: 1, "content-length": 1, connection: 1, "transfer-encoding": 1 };
+
+	// fetch(input, init) — build a Request, then hand the method/url/headers/body
+	// to the Odin transport. native.request settles by invoking one of the two
+	// callbacks we pass: onResponse({status, statusText, headers, body}) on
+	// success, or onError(message) on failure. The transport runs on the event
+	// loop, so the returned promise resolves on a later tick. Only http:// is
+	// wired today; https:// rejects from the native side.
 	function fetch(input, init) {
-		return Promise.reject(new Error("fetch: network backend not implemented yet"));
+		var req;
+		try {
+			req = new Request(input, init);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+
+		if (!native || typeof native.request !== "function") {
+			return Promise.reject(new TypeError("fetch: native network backend unavailable"));
+		}
+
+		var headerLines = "";
+		req.headers.forEach(function (value, key) {
+			if (TRANSPORT_OWNED_HEADERS[key]) return; // key is lowercased by normalizeName
+			var text = String(value);
+			// Reject header-injection attempts rather than splitting the request.
+			if (/[\r\n]/.test(key) || /[\r\n]/.test(text)) return;
+			headerLines += key + ": " + text + "\r\n";
+		});
+		// Body bytes are stored byte-exact on the Request (see bodyToBytes).
+		var body = req._bodyBytes;
+
+		return new Promise(function (resolve, reject) {
+			function onResponse(raw) {
+				var headers = new Headers();
+				var pairs = raw.headers || [];
+				for (var i = 0; i + 1 < pairs.length; i += 2) headers.append(pairs[i], pairs[i + 1]);
+				resolve(
+					new Response(raw.body, {
+						status: raw.status,
+						statusText: raw.statusText,
+						headers: headers,
+						url: req.url,
+					}),
+				);
+			}
+			function onError(message) {
+				reject(new TypeError(String(message)));
+			}
+			native.request(req.method, req.url, headerLines, body, onResponse, onError);
+		});
 	}
 
 	if (typeof globalThis.Headers === "undefined") globalThis.Headers = Headers;

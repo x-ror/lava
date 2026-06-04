@@ -19,6 +19,10 @@ Runtime_State :: struct {
 	// initial JSEvaluateScript returned cleanly (see resolve_exit_code).
 	async_failed:      bool,
 	rejection_handler: jsc.JSValueRef, // GC-protected fn registered with JSC; unprotected on destroy
+	// Settled fetch requests awaiting free. Their teardown is deferred to here
+	// because the io_uring watcher may reference a request once more after it is
+	// stopped; freeing only at destroy keeps that memory valid (see fetch.odin).
+	pending_free:      [dynamic]^Fetch_Request,
 }
 
 // JS_Callback bridges a JS function into an event-loop Callback. The function
@@ -61,6 +65,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 
 destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	if state == nil do return
+	fetch_destroy_pending(state)
 	for key, value in state.module_cache {
 		jsc.JSValueUnprotect(ctx, value)
 		delete(key)
@@ -250,7 +255,10 @@ set_timeout_cb :: proc "c" (
 
 	delay := 0.0
 	if argument_count >= 2 do delay = jsc.JSValueToNumber(ctx, arguments[1], nil)
-	if delay < 0 do delay = 0
+	// Node floors timer delays at 1ms (delays < 1 become 1). Besides matching Node,
+	// this prevents a 0ms timer from busy-spinning the loop and starving pending
+	// I/O (and freezing the virtual clock) while a request is in flight.
+	if !(delay >= 1) do delay = 1
 
 	cb := make_js_callback(ctx, fn, false)
 	id := eventloop.set_timeout(loop, js_callback_trampoline, u64(delay), cb)
@@ -274,7 +282,8 @@ set_interval_cb :: proc "c" (
 
 	interval := 0.0
 	if argument_count >= 2 do interval = jsc.JSValueToNumber(ctx, arguments[1], nil)
-	if interval < 0 do interval = 0
+	// Match Node's 1ms floor (and avoid a 0ms interval starving pending I/O).
+	if !(interval >= 1) do interval = 1
 
 	cb := make_js_callback(ctx, fn, true)
 	id := eventloop.set_interval(loop, js_callback_trampoline, u64(interval), cb)
@@ -501,6 +510,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	natives := jsc.JSObjectMake(ctx, nil, nil)
 	set_named(ctx, natives, "crypto", cast(jsc.JSValueRef)make_crypto_bindings(ctx))
 	set_named(ctx, natives, "buffer", cast(jsc.JSValueRef)make_buffer_bindings(ctx))
+	set_named(ctx, natives, "fetch", cast(jsc.JSValueRef)make_fetch_bindings(ctx))
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef

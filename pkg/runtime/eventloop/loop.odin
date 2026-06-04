@@ -59,6 +59,7 @@ Loop :: struct {
 	cancelled_ids:   map[Timer_ID]bool,
 	running_id:      Timer_ID,
 	active_io_count: int,
+	io_events:       u64, // bumped by platform_poll each time a watcher callback fires
 	allocator:       mem.Allocator,
 	platform:        Platform_Loop,
 }
@@ -380,10 +381,23 @@ run_once :: proc(loop: ^Loop) -> bool {
 
 	if has_nothing_to_do {
 		timeout_ms := get_next_timer_timeout(loop)
-		if timeout_ms != 0 {
+		// With no timers but pending I/O, block indefinitely until an fd is ready
+		// rather than spinning (get_next_timer_timeout returns -1 in that case).
+		if timeout_ms != 0 || loop.active_io_count > 0 {
+			io_before := loop.io_events
 			platform_poll(loop, timeout_ms)
-			// After poll, update the clock so newly-due timers fire this tick
-			// (only when we slept and woke up naturally from a timer timeout)
+			if loop.io_events != io_before {
+				// A fired I/O callback counts as progress so the run-until-idle
+				// driver does not treat an I/O-only tick as "nothing happened".
+				did_work = true
+			} else if timeout_ms > 0 {
+				// Woke on the timer deadline with no fd ready: advance the virtual
+				// clock so the now-due timer fires next tick. Without this, a timer
+				// co-pending with in-flight I/O would be dropped and the loop would
+				// exit early. (timeout_ms < 0 is a pure-I/O wait — never advance.)
+				advance_time(loop, u64(timeout_ms))
+				did_work = true
+			}
 		}
 	}
 
@@ -441,6 +455,13 @@ run_next :: proc(loop: ^Loop) -> bool {
 	   has_due_timer(loop) ||
 	   active_immediate_count(loop) > 0 ||
 	   active_close_count(loop) > 0 {
+		return run_once(loop)
+	}
+
+	// Pending I/O with nothing else ready: run a tick so the poll phase blocks on
+	// the fd(s). Without this, a request whose only pending work is a socket would
+	// never be driven and the loop would exit prematurely.
+	if loop.active_io_count > 0 {
 		return run_once(loop)
 	}
 
