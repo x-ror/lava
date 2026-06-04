@@ -446,10 +446,35 @@ install_microtasks :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
 	factory := eval_internal(ctx, "lava:microtasks", MICROTASK_PRELUDE)
 	if factory == nil || !jsc.JSValueIsObject(ctx, factory) do return
 
-	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)global, process}
+	// A throw from a nextTick/queueMicrotask callback is an uncaught exception
+	// (not an unhandled rejection); the shim routes it here, the same path the
+	// timer trampoline uses for async callbacks.
+	report := make_native_function(ctx, "__lava_report_uncaught", microtask_report_uncaught_cb)
+	if report == nil do return
+
+	args := [3]jsc.JSValueRef{cast(jsc.JSValueRef)global, process, cast(jsc.JSValueRef)report}
 	exception: jsc.JSValueRef
-	jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)factory, nil, 2, raw_data(args[:]), &exception)
+	jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)factory, nil, 3, raw_data(args[:]), &exception)
 	if exception != nil do report_internal_exception(ctx, "lava:microtasks", exception)
+}
+
+// microtask_report_uncaught_cb(error) reports a throw from a nextTick or
+// queueMicrotask callback as an uncaught exception and flags the process to exit
+// non-zero — mirroring js_callback_trampoline's handling of a throwing timer.
+microtask_report_uncaught_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count >= 1 {
+		report_uncaught(ctx, arguments[0])
+		mark_async_failed(ctx)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
 }
 
 // install_internal_modules evaluates the JS built-in modules (util, events,
