@@ -47,14 +47,16 @@ crypto_algorithm :: proc(name: string) -> (hash.Algorithm, bool) {
 	case "sha3-512":
 		return .SHA3_512, true
 
-	// TODO(hash-algorithms): Odin already has these primitives. Wire their Node
-	// names into getHashes()/createHash()/createHmac() with compatibility tests.
+	// BLAKE2 and SM3, served by the same core:crypto/hash interface. The generic
+	// digest sizes (BLAKE2b=64, BLAKE2s=32, SM3=32) match Node's blake2b512 /
+	// blake2s256 / sm3, and BLOCK_SIZES exist for all three so HMAC/PBKDF2/HKDF
+	// work without any extra wiring.
 	case "blake2b512":
-		return .Invalid, false
+		return .BLAKE2B, true
 	case "blake2s256":
-		return .Invalid, false
+		return .BLAKE2S, true
 	case "sm3":
-		return .Invalid, false
+		return .SM3, true
 
 	// TODO(hash-aliases): Node/OpenSSL exposes these digest aliases. Normalize
 	// them to the canonical algorithms above once alias coverage is tested.

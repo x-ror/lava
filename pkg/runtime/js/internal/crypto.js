@@ -54,11 +54,6 @@
 	var HASHES = [
 		"md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-256",
 		"sha3-224", "sha3-256", "sha3-384", "sha3-512",
-	];
-
-	// TODO(hash-algorithms): Odin already has these primitives; add them to
-	// HASHES once crypto_algorithm() maps them and compatibility tests cover them.
-	var TODO_HASH_ALGORITHMS = [
 		"blake2b512", "blake2s256", "sm3",
 	];
 

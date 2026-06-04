@@ -59,7 +59,7 @@ implementations — no `primordials`, no `internalBinding` coupling.
 - [x] **`Buffer` global** — `from`/`alloc`/`concat`/`copy`/`toString` over
       `Uint8Array`; utf8/hex/base64 codecs backed by Odin (`pkg/runtime/buffer.odin`,
       `core:encoding`) as the sole impl — _(passes `03-buffer`)_
-- [x] **`node:crypto`** — `createHash`/`createHmac` (md5/sha1/sha2/sha3),
+- [x] **`node:crypto`** — `createHash`/`createHmac` (md5/sha1/sha2/sha3/blake2/sm3),
       `randomBytes`/`randomUUID`/`randomFill*`, `pbkdf2`/`pbkdf2Sync`, all backed
       by Odin `core:crypto` (`pkg/runtime/crypto.odin`) — _(passes `07-crypto`)_
 - [x] **`fetch` / `Response` / `Headers` / `Request`** globals — body + headers

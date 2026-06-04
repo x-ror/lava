@@ -27,6 +27,39 @@ assert.equal(partial.update('va').digest('hex'), digest);
 assert.equal(forked.update('va').digest('hex'), digest);
 assert.equal(crypto.getHashes().includes('sha256'), true);
 
+// BLAKE2 and SM3 digests, served by the same Odin core:crypto/hash interface and
+// exercised through createHash/hash, createHmac, and getHashes(). Vectors are
+// Node's output for the shared 'lava'/'key' inputs used above.
+const blake2b512 = 'ed2807e5432a1f5e5cb553cde7531bea3d11912fcb4181d5c88701c55aea9c390e1a808b8a5d36bc977fc06824608c01eedf38f43e45edcdbda9543d30ba42eb';
+const blake2s256 = '7c32c2e0e882663ff209f64d177449954fb5f14fa1f6af8731ef1f22992d880f';
+const sm3 = 'd26e27dc1877fb10e21acd8a907f8616ef65a2b2d3703a25c0ba29e20980e529';
+assert.equal(crypto.createHash('blake2b512').update('lava').digest('hex'), blake2b512);
+assert.equal(crypto.createHash('blake2s256').update('lava').digest('hex'), blake2s256);
+assert.equal(crypto.createHash('sm3').update('lava').digest('hex'), sm3);
+assert.equal(crypto.hash('blake2b512', 'lava'), blake2b512);
+assert.equal(crypto.hash('blake2s256', 'lava'), blake2s256);
+assert.equal(crypto.hash('sm3', 'lava'), sm3);
+assert.equal(crypto.createHash('blake2b512').update('lava').digest().length, 64);
+assert.equal(crypto.createHash('blake2s256').update('lava').digest().length, 32);
+assert.equal(crypto.createHash('sm3').update('lava').digest().length, 32);
+assert.equal(crypto.createHmac('blake2b512', 'key').update('lava').digest('hex'),
+	'ea0dbc86ac6f1c1850bd389f6163349248d3cfdae04faf714f14b04906c2771eb8e6c81b3b9ede207b99fa844e8a94e21ee91acdbcfe3faf0d95d7f814205dd7');
+assert.equal(crypto.createHmac('blake2s256', 'key').update('lava').digest('hex'),
+	'7abeda0371857341bb56a310b253ba4db37a1e44fd086113695eb45fcd7e4dda');
+assert.equal(crypto.createHmac('sm3', 'key').update('lava').digest('hex'),
+	'3427691b7a3cfa72f87c29ac58ec515005b47978abce1ebdc8347ee42aaa77ce');
+for (const algo of ['blake2b512', 'blake2s256', 'sm3']) assert.equal(crypto.getHashes().includes(algo), true);
+
+// The same algorithms flow through the HMAC-based KDFs (pbkdf2/hkdf) for free.
+assert.equal(crypto.pbkdf2Sync('password', 'salt', 1, 8, 'sm3').toString('hex'), '4612f922a1fdcefa');
+assert.equal(Buffer.from(crypto.hkdfSync(
+	'blake2s256',
+	Buffer.alloc(22, 0x0b),
+	Buffer.from('000102030405060708090a0b0c', 'hex'),
+	Buffer.from('f0f1f2f3f4f5f6f7f8f9', 'hex'),
+	42,
+)).toString('hex'), '1472c31f2ff768c71b19f8803683ee3b13c1a5fb3ea59c0c3bf0d44a4a40dcd4329d9cd85bbe35a1b3e7');
+
 // Hash/Hmac snapshot byte input at update/key time, and finalize after digest()
 const mutableHashInput = Buffer.from('lava');
 const mutableHash = crypto.createHash('sha256').update(mutableHashInput);
