@@ -1,6 +1,6 @@
 // node:crypto — hashing, HMAC, CSPRNG and PBKDF2 backed by the Odin crypto
 // stdlib. The `native` bindings object (fourth factory argument, supplied by the
-// loader) exposes four primitives implemented in pkg/runtime/crypto.odin:
+// loader) exposes primitives implemented in pkg/runtime/crypto.odin:
 //
 //   native.randomFill(typedArray)              -> fills in place with OS CSPRNG bytes
 //   native.randomInt(range)                    -> uniform integer in [0, range)
@@ -18,14 +18,12 @@
 
 	var Buffer = require("buffer").Buffer;
 
-	// --- helpers -------------------------------------------------------------
-
 	function toU8(data, encoding) {
-		if (data instanceof Uint8Array) return new Uint8Array(data); // snapshot Buffer/TypedArray input
+		if (data instanceof Uint8Array) return new Uint8Array(data);
 		if (typeof data === "string") return new Uint8Array(Buffer.from(data, encoding || "utf8"));
 		if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
 		if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
-		return new Uint8Array(data); // array-like / array of byte values
+		return new Uint8Array(data);
 	}
 
 	function concat(chunks) {
@@ -50,7 +48,6 @@
 		return err;
 	}
 
-	// Hash algorithms the Odin native layer (crypto_algorithm) can service.
 	var HASHES = [
 		"md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-256",
 		"sha3-224", "sha3-256", "sha3-384", "sha3-512",
@@ -101,8 +98,6 @@
 			throw err;
 		};
 	}
-
-	// --- hashing -------------------------------------------------------------
 
 	// Hash/Hmac accumulate chunks and call the one-shot native primitive at
 	// digest time (no streaming state crosses the boundary). Methods live on the
@@ -172,8 +167,6 @@
 		return out.toString(outputEncoding);
 	}
 
-	// --- randomness ----------------------------------------------------------
-
 	function randomBytes(size, callback) {
 		var buf = Buffer.alloc(size);
 		native.randomFill(buf);
@@ -191,7 +184,6 @@
 		}
 		offset = offset || 0;
 		var end = size === undefined ? buffer.length : offset + size;
-		// subarray shares the backing store, so the native fill writes through.
 		native.randomFill(buffer.subarray(offset, end));
 		return buffer;
 	}
@@ -207,8 +199,8 @@
 
 	function randomUUID() {
 		var b = randomBytes(16);
-		b[6] = (b[6] & 0x0f) | 0x40; // version 4
-		b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+		b[6] = (b[6] & 0x0f) | 0x40;
+		b[8] = (b[8] & 0x3f) | 0x80;
 		var s = "";
 		for (var i = 0; i < 16; i++) {
 			s += HEX[(b[i] >> 4) & 0xf] + HEX[b[i] & 0xf];
@@ -251,8 +243,6 @@
 		}
 		return sample();
 	}
-
-	// --- key derivation ------------------------------------------------------
 
 	function pbkdf2Sync(password, salt, iterations, keylen, digest) {
 		if (typeof digest !== "string") throw new TypeError("The \"digest\" argument must be of type string");

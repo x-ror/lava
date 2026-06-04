@@ -78,13 +78,11 @@
 		[Symbol.iterator]() { return this._map.entries(); }
 	}
 
-	// bodyToBytes normalizes a body init into byte-exact storage (a Uint8Array) or
-	// null. Strings are UTF-8 encoded; Buffer/Uint8Array/ArrayBuffer are kept
-	// byte-for-byte (no latin1 round-trip), so binary request bodies are not
-	// corrupted and so response bytes survive intact for arrayBuffer().
+	// Body storage stays byte-exact; request bodies and response bytes must not
+	// round-trip through latin1 text.
 	function bodyToBytes(body) {
 		if (body === null || body === undefined || body === "") return null;
-		if (body instanceof Uint8Array) return body; // Buffer is a Uint8Array subclass
+		if (body instanceof Uint8Array) return body;
 		if (body instanceof ArrayBuffer) return new Uint8Array(body);
 		var text = typeof body === "string" ? body : String(body);
 		if (text === "") return null;
@@ -106,7 +104,7 @@
 
 	class Body {
 		constructor(body) {
-			this._bodyBytes = bodyToBytes(body); // Uint8Array or null, byte-exact
+			this._bodyBytes = bodyToBytes(body);
 			this.bodyUsed = false;
 		}
 		text() {
@@ -212,12 +210,11 @@
 
 		var headerLines = "";
 		req.headers.forEach(function (value, key) {
-			if (TRANSPORT_OWNED_HEADERS[key]) return; // key is lowercased by normalizeName
+			if (TRANSPORT_OWNED_HEADERS[key]) return;
 			// Names/values were CR/LF/NUL-validated when set (see Headers.append),
 			// so a header cannot split the request line here.
 			headerLines += key + ": " + String(value) + "\r\n";
 		});
-		// Body bytes are stored byte-exact on the Request (see bodyToBytes).
 		var body = req._bodyBytes;
 
 		return new Promise(function (resolve, reject) {

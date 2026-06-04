@@ -7,8 +7,7 @@
 	var bufferModule = require("buffer");
 	var Buffer = bufferModule.Buffer;
 
-	// Label -> canonical encoding name. Only encodings Lava can service are
-	// listed; an unknown label makes the TextDecoder constructor throw, like Node.
+	// Only labels Lava can service are listed; unknown labels throw like Node.
 	var LABELS = {
 		"utf-8": "utf-8", "utf8": "utf-8", "unicode-1-1-utf-8": "utf-8",
 		"unicode11utf8": "utf-8", "unicode20utf8": "utf-8", "x-unicode20utf8": "utf-8",
@@ -38,8 +37,6 @@
 		if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
 		throw new TypeError("The \"" + who + "\" argument must be an instance of ArrayBuffer or a view");
 	}
-
-	// --- TextEncoder (utf-8 only, per spec) ----------------------------------
 
 	function TextEncoder() {
 		if (!(this instanceof TextEncoder)) throw new TypeError("Constructor TextEncoder requires 'new'");
@@ -77,7 +74,7 @@
 		for (var i = 0; i < source.length;) {
 			var cp = source.codePointAt(i);
 			var units = cp > 0xffff ? 2 : 1;
-			if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd; // lone surrogate
+			if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
 			var size = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
 			if (written + size > capacity) break;
 			written += encodeCodePoint(cp, dest, written);
@@ -86,8 +83,6 @@
 		}
 		return { read: read, written: written };
 	};
-
-	// --- TextDecoder ----------------------------------------------------------
 
 	function TextDecoder(label, options) {
 		if (!(this instanceof TextDecoder)) throw new TypeError("Constructor TextDecoder requires 'new'");

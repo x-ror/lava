@@ -47,7 +47,6 @@
 (function (globalThis, process, reportUncaught) {
 	"use strict";
 
-	// Intrinsics captured at install time (see "Hardening" above).
 	var PromiseCtor = Promise;
 	var bind = Function.prototype.bind;
 	var call = Function.prototype.call;
@@ -59,14 +58,10 @@
 	var EMPTY = [];
 	var resolved = promiseResolve(PromiseCtor);
 
-	// schedule(fn) enqueues fn as a JSC microtask, in FIFO with promise jobs, via
-	// a reaction on a pre-resolved promise. fn must not throw (callers guard).
 	function schedule(fn) {
 		promiseThen(resolved, fn);
 	}
 
-	// runGuarded calls fn(...args) and turns any throw into an uncaught exception
-	// report rather than letting it reject the scheduling promise.
 	function runGuarded(fn, args) {
 		try {
 			functionApply(fn, undefined, args);
@@ -75,20 +70,17 @@
 		}
 	}
 
-	var queue = []; // pending nextTick tasks: { fn, args }
+	var queue = [];
 	var head = 0;
 	var tail = 0;
-	var armed = false; // a drain microtask is scheduled but has not yet run
-	var draining = false; // currently inside drain()
+	var armed = false;
+	var draining = false;
 
 	function drain() {
 		armed = false;
-		if (draining) return; // re-entrancy guard (shouldn't happen, but be safe)
+		if (draining) return;
 		draining = true;
 		try {
-			// Advance by index so nextTicks queued *during* the drain (including nested
-			// ones) are flushed in this same pass, ahead of any promise job. Avoid
-			// Array.prototype methods here: userland may have replaced them.
 			while (head < tail) {
 				var task = queue[head];
 				queue[head] = undefined;
@@ -110,8 +102,6 @@
 		var args = arguments.length > 1 ? arraySlice(arguments, 1) : EMPTY;
 		queue[tail] = { fn: callback, args: args };
 		tail = tail + 1;
-		// Arm a single drain reaction for the batch. Already-armed or mid-drain: the
-		// existing drain/while-loop will pick this task up.
 		if (!armed && !draining) {
 			armed = true;
 			schedule(drain);
@@ -122,8 +112,6 @@
 		if (typeof callback !== "function") {
 			throw new TypeError('The "callback" argument must be of type function. Received ' + typeof callback);
 		}
-		// Share JSC's single microtask queue with promise jobs, in FIFO order; a
-		// throw surfaces as an uncaught exception (Node), not an unhandled rejection.
 		schedule(function () {
 			runGuarded(callback, EMPTY);
 		});

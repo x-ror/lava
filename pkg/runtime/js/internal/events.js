@@ -117,7 +117,6 @@
 		var events = this._events;
 		var handler = events === undefined ? undefined : events[type];
 		if (handler === undefined) {
-			// Node throws if an unhandled 'error' event is emitted.
 			if (type === "error") {
 				var err = arguments[1];
 				if (err instanceof Error) throw err;
