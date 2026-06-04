@@ -3,9 +3,12 @@
 // loader) exposes four primitives implemented in pkg/runtime/crypto.odin:
 //
 //   native.randomFill(typedArray)              -> fills in place with OS CSPRNG bytes
+//   native.randomInt(range)                    -> uniform integer in [0, range)
 //   native.hash(algo, Uint8Array)              -> digest Uint8Array
 //   native.hmac(algo, key, data)               -> HMAC Uint8Array
 //   native.pbkdf2(algo, password, salt, it, n) -> derived-key Uint8Array
+//   native.hkdf(algo, ikm, salt, info, n)      -> derived-key Uint8Array
+//   native.timingSafeEqual(a, b)               -> constant-time boolean
 //
 // Streaming (createHash().update()…digest()) is handled here by accumulating
 // chunks and calling the one-shot native primitive once at digest time, so no
@@ -18,8 +21,10 @@
 	// --- helpers -------------------------------------------------------------
 
 	function toU8(data, encoding) {
-		if (data instanceof Uint8Array) return data; // Buffer included (subclass)
+		if (data instanceof Uint8Array) return new Uint8Array(data); // snapshot Buffer/TypedArray input
 		if (typeof data === "string") return new Uint8Array(Buffer.from(data, encoding || "utf8"));
+		if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
+		if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
 		return new Uint8Array(data); // array-like / array of byte values
 	}
 
@@ -37,6 +42,12 @@
 
 	function normalizeAlgo(algorithm) {
 		return String(algorithm).toLowerCase();
+	}
+
+	function finalizedError() {
+		var err = new Error("Digest already called");
+		err.code = "ERR_CRYPTO_HASH_FINALIZED";
+		return err;
 	}
 
 	// Hash algorithms the Odin native layer (crypto_algorithm) can service.
@@ -60,16 +71,21 @@
 		if (!(this instanceof Hash)) return new Hash(algorithm);
 		this._algo = normalizeAlgo(algorithm);
 		this._chunks = [];
+		this._finalized = false;
 	}
 	Hash.prototype.update = function (data, encoding) {
+		if (this._finalized) throw finalizedError();
 		this._chunks.push(toU8(data, encoding));
 		return this;
 	};
 	Hash.prototype.digest = function (encoding) {
+		if (this._finalized) throw finalizedError();
+		this._finalized = true;
 		var out = Buffer.from(native.hash(this._algo, concat(this._chunks)));
 		return encoding ? out.toString(encoding) : out;
 	};
 	Hash.prototype.copy = function () {
+		if (this._finalized) throw finalizedError();
 		var clone = new Hash(this._algo);
 		clone._chunks = this._chunks.slice();
 		return clone;
@@ -80,12 +96,19 @@
 		this._algo = normalizeAlgo(algorithm);
 		this._key = toU8(key);
 		this._chunks = [];
+		this._finalized = false;
 	}
 	Hmac.prototype.update = function (data, encoding) {
+		if (this._finalized) throw finalizedError();
 		this._chunks.push(toU8(data, encoding));
 		return this;
 	};
 	Hmac.prototype.digest = function (encoding) {
+		if (this._finalized) {
+			var empty = Buffer.alloc(0);
+			return encoding ? empty.toString(encoding) : empty;
+		}
+		this._finalized = true;
 		var out = Buffer.from(native.hmac(this._algo, this._key, concat(this._chunks)));
 		return encoding ? out.toString(encoding) : out;
 	};
@@ -156,13 +179,11 @@
 	function timingSafeEqual(a, b) {
 		var ua = toU8(a), ub = toU8(b);
 		if (ua.length !== ub.length) throw new RangeError("Input buffers must have the same byte length");
-		var diff = 0;
-		for (var i = 0; i < ua.length; i++) diff |= ua[i] ^ ub[i];
-		return diff === 0;
+		return native.timingSafeEqual(ua, ub);
 	}
 
-	// randomInt([min, ] max[, callback]) — uniform integer in [min, max) via
-	// rejection sampling over 48 random bits (Node caps the range at 2^48).
+	// randomInt([min, ] max[, callback]) — uniform integer in [min, max).
+	// Node caps the range at 2^48; native.randomInt handles rejection sampling.
 	function randomInt(min, max, callback) {
 		if (typeof min === "function") { callback = min; min = undefined; max = undefined; }
 		else if (typeof max === "function") { callback = max; max = undefined; }
@@ -175,12 +196,7 @@
 		if (range > 0x1000000000000) throw new RangeError("The value of \"max - min\" is out of range. It must be <= 2^48.");
 
 		function sample() {
-			var limit = 0x1000000000000 - (0x1000000000000 % range), value;
-			do {
-				var r = randomBytes(6);
-				value = r[0] * 0x10000000000 + r[1] * 0x100000000 + r[2] * 0x1000000 + r[3] * 0x10000 + r[4] * 0x100 + r[5];
-			} while (value >= limit);
-			return min + (value % range);
+			return min + native.randomInt(range);
 		}
 
 		if (typeof callback === "function") {
@@ -217,28 +233,9 @@
 	}
 
 	// hkdfSync(digest, ikm, salt, info, keylen) — RFC 5869 HKDF over the native
-	// HMAC primitive. Returns an ArrayBuffer, matching Node.
+	// crypto primitive. Returns an ArrayBuffer, matching Node.
 	function hkdfSync(digest, ikm, salt, info, keylen) {
-		var algo = normalizeAlgo(digest);
-		var ikmBytes = toU8(ikm), infoBytes = toU8(info);
-		var hashLen = native.hash(algo, new Uint8Array(0)).length; // probe digest size
-		var saltBytes = toU8(salt);
-		if (saltBytes.length === 0) saltBytes = new Uint8Array(hashLen); // default: hashLen zero bytes
-		if (keylen > 255 * hashLen) throw new RangeError("Invalid key length");
-
-		var prk = native.hmac(algo, saltBytes, ikmBytes); // extract
-		var blocks = Math.ceil(keylen / hashLen);
-		var okm = new Uint8Array(blocks * hashLen);
-		var prev = new Uint8Array(0);
-		for (var i = 0; i < blocks; i++) {
-			var input = new Uint8Array(prev.length + infoBytes.length + 1);
-			input.set(prev, 0);
-			input.set(infoBytes, prev.length);
-			input[input.length - 1] = i + 1;
-			prev = native.hmac(algo, prk, input); // expand
-			okm.set(prev, i * hashLen);
-		}
-		return okm.slice(0, keylen).buffer;
+		return native.hkdf(normalizeAlgo(digest), toU8(ikm), toU8(salt), toU8(info), keylen).buffer;
 	}
 
 	function hkdf(digest, ikm, salt, info, keylen, callback) {

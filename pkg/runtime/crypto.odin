@@ -4,8 +4,10 @@ import "base:runtime"
 import "core:c"
 import "core:crypto"
 import "core:crypto/hash"
+import "core:crypto/hkdf"
 import "core:crypto/hmac"
 import "core:crypto/pbkdf2"
+import "core:math/rand"
 import jsc "lava:pkg/jsc"
 
 // Native backing for the node:crypto built-in. The JavaScript surface
@@ -111,6 +113,31 @@ crypto_random_fill_cb :: proc "c" (
 	}
 	if len(view) > 0 do crypto.rand_bytes(view)
 	return arguments[0]
+}
+
+// randomInt(range) — uniform integer in [0, range) using Odin's unbiased bounded
+// sampler backed by the crypto system-entropy generator. JS validates Node's
+// min/max contract and adds min afterward.
+crypto_random_int_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return jsc.JSValueMakeUndefined(ctx)
+
+	range := u64(jsc.JSValueToNumber(ctx, arguments[0], nil))
+	max_48 :: u64(1) << 48
+	if range == 0 || range > max_48 {
+		if exception != nil do exception^ = make_js_error(ctx, "randomInt range must be in (0, 2^48]")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	value := rand.uint64_max(range, crypto.random_generator())
+	return jsc.JSValueMakeNumber(ctx, f64(value))
 }
 
 // hash(algorithm, data) — one-shot digest. The JS layer accumulates update()
@@ -226,12 +253,80 @@ crypto_pbkdf2_cb :: proc "c" (
 	return make_uint8_array(ctx, dst)
 }
 
+// hkdf(algorithm, ikm, salt, info, keylen) — RFC 5869 extract+expand. The
+// derived key bytes are returned as a Uint8Array; the JS shim exposes the
+// backing ArrayBuffer to match Node's hkdfSync().
+crypto_hkdf_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 5 do return jsc.JSValueMakeUndefined(ctx)
+
+	name, alloc := jsc_value_to_string_or_default(ctx, arguments[0])
+	defer if alloc do delete(name, context.allocator)
+
+	algo, valid := crypto_algorithm(name)
+	if !valid {
+		if exception != nil do exception^ = make_js_error(ctx, "Digest method not supported")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	ikm, ikm_ok := typed_array_view(ctx, arguments[1])
+	salt, salt_ok := typed_array_view(ctx, arguments[2])
+	info, info_ok := typed_array_view(ctx, arguments[3])
+	if !ikm_ok || !salt_ok || !info_ok {
+		if exception != nil do exception^ = make_js_error(ctx, "hkdf expects Uint8Array ikm, salt, and info")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	keylen := int(jsc.JSValueToNumber(ctx, arguments[4], nil))
+	hash_len := hash.DIGEST_SIZES[algo]
+	if keylen < 0 || keylen > 255 * hash_len {
+		if exception != nil do exception^ = make_js_error(ctx, "Invalid key length")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	dst := make([]byte, keylen, context.allocator)
+	hkdf.extract_and_expand(algo, salt, ikm, info, dst)
+	return make_uint8_array(ctx, dst)
+}
+
+// timingSafeEqual(a, b) — constant-time byte comparison for equal-length typed
+// arrays. JS keeps Node's length-mismatch RangeError behavior before calling.
+crypto_timing_safe_equal_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 2 do return jsc.JSValueMakeBoolean(ctx, false)
+
+	a, a_ok := typed_array_view(ctx, arguments[0])
+	b, b_ok := typed_array_view(ctx, arguments[1])
+	if !a_ok || !b_ok {
+		if exception != nil do exception^ = make_js_error(ctx, "timingSafeEqual expects Uint8Array arguments")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	return jsc.JSValueMakeBoolean(ctx, b32(crypto.compare_constant_time(a, b) == 1))
+}
+
 // make_crypto_bindings builds the `native` object handed to js/internal/crypto.js.
 make_crypto_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
 	inject_native_function(ctx, bindings, "randomFill", crypto_random_fill_cb)
+	inject_native_function(ctx, bindings, "randomInt", crypto_random_int_cb)
 	inject_native_function(ctx, bindings, "hash", crypto_hash_cb)
 	inject_native_function(ctx, bindings, "hmac", crypto_hmac_cb)
 	inject_native_function(ctx, bindings, "pbkdf2", crypto_pbkdf2_cb)
+	inject_native_function(ctx, bindings, "hkdf", crypto_hkdf_cb)
+	inject_native_function(ctx, bindings, "timingSafeEqual", crypto_timing_safe_equal_cb)
 	return bindings
 }

@@ -87,10 +87,10 @@ test-compat:
 	./scripts/run-node-compat-all.sh
 
 test-compat-lava: build
-	RUN_LAVA=1 SKIP_KNOWN_LAVA_GAPS=1 ./scripts/run-node-compat-all.sh
+	RUN_LAVA=1 SKIP_KNOWN_LAVA_GAPS=1 LAVA_BIN="$(LAVA)" ./scripts/run-node-compat-all.sh
 
 test-compat-lava-strict: build
-	RUN_LAVA=1 ./scripts/run-node-compat-all.sh
+	RUN_LAVA=1 LAVA_BIN="$(LAVA)" ./scripts/run-node-compat-all.sh
 
 test-odin:
 	$(ODIN) test cmd/lava -collection:lava=.
@@ -105,7 +105,7 @@ test-eventloop-node:
 	./scripts/run-eventloop-oracle.sh
 
 test-eventloop-lava: build
-	RUN_LAVA=1 SKIP_KNOWN_LAVA_GAPS=1 ./scripts/run-eventloop-oracle.sh
+	RUN_LAVA=1 SKIP_KNOWN_LAVA_GAPS=1 LAVA_BIN="$(LAVA)" ./scripts/run-eventloop-oracle.sh
 
 test-lava: test-compat-lava test-eventloop-lava
 

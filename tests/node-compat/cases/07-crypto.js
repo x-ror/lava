@@ -27,6 +27,30 @@ assert.equal(partial.update('va').digest('hex'), digest);
 assert.equal(forked.update('va').digest('hex'), digest);
 assert.equal(crypto.getHashes().includes('sha256'), true);
 
+// Hash/Hmac snapshot byte input at update/key time, and finalize after digest()
+const mutableHashInput = Buffer.from('lava');
+const mutableHash = crypto.createHash('sha256').update(mutableHashInput);
+mutableHashInput[0] = 0x6a; // "java"; must not affect the already-updated hash
+assert.equal(mutableHash.digest('hex'), digest);
+
+const finalizedHash = crypto.createHash('sha256');
+finalizedHash.digest('hex');
+assert.throws(() => finalizedHash.digest('hex'), {code: 'ERR_CRYPTO_HASH_FINALIZED'});
+assert.throws(() => finalizedHash.update('x'), {code: 'ERR_CRYPTO_HASH_FINALIZED'});
+assert.throws(() => finalizedHash.copy(), {code: 'ERR_CRYPTO_HASH_FINALIZED'});
+
+const mutableHmacKey = Buffer.from('key');
+const mutableHmacInput = Buffer.from('lava');
+const mutableHmac = crypto.createHmac('sha256', mutableHmacKey).update(mutableHmacInput);
+mutableHmacKey[0] = 0x4b;
+mutableHmacInput[0] = 0x6a;
+assert.equal(mutableHmac.digest('hex'), hmac);
+
+const finalizedHmac = crypto.createHmac('sha256', 'key');
+finalizedHmac.digest('hex');
+assert.equal(finalizedHmac.digest('hex'), '');
+assert.throws(() => finalizedHmac.update('x'), {code: 'ERR_CRYPTO_HASH_FINALIZED'});
+
 // constant-time comparison
 assert.equal(crypto.timingSafeEqual(Buffer.from('lava'), Buffer.from('lava')), true);
 assert.equal(crypto.timingSafeEqual(Buffer.from('lava'), Buffer.from('java')), false);

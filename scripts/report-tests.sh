@@ -4,10 +4,10 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 REPORT_DIR=${REPORT_DIR:-"$ROOT_DIR/reports"}
 REPORT_FILE=${REPORT_FILE:-"$REPORT_DIR/test-report.tsv"}
-TMP_DIR=${TMPDIR:-/tmp}/lava-test-report.$$
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lava-test-report.XXXXXX")
 TIME_BIN=${TIME_BIN:-/usr/bin/time}
 
-mkdir -p "$REPORT_DIR" "$TMP_DIR"
+mkdir -p "$REPORT_DIR"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 printf 'suite\tstatus\texit_code\telapsed_sec\tmax_rss_kb\tcommand\n' >"$REPORT_FILE"
