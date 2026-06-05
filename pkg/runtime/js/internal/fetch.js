@@ -7,6 +7,15 @@
 (function (require, module, exports, native) {
 	"use strict";
 
+	// Shared, hoisted codecs. TextEncoder.encode / TextDecoder.decode (non-
+	// streaming) are stateless across calls, so a single instance each is reused
+	// across every body conversion instead of allocating one per call — the
+	// previous per-call `new TextEncoder()/new TextDecoder()` sat on the hot path
+	// (every Request/Response body, every .text()/.json()). Null when the global
+	// is unavailable, in which case the latin1 fallbacks below take over.
+	var sharedEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+	var sharedDecoder = typeof TextDecoder !== "undefined" ? new TextDecoder() : null;
+
 	function normalizeName(name) {
 		return String(name).toLowerCase();
 	}
@@ -44,6 +53,18 @@
 		return value.replace(/^[\r\n\t ]+|[\r\n\t ]+$/g, "");
 	}
 
+	// Shared by Headers.append and Headers.set, which performed the identical
+	// normalize→validate→coerce dance. Order matches undici: trim the value,
+	// then reject a bad name, then reject a bad (trimmed) value. Returns the
+	// cleaned name/value pair ready to store.
+	function normalizeAndValidate(name, value) {
+		var text = normalizeHeaderValue(String(value));
+		var key = String(name);
+		assertValidHeaderName(key);
+		assertValidHeaderValue(key, text);
+		return { name: key, value: text };
+	}
+
 	class Headers {
 		constructor(init) {
 			this._map = new Map();
@@ -57,10 +78,8 @@
 			}
 		}
 		append(name, value) {
-			var text = normalizeHeaderValue(String(value));
-			assertValidHeaderName(String(name));
-			assertValidHeaderValue(name, text);
-			this._append(name, text);
+			var header = normalizeAndValidate(name, value);
+			this._append(header.name, header.value);
 		}
 		// _append stores without validation — for response headers parsed off the
 		// wire, which the transport has already framed line-by-line.
@@ -70,10 +89,8 @@
 			this._map.set(key, existing === undefined ? String(value) : existing + ", " + value);
 		}
 		set(name, value) {
-			var text = normalizeHeaderValue(String(value));
-			assertValidHeaderName(String(name));
-			assertValidHeaderValue(name, text);
-			this._map.set(normalizeName(name), text);
+			var header = normalizeAndValidate(name, value);
+			this._map.set(normalizeName(header.name), header.value);
 		}
 		get(name) {
 			assertValidHeaderName(String(name));
@@ -94,12 +111,14 @@
 	// Body storage stays byte-exact; request bodies and response bytes must not
 	// round-trip through latin1 text.
 	function bodyToBytes(body) {
-		if (body === null || body === undefined || body === "") return null;
+		if (body === null || body === undefined) return null;
 		if (body instanceof Uint8Array) return body;
 		if (body instanceof ArrayBuffer) return new Uint8Array(body);
 		var text = typeof body === "string" ? body : String(body);
+		// An empty string (passed directly or produced by String(body)) has no
+		// bytes — treat it as an absent body.
 		if (text === "") return null;
-		if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text);
+		if (sharedEncoder) return sharedEncoder.encode(text);
 		var bytes = new Uint8Array(text.length);
 		for (var i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
 		return bytes;
@@ -109,7 +128,7 @@
 	// fallback keeps things working if TextDecoder is somehow unavailable).
 	function bytesToText(bytes) {
 		if (bytes === null) return "";
-		if (typeof TextDecoder !== "undefined") return new TextDecoder().decode(bytes);
+		if (sharedDecoder) return sharedDecoder.decode(bytes);
 		var s = "";
 		for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
 		return s;
@@ -155,6 +174,10 @@
 			this.url = init.url || "";
 		}
 		clone() {
+			// NOTE: bodyToBytes returns a Uint8Array as-is, so the clone shares this
+			// instance's underlying buffer. Safe while all reads are non-mutating
+			// (text/json, and arrayBuffer which copies out); revisit if a mutating
+			// body path is ever added.
 			return new Response(this._bodyBytes, {
 				status: this.status,
 				statusText: this.statusText,
