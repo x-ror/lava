@@ -139,7 +139,9 @@ fetch_request_cb :: proc "c" (
 }
 
 // parse_http_url splits an absolute http(s) URL into host, port, path, scheme.
-// IPv6 literal hosts ([::1]) are not handled in v1.
+// An IPv6 literal host ([::1]) is returned bracket-stripped (host == "::1");
+// build_http_request re-brackets it for the Host header and the Linux transport
+// connects over AF_INET6.
 parse_http_url :: proc(url: string) -> (host: string, port: int, path: string, scheme: string, ok: bool) {
 	rest := url
 	switch {
@@ -181,7 +183,19 @@ parse_http_url :: proc(url: string) -> (host: string, port: int, path: string, s
 
 	host = authority
 	port = 443 if scheme == "https" else 80
-	if colon := strings.last_index_byte(authority, ':'); colon >= 0 {
+	if len(authority) > 0 && authority[0] == '[' {
+		// IPv6 literal (RFC 3986 §3.2.2): the address itself contains colons, so
+		// the host is the bytes inside the brackets and a ":port" suffix can only
+		// follow the closing ']'. Strip the brackets here — the connect path wants
+		// the bare address; build_http_request re-wraps it for the Host header.
+		rb := strings.index_byte(authority, ']')
+		if rb < 0 do return "", 0, "", "", false
+		host = authority[1:rb]
+		rest_after := authority[rb + 1:]
+		if len(rest_after) > 1 && rest_after[0] == ':' {
+			if p, p_ok := strconv.parse_int(rest_after[1:]); p_ok do port = p
+		}
+	} else if colon := strings.last_index_byte(authority, ':'); colon >= 0 {
 		host = authority[:colon]
 		if p, p_ok := strconv.parse_int(authority[colon + 1:]); p_ok do port = p
 	}
@@ -211,7 +225,12 @@ build_http_request :: proc(
 	strings.write_string(&b, " HTTP/1.1\r\n")
 
 	strings.write_string(&b, "Host: ")
+	// An IPv6 literal host arrives bracket-stripped (it is the only host that can
+	// contain a colon); RFC 7230 §5.4 requires the Host header to re-wrap it in [].
+	host_is_ip6 := strings.index_byte(host, ':') >= 0
+	if host_is_ip6 do strings.write_byte(&b, '[')
 	strings.write_string(&b, host)
+	if host_is_ip6 do strings.write_byte(&b, ']')
 	if port != 80 {
 		strings.write_byte(&b, ':')
 		strings.write_int(&b, port)

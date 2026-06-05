@@ -2,6 +2,7 @@
 package lava_runtime
 
 import "core:net"
+import "core:strings"
 import "core:sys/linux"
 import eventloop "lava:pkg/runtime/eventloop"
 
@@ -20,23 +21,51 @@ fetch_close_fd :: proc(fd: uintptr) {
 // connect completion). On failure it returns ok=false with a message; the
 // caller rejects.
 fetch_transport_start :: proc(req: ^Fetch_Request, host: string, port: int) -> (ok: bool, err: string) {
-	endpoint, dns_err := net.resolve_ip4(host)
-	if dns_err != nil do return false, "fetch: could not resolve host"
-	ip4, ip_ok := endpoint.address.(net.IP4_Address)
-	if !ip_ok do return false, "fetch: host has no IPv4 address"
+	fd: linux.Fd
+	// An IPv6 literal host (e.g. "::1") arrives bracket-stripped from
+	// parse_http_url and is the only host that can contain a colon; connect over
+	// AF_INET6. Everything else takes the IPv4 path. DNS still resolves
+	// synchronously (v1); a literal address is parsed without a lookup.
+	if strings.index_byte(host, ':') >= 0 {
+		ip6, ip_ok := net.parse_ip6_address(host)
+		if !ip_ok do return false, "fetch: could not resolve host"
 
-	fd, sock_err := linux.socket(.INET, .STREAM, {.NONBLOCK}, .TCP)
-	if sock_err != .NONE do return false, "fetch: could not create socket"
+		sock_fd, sock_err := linux.socket(.INET6, .STREAM, {.NONBLOCK}, .TCP)
+		if sock_err != .NONE do return false, "fetch: could not create socket"
 
-	addr := linux.Sock_Addr_In {
-		sin_family = .INET,
-		sin_port   = u16be(port),
-		sin_addr   = transmute([4]u8)ip4,
-	}
-	conn_err := linux.connect(fd, &addr)
-	if conn_err != .NONE && conn_err != .EINPROGRESS {
-		linux.close(fd)
-		return false, "fetch: connect failed"
+		// IP6_Address is [8]u16be, whose memory layout is already the 16 network-
+		// order bytes sin6_addr expects.
+		addr := linux.Sock_Addr_In6 {
+			sin6_family = .INET6,
+			sin6_port   = u16be(port),
+			sin6_addr   = transmute([16]u8)ip6,
+		}
+		if conn_err := linux.connect(sock_fd, &addr);
+		   conn_err != .NONE && conn_err != .EINPROGRESS {
+			linux.close(sock_fd)
+			return false, "fetch: connect failed"
+		}
+		fd = sock_fd
+	} else {
+		endpoint, dns_err := net.resolve_ip4(host)
+		if dns_err != nil do return false, "fetch: could not resolve host"
+		ip4, ip_ok := endpoint.address.(net.IP4_Address)
+		if !ip_ok do return false, "fetch: host has no IPv4 address"
+
+		sock_fd, sock_err := linux.socket(.INET, .STREAM, {.NONBLOCK}, .TCP)
+		if sock_err != .NONE do return false, "fetch: could not create socket"
+
+		addr := linux.Sock_Addr_In {
+			sin_family = .INET,
+			sin_port   = u16be(port),
+			sin_addr   = transmute([4]u8)ip4,
+		}
+		if conn_err := linux.connect(sock_fd, &addr);
+		   conn_err != .NONE && conn_err != .EINPROGRESS {
+			linux.close(sock_fd)
+			return false, "fetch: connect failed"
+		}
+		fd = sock_fd
 	}
 
 	req.fd = uintptr(fd)

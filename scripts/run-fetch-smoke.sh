@@ -35,8 +35,15 @@ while [ "$i" -lt 50 ]; do
 	sleep 0.1
 done
 
-FETCH_BASE="http://127.0.0.1:$PORT" "$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>&1 || true
-FETCH_BASE="http://127.0.0.1:$PORT" "$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>&1 || true
+# Enable the IPv6 case only when the loopback listener is actually reachable
+# (some CI sandboxes lack IPv6); both runtimes then see FETCH_BASE6 identically.
+FETCH_BASE6=""
+if "$NODE_BIN" -e "require('net').connect($PORT,'::1').on('connect',function(){process.exit(0)}).on('error',function(){process.exit(1)})" 2>/dev/null; then
+	FETCH_BASE6="http://[::1]:$PORT"
+fi
+
+FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" "$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>&1 || true
+FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" "$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>&1 || true
 
 if diff -u "$TMP_DIR/node.out" "$TMP_DIR/lava.out"; then
 	printf '%s\n' 'fetch smoke passed (lava output matches node)'
