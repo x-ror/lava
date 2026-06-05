@@ -31,6 +31,19 @@
 		}
 	}
 
+	// Fetch spec "normalize a byte sequence" (https://fetch.spec.whatwg.org/#concept-header-value-normalize):
+	// strip leading/trailing HTTP whitespace — tab (0x09), LF (0x0A), CR (0x0D),
+	// space (0x20) — from a header value. undici applies this on the public
+	// append/set path BEFORE validating, so a value like "\r\nfoo" normalizes to
+	// "foo" and is accepted, while an interior CR/LF ("foo\r\nbar") survives the
+	// trim and is then rejected by assertValidHeaderValue. Vertical tab / form
+	// feed are not HTTP whitespace and are preserved. Wire (response) headers
+	// arrive via _append and are not re-normalized — the transport already trims
+	// OWS around values — matching undici, which fills response headers verbatim.
+	function normalizeHeaderValue(value) {
+		return value.replace(/^[\r\n\t ]+|[\r\n\t ]+$/g, "");
+	}
+
 	class Headers {
 		constructor(init) {
 			this._map = new Map();
@@ -44,7 +57,7 @@
 			}
 		}
 		append(name, value) {
-			var text = String(value);
+			var text = normalizeHeaderValue(String(value));
 			assertValidHeaderName(String(name));
 			assertValidHeaderValue(name, text);
 			this._append(name, text);
@@ -57,7 +70,7 @@
 			this._map.set(key, existing === undefined ? String(value) : existing + ", " + value);
 		}
 		set(name, value) {
-			var text = String(value);
+			var text = normalizeHeaderValue(String(value));
 			assertValidHeaderName(String(name));
 			assertValidHeaderValue(name, text);
 			this._map.set(normalizeName(name), text);
