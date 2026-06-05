@@ -68,6 +68,18 @@ async function main() {
 	]);
 	console.log('concurrent:', a, b, c);
 
+	// IPv6 literal host: parse [::1], connect over AF_INET6, and re-bracket the
+	// Host header. Only runs when the runner confirmed IPv6 loopback is up (it
+	// sets FETCH_BASE6), so Node and Lava take this branch identically.
+	const base6 = process.env.FETCH_BASE6;
+	if (base6) {
+		const r6 = await fetch(base6 + '/hello.txt');
+		console.log('ipv6 hello:', r6.status, JSON.stringify(await r6.text()));
+		const host6 = await fetch(base6 + '/host').then((r) => r.json());
+		// Host must be the re-bracketed literal with the explicit port.
+		console.log('ipv6 host header:', host6.host === base6.slice('http://'.length));
+	}
+
 	// Connection refused rejects (port 9 is the discard port, closed here)
 	let refused = false;
 	try {

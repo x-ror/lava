@@ -6,7 +6,7 @@ const http = require('node:http');
 
 const port = Number(process.argv[2] || 8799);
 
-const server = http.createServer((req, res) => {
+const handler = (req, res) => {
 	if (req.method === 'POST') {
 		let body = '';
 		req.on('data', (chunk) => {
@@ -21,6 +21,12 @@ const server = http.createServer((req, res) => {
 	}
 
 	switch (req.url) {
+	case '/host':
+		// Echo the request's Host header so the IPv6 case can assert the client
+		// re-bracketed the literal (Host: [::1]:<port>) per RFC 7230.
+		res.writeHead(200, { 'content-type': 'application/json' });
+		res.end(JSON.stringify({ host: req.headers.host }));
+		return;
 	case '/hello.txt':
 		res.writeHead(200, { 'content-type': 'text/plain' });
 		res.end('plain text body line\n');
@@ -53,6 +59,13 @@ const server = http.createServer((req, res) => {
 		res.writeHead(404, { 'content-type': 'text/plain' });
 		res.end('nope');
 	}
-});
+};
 
-server.listen(port, '127.0.0.1');
+http.createServer(handler).listen(port, '127.0.0.1');
+// IPv6 loopback listener on the same port (a distinct address/family tuple), so
+// the smoke suite can exercise http://[::1]:<port>/ when IPv6 is available. A
+// bind failure on hosts without IPv6 loopback is ignored — the runner probes
+// reachability before enabling the IPv6 case.
+const server6 = http.createServer(handler);
+server6.on('error', () => {});
+server6.listen(port, '::1');
