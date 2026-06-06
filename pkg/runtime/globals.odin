@@ -15,6 +15,11 @@ Runtime_State :: struct {
 	module_cache:    map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
 	builtin_require: jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
 	esm_transform:   jsc.JSValueRef, // js/internal/esm.js transform(source,url,filename,dirname); GC-protected
+	// Directories of the modules currently being evaluated, innermost last.
+	// native_require_cb pushes a module's dir around evaluating its body so a
+	// nested module's relative specifiers resolve against that module's own
+	// directory instead of the entry file's. Owns the pushed strings.
+	module_dir_stack:  [dynamic]string,
 	// Set when an uncaught exception escapes an async callback or a promise
 	// rejects with no handler. The process then exits non-zero even though the
 	// initial JSEvaluateScript returned cleanly (see resolve_exit_code).
@@ -81,6 +86,8 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 		delete(key)
 	}
 	delete(state.module_cache)
+	for dir in state.module_dir_stack do delete(dir)
+	delete(state.module_dir_stack)
 	if state.builtin_require != nil do jsc.JSValueUnprotect(ctx, state.builtin_require)
 	if state.esm_transform != nil do jsc.JSValueUnprotect(ctx, state.esm_transform)
 	if state.rejection_handler != nil do jsc.JSValueUnprotect(ctx, state.rejection_handler)
@@ -129,6 +136,34 @@ module_cache_put :: proc(
 	if err != nil do return
 	jsc.JSValueProtect(ctx, value)
 	state.module_cache[cloned] = value
+}
+
+// --- Module resolution base-directory stack ---
+//
+// push_module_dir stores an independent copy of `dir` (callers typically pass a
+// slice of the resolved path, e.g. filepath.dir(resolved), which must not be
+// freed here); pop_module_dir frees that copy. Pushes/pops are balanced around a
+// module's body evaluation in native_require_cb — push always appends exactly
+// one entry (an empty string on clone failure) so pop stays in lockstep.
+
+push_module_dir :: proc(state: ^Runtime_State, dir: string) {
+	if state == nil do return
+	cloned, err := strings.clone(dir)
+	if err != nil do cloned = ""
+	append(&state.module_dir_stack, cloned)
+}
+
+pop_module_dir :: proc(state: ^Runtime_State) {
+	if state == nil || len(state.module_dir_stack) == 0 do return
+	dir := pop(&state.module_dir_stack)
+	if len(dir) > 0 do delete(dir)
+}
+
+// current_module_dir returns the innermost executing module's directory, or
+// ("", false) when no module is on the stack (e.g. while the entry file runs).
+current_module_dir :: proc(state: ^Runtime_State) -> (string, bool) {
+	if state == nil || len(state.module_dir_stack) == 0 do return "", false
+	return state.module_dir_stack[len(state.module_dir_stack) - 1], true
 }
 
 // --- JS callback bridge ---
