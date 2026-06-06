@@ -39,9 +39,9 @@ The original runtime plan (PR #1) is complete:
 
 ## Remaining
 
-Tracked against the `tests/node-compat/cases` oracle. Through Lava today
-**8 of 9 cases pass** (`00`,`02`–`08`); only `01-esm` remains, blocked on the
-ESM loader below.
+Tracked against the `tests/node-compat/cases` oracle. Every case in
+`tests/node-compat/cases` now passes under Lava, including the ESM cases
+(`01-esm`, `12-esm-features`); the ESM loader below has landed.
 
 ### Internal JS module layer (done in this batch)
 
@@ -89,9 +89,17 @@ implementations — no `primordials`, no `internalBinding` coupling.
       symbol absent from Apple's JavaScriptCore.framework, so it is not portable.
       Tracked as a follow-up. _(`fetch` never needed this — it settles a
       JS-created promise via native callbacks.)_
-- [ ] **ESM** — only CommonJS `require` works; no `.mjs` / `import` /
-      `import.meta` / `node:url` `fileURLToPath` _(blocks `01-esm`, the last
-      failing case)_
+- [x] **ESM** — `.mjs` files, static `import` / `export`, `import.meta.url`, and
+      `node:url` `fileURLToPath` now work. JSC's classic C API
+      (`JSEvaluateScript`) only runs script-goal source, so an ESM→CommonJS
+      source transform (`js/internal/esm.js`, stored on `Runtime_State` and
+      applied by `native_require_cb` / the `.mjs` entrypoint) rewrites the static
+      module syntax onto the existing native `require`, tagging the namespace with
+      a non-enumerable `__esModule` for CJS↔ESM default interop. Handles only
+      static, statement-position forms — anything else errors explicitly rather
+      than mistranslating. _(passes `01-esm`, `12-esm-features`.)_ _Divergence:_
+      named imports from a CJS module are resolved by runtime destructuring, so
+      Lava accepts some that Node's static cjs-lexer rejects.
 - [x] **Native CSPRNG** — `crypto.randomBytes`/`randomUUID`/`randomFill*` now
       draw from the OS CSPRNG via `crypto.rand_bytes`, replacing `Math.random`.
 - [x] **Real network transport for `fetch()`** — `http://` over non-blocking

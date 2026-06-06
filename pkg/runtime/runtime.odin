@@ -79,7 +79,36 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 
 	setup_module_environment(cast(jsc.JSContextRef)ctx, source_name, loop)
 
-	script := js_string_from_string(source)
+	// ESM entrypoints (.mjs) are rewritten to CommonJS via the same transform the
+	// loader applies to imported .mjs modules; script (.js) and `lava eval`
+	// sources run unchanged.
+	eval_source := source
+	mjs_wrapped: string
+	mjs_allocated := false
+	defer if mjs_allocated do delete(mjs_wrapped)
+	if strings.has_suffix(source_name, ".mjs") {
+		wrap_exception: jsc.JSValueRef
+		wrapped, ok := esm_wrap_source(
+			cast(jsc.JSContextRef)ctx,
+			source,
+			source_name,
+			&wrap_exception,
+		)
+		if !ok {
+			msg, allocated := value_to_string(cast(jsc.JSContextRef)ctx, wrap_exception)
+			return Result {
+				status = .Execution_Error,
+				exit_code = 1,
+				message = msg,
+				is_allocated = allocated,
+			}
+		}
+		eval_source = wrapped
+		mjs_wrapped = wrapped
+		mjs_allocated = true
+	}
+
+	script := js_string_from_string(eval_source)
 	if script == nil {
 		return Result {
 			status = .Invalid_Input,

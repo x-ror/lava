@@ -7,5 +7,3 @@
 # `main().catch((e) => { console.error(e); process.exit(1); })` so a failure
 # reports a clean error and does not depend on the rejection plumbing it is
 # meant to exercise.
-tests/node-compat/cases/01-esm.mjs
-
