@@ -3,7 +3,7 @@ LAVA ?= bin/lava
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help build run eval check check-cli check-runtime check-jsc check-native test test-lava test-report test-report-html api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-node test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
+.PHONY: help build run eval check check-cli check-runtime check-jsc check-native test test-lava test-report test-report-html api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -29,6 +29,7 @@ help:
 	@printf '%s\n' '  make test-odin          Run Odin tests for the CLI package'
 	@printf '%s\n' '  make test-eventloop-odin Run Odin event-loop core tests'
 	@printf '%s\n' '  make test-sqlite-node   Run SQLite std tests with Node as oracle'
+	@printf '%s\n' '  make test-sqlite-lava   Build and compare SQLite std tests through Lava'
 	@printf '%s\n' '  make test-eventloop-node Run event-loop ordering tests with Node as oracle'
 	@printf '%s\n' '  make test-eventloop-lava Build and compare event-loop tests through Lava, skipping known gaps'
 	@printf '%s\n' '  make test-fetch-smoke   Compare fetch over a real socket node vs Lava (binds a local port)'
@@ -67,7 +68,7 @@ check-jsc:
 check-native:
 	./scripts/check-native-deps.sh
 
-test: test-odin test-eventloop-odin test-compat test-sqlite-node test-eventloop-node
+test: test-odin test-eventloop-odin test-sqlite-odin test-compat test-sqlite-node test-eventloop-node
 
 test-report:
 	./scripts/report-tests.sh
@@ -99,8 +100,14 @@ test-odin:
 test-eventloop-odin:
 	$(ODIN) test pkg/runtime/eventloop
 
+test-sqlite-odin:
+	$(ODIN) test pkg/std/sqlite
+
 test-sqlite-node:
 	./scripts/run-sqlite-oracle.sh
+
+test-sqlite-lava: build
+	RUN_LAVA=1 LAVA_BIN="$(LAVA)" ./scripts/run-sqlite-oracle.sh
 
 test-eventloop-node:
 	./scripts/run-eventloop-oracle.sh
@@ -111,7 +118,7 @@ test-eventloop-lava: build
 test-fetch-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-fetch-smoke.sh
 
-test-lava: test-compat-lava test-eventloop-lava
+test-lava: test-compat-lava test-eventloop-lava test-sqlite-lava
 
 fmt:
 	$(ODIN) strip-semicolon cmd/lava

@@ -139,8 +139,13 @@ implementations — no `primordials`, no `internalBinding` coupling.
       `isDirectory`/`isSymbolicLink`), `readdirSync`, `rmSync` (`recursive`/`force`),
       and async `writeFile`. _(case `02`.)_ Deferred: async `stat`/`readdir`/`mkdir`,
       `fs.promises`, file handles, watchers.
-- [ ] **Wire `pkg/std/sqlite`** — currently stubbed
-      (`Native_SQLite_Unavailable`).
+- [x] **Wire `pkg/std/sqlite`** — `node:sqlite` (`DatabaseSync` with
+      `exec`/`prepare`/`isOpen`/`close`, `StatementSync` with `get`/`all`/`run`
+      and `?` parameter binding; INTEGER/REAL/TEXT/BLOB/NULL coercion). Native
+      libsqlite3 bindings in `pkg/std/sqlite`; JSC bridge + handle registry in
+      `pkg/runtime/sqlite.odin`; JS surface in `js/internal/sqlite.js`. Needs the
+      sqlite3 dev package (Linux: `libsqlite3-dev`; macOS: system sqlite3). Runs
+      the oracle through Lava via `make test-sqlite-lava`.
 
 ### Low priority / correctness polish
 

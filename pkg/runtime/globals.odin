@@ -24,6 +24,11 @@ Runtime_State :: struct {
 	// because the io_uring watcher may reference a request once more after it is
 	// stopped; freeing only at destroy keeps that memory valid (see fetch.odin).
 	pending_free:      [dynamic]^Fetch_Request,
+	// node:sqlite handle registries: opaque id -> ^sqlite.Database / ^sqlite.Statement
+	// (kept as rawptr so this struct need not import pkg/std/sqlite). See sqlite.odin.
+	sqlite_dbs:        map[u64]rawptr,
+	sqlite_stmts:      map[u64]rawptr,
+	next_sqlite_id:    u64,
 }
 
 // JS_Callback bridges a JS function into an event-loop Callback. The function
@@ -61,12 +66,16 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state := new(Runtime_State)
 	state.loop = loop
 	state.module_cache = make(map[string]jsc.JSValueRef)
+	state.sqlite_dbs = make(map[u64]rawptr)
+	state.sqlite_stmts = make(map[u64]rawptr)
+	state.next_sqlite_id = 1
 	return state
 }
 
 destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	if state == nil do return
 	fetch_destroy_pending(state)
+	sqlite_destroy_state(state)
 	for key, value in state.module_cache {
 		jsc.JSValueUnprotect(ctx, value)
 		delete(key)
@@ -505,6 +514,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"url", INTERNAL_URL},
 		{"structured_clone", INTERNAL_STRUCTURED_CLONE},
 		{"path", INTERNAL_PATH},
+		{"sqlite", INTERNAL_SQLITE},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -524,6 +534,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "crypto", cast(jsc.JSValueRef)make_crypto_bindings(ctx))
 	set_named(ctx, natives, "buffer", cast(jsc.JSValueRef)make_buffer_bindings(ctx))
 	set_named(ctx, natives, "fetch", cast(jsc.JSValueRef)make_fetch_bindings(ctx))
+	set_named(ctx, natives, "sqlite", cast(jsc.JSValueRef)make_sqlite_bindings(ctx))
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef
@@ -745,6 +756,7 @@ INTERNAL_ENCODING :: #load("js/internal/encoding.js", string)
 INTERNAL_URL :: #load("js/internal/url.js", string)
 INTERNAL_STRUCTURED_CLONE :: #load("js/internal/structured_clone.js", string)
 INTERNAL_PATH :: #load("js/internal/path.js", string)
+INTERNAL_SQLITE :: #load("js/internal/sqlite.js", string)
 
 // ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
 // the module resolver (see install_internal_modules); evaluates to a function.
