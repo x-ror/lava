@@ -834,6 +834,10 @@ native_require_cb :: proc "c" (
 		if !wrap_ok do return jsc.JSValueMakeUndefined(ctx)
 		defer delete(wrapped, context.allocator)
 
+		// Resolve this module's relative specifiers against its own directory.
+		push_module_dir(state, filepath.dir(resolved))
+		defer pop_module_dir(state)
+
 		value := eval_source_value(ctx, wrapped, resolved, exception)
 		if exception == nil || exception^ == nil {
 			module_cache_put(ctx, state, resolved, value)
@@ -863,6 +867,12 @@ native_require_cb :: proc "c" (
 		}
 		wrapped, wrapped_err := strings.concatenate(wrapper_parts[:], context.temp_allocator)
 		if wrapped_err != nil do return jsc.JSValueMakeUndefined(ctx)
+
+		// Resolve this module's relative specifiers against its own directory.
+		// (`dirname` is a slice of `resolved`; push copies it.)
+		push_module_dir(state, dirname)
+		defer pop_module_dir(state)
+
 		value := eval_source_value(ctx, wrapped, resolved, exception)
 		if exception == nil || exception^ == nil {
 			module_cache_put(ctx, state, resolved, value)
@@ -913,7 +923,17 @@ resolve_module_path :: proc(ctx: jsc.JSContextRef, specifier: string) -> (string
 		parts := [?]string{base_dir, specifier}
 		joined, join_err := filepath.join(parts[:], context.temp_allocator)
 		if join_err != nil do return "", false
-		candidate, _ = filepath.abs(joined, context.allocator)
+		// filepath.abs canonicalizes via the OS (realpath) and returns "" for a
+		// path that does not exist yet — which an extensionless specifier always
+		// is, since the real file is "<joined>.js". That would abort before the
+		// extension probes below. base_dir is already absolute, so fall back to a
+		// lexical clean so require('./util') / import './x.mjs' still resolve.
+		if abs_path, abs_err := filepath.abs(joined, context.allocator);
+		   abs_err == os.ERROR_NONE && len(abs_path) > 0 {
+			candidate = abs_path
+		} else {
+			candidate, _ = filepath.clean(joined, context.allocator)
+		}
 	}
 	if len(candidate) == 0 do return "", false
 
@@ -940,6 +960,17 @@ module_file_exists :: proc(path: string) -> bool {
 }
 
 current_dirname :: proc(ctx: jsc.JSContextRef) -> string {
+	// A module evaluated under native_require_cb resolves its relative specifiers
+	// against its own directory (tracked on the module-dir stack). Only the entry
+	// file, which runs with the stack empty, falls back to the global __dirname.
+	if state := get_state_from_ctx(ctx); state != nil {
+		if dir, ok := current_module_dir(state); ok {
+			cloned, clone_err := strings.clone(dir, context.allocator)
+			if clone_err != nil do return ""
+			return cloned
+		}
+	}
+
 	global_obj := jsc.JSContextGetGlobalObject(ctx)
 	key := jsc.JSStringCreateWithUTF8CString("__dirname")
 	defer jsc.JSStringRelease(key)
