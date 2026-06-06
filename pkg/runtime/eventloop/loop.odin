@@ -54,6 +54,7 @@ Loop :: struct {
 	next_ticks:      [dynamic]Task,
 	microtasks:      [dynamic]Task,
 	immediates:      [dynamic]Task,
+	io_callbacks:    [dynamic]Task, // poll-phase completions (e.g. fs.readFile); run before check
 	close_callbacks: [dynamic]Task,
 	timers:          [dynamic]Timer,
 	cancelled_ids:   map[Timer_ID]bool,
@@ -97,6 +98,7 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.next_ticks)
 	delete(loop.microtasks)
 	delete(loop.immediates)
+	delete(loop.io_callbacks)
 	delete(loop.close_callbacks)
 	delete(loop.timers)
 	delete(loop.cancelled_ids)
@@ -124,10 +126,21 @@ pending_count :: proc(loop: ^Loop) -> int {
 		len(loop.next_ticks) +
 		len(loop.microtasks) +
 		active_immediate_count(loop) +
+		active_io_callback_count(loop) +
 		active_close_count(loop) +
 		active_timer_count(loop) +
 		loop.active_io_count \
 	)
+}
+
+active_io_callback_count :: proc(loop: ^Loop) -> int {
+	count := 0
+	for &task in loop.io_callbacks {
+		if !task.cancelled && !is_cancel_requested(loop, task.id) {
+			count += 1
+		}
+	}
+	return count
 }
 
 active_timer_count :: proc(loop: ^Loop) -> int {
@@ -211,6 +224,21 @@ set_immediate :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) 
 	id := next_handle_id(loop)
 	append(
 		&loop.immediates,
+		Task{id = id, callback = callback, user_data = user_data, seq = next_sequence(loop)},
+	)
+	return id
+}
+
+// queue_io_callback registers a poll-phase completion callback (e.g. an async
+// fs.readFile whose result is ready). It runs in the poll phase — after timers,
+// before check (setImmediate) — matching Node's I/O-callback ordering.
+queue_io_callback :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) -> Timer_ID {
+	if callback == nil {
+		return 0
+	}
+	id := next_handle_id(loop)
+	append(
+		&loop.io_callbacks,
 		Task{id = id, callback = callback, user_data = user_data, seq = next_sequence(loop)},
 	)
 	return id
@@ -370,7 +398,31 @@ run_once :: proc(loop: ^Loop) -> bool {
 		}
 	}
 
-	// Phase 4: poll — block for I/O only when there is nothing else to do
+	// Phase 4a: deliver ready I/O completion callbacks (e.g. async fs.readFile)
+	// queued before this tick. They run after timers and before check, matching
+	// Node's poll-before-check order. The sequence limit defers callbacks queued
+	// *during* this phase to the next iteration.
+	io_phase_sequence_limit := loop.next_sequence
+	for {
+		index := next_io_callback_index(loop, io_phase_sequence_limit)
+		if index < 0 {
+			break
+		}
+
+		task := loop.io_callbacks[index]
+		ordered_remove(&loop.io_callbacks, index)
+		if task.cancelled || is_cancel_requested(loop, task.id) {
+			continue
+		}
+
+		did_work = true
+		loop.running_id = task.id
+		task.callback(loop, task.user_data)
+		loop.running_id = 0
+		drain_microtasks(loop)
+	}
+
+	// Phase 4b: poll — block for I/O only when there is nothing else to do
 	// (no immediates, no close callbacks, no pending microtasks)
 	has_nothing_to_do :=
 		!did_work &&
@@ -454,6 +506,7 @@ run_next :: proc(loop: ^Loop) -> bool {
 	   len(loop.microtasks) > 0 ||
 	   has_due_timer(loop) ||
 	   active_immediate_count(loop) > 0 ||
+	   active_io_callback_count(loop) > 0 ||
 	   active_close_count(loop) > 0 {
 		return run_once(loop)
 	}
@@ -591,6 +644,20 @@ next_immediate_index :: proc(loop: ^Loop, sequence_limit: u64) -> int {
 			continue
 		}
 		if immediate.seq >= sequence_limit {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+next_io_callback_index :: proc(loop: ^Loop, sequence_limit: u64) -> int {
+	for i in 0 ..< len(loop.io_callbacks) {
+		task := loop.io_callbacks[i]
+		if task.cancelled || is_cancel_requested(loop, task.id) {
+			continue
+		}
+		if task.seq >= sequence_limit {
 			continue
 		}
 		return i

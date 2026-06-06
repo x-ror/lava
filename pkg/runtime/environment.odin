@@ -142,6 +142,148 @@ fs_buffer_deallocator :: proc "c" (bytes: rawptr, deallocator_context: rawptr) {
 	if bytes != nil do free(bytes)
 }
 
+// FS_Read_Request carries an async fs.readFile result from the (synchronous) read
+// to the poll-phase callback that invokes the JS callback with (err, data).
+FS_Read_Request :: struct {
+	ctx:       jsc.JSContextRef,
+	callback:  jsc.JSObjectRef, // GC-protected until the completion fires
+	data:      []byte, // file contents on success (ownership handed to JSC for Buffer)
+	ok:        bool,
+	as_string: bool, // an encoding was supplied → deliver a string, else a Uint8Array
+	err_msg:   string,
+	err_code:  string,
+	err_path:  string,
+}
+
+// fs.readFile(path[, options], callback). The file is read synchronously and the
+// callback is delivered on the event loop's poll phase (queue_io_callback), so it
+// runs before any setImmediate scheduled in the same turn — matching Node's
+// I/O-callback ordering. (This is not yet threadpool-backed async I/O; the read
+// itself is synchronous, but the callback timing matches.)
+fs_read_file_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 2 {
+		if exception != nil {
+			exception^ = make_js_error(ctx, "fs.readFile requires a path and a callback")
+		}
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	args := arguments[:int(argument_count)]
+	callback := callback_arg(ctx, args[argument_count - 1])
+	if callback == nil {
+		if exception != nil {
+			exception^ = make_js_error(ctx, "fs.readFile callback must be a function")
+		}
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
+	defer if path_alloc do delete(path_str, context.allocator)
+
+	// Options sit between path and callback: a string encoding, or { encoding }.
+	as_string := false
+	if argument_count >= 3 {
+		opt := args[1]
+		if jsc.JSValueIsString(ctx, opt) {
+			as_string = true
+		} else if jsc.JSValueIsObject(ctx, opt) {
+			enc := get_named(ctx, cast(jsc.JSObjectRef)opt, "encoding")
+			if enc != nil && jsc.JSValueIsString(ctx, enc) do as_string = true
+		}
+	}
+
+	req := new(FS_Read_Request)
+	req.ctx = ctx
+	req.callback = callback
+	req.as_string = as_string
+	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)callback)
+
+	data, err := os.read_entire_file(path_str, context.allocator)
+	if err != os.ERROR_NONE {
+		req.ok = false
+		req.err_code = os.exists(path_str) ? "EIO" : "ENOENT"
+		req.err_path, _ = strings.clone(path_str, context.allocator)
+		req.err_msg = fmt.aprintf(
+			"%s: error reading file, open '%s'",
+			req.err_code,
+			path_str,
+			allocator = context.allocator,
+		)
+	} else {
+		req.ok = true
+		req.data = data
+	}
+
+	loop := get_loop_from_ctx(ctx)
+	if loop != nil {
+		eventloop.queue_io_callback(loop, fs_read_complete_cb, req)
+	} else {
+		// No loop bound (e.g. bare eval): deliver inline so the callback still runs.
+		fs_read_complete_cb(nil, req)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// fs_read_complete_cb runs in the poll phase and invokes the JS callback with the
+// Node (err, data) convention, then releases the request.
+fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	context = runtime.default_context()
+	req := cast(^FS_Read_Request)user_data
+	if req == nil do return
+	ctx := req.ctx
+
+	call_args: [2]jsc.JSValueRef
+	if req.ok {
+		call_args[0] = jsc.JSValueMakeNull(ctx)
+		if req.as_string {
+			call_args[1] = js_string_value(ctx, string(req.data))
+			delete(req.data, context.allocator)
+		} else {
+			// Hand the bytes to JSC; fs_buffer_deallocator frees them on collection.
+			array := jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
+				ctx,
+				.Uint8Array,
+				raw_data(req.data),
+				c.size_t(len(req.data)),
+				fs_buffer_deallocator,
+				nil,
+				nil,
+			)
+			call_args[1] = cast(jsc.JSValueRef)array
+		}
+	} else {
+		err := make_js_error(ctx, req.err_msg)
+		if jsc.JSValueIsObject(ctx, err) {
+			err_obj := cast(jsc.JSObjectRef)err
+			set_named(ctx, err_obj, "code", js_string_value(ctx, req.err_code))
+			set_named(ctx, err_obj, "path", js_string_value(ctx, req.err_path))
+			set_named(ctx, err_obj, "syscall", js_string_value(ctx, "open"))
+		}
+		call_args[0] = err
+		call_args[1] = jsc.JSValueMakeUndefined(ctx)
+		if len(req.err_msg) > 0 do delete(req.err_msg, context.allocator)
+		if len(req.err_path) > 0 do delete(req.err_path, context.allocator)
+	}
+
+	exception: jsc.JSValueRef
+	jsc.JSObjectCallAsFunction(ctx, req.callback, nil, 2, raw_data(call_args[:]), &exception)
+	if exception != nil {
+		report_uncaught(ctx, exception)
+		mark_async_failed(ctx)
+	}
+
+	jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)req.callback)
+	free(req)
+}
+
 fs_exists_sync_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -211,6 +353,7 @@ native_require_cb :: proc "c" (
 	if specifier == "node:fs" {
 		fs_obj := jsc.JSObjectMake(ctx, nil, nil)
 
+		inject_native_function(ctx, fs_obj, "readFile", fs_read_file_cb)
 		inject_native_function(ctx, fs_obj, "readFileSync", fs_read_file_sync_cb)
 		inject_native_function(ctx, fs_obj, "existsSync", fs_exists_sync_cb)
 

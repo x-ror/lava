@@ -28,6 +28,11 @@ The original runtime plan (PR #1) is complete:
       instead of returning `undefined`.
 - [x] **`fs.readFileSync`** returns a `Uint8Array` (no encoding) or string (with
       encoding); no more lossy UTF-8 on binary data.
+- [x] **`fs.readFile`** (async callback form) — `(path[, options], cb)`, delivered
+      on the event loop's poll phase via a new `queue_io_callback`, so the callback
+      runs before a same-turn `setImmediate` (matches Node; passes the
+      `08-io-before-immediate` oracle). The read itself is synchronous for now —
+      not yet threadpool-backed — but the callback timing matches.
 - [x] **Memory** — `free_all` the temp arena at the require boundary;
       single-allocation JS→string conversion.
 - [x] **Windows support** — `pkg/jsc/bindings_windows.odin`
