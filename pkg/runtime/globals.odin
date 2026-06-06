@@ -503,6 +503,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"timers/promises", INTERNAL_TIMERS_PROMISES},
 		{"encoding", INTERNAL_ENCODING},
 		{"url", INTERNAL_URL},
+		{"structured_clone", INTERNAL_STRUCTURED_CLONE},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -741,6 +742,7 @@ INTERNAL_ABORT :: #load("js/internal/abort.js", string)
 INTERNAL_TIMERS_PROMISES :: #load("js/internal/timers_promises.js", string)
 INTERNAL_ENCODING :: #load("js/internal/encoding.js", string)
 INTERNAL_URL :: #load("js/internal/url.js", string)
+INTERNAL_STRUCTURED_CLONE :: #load("js/internal/structured_clone.js", string)
 
 // ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
 // the module resolver (see install_internal_modules); evaluates to a function.
