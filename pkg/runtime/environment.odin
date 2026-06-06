@@ -350,6 +350,27 @@ native_require_cb :: proc "c" (
 		return value
 	}
 
+	if strings.has_suffix(resolved, ".mjs") {
+		data, err := os.read_entire_file(resolved, context.allocator)
+		if err != os.ERROR_NONE {
+			if exception != nil {
+				exception^ = make_js_error(ctx, fmt.tprintf("Cannot read module '%s'", resolved))
+			}
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		defer delete(data, context.allocator)
+
+		wrapped, wrap_ok := esm_wrap_source(ctx, string(data), resolved, exception)
+		if !wrap_ok do return jsc.JSValueMakeUndefined(ctx)
+		defer delete(wrapped, context.allocator)
+
+		value := eval_source_value(ctx, wrapped, resolved, exception)
+		if exception == nil || exception^ == nil {
+			module_cache_put(ctx, state, resolved, value)
+		}
+		return value
+	}
+
 	if strings.has_suffix(resolved, ".cjs") || strings.has_suffix(resolved, ".js") {
 		data, err := os.read_entire_file(resolved, context.allocator)
 		if err != os.ERROR_NONE {
@@ -428,7 +449,7 @@ resolve_module_path :: proc(ctx: jsc.JSContextRef, specifier: string) -> (string
 
 	if module_file_exists(candidate) do return candidate, true
 
-	extensions := [?]string{".js", ".cjs", ".json"}
+	extensions := [?]string{".js", ".cjs", ".mjs", ".json"}
 	for ext in extensions {
 		ext_parts := [?]string{candidate, ext}
 		with_ext, with_ext_err := strings.concatenate(ext_parts[:], context.allocator)
@@ -478,6 +499,80 @@ eval_source_value :: proc(
 	}
 	if value == nil do return jsc.JSValueMakeUndefined(ctx)
 	return value
+}
+
+// esm_wrap_source rewrites an ES module `source` (resolved at `filename`) into a
+// self-contained CommonJS expression by calling js/internal/esm.js. The returned
+// string is allocated in context.allocator and must be freed by the caller. On
+// failure it sets `exception` (when non-nil) and returns ("", false).
+esm_wrap_source :: proc(
+	ctx: jsc.JSContextRef,
+	source, filename: string,
+	exception: ^jsc.JSValueRef,
+) -> (
+	string,
+	bool,
+) {
+	state := get_state_from_ctx(ctx)
+	if state == nil || state.esm_transform == nil {
+		if exception != nil {
+			exception^ = make_js_error(ctx, "ESM transform unavailable")
+		}
+		return "", false
+	}
+
+	abs_path, abs_err := filepath.abs(filename, context.temp_allocator)
+	if abs_err != os.ERROR_NONE {
+		// Fall back to the path as given when abs resolution fails.
+		abs_path = filename
+	}
+	dir := filepath.dir(abs_path)
+	url := esm_file_url(abs_path)
+
+	args := [4]jsc.JSValueRef {
+		js_string_value(ctx, source),
+		js_string_value(ctx, url),
+		js_string_value(ctx, abs_path),
+		js_string_value(ctx, dir),
+	}
+	call_exception: jsc.JSValueRef
+	result := jsc.JSObjectCallAsFunction(
+		ctx,
+		cast(jsc.JSObjectRef)state.esm_transform,
+		nil,
+		4,
+		raw_data(args[:]),
+		&call_exception,
+	)
+	if call_exception != nil {
+		if exception != nil do exception^ = call_exception
+		return "", false
+	}
+
+	wrapped, allocated := jsc_value_to_string_or_default(ctx, result)
+	if !allocated {
+		if exception != nil {
+			exception^ = make_js_error(ctx, "ESM transform produced no output")
+		}
+		return "", false
+	}
+	return wrapped, true
+}
+
+// esm_file_url builds the `file://` URL exposed to a module as import.meta.url.
+esm_file_url :: proc(abs_path: string) -> string {
+	when ODIN_OS == .Windows {
+		slashed, _ := strings.replace_all(abs_path, "\\", "/", context.temp_allocator)
+		parts := [?]string{"file:///", slashed}
+		result, err := strings.concatenate(parts[:], context.temp_allocator)
+		if err != nil do return abs_path
+		return result
+	} else {
+		parts := [?]string{"file://", abs_path}
+		result, err := strings.concatenate(parts[:], context.temp_allocator)
+		if err != nil do return abs_path
+		return result
+	}
 }
 
 js_quote :: proc(value: string) -> string {

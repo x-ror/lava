@@ -14,6 +14,7 @@ Runtime_State :: struct {
 	loop:            ^eventloop.Loop,
 	module_cache:    map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
 	builtin_require: jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
+	esm_transform:   jsc.JSValueRef, // js/internal/esm.js transform(source,url,filename,dirname); GC-protected
 	// Set when an uncaught exception escapes an async callback or a promise
 	// rejects with no handler. The process then exits non-zero even though the
 	// initial JSEvaluateScript returned cleanly (see resolve_exit_code).
@@ -72,6 +73,7 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	}
 	delete(state.module_cache)
 	if state.builtin_require != nil do jsc.JSValueUnprotect(ctx, state.builtin_require)
+	if state.esm_transform != nil do jsc.JSValueUnprotect(ctx, state.esm_transform)
 	if state.rejection_handler != nil do jsc.JSValueUnprotect(ctx, state.rejection_handler)
 	free(state)
 }
@@ -500,6 +502,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"abort", INTERNAL_ABORT},
 		{"timers/promises", INTERNAL_TIMERS_PROMISES},
 		{"encoding", INTERNAL_ENCODING},
+		{"url", INTERNAL_URL},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -538,6 +541,16 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 
 	jsc.JSValueProtect(ctx, resolver)
 	state.builtin_require = resolver
+
+	// The ESM source transform (js/internal/esm.js) evaluates directly to a
+	// `transform(source, url, filename, dirname)` function. It is stored on the
+	// state — not registered as a requireable module — so native_require_cb can
+	// rewrite `.mjs` files to CommonJS without exposing it to user code.
+	esm := eval_internal(ctx, "lava:esm", INTERNAL_ESM)
+	if esm != nil && jsc.JSValueIsObject(ctx, esm) {
+		jsc.JSValueProtect(ctx, esm)
+		state.esm_transform = esm
+	}
 }
 
 // require_builtin asks the JS resolver for an internal module by specifier.
@@ -727,3 +740,8 @@ INTERNAL_FETCH :: #load("js/internal/fetch.js", string)
 INTERNAL_ABORT :: #load("js/internal/abort.js", string)
 INTERNAL_TIMERS_PROMISES :: #load("js/internal/timers_promises.js", string)
 INTERNAL_ENCODING :: #load("js/internal/encoding.js", string)
+INTERNAL_URL :: #load("js/internal/url.js", string)
+
+// ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
+// the module resolver (see install_internal_modules); evaluates to a function.
+INTERNAL_ESM :: #load("js/internal/esm.js", string)
