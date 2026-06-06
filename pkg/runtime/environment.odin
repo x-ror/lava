@@ -92,96 +92,9 @@ inject_global_string :: proc(
 	jsc.JSObjectSetProperty(ctx, global_obj, js_name, js_val, {}, nil)
 }
 
-path_basename_cb :: proc "c" (
-	ctx: jsc.JSContextRef,
-	function: jsc.JSObjectRef,
-	this_object: jsc.JSObjectRef,
-	argument_count: c.size_t,
-	arguments: [^]jsc.JSValueRef,
-	exception: ^jsc.JSValueRef,
-) -> jsc.JSValueRef {
-	context = runtime.default_context()
-	if argument_count < 1 do return jsc.JSValueMakeUndefined(ctx)
-
-	args := arguments[:int(argument_count)]
-
-	path_str, alloc := jsc_value_to_string_or_default(ctx, args[0])
-	defer if alloc do delete(path_str, context.allocator)
-
-	base := filepath.base(path_str)
-
-	c_base, c_base_err := strings.clone_to_cstring(base, context.temp_allocator)
-	if c_base_err != nil do return jsc.JSValueMakeUndefined(ctx)
-	js_str := jsc.JSStringCreateWithUTF8CString(c_base)
-	defer jsc.JSStringRelease(js_str)
-
-	return jsc.JSValueMakeString(ctx, js_str)
-}
-
-path_join_cb :: proc "c" (
-	ctx: jsc.JSContextRef,
-	function: jsc.JSObjectRef,
-	this_object: jsc.JSObjectRef,
-	argument_count: c.size_t,
-	arguments: [^]jsc.JSValueRef,
-	exception: ^jsc.JSValueRef,
-) -> jsc.JSValueRef {
-	context = runtime.default_context()
-	if argument_count == 0 do return js_string_value(ctx, ".")
-
-	args := arguments[:int(argument_count)]
-	parts := make([]string, len(args), context.temp_allocator)
-	allocated := make([]bool, len(args), context.temp_allocator)
-
-	for arg, i in args {
-		parts[i], allocated[i] = jsc_value_to_string_or_default(ctx, arg)
-	}
-	defer {
-		for part, i in parts {
-			if allocated[i] do delete(part, context.allocator)
-		}
-	}
-
-	joined, join_err := filepath.join(parts, context.temp_allocator)
-	if join_err != nil do return jsc.JSValueMakeUndefined(ctx)
-	return js_string_value(ctx, joined)
-}
-
-path_extname_cb :: proc "c" (
-	ctx: jsc.JSContextRef,
-	function: jsc.JSObjectRef,
-	this_object: jsc.JSObjectRef,
-	argument_count: c.size_t,
-	arguments: [^]jsc.JSValueRef,
-	exception: ^jsc.JSValueRef,
-) -> jsc.JSValueRef {
-	context = runtime.default_context()
-	if argument_count < 1 do return js_string_value(ctx, "")
-
-	args := arguments[:int(argument_count)]
-	path_str, alloc := jsc_value_to_string_or_default(ctx, args[0])
-	defer if alloc do delete(path_str, context.allocator)
-
-	return js_string_value(ctx, path_extname(path_str))
-}
-
-path_is_absolute_cb :: proc "c" (
-	ctx: jsc.JSContextRef,
-	function: jsc.JSObjectRef,
-	this_object: jsc.JSObjectRef,
-	argument_count: c.size_t,
-	arguments: [^]jsc.JSValueRef,
-	exception: ^jsc.JSValueRef,
-) -> jsc.JSValueRef {
-	context = runtime.default_context()
-	if argument_count < 1 do return jsc.JSValueMakeBoolean(ctx, false)
-
-	args := arguments[:int(argument_count)]
-	path_str, alloc := jsc_value_to_string_or_default(ctx, args[0])
-	defer if alloc do delete(path_str, context.allocator)
-
-	return jsc.JSValueMakeBoolean(ctx, b32(is_absolute_path(path_str)))
-}
+// node:path is implemented in JavaScript (js/internal/path.js) so the POSIX and
+// Windows normalize/resolve/relative semantics match Node exactly; it is wired
+// through the internal-module loader like the other built-ins.
 
 fs_read_file_sync_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
@@ -293,19 +206,7 @@ native_require_cb :: proc "c" (
 		return builtin
 	}
 
-	// 1. Обробка вбудованого модуля node:path
-	if specifier == "node:path" {
-		path_obj := jsc.JSObjectMake(ctx, nil, nil)
-
-		inject_native_function(ctx, path_obj, "basename", path_basename_cb)
-		inject_native_function(ctx, path_obj, "join", path_join_cb)
-		inject_native_function(ctx, path_obj, "extname", path_extname_cb)
-		inject_native_function(ctx, path_obj, "isAbsolute", path_is_absolute_cb)
-
-		value := cast(jsc.JSValueRef)path_obj
-		module_cache_put(ctx, state, specifier, value)
-		return value
-	}
+	// node:path is served by the JS internal-module loader above (require_builtin).
 
 	if specifier == "node:fs" {
 		fs_obj := jsc.JSObjectMake(ctx, nil, nil)
@@ -592,23 +493,8 @@ js_string_value :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef 
 	return jsc.JSValueMakeString(ctx, js_str)
 }
 
-// Path separator characters recognized when parsing module/path strings.
-// Windows accepts both '/' and '\\'; other platforms only '/'.
-when ODIN_OS == .Windows {
-	PATH_SEPARATORS :: `/\`
-} else {
-	PATH_SEPARATORS :: `/`
-}
-
-path_extname :: proc(path: string) -> string {
-	last_slash := strings.last_index_any(path, PATH_SEPARATORS)
-	last_dot := strings.last_index_byte(path, '.')
-	if last_dot <= last_slash || last_dot < 0 || last_dot == len(path) - 1 {
-		return ""
-	}
-	return path[last_dot:]
-}
-
+// is_absolute_path classifies module specifiers during resolution. (node:path's
+// own isAbsolute lives in js/internal/path.js.)
 is_absolute_path :: proc(path: string) -> bool {
 	when ODIN_OS == .Windows {
 		if len(path) == 0 do return false

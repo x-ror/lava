@@ -122,11 +122,13 @@ implementations — no `primordials`, no `internalBinding` coupling.
 
 ### Medium priority (more of the Node surface)
 
-- [ ] **`TextEncoder` / `TextDecoder` / `structuredClone`** globals (pure JS;
-      reuse the buffer utf8 codec).
-- [ ] **More `node:path`** — `resolve`, `relative`, `normalize`, `dirname`,
-      `sep`, `posix`/`win32` namespaces (only `basename`/`join`/`extname`/
-      `isAbsolute` today).
+- [x] **`TextEncoder` / `TextDecoder` / `structuredClone`** globals (pure JS;
+      TextEncoder/TextDecoder reuse the buffer utf8 codec; structuredClone is the
+      HTML clone algorithm in `js/internal/structured_clone.js`). _(cases `11`, `13`.)_
+- [x] **Full `node:path`** — `resolve`, `relative`, `normalize`, `dirname`, `sep`,
+      `delimiter`, `parse`, `format`, and the `posix`/`win32` namespaces, ported to
+      JS (`js/internal/path.js`) so semantics match Node exactly; the partial native
+      implementation was retired. _(case `02`.)_
 - [ ] **More `node:fs`** — `writeFileSync`, `mkdirSync`, `statSync`, `readdirSync`,
       async variants.
 - [ ] **Wire `pkg/std/sqlite`** — currently stubbed
