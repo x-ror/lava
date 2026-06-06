@@ -40,6 +40,7 @@
 	req("fetch");
 	req("abort");
 	req("encoding");
+	req("structured_clone");
 
 	return req;
 })
