@@ -18,9 +18,12 @@ Status :: enum {
 	Error,
 }
 
-// Result carries a status and a STATIC description only. Dynamic SQLite error
-// text is fetched separately via `errmsg(db)` so message ownership stays simple
-// (callers never free Result.message).
+// Result carries a status and a short description. Most messages are static
+// literals; `open` failure additionally clones the live SQLite error into the
+// temp allocator (valid until the next temp reset, so consume it immediately —
+// the node:sqlite bridge copies it into a JS string right away). Callers never
+// free Result.message. For errors on an already-open Database, the live text is
+// also reachable via `errmsg(db)`.
 Result :: struct {
 	status:  Status,
 	message: string,
@@ -71,7 +74,11 @@ when SQLITE_AVAILABLE {
 	@(default_calling_convention = "c", link_prefix = "")
 	foreign sqlite_lib {
 		sqlite3_open :: proc(filename: cstring, ppDb: ^rawptr) -> c.int ---
-		sqlite3_close :: proc(db: rawptr) -> c.int ---
+		// close_v2 is the deferred ("zombie") close: unlike sqlite3_close it never
+		// fails with SQLITE_BUSY when statements are still live — it frees the
+		// connection once the last statement is finalized. Safe even if a caller
+		// closes a db before finalizing its statements.
+		sqlite3_close_v2 :: proc(db: rawptr) -> c.int ---
 		sqlite3_errmsg :: proc(db: rawptr) -> cstring ---
 		sqlite3_exec :: proc(db: rawptr, sql: cstring, cb: rawptr, arg: rawptr, errmsg: ^cstring) -> c.int ---
 		sqlite3_prepare_v2 :: proc(db: rawptr, zSql: cstring, nByte: c.int, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int ---
@@ -93,7 +100,7 @@ when SQLITE_AVAILABLE {
 		sqlite3_bind_null :: proc(stmt: rawptr, i: c.int) -> c.int ---
 		sqlite3_bind_blob :: proc(stmt: rawptr, i: c.int, p: rawptr, n: c.int, destroy: rawptr) -> c.int ---
 		sqlite3_bind_parameter_count :: proc(stmt: rawptr) -> c.int ---
-		sqlite3_changes :: proc(db: rawptr) -> c.int ---
+		sqlite3_changes64 :: proc(db: rawptr) -> i64 ---
 		sqlite3_last_insert_rowid :: proc(db: rawptr) -> i64 ---
 	}
 
@@ -116,8 +123,21 @@ open :: proc(path: string) -> (Database, Result) {
 		handle: rawptr
 		rc := sqlite3_open(cpath, &handle)
 		if rc != SQLITE_OK {
-			if handle != nil do sqlite3_close(handle)
-			return Database{}, Result{status = .Error, message = "could not open database"}
+			// sqlite3_open returns a handle even on failure, and the real error text
+			// is only reachable through it. errmsg is borrowed and invalidated by
+			// close, so clone it (into temp, like the bridge's other error paths)
+			// before closing the handle.
+			msg := "could not open database"
+			if handle != nil {
+				if detail := sqlite3_errmsg(handle); detail != nil {
+					if cloned, err := strings.clone(string(detail), context.temp_allocator);
+					   err == nil && len(cloned) > 0 {
+						msg = cloned
+					}
+				}
+				sqlite3_close_v2(handle)
+			}
+			return Database{}, Result{status = .Error, message = msg}
 		}
 		return Database{handle = handle, is_open = true}, Result{status = .Ok}
 	}
@@ -126,7 +146,7 @@ open :: proc(path: string) -> (Database, Result) {
 close :: proc(db: ^Database) {
 	when SQLITE_AVAILABLE {
 		if db != nil && db.handle != nil {
-			sqlite3_close(db.handle)
+			sqlite3_close_v2(db.handle)
 		}
 	}
 	if db != nil {
@@ -163,6 +183,10 @@ prepare :: proc(db: ^Database, sql: string) -> (Statement, Result) {
 	} else {
 		csql := strings.clone_to_cstring(sql, context.temp_allocator)
 		handle: rawptr
+		// pzTail is nil on purpose: prepare compiles only the first statement and
+		// silently ignores anything after the first ";". This matches node:sqlite
+		// (verified against Node 24 — `prepare("SELECT 1; SELECT 2")` runs SELECT 1),
+		// which is more permissive than better-sqlite3's "one statement only" error.
 		rc := sqlite3_prepare_v2(db.handle, csql, -1, &handle, nil)
 		if rc != SQLITE_OK || handle == nil {
 			return Statement{}, Result{status = .Error, message = "prepare failed"}
@@ -187,6 +211,8 @@ step :: proc(stmt: ^Statement) -> Step_Result {
 	}
 }
 
+// reset rewinds the cursor AND clears all bound parameters, so the statement can be
+// re-primed with fresh bindings (matches how the node:sqlite bridge reuses it).
 reset :: proc(stmt: ^Statement) {
 	when SQLITE_AVAILABLE {
 		if stmt != nil && stmt.handle != nil {
@@ -247,6 +273,7 @@ column_int :: proc(stmt: ^Statement, i: int) -> i64 {
 	when !SQLITE_AVAILABLE {
 		return 0
 	} else {
+		if stmt == nil || stmt.handle == nil do return 0
 		return sqlite3_column_int64(stmt.handle, c.int(i))
 	}
 }
@@ -255,6 +282,7 @@ column_double :: proc(stmt: ^Statement, i: int) -> f64 {
 	when !SQLITE_AVAILABLE {
 		return 0
 	} else {
+		if stmt == nil || stmt.handle == nil do return 0
 		return sqlite3_column_double(stmt.handle, c.int(i))
 	}
 }
@@ -264,6 +292,7 @@ column_text :: proc(stmt: ^Statement, i: int) -> string {
 	when !SQLITE_AVAILABLE {
 		return ""
 	} else {
+		if stmt == nil || stmt.handle == nil do return ""
 		ptr := sqlite3_column_text(stmt.handle, c.int(i))
 		if ptr == nil do return ""
 		n := int(sqlite3_column_bytes(stmt.handle, c.int(i)))
@@ -276,6 +305,7 @@ column_blob :: proc(stmt: ^Statement, i: int) -> []byte {
 	when !SQLITE_AVAILABLE {
 		return nil
 	} else {
+		if stmt == nil || stmt.handle == nil do return nil
 		ptr := sqlite3_column_blob(stmt.handle, c.int(i))
 		n := int(sqlite3_column_bytes(stmt.handle, c.int(i)))
 		if ptr == nil || n == 0 do return nil
@@ -295,24 +325,28 @@ bind_parameter_count :: proc(stmt: ^Statement) -> int {
 // Bind parameters are 1-based, matching the SQLite C API.
 bind_int :: proc(stmt: ^Statement, index: int, value: i64) {
 	when SQLITE_AVAILABLE {
+		if stmt == nil || stmt.handle == nil do return
 		sqlite3_bind_int64(stmt.handle, c.int(index), value)
 	}
 }
 
 bind_double :: proc(stmt: ^Statement, index: int, value: f64) {
 	when SQLITE_AVAILABLE {
+		if stmt == nil || stmt.handle == nil do return
 		sqlite3_bind_double(stmt.handle, c.int(index), value)
 	}
 }
 
 bind_null :: proc(stmt: ^Statement, index: int) {
 	when SQLITE_AVAILABLE {
+		if stmt == nil || stmt.handle == nil do return
 		sqlite3_bind_null(stmt.handle, c.int(index))
 	}
 }
 
 bind_text :: proc(stmt: ^Statement, index: int, value: string) {
 	when SQLITE_AVAILABLE {
+		if stmt == nil || stmt.handle == nil do return
 		cval := strings.clone_to_cstring(value, context.temp_allocator)
 		sqlite3_bind_text(stmt.handle, c.int(index), cval, c.int(len(value)), sqlite_transient())
 	}
@@ -320,6 +354,7 @@ bind_text :: proc(stmt: ^Statement, index: int, value: string) {
 
 bind_blob :: proc(stmt: ^Statement, index: int, value: []byte) {
 	when SQLITE_AVAILABLE {
+		if stmt == nil || stmt.handle == nil do return
 		ptr := len(value) > 0 ? raw_data(value) : nil
 		sqlite3_bind_blob(stmt.handle, c.int(index), ptr, c.int(len(value)), sqlite_transient())
 	}
@@ -330,7 +365,7 @@ changes :: proc(db: ^Database) -> i64 {
 		return 0
 	} else {
 		if db == nil || db.handle == nil do return 0
-		return i64(sqlite3_changes(db.handle))
+		return sqlite3_changes64(db.handle)
 	}
 }
 
