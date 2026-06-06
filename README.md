@@ -13,10 +13,13 @@ Compatibility targets modern Node.js 22+ behavior rather than legacy Node APIs.
 
 - Odin
 - JavaScriptCore development headers and libraries
+- SQLite development headers and libraries (for `node:sqlite`)
 
-On Linux, the JSC package is exposed through `pkg-config` as `javascriptcoregtk-6.0`.
+On Linux, the JSC package is exposed through `pkg-config` as `javascriptcoregtk-6.0`,
+and SQLite as `sqlite3` (e.g. `apt-get install libjavascriptcoregtk-6.0-dev libsqlite3-dev`).
 
-On macOS, JSC is provided by the `JavaScriptCore` framework.
+On macOS, JSC is provided by the `JavaScriptCore` framework and SQLite by the
+system `libsqlite3`.
 
 ## Build
 
@@ -43,6 +46,7 @@ make check-native
 make test
 make test-node
 make test-sqlite-node
+make test-sqlite-lava
 ```
 
 ## Layout
