@@ -37,11 +37,15 @@ Runtime_State :: struct {
 }
 
 // JS_Callback bridges a JS function into an event-loop Callback. The function
-// is GC-protected for the lifetime of the binding so JavaScriptCore cannot
-// collect it between scheduling and firing.
+// and any trailing timer arguments are GC-protected for the lifetime of the
+// binding so JavaScriptCore cannot collect them between scheduling and firing.
 JS_Callback :: struct {
 	ctx:       jsc.JSContextRef,
 	func:      jsc.JSObjectRef,
+	// Trailing arguments forwarded to the callback on every fire
+	// (setTimeout/Interval(fn, delay, ...args), setImmediate(fn, ...args)).
+	// Owned + GC-protected by this binding; nil when there are none.
+	args:      []jsc.JSValueRef,
 	repeating: bool,
 }
 
@@ -172,13 +176,50 @@ make_js_callback :: proc(
 	ctx: jsc.JSContextRef,
 	fn: jsc.JSObjectRef,
 	repeating: bool,
+	args: []jsc.JSValueRef = nil,
 ) -> ^JS_Callback {
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)fn)
 	cb := new(JS_Callback)
 	cb.ctx = ctx
 	cb.func = fn
+	cb.args = args
 	cb.repeating = repeating
 	return cb
+}
+
+// capture_timer_args clones and GC-protects the trailing timer arguments — every
+// argument at or after `start` (index 2 for setTimeout/setInterval, 1 for
+// setImmediate). The returned slice is owned by the JS_Callback and released by
+// free_js_callback. Returns nil when there are none (or on allocation failure).
+capture_timer_args :: proc(
+	ctx: jsc.JSContextRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	start: int,
+) -> []jsc.JSValueRef {
+	n := int(argument_count) - start
+	if n <= 0 do return nil
+	args, err := make([]jsc.JSValueRef, n)
+	if err != nil do return nil
+	for i in 0 ..< n {
+		v := arguments[start + i]
+		jsc.JSValueProtect(ctx, v)
+		args[i] = v
+	}
+	return args
+}
+
+// free_js_callback releases a binding: it unprotects the function and every
+// forwarded argument, frees the args slice, and frees the binding itself. Called
+// once per binding — by js_callback_trampoline on a one-shot's only fire, or by
+// js_callback_dispose when the loop drops the binding without (re-)firing.
+free_js_callback :: proc(cb: ^JS_Callback) {
+	jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
+	for arg in cb.args {
+		jsc.JSValueUnprotect(cb.ctx, arg)
+	}
+	delete(cb.args)
+	free(cb)
 }
 
 js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
@@ -186,7 +227,14 @@ js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	if cb == nil do return
 
 	exception: jsc.JSValueRef
-	jsc.JSObjectCallAsFunction(cb.ctx, cb.func, nil, 0, nil, &exception)
+	jsc.JSObjectCallAsFunction(
+		cb.ctx,
+		cb.func,
+		nil,
+		c.size_t(len(cb.args)),
+		raw_data(cb.args),
+		&exception,
+	)
 	if exception != nil {
 		report_uncaught(cb.ctx, exception)
 		mark_async_failed(cb.ctx)
@@ -198,8 +246,7 @@ js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	// (the loop's dispose hook) when the interval is cleared, since the
 	// trampoline never runs for a cancelled timer.
 	if !cb.repeating {
-		jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
-		free(cb)
+		free_js_callback(cb)
 	}
 }
 
@@ -212,8 +259,7 @@ js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 js_callback_dispose :: proc(user_data: rawptr) {
 	cb := cast(^JS_Callback)user_data
 	if cb == nil do return
-	jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
-	free(cb)
+	free_js_callback(cb)
 }
 
 report_uncaught :: proc(ctx: jsc.JSContextRef, exception: jsc.JSValueRef) {
@@ -320,7 +366,8 @@ set_timeout_cb :: proc "c" (
 	// I/O (and freezing the virtual clock) while a request is in flight.
 	if !(delay >= 1) do delay = 1
 
-	cb := make_js_callback(ctx, fn, false)
+	// Trailing args (setTimeout(fn, delay, ...args)) are forwarded on fire.
+	cb := make_js_callback(ctx, fn, false, capture_timer_args(ctx, argument_count, arguments, 2))
 	id := eventloop.set_timeout(loop, js_callback_trampoline, u64(delay), cb, js_callback_dispose)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
@@ -345,7 +392,8 @@ set_interval_cb :: proc "c" (
 	// Match Node's 1ms floor (and avoid a 0ms interval starving pending I/O).
 	if !(interval >= 1) do interval = 1
 
-	cb := make_js_callback(ctx, fn, true)
+	// Trailing args (setInterval(fn, delay, ...args)) are forwarded on every fire.
+	cb := make_js_callback(ctx, fn, true, capture_timer_args(ctx, argument_count, arguments, 2))
 	id := eventloop.set_interval(loop, js_callback_trampoline, u64(interval), cb, js_callback_dispose)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
@@ -365,7 +413,8 @@ set_immediate_cb :: proc "c" (
 	fn := callback_arg(ctx, arguments[0])
 	if fn == nil do return jsc.JSValueMakeUndefined(ctx)
 
-	cb := make_js_callback(ctx, fn, false)
+	// Trailing args (setImmediate(fn, ...args)) are forwarded on fire.
+	cb := make_js_callback(ctx, fn, false, capture_timer_args(ctx, argument_count, arguments, 1))
 	id := eventloop.set_immediate(loop, js_callback_trampoline, cb, js_callback_dispose)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
