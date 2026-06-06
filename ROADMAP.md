@@ -134,8 +134,11 @@ implementations — no `primordials`, no `internalBinding` coupling.
       `delimiter`, `parse`, `format`, and the `posix`/`win32` namespaces, ported to
       JS (`js/internal/path.js`) so semantics match Node exactly; the partial native
       implementation was retired. _(case `02`.)_
-- [ ] **More `node:fs`** — `writeFileSync`, `mkdirSync`, `statSync`, `readdirSync`,
-      async variants.
+- [x] **More `node:fs`** — `writeFileSync` (string/Uint8Array), `mkdirSync`
+      (`recursive`), `statSync` (`Stats` with `size`/`*Ms` times + `isFile`/
+      `isDirectory`/`isSymbolicLink`), `readdirSync`, `rmSync` (`recursive`/`force`),
+      and async `writeFile`. _(case `02`.)_ Deferred: async `stat`/`readdir`/`mkdir`,
+      `fs.promises`, file handles, watchers.
 - [ ] **Wire `pkg/std/sqlite`** — currently stubbed
       (`Native_SQLite_Unavailable`).
 

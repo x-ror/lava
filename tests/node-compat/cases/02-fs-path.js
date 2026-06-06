@@ -75,3 +75,51 @@ assert.equal(path.win32.sep, '\\');
 assert.equal(path.posix.win32, path.win32);
 assert.equal(path.win32.posix, path.posix);
 
+// --- expanded node:fs surface (write / mkdir / stat / readdir / rm) ---
+
+// statSync / readdirSync on the existing read-only fixtures.
+const fixturesDir = path.join(__dirname, '..', 'fixtures');
+assert.equal(fs.statSync(fixturePath).isFile(), true);
+assert.equal(fs.statSync(fixturePath).isDirectory(), false);
+assert.equal(fs.statSync(fixturePath).size, 41);
+assert.equal(typeof fs.statSync(fixturePath).mtimeMs, 'number');
+assert.equal(fs.statSync(fixturesDir).isDirectory(), true);
+assert.equal(fs.readdirSync(fixturesDir).includes('hello.txt'), true);
+
+// Writes go to a pid-namespaced scratch dir so the node and lava runs never
+// collide; each run creates it fresh and removes it at the end.
+const scratch = path.join(process.env.TMPDIR || '/tmp', 'lava-fs-compat-' + process.pid);
+fs.rmSync(scratch, {recursive: true, force: true});
+
+// mkdirSync (recursive) then a non-recursive mkdir on an existing dir throws.
+fs.mkdirSync(path.join(scratch, 'nested'), {recursive: true});
+assert.equal(fs.existsSync(path.join(scratch, 'nested')), true);
+assert.throws(() => fs.mkdirSync(scratch), (e) => e.code === 'EEXIST');
+
+// writeFileSync (string and Uint8Array) round-trips through readFileSync.
+const textFile = path.join(scratch, 'note.txt');
+fs.writeFileSync(textFile, 'lava fs');
+assert.equal(fs.readFileSync(textFile, 'utf8'), 'lava fs');
+fs.writeFileSync(path.join(scratch, 'bytes.bin'), new Uint8Array([7, 8, 9]));
+assert.equal(fs.readFileSync(path.join(scratch, 'bytes.bin')).length, 3);
+
+// statSync on the written file; readdirSync lists what was created (sorted).
+assert.equal(fs.statSync(textFile).size, 7);
+assert.deepEqual(fs.readdirSync(scratch).sort(), ['bytes.bin', 'nested', 'note.txt']);
+
+// statSync on a missing path throws ENOENT.
+assert.throws(() => fs.statSync(path.join(scratch, 'nope')), (e) => e.code === 'ENOENT');
+
+// Async writeFile -> readFile round-trip, then recursive cleanup. The sentinel
+// console.log proves the async chain ran (so a silent skip can't pass).
+fs.writeFile(path.join(scratch, 'async.txt'), 'async fs', (writeErr) => {
+	assert.equal(writeErr, null);
+	fs.readFile(path.join(scratch, 'async.txt'), 'utf8', (readErr, contents) => {
+		assert.equal(readErr, null);
+		assert.equal(contents, 'async fs');
+		fs.rmSync(scratch, {recursive: true, force: true});
+		assert.equal(fs.existsSync(scratch), false);
+		console.log('fs-extended-ok');
+	});
+});
+
