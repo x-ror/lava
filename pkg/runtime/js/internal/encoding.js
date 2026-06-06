@@ -1,6 +1,8 @@
 // TextEncoder / TextDecoder (WHATWG Encoding standard), installed as globals.
-// Built on Buffer for utf-8 and utf-16le; windows-1252 (the WHATWG alias for
-// latin1/ascii) uses an explicit high-byte table so it is exact, not approximate.
+// Built on Buffer for utf-8 and utf-16le. The windows-1252 label (which Node
+// also reports for the latin1/ascii aliases) is decoded as a 1:1 byte->code
+// point map: Node's TextDecoder passes the 0x80-0x9F C1 range through unchanged
+// rather than applying the windows-1252 punctuation table, so we match that.
 (function (require, module, exports) {
 	"use strict";
 
@@ -19,12 +21,6 @@
 		"x-cp1252": "windows-1252", "cp819": "windows-1252", "ibm819": "windows-1252", "l1": "windows-1252",
 		"ascii": "windows-1252", "us-ascii": "windows-1252", "ansi_x3.4-1968": "windows-1252",
 	};
-
-	// windows-1252 code points for bytes 0x80-0x9F (others equal the byte value).
-	var WIN1252_HIGH = [
-		8364, 129, 8218, 402, 8222, 8230, 8224, 8225, 710, 8240, 352, 8249, 338, 141, 381, 143,
-		144, 8216, 8217, 8220, 8221, 8226, 8211, 8212, 732, 8482, 353, 8250, 339, 157, 382, 376,
-	];
 
 	function normalizeLabel(label) {
 		return LABELS[String(label === undefined ? "utf-8" : label).trim().toLowerCase()];
@@ -100,8 +96,7 @@
 	function decodeWin1252(bytes) {
 		var out = "";
 		for (var i = 0; i < bytes.length; i++) {
-			var b = bytes[i];
-			out += String.fromCharCode(b >= 0x80 && b <= 0x9f ? WIN1252_HIGH[b - 0x80] : b);
+			out += String.fromCharCode(bytes[i]);
 		}
 		return out;
 	}

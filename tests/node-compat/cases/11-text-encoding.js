@@ -22,11 +22,13 @@ assert.equal(decoder.ignoreBOM, false);
 assert.equal(decoder.decode(new Uint8Array([104, 195, 169])), 'hé');
 assert.equal(new TextDecoder('utf-16le').decode(new Uint8Array([0x68, 0, 0xe9, 0])), 'hé');
 
-// WHATWG aliases latin1/ascii to windows-1252, with the exact high-byte table
+// Node reports the latin1/ascii aliases as windows-1252, but its decoder maps
+// the bytes 1:1 (the 0x80-0x9F C1 range passes through, not the windows-1252
+// punctuation table), so 0x80 stays U+0080 rather than becoming '€'.
 assert.equal(new TextDecoder('latin1').encoding, 'windows-1252');
 assert.equal(new TextDecoder('ascii').encoding, 'windows-1252');
 assert.equal(new TextDecoder('UTF-16LE').encoding, 'utf-16le');
-assert.equal(new TextDecoder('windows-1252').decode(new Uint8Array([0x80, 0xe9])), '€é');
+assert.equal(new TextDecoder('windows-1252').decode(new Uint8Array([0x80, 0xe9])), '\x80é');
 
 // BOM is stripped by default, kept with ignoreBOM
 assert.equal(new TextDecoder().decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])), 'A');
