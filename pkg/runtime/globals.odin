@@ -194,12 +194,26 @@ js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 
 	// Non-repeating callbacks (setTimeout/setImmediate/microtasks) fire once;
 	// release their GC protection and heap binding. Repeating timers keep the
-	// binding alive for the next tick. NOTE: clearInterval leaks the binding —
-	// the loop drops the timer without firing it. Tracked as a follow-up.
+	// binding alive for the next tick — it is released by js_callback_dispose
+	// (the loop's dispose hook) when the interval is cleared, since the
+	// trampoline never runs for a cancelled timer.
 	if !cb.repeating {
 		jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
 		free(cb)
 	}
+}
+
+// js_callback_dispose is the event loop's dispose hook for timer/immediate
+// bindings: it releases a JS_Callback the loop drops without firing (a cleared
+// setTimeout/setImmediate) or after firing without re-arming (a setInterval
+// cleared from within its own callback). It mirrors the trampoline's one-shot
+// cleanup, so a binding is freed exactly once — by the trampoline when it fires
+// for the last time, or here when it is cancelled.
+js_callback_dispose :: proc(user_data: rawptr) {
+	cb := cast(^JS_Callback)user_data
+	if cb == nil do return
+	jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
+	free(cb)
 }
 
 report_uncaught :: proc(ctx: jsc.JSContextRef, exception: jsc.JSValueRef) {
@@ -307,7 +321,7 @@ set_timeout_cb :: proc "c" (
 	if !(delay >= 1) do delay = 1
 
 	cb := make_js_callback(ctx, fn, false)
-	id := eventloop.set_timeout(loop, js_callback_trampoline, u64(delay), cb)
+	id := eventloop.set_timeout(loop, js_callback_trampoline, u64(delay), cb, js_callback_dispose)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
 
@@ -332,7 +346,7 @@ set_interval_cb :: proc "c" (
 	if !(interval >= 1) do interval = 1
 
 	cb := make_js_callback(ctx, fn, true)
-	id := eventloop.set_interval(loop, js_callback_trampoline, u64(interval), cb)
+	id := eventloop.set_interval(loop, js_callback_trampoline, u64(interval), cb, js_callback_dispose)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
 
@@ -352,7 +366,7 @@ set_immediate_cb :: proc "c" (
 	if fn == nil do return jsc.JSValueMakeUndefined(ctx)
 
 	cb := make_js_callback(ctx, fn, false)
-	id := eventloop.set_immediate(loop, js_callback_trampoline, cb)
+	id := eventloop.set_immediate(loop, js_callback_trampoline, cb, js_callback_dispose)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
 

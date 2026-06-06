@@ -3,8 +3,18 @@ package eventloop
 import "core:testing"
 
 Recorder :: struct {
-	events:      [dynamic]int,
-	interval_id: Timer_ID,
+	events:        [dynamic]int,
+	interval_id:   Timer_ID,
+	dispose_count: int,
+}
+
+// count_dispose is a Dispose hook: the loop calls it for a handle it drops
+// without (re-)firing, mirroring how the JS bridge frees a cleared timer's
+// binding. It must run exactly once per cancelled handle and never for one that
+// fired and "freed itself" (a double-free in the real bridge).
+count_dispose :: proc(user_data: rawptr) {
+	rec := cast(^Recorder)user_data
+	rec.dispose_count += 1
 }
 
 record :: proc(loop: ^Loop, user_data: rawptr) {
@@ -236,6 +246,96 @@ cleared_timer_does_not_run :: proc(t: ^testing.T) {
 	testing.expect(t, !clear_timeout(&loop, id))
 	testing.expect(t, !run_until_idle(&loop))
 	testing.expect_value(t, len(rec.events), 0)
+}
+
+// --- Dispose-hook (binding cleanup) regression: clearing a timer/immediate must
+// release its binding exactly once, and a normally-fired one-shot must not be
+// disposed (that path frees its own binding — a double-free in the real bridge).
+
+@(test)
+cleared_timeout_disposes_binding :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	id := set_timeout(&loop, record, 5, &rec, count_dispose)
+	testing.expect(t, clear_timeout(&loop, id))
+	// No other pending work: run_until_idle must not even tick. The binding is
+	// freed eagerly at clear, not lazily on a later tick that may never come.
+	testing.expect(t, !run_until_idle(&loop))
+	testing.expect_value(t, len(rec.events), 0)
+	testing.expect_value(t, rec.dispose_count, 1)
+}
+
+@(test)
+fired_timeout_is_not_disposed :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	set_timeout(&loop, record, 0, &rec, count_dispose)
+	testing.expect(t, run_until_idle(&loop))
+	testing.expect_value(t, len(rec.events), 1)
+	// A one-shot that fired freed itself; the loop must not also dispose it.
+	testing.expect_value(t, rec.dispose_count, 0)
+}
+
+@(test)
+cleared_immediate_disposes_binding :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	id := set_immediate(&loop, record, &rec, count_dispose)
+	testing.expect(t, clear_immediate(&loop, id))
+	testing.expect(t, !run_until_idle(&loop))
+	testing.expect_value(t, len(rec.events), 0)
+	testing.expect_value(t, rec.dispose_count, 1)
+}
+
+@(test)
+cleared_pending_interval_disposes_binding :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	id := set_interval(&loop, record, 5, &rec, count_dispose)
+	// Cleared before it ever fires: its binding must still be released.
+	testing.expect(t, clear_interval(&loop, id))
+	testing.expect(t, !run_until_idle(&loop))
+	testing.expect_value(t, len(rec.events), 0)
+	testing.expect_value(t, rec.dispose_count, 1)
+}
+
+@(test)
+interval_cleared_from_own_callback_disposes_binding :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// Fires twice, then clears itself: it fired (so it was not freed on fire,
+	// unlike a one-shot) and is not re-armed, so it is disposed exactly once.
+	rec.interval_id = set_interval(
+		&loop,
+		record_interval_and_clear_after_two_ticks,
+		5,
+		&rec,
+		count_dispose,
+	)
+	testing.expect(t, run_until_idle(&loop))
+	expect_events(t, rec.events[:], []int{1, 1})
+	testing.expect_value(t, rec.dispose_count, 1)
+	testing.expect_value(t, pending_count(&loop), 0)
 }
 
 @(test)
