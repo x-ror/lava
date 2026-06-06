@@ -3,6 +3,13 @@ package eventloop
 import "core:mem"
 
 Callback :: proc(loop: ^Loop, user_data: rawptr)
+// Dispose releases a handle's user_data when the loop drops it WITHOUT invoking
+// its `callback` — i.e. it was cancelled before firing, or it was a repeating
+// timer cancelled from within its own callback (so it fired but will not be
+// re-armed). The firing path of a one-shot frees its own user_data, so for a
+// given handle dispose and a normal one-shot fire are mutually exclusive; a
+// repeating timer never frees on fire, so dispose is always its release path.
+Dispose :: proc(user_data: rawptr)
 Timer_ID :: u64
 
 Backend :: enum {
@@ -30,6 +37,7 @@ Task :: struct {
 	id:        Timer_ID,
 	callback:  Callback,
 	user_data: rawptr,
+	dispose:   Dispose, // released if the task is cancelled before its callback runs
 	seq:       u64,
 	cancelled: bool,
 }
@@ -38,6 +46,7 @@ Timer :: struct {
 	id:        Timer_ID,
 	callback:  Callback,
 	user_data: rawptr,
+	dispose:   Dispose, // released when the timer is dropped without (re-)firing
 	due_ms:    u64,
 	repeat_ms: u64,
 	repeating: bool,
@@ -204,8 +213,9 @@ set_timeout :: proc(
 	callback: Callback,
 	delay_ms: u64,
 	user_data: rawptr = nil,
+	dispose: Dispose = nil,
 ) -> Timer_ID {
-	return set_timer(loop, callback, delay_ms, 0, false, user_data)
+	return set_timer(loop, callback, delay_ms, 0, false, user_data, dispose)
 }
 
 set_interval :: proc(
@@ -213,18 +223,30 @@ set_interval :: proc(
 	callback: Callback,
 	interval_ms: u64,
 	user_data: rawptr = nil,
+	dispose: Dispose = nil,
 ) -> Timer_ID {
-	return set_timer(loop, callback, interval_ms, interval_ms, true, user_data)
+	return set_timer(loop, callback, interval_ms, interval_ms, true, user_data, dispose)
 }
 
-set_immediate :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) -> Timer_ID {
+set_immediate :: proc(
+	loop: ^Loop,
+	callback: Callback,
+	user_data: rawptr = nil,
+	dispose: Dispose = nil,
+) -> Timer_ID {
 	if callback == nil {
 		return 0
 	}
 	id := next_handle_id(loop)
 	append(
 		&loop.immediates,
-		Task{id = id, callback = callback, user_data = user_data, seq = next_sequence(loop)},
+		Task {
+			id = id,
+			callback = callback,
+			user_data = user_data,
+			dispose = dispose,
+			seq = next_sequence(loop),
+		},
 	)
 	return id
 }
@@ -283,6 +305,7 @@ set_timer :: proc(
 	delay_ms, repeat_ms: u64,
 	repeating: bool,
 	user_data: rawptr = nil,
+	dispose: Dispose = nil,
 ) -> Timer_ID {
 	if callback == nil {
 		return 0
@@ -292,6 +315,7 @@ set_timer :: proc(
 		id        = next_handle_id(loop),
 		callback  = callback,
 		user_data = user_data,
+		dispose   = dispose,
 		due_ms    = loop.now_ms + delay_ms,
 		repeat_ms = repeat_ms,
 		repeating = repeating,
@@ -307,9 +331,17 @@ clear_timeout :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 		return false
 	}
 
+	// A handle still queued here is not the one currently executing (the running
+	// timer/immediate was removed from its slice before its callback ran), so it
+	// will never fire — release its binding now. The struct stays in the slice,
+	// flagged cancelled, for discard_cancelled_* to drop; firing is skipped via
+	// the cancelled flag, so nothing touches the freed user_data. dispose is
+	// nulled so no later path can release it twice.
 	for i in 0 ..< len(loop.timers) {
 		if loop.timers[i].id == id && !loop.timers[i].cancelled {
 			loop.timers[i].cancelled = true
+			run_dispose(loop.timers[i].dispose, loop.timers[i].user_data)
+			loop.timers[i].dispose = nil
 			append_cancel_request(loop, id)
 			return true
 		}
@@ -318,12 +350,17 @@ clear_timeout :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 	for i in 0 ..< len(loop.immediates) {
 		if loop.immediates[i].id == id && !loop.immediates[i].cancelled {
 			loop.immediates[i].cancelled = true
+			run_dispose(loop.immediates[i].dispose, loop.immediates[i].user_data)
+			loop.immediates[i].dispose = nil
 			append_cancel_request(loop, id)
 			return true
 		}
 	}
 
-	// Support cancelling the currently-running callback
+	// Cancelling the currently-running callback (e.g. clearInterval(self)): its
+	// binding cannot be freed mid-call. A one-shot frees itself when the callback
+	// returns; a repeating timer is released in run_once's re-arm branch once it
+	// is decided it will not be re-armed.
 	if loop.running_id == id {
 		append_cancel_request(loop, id)
 		return true
@@ -395,6 +432,12 @@ run_once :: proc(loop: ^Loop) -> bool {
 			timer.due_ms = loop.now_ms + timer.repeat_ms
 			timer.seq = next_sequence(loop)
 			insert_timer(loop, timer)
+		} else if timer.repeating {
+			// Repeating timer cancelled from within its own callback: it already
+			// fired (so, unlike a one-shot, its callback did NOT free the binding)
+			// and is not being re-armed, so release it here. A non-repeating timer
+			// freed its binding when it fired, so it is intentionally not disposed.
+			run_dispose(timer.dispose, timer.user_data)
 		}
 	}
 
@@ -686,6 +729,16 @@ next_timer_due :: proc(loop: ^Loop) -> (u64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// run_dispose invokes a handle's dispose hook (if any) to release its user_data.
+// A timer/immediate only reaches here when it is dropped without firing (or, for
+// a repeating timer, after firing but without re-arming), so dispose runs at most
+// once per handle and never alongside the callback's own one-shot cleanup.
+run_dispose :: proc(dispose: Dispose, user_data: rawptr) {
+	if dispose != nil {
+		dispose(user_data)
+	}
 }
 
 discard_cancelled_timers :: proc(loop: ^Loop) {
