@@ -34,6 +34,12 @@ record_and_schedule_timer :: proc(loop: ^Loop, user_data: rawptr) {
 	set_timeout(loop, record_3, 0, user_data)
 }
 
+record_and_schedule_immediate :: proc(loop: ^Loop, user_data: rawptr) {
+	rec := cast(^Recorder)user_data
+	append(&rec.events, 1)
+	set_immediate(loop, record_2, user_data)
+}
+
 record_interval_and_clear_after_two_ticks :: proc(loop: ^Loop, user_data: rawptr) {
 	rec := cast(^Recorder)user_data
 	append(&rec.events, 1)
@@ -133,6 +139,41 @@ immediates_run_after_due_timers :: proc(t: ^testing.T) {
 
 	testing.expect(t, run_once(&loop))
 	expect_events(t, rec.events[:], []int{1, 2})
+}
+
+@(test)
+io_callbacks_run_before_immediates :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// Even when the immediate is queued first, the poll-phase I/O callback runs
+	// ahead of the check-phase immediate within the same tick.
+	set_immediate(&loop, record_2, &rec)
+	queue_io_callback(&loop, record, &rec)
+
+	testing.expect(t, run_once(&loop))
+	expect_events(t, rec.events[:], []int{1, 2})
+	testing.expect_value(t, pending_count(&loop), 0)
+}
+
+@(test)
+io_callback_scheduling_immediate_runs_in_order :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// Mirrors the 08-io-before-immediate oracle case: an fs.readFile-style poll
+	// completion records, then schedules a setImmediate that records after it.
+	queue_io_callback(&loop, record_and_schedule_immediate, &rec)
+
+	run_until_idle(&loop)
+	expect_events(t, rec.events[:], []int{1, 2})
+	testing.expect_value(t, pending_count(&loop), 0)
 }
 
 @(test)
