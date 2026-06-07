@@ -209,6 +209,37 @@
 		return s;
 	}
 
+	// WHATWG crypto.getRandomValues: fill an integer TypedArray in place with
+	// CSPRNG bytes and return it. Float views and DataView are rejected; the spec
+	// caps a single call at 65536 bytes.
+	function getRandomValues(typedArray) {
+		if (
+			typedArray == null ||
+			typeof typedArray.byteLength !== "number" ||
+			!(typedArray.buffer instanceof ArrayBuffer) ||
+			typedArray instanceof Float32Array ||
+			typedArray instanceof Float64Array ||
+			(typeof DataView !== "undefined" && typedArray instanceof DataView)
+		) {
+			throw new TypeError("The data argument must be an integer-type TypedArray");
+		}
+		if (typedArray.byteLength > 65536) {
+			throw new RangeError(
+				"The ArrayBufferView's byte length (" + typedArray.byteLength +
+					") exceeds the number of bytes of entropy available via this API (65536)"
+			);
+		}
+		if (typedArray.byteLength > 0) {
+			// native.randomFill ignores a view's byteOffset (issue #68), so fill a
+			// fresh offset-0 array and copy in via TypedArray.set (offset-correct in
+			// JS, and platform-independent).
+			var tmp = new Uint8Array(typedArray.byteLength);
+			native.randomFill(tmp);
+			new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength).set(tmp);
+		}
+		return typedArray;
+	}
+
 	// Constant-time comparison: never short-circuits on the first differing byte.
 	function timingSafeEqual(a, b) {
 		var ua = toU8(a), ub = toU8(b);
@@ -386,7 +417,7 @@
 			configurable: true,
 		},
 		getRandomValues: {
-			get: function () { return notImplemented("getRandomValues"); },
+			get: function () { return getRandomValues; },
 			configurable: true,
 		},
 		prng: {
@@ -413,6 +444,16 @@
 			configurable: true,
 		},
 	});
+
+	// WHATWG Web Crypto global. Only the random surface is provided here;
+	// crypto.subtle is a follow-up. Eager-required by loader.js so it is present
+	// without an explicit require.
+	if (typeof globalThis.crypto === "undefined") {
+		globalThis.crypto = {
+			randomUUID: randomUUID,
+			getRandomValues: getRandomValues,
+		};
+	}
 
 	module.exports = exported;
 })
