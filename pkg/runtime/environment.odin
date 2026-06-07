@@ -856,8 +856,12 @@ native_require_cb :: proc "c" (
 		defer delete(data, context.allocator)
 
 		dirname := filepath.dir(resolved)
+		// The wrapper prefix must NOT end with a newline: the module body has to
+		// start on line 1 so JSEvaluateScript (startingLineNumber 1) reports the
+		// user's own source lines in stack traces, not a wrapper-shifted line.
+		// (Matches Node's Module.wrap, whose prefix likewise ends with "{ ".)
 		wrapper_parts := [?]string {
-			"(function(){var module={exports:{},children:[]};var exports=module.exports;(function(exports,require,module,__filename,__dirname){\n",
+			"(function(){var module={exports:{},children:[]};var exports=module.exports;(function(exports,require,module,__filename,__dirname){ ",
 			string(data),
 			"\n})(exports,require,module,",
 			js_quote(resolved),
