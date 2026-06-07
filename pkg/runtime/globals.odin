@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:c"
 import "core:os"
 import "core:strings"
+import "core:time"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 
@@ -550,9 +551,50 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 	install_internal_modules(ctx, global)
 
 	install_process(ctx, global)
+	install_performance(ctx, global)
 	// process.nextTick + queueMicrotask are a JS shim (needs `process` to exist).
 	install_microtasks(ctx, global)
 	install_rejection_tracker(ctx)
+}
+
+// The Performance API clock origin. perf_origin_tick anchors the monotonic
+// high-resolution timer (performance.now); perf_time_origin_ms is the wall-clock
+// Unix epoch at that anchor (performance.timeOrigin), so
+// timeOrigin + now() approximates Date.now(). Captured once per process.
+@(private = "file")
+perf_initialized: bool
+@(private = "file")
+perf_origin_tick: time.Tick
+@(private = "file")
+perf_time_origin_ms: f64
+
+// install_performance installs the `performance` global with a monotonic now()
+// and a timeOrigin, matching the W3C High Resolution Time surface Node exposes.
+install_performance :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
+	if !perf_initialized {
+		perf_origin_tick = time.tick_now()
+		perf_time_origin_ms = f64(time.to_unix_nanoseconds(time.now())) / 1e6
+		perf_initialized = true
+	}
+
+	performance := jsc.JSObjectMake(ctx, nil, nil)
+	inject_native_function(ctx, performance, "now", performance_now_cb)
+	set_named(ctx, performance, "timeOrigin", jsc.JSValueMakeNumber(ctx, perf_time_origin_ms))
+	set_named(ctx, global, "performance", cast(jsc.JSValueRef)performance)
+}
+
+// performance_now_cb returns the high-resolution milliseconds (a fractional
+// double) elapsed on the monotonic clock since the time origin.
+performance_now_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	ms := time.duration_milliseconds(time.tick_since(perf_origin_tick))
+	return jsc.JSValueMakeNumber(ctx, ms)
 }
 
 // install_microtasks evaluates MICROTASK_PRELUDE to a factory and calls it with
