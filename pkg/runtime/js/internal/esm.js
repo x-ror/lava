@@ -235,7 +235,10 @@
 			'"use strict";',
 			bodyStr,
 			tailStr,
-			"})(require, module, exports, " + jsonString(filename) + ", " + jsonString(dirname) +
+			// Bind require to this module's directory so relative specifiers (and any
+			// deferred require) resolve against it, not the entry file's directory.
+			"})(function(s){ return require(s, " + jsonString(dirname) + "); }, module, exports, " +
+				jsonString(filename) + ", " + jsonString(dirname) +
 				", { url: " + jsonString(url) + " });",
 			"return module.exports;",
 			"})()",

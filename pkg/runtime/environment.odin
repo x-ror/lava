@@ -818,7 +818,22 @@ native_require_cb :: proc "c" (
 		return value
 	}
 
-	resolved, resolved_ok := resolve_module_path(ctx, specifier)
+	// Relative specifiers resolve against the requiring module's own directory,
+	// which its bound require passes as args[1] (see the wrapper in the .cjs/.js
+	// and .mjs branches). The entry's global require has no such argument and
+	// falls back to the global __dirname. Because the directory is captured in the
+	// module's require closure — not read from a call stack — a deferred/async
+	// require resolves identically to a synchronous one.
+	base_dir: string
+	base_dir_alloc: bool
+	if len(args) >= 2 && jsc.JSValueIsString(ctx, args[1]) {
+		base_dir, base_dir_alloc = jsc_value_to_string_or_default(ctx, args[1])
+	} else {
+		base_dir, base_dir_alloc = global_dirname(ctx)
+	}
+	defer if base_dir_alloc do delete(base_dir, context.allocator)
+
+	resolved, resolved_ok := resolve_module_path(specifier, base_dir)
 	if !resolved_ok {
 		// Node throws MODULE_NOT_FOUND rather than silently yielding undefined.
 		if exception != nil {
@@ -864,10 +879,6 @@ native_require_cb :: proc "c" (
 		if !wrap_ok do return jsc.JSValueMakeUndefined(ctx)
 		defer delete(wrapped, context.allocator)
 
-		// Resolve this module's relative specifiers against its own directory.
-		push_module_dir(state, filepath.dir(resolved))
-		defer pop_module_dir(state)
-
 		value := eval_source_value(ctx, wrapped, resolved, exception)
 		if exception == nil || exception^ == nil {
 			module_cache_put(ctx, state, resolved, value)
@@ -893,12 +904,17 @@ native_require_cb :: proc "c" (
 		// module body has to start on line 1 so JSEvaluateScript (startingLineNumber
 		// 1) reports the user's own source lines in stack traces, not a
 		// wrapper-shifted line. (Matches Node's Module.wrap, whose prefix ends "{ ".)
+		// The module body receives a `require` bound to this module's directory
+		// (function(s){return require(s, dirname)}) — captured in its closure, so a
+		// deferred/async require resolves against this module's dir, not the entry's.
 		wrapper_parts := [?]string {
 			"(function(){var module={exports:{},children:[]};var exports=module.exports;__lava_precache(",
 			js_quote(resolved),
 			",module.exports);(function(exports,require,module,__filename,__dirname){ ",
 			string(data),
-			"\n})(exports,require,module,",
+			"\n})(exports,function(s){return require(s,",
+			js_quote(dirname),
+			");},module,",
 			js_quote(resolved),
 			",",
 			js_quote(dirname),
@@ -906,11 +922,6 @@ native_require_cb :: proc "c" (
 		}
 		wrapped, wrapped_err := strings.concatenate(wrapper_parts[:], context.temp_allocator)
 		if wrapped_err != nil do return jsc.JSValueMakeUndefined(ctx)
-
-		// Resolve this module's relative specifiers against its own directory.
-		// (`dirname` is a slice of `resolved`; push copies it.)
-		push_module_dir(state, dirname)
-		defer pop_module_dir(state)
 
 		value := eval_source_value(ctx, wrapped, resolved, exception)
 		if exception == nil || exception^ == nil {
@@ -944,7 +955,11 @@ inject_native_function :: proc(
 	jsc.JSObjectSetProperty(ctx, object, js_name, cast(jsc.JSValueRef)fn, {}, nil)
 }
 
-resolve_module_path :: proc(ctx: jsc.JSContextRef, specifier: string) -> (string, bool) {
+// resolve_module_path resolves a relative or absolute `specifier` to a real file
+// path. Relative specifiers resolve against `base_dir` — the requiring module's
+// own directory, supplied by its bound require (see native_require_cb) — so a
+// deferred/async require resolves the same as a synchronous one.
+resolve_module_path :: proc(specifier: string, base_dir: string) -> (string, bool) {
 	is_relative := strings.has_prefix(specifier, "./") || strings.has_prefix(specifier, "../")
 	when ODIN_OS == .Windows {
 		if strings.has_prefix(specifier, ".\\") || strings.has_prefix(specifier, "..\\") {
@@ -959,13 +974,11 @@ resolve_module_path :: proc(ctx: jsc.JSContextRef, specifier: string) -> (string
 	if is_absolute_path(specifier) {
 		candidate, _ = strings.clone(specifier, context.allocator)
 	} else {
-		base_dir := current_dirname(ctx)
-		base_dir_allocated := len(base_dir) > 0
-		defer if base_dir_allocated do delete(base_dir, context.allocator)
-		if len(base_dir) == 0 {
-			base_dir = "."
+		dir := base_dir
+		if len(dir) == 0 {
+			dir = "."
 		}
-		parts := [?]string{base_dir, specifier}
+		parts := [?]string{dir, specifier}
 		joined, join_err := filepath.join(parts[:], context.temp_allocator)
 		if join_err != nil do return "", false
 		// filepath.abs canonicalizes via the OS (realpath) and returns "" for a
@@ -1004,26 +1017,17 @@ module_file_exists :: proc(path: string) -> bool {
 	return os.exists(path)
 }
 
-current_dirname :: proc(ctx: jsc.JSContextRef) -> string {
-	// A module evaluated under native_require_cb resolves its relative specifiers
-	// against its own directory (tracked on the module-dir stack). Only the entry
-	// file, which runs with the stack empty, falls back to the global __dirname.
-	if state := get_state_from_ctx(ctx); state != nil {
-		if dir, ok := current_module_dir(state); ok {
-			cloned, clone_err := strings.clone(dir, context.allocator)
-			if clone_err != nil do return ""
-			return cloned
-		}
-	}
-
+// global_dirname reads the global __dirname (the entry file's directory). It is
+// the resolution base for the entry's own require; required modules instead pass
+// their own directory via their bound require (see native_require_cb). Returns
+// (dir, allocated) — the caller frees `dir` when allocated.
+global_dirname :: proc(ctx: jsc.JSContextRef) -> (string, bool) {
 	global_obj := jsc.JSContextGetGlobalObject(ctx)
 	key := jsc.JSStringCreateWithUTF8CString("__dirname")
 	defer jsc.JSStringRelease(key)
 
 	value := jsc.JSObjectGetProperty(ctx, global_obj, key, nil)
-	result, allocated := jsc_value_to_string_or_default(ctx, value)
-	if !allocated do return ""
-	return result
+	return jsc_value_to_string_or_default(ctx, value)
 }
 
 eval_source_value :: proc(
