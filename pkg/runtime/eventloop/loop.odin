@@ -636,6 +636,19 @@ run_until_idle :: proc(loop: ^Loop, max_iterations := 1024) -> bool {
 	return did_work
 }
 
+// run drives the loop to completion with no iteration ceiling — the runtime's
+// entry point. It runs until the loop is genuinely idle (no pending work) or a
+// tick makes no progress, so a long-running program is not truncated and an
+// unbounded interval keeps running, matching Node. (run_until_idle keeps its
+// bounded form for deterministic tests.)
+run :: proc(loop: ^Loop) {
+	for has_pending_work(loop) {
+		if !run_next(loop) {
+			return
+		}
+	}
+}
+
 // get_next_timer_timeout returns milliseconds until the next timer fires.
 // Returns 0 if a timer is already due, -1 if there are no timers.
 get_next_timer_timeout :: proc(loop: ^Loop) -> int {

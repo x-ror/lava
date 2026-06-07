@@ -161,7 +161,7 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 	}
 
 	if loop != nil {
-		eventloop.run_until_idle(loop)
+		eventloop.run(loop)
 	}
 
 	exit_code := resolve_exit_code(cast(jsc.JSContextRef)ctx, state)
