@@ -1,6 +1,7 @@
 package eventloop
 
 import "core:mem"
+import "core:time"
 
 Callback :: proc(loop: ^Loop, user_data: rawptr)
 // Dispose releases a handle's user_data when the loop drops it WITHOUT invoking
@@ -72,6 +73,11 @@ Loop :: struct {
 	io_events:       u64, // bumped by platform_poll each time a watcher callback fires
 	allocator:       mem.Allocator,
 	platform:        Platform_Loop,
+	// When set (the lava runtime), now_ms tracks the monotonic wall clock so
+	// timer deadlines elapse in real time. When unset (deterministic Odin tests),
+	// now_ms is a logical clock advanced explicitly via the run drivers.
+	real_time:       bool,
+	start_tick:      time.Tick, // monotonic origin for real_time mode
 }
 
 Poll_Mode :: enum {
@@ -87,12 +93,20 @@ IO_Watcher :: struct {
 	user_data: rawptr,
 }
 
-init :: proc(allocator := context.allocator) -> Loop {
+// init creates a loop. Pass real_time=true (the lava runtime) to have timer
+// deadlines elapse against the monotonic wall clock; leave it false (the default,
+// used by deterministic tests) to drive a logical clock via run_next/advance_time.
+init :: proc(allocator := context.allocator, real_time := false) -> Loop {
 	loop := Loop {
 		backend       = .Unavailable,
 		next_timer_id = 1,
 		allocator     = allocator,
 		cancelled_ids = make(map[Timer_ID]bool, 16, allocator),
+		real_time     = real_time,
+	}
+
+	if real_time {
+		loop.start_tick = time.tick_now()
 	}
 
 	if platform_init(&loop) {
@@ -100,6 +114,22 @@ init :: proc(allocator := context.allocator) -> Loop {
 	}
 
 	return loop
+}
+
+// real_now_ms returns milliseconds elapsed on the monotonic clock since the loop
+// started. Only meaningful in real_time mode.
+real_now_ms :: proc(loop: ^Loop) -> u64 {
+	elapsed := time.duration_milliseconds(time.tick_since(loop.start_tick))
+	if elapsed < 0 do return 0
+	return u64(elapsed)
+}
+
+// sync_real_clock advances now_ms to the monotonic wall clock in real_time mode.
+// A no-op otherwise, so deterministic tests keep their explicit logical clock.
+sync_real_clock :: proc(loop: ^Loop) {
+	if loop.real_time {
+		loop.now_ms = real_now_ms(loop)
+	}
 }
 
 destroy :: proc(loop: ^Loop) {
@@ -311,6 +341,10 @@ set_timer :: proc(
 		return 0
 	}
 
+	// Anchor the deadline to the real clock in real_time mode so the delay is
+	// measured from when the timer is scheduled, not from the loop's last tick.
+	sync_real_clock(loop)
+
 	timer := Timer {
 		id        = next_handle_id(loop),
 		callback  = callback,
@@ -401,6 +435,10 @@ drain_microtasks :: proc(loop: ^Loop) {
 run_once :: proc(loop: ^Loop) -> bool {
 	did_work := false
 
+	// Sample the real clock first so the timer phase fires every timer whose
+	// deadline has actually elapsed (no-op in virtual-clock mode).
+	sync_real_clock(loop)
+
 	// Phase 1 & 2: next_tick + microtasks (before anything else)
 	if len(loop.next_ticks) > 0 || len(loop.microtasks) > 0 {
 		did_work = true
@@ -486,11 +524,15 @@ run_once :: proc(loop: ^Loop) -> bool {
 				// driver does not treat an I/O-only tick as "nothing happened".
 				did_work = true
 			} else if timeout_ms > 0 {
-				// Woke on the timer deadline with no fd ready: advance the virtual
-				// clock so the now-due timer fires next tick. Without this, a timer
-				// co-pending with in-flight I/O would be dropped and the loop would
-				// exit early. (timeout_ms < 0 is a pure-I/O wait — never advance.)
-				advance_time(loop, u64(timeout_ms))
+				// Woke on the timer deadline with no fd ready: the now-due timer
+				// fires on the next tick. In real_time mode the next run_once
+				// re-samples the monotonic clock; in virtual mode we advance the
+				// logical clock by the slept interval so the timer is not dropped
+				// (a timer co-pending with in-flight I/O would otherwise be lost
+				// and the loop would exit early). timeout_ms < 0 is a pure-I/O wait.
+				if !loop.real_time {
+					advance_time(loop, u64(timeout_ms))
+				}
 				did_work = true
 			}
 		}
@@ -564,6 +606,13 @@ run_next :: proc(loop: ^Loop) -> bool {
 	next_due, ok := next_timer_due(loop)
 	if !ok {
 		return false
+	}
+
+	// Real_time mode: don't fast-forward. run_once samples the monotonic clock
+	// and, if the deadline is still in the future, blocks in the poll phase until
+	// it elapses — so the timer fires in real wall-clock time.
+	if loop.real_time {
+		return run_once(loop)
 	}
 
 	loop.now_ms = next_due
