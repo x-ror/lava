@@ -34,13 +34,14 @@
 	}
 
 	// Eagerly instantiate modules that install globals (Buffer; fetch/Response/
-	// Headers/Request), so they are present even when user code never requires
-	// them explicitly.
+	// Headers/Request; crypto's WHATWG global), so they are present even when user
+	// code never requires them explicitly.
 	req("buffer");
 	req("fetch");
 	req("abort");
 	req("encoding");
 	req("structured_clone");
+	req("crypto");
 
 	return req;
 })
