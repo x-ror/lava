@@ -52,7 +52,7 @@ eval_command :: proc(args: []string) {
 		os.exit(2)
 	}
 
-	loop := eventloop.init()
+	loop := eventloop.init(real_time = true)
 	result := lava_runtime.eval(args[0], "<eval>", &loop, true)
 	print_result(result)
 	exit_code := result.exit_code
@@ -66,7 +66,7 @@ run_command :: proc(args: []string) {
 		os.exit(2)
 	}
 
-	loop := eventloop.init()
+	loop := eventloop.init(real_time = true)
 	result := lava_runtime.run_file(args[0], &loop)
 	print_result(result)
 	exit_code := result.exit_code
