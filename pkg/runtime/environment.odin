@@ -41,6 +41,11 @@ setup_module_environment :: proc(ctx: jsc.JSContextRef, file_path: string, loop:
 	// Виправлено: явне приведення типов cast(jsc.JSValueRef)
 	jsc.JSObjectSetProperty(ctx, global_obj, req_name, cast(jsc.JSValueRef)req_func, {}, nil)
 
+	// Internal bridge the CommonJS wrapper calls to register an in-progress
+	// module's exports before its body runs (see native_require_cb), so a
+	// circular require resolves to the partial exports instead of recursing.
+	inject_native_function(ctx, global_obj, "__lava_precache", module_precache_cb)
+
 	// 4. Створюємо та інжектуємо об'єкт module та module.children
 	module_obj := jsc.JSObjectMake(ctx, nil, nil)
 	children_arr := jsc.JSObjectMake(ctx, nil, nil)
@@ -733,6 +738,31 @@ noop_cb :: proc "c" (
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
+// module_precache_cb implements the global __lava_precache(resolvedPath, exports)
+// the CommonJS wrapper invokes before running a module body. It registers the
+// module's (initially empty) exports in the cache so a require() cycle that
+// re-enters this module gets the partial exports instead of recursing forever.
+// native_require_cb overwrites the entry with the final exports after the body
+// runs (handling module.exports reassignment).
+module_precache_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 2 do return jsc.JSValueMakeUndefined(ctx)
+	state := get_state_from_ctx(ctx)
+	if state == nil do return jsc.JSValueMakeUndefined(ctx)
+	path, allocated := jsc_value_to_string_or_default(ctx, arguments[0])
+	defer if allocated do delete(path, context.allocator)
+	if !allocated do return jsc.JSValueMakeUndefined(ctx)
+	module_cache_set(ctx, state, path, arguments[1])
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
 native_require_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -856,12 +886,17 @@ native_require_cb :: proc "c" (
 		defer delete(data, context.allocator)
 
 		dirname := filepath.dir(resolved)
-		// The wrapper prefix must NOT end with a newline: the module body has to
-		// start on line 1 so JSEvaluateScript (startingLineNumber 1) reports the
-		// user's own source lines in stack traces, not a wrapper-shifted line.
-		// (Matches Node's Module.wrap, whose prefix likewise ends with "{ ".)
+		// __lava_precache registers this module's exports in the cache BEFORE the
+		// body runs, so a circular require() that re-enters this module gets the
+		// partial exports instead of recursing forever (then we overwrite with the
+		// final exports below). The wrapper prefix must NOT end with a newline: the
+		// module body has to start on line 1 so JSEvaluateScript (startingLineNumber
+		// 1) reports the user's own source lines in stack traces, not a
+		// wrapper-shifted line. (Matches Node's Module.wrap, whose prefix ends "{ ".)
 		wrapper_parts := [?]string {
-			"(function(){var module={exports:{},children:[]};var exports=module.exports;(function(exports,require,module,__filename,__dirname){ ",
+			"(function(){var module={exports:{},children:[]};var exports=module.exports;__lava_precache(",
+			js_quote(resolved),
+			",module.exports);(function(exports,require,module,__filename,__dirname){ ",
 			string(data),
 			"\n})(exports,require,module,",
 			js_quote(resolved),
@@ -879,7 +914,13 @@ native_require_cb :: proc "c" (
 
 		value := eval_source_value(ctx, wrapped, resolved, exception)
 		if exception == nil || exception^ == nil {
-			module_cache_put(ctx, state, resolved, value)
+			// Overwrite the pre-registered partial entry with the final exports
+			// (the body may have reassigned module.exports).
+			module_cache_set(ctx, state, resolved, value)
+		} else {
+			// Module threw while loading: drop the partial so a later require
+			// re-loads it rather than getting half-initialised exports.
+			module_cache_remove(ctx, state, resolved)
 		}
 		return value
 	}
