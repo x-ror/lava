@@ -142,6 +142,52 @@ module_cache_put :: proc(
 	state.module_cache[cloned] = value
 }
 
+// module_cache_set inserts or replaces the cached exports for `key`. The
+// CommonJS loader uses it to pre-register an in-progress module before
+// evaluating its body (so a re-entrant/circular require returns the partial
+// exports) and again afterwards to store the final exports (the body may have
+// reassigned module.exports). Replacing re-points GC protection to the new value.
+module_cache_set :: proc(
+	ctx: jsc.JSContextRef,
+	state: ^Runtime_State,
+	key: string,
+	value: jsc.JSValueRef,
+) {
+	if state == nil do return
+	if existing, ok := state.module_cache[key]; ok {
+		if existing == value do return
+		jsc.JSValueProtect(ctx, value) // protect new before unprotecting old
+		jsc.JSValueUnprotect(ctx, existing)
+		state.module_cache[key] = value // reuse the existing (owned) key string
+		return
+	}
+	cloned, err := strings.clone(key)
+	if err != nil do return
+	jsc.JSValueProtect(ctx, value)
+	state.module_cache[cloned] = value
+}
+
+// module_cache_remove drops a cached entry, unprotecting its value and freeing
+// the owned key string. Used when a module throws while loading so a failed
+// module is not left cached as partial exports (matching Node, which re-loads).
+module_cache_remove :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State, key: string) {
+	if state == nil do return
+	value, ok := state.module_cache[key]
+	if !ok do return
+	jsc.JSValueUnprotect(ctx, value)
+	// The stored key is a clone we own; capture it so we can free it after the
+	// entry is removed (Odin maps do not free string-key backing memory).
+	stored_key: string
+	for k in state.module_cache {
+		if k == key {
+			stored_key = k
+			break
+		}
+	}
+	delete_key(&state.module_cache, key)
+	if len(stored_key) > 0 do delete(stored_key)
+}
+
 // --- Module resolution base-directory stack ---
 //
 // push_module_dir stores an independent copy of `dir` (callers typically pass a
