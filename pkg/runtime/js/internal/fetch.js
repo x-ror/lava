@@ -7,14 +7,26 @@
 (function (require, module, exports, native) {
 	"use strict";
 
-	// Shared, hoisted codecs. TextEncoder.encode / TextDecoder.decode (non-
-	// streaming) are stateless across calls, so a single instance each is reused
-	// across every body conversion instead of allocating one per call — the
-	// previous per-call `new TextEncoder()/new TextDecoder()` sat on the hot path
-	// (every Request/Response body, every .text()/.json()). Null when the global
-	// is unavailable, in which case the latin1 fallbacks below take over.
-	var sharedEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
-	var sharedDecoder = typeof TextDecoder !== "undefined" ? new TextDecoder() : null;
+	// Shared, lazily-created codecs. TextEncoder.encode / TextDecoder.decode
+	// (non-streaming) are stateless across calls, so a single instance each is
+	// reused across every body conversion instead of allocating one per call —
+	// the previous per-call `new TextEncoder()/new TextDecoder()` sat on the hot
+	// path (every Request/Response body, every .text()/.json()). They are created
+	// on first use rather than at load time: loader.js may eager-require this
+	// module before encoding.js installs the TextEncoder/TextDecoder globals, so
+	// capturing them at load time would cache null and silently fall back to a
+	// (wrong) latin1 round-trip (issue #43). getEncoder/getDecoder return null
+	// only if the global never appears, in which case the latin1 fallbacks apply.
+	var sharedEncoder = null;
+	var sharedDecoder = null;
+	function getEncoder() {
+		if (sharedEncoder === null && typeof TextEncoder !== "undefined") sharedEncoder = new TextEncoder();
+		return sharedEncoder;
+	}
+	function getDecoder() {
+		if (sharedDecoder === null && typeof TextDecoder !== "undefined") sharedDecoder = new TextDecoder();
+		return sharedDecoder;
+	}
 
 	function normalizeName(name) {
 		return String(name).toLowerCase();
@@ -118,7 +130,8 @@
 		// An empty string (passed directly or produced by String(body)) has no
 		// bytes — treat it as an absent body.
 		if (text === "") return null;
-		if (sharedEncoder) return sharedEncoder.encode(text);
+		var encoder = getEncoder();
+		if (encoder) return encoder.encode(text);
 		var bytes = new Uint8Array(text.length);
 		for (var i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
 		return bytes;
@@ -128,7 +141,8 @@
 	// fallback keeps things working if TextDecoder is somehow unavailable).
 	function bytesToText(bytes) {
 		if (bytes === null) return "";
-		if (sharedDecoder) return sharedDecoder.decode(bytes);
+		var decoder = getDecoder();
+		if (decoder) return decoder.decode(bytes);
 		var s = "";
 		for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
 		return s;
