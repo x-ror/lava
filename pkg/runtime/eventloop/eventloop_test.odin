@@ -1,6 +1,8 @@
 package eventloop
 
 import "core:testing"
+import "core:thread"
+import "core:time"
 
 Recorder :: struct {
 	events:        [dynamic]int,
@@ -468,4 +470,31 @@ microtasks_drain_between_immediate_callbacks :: proc(t: ^testing.T) {
 	testing.expect(t, run_once(&loop))
 	// immediate(1) fires → queues microtask(2); microtask(2) drains; then immediate(3)
 	expect_events(t, rec.events[:], []int{1, 2, 3})
+}
+
+// --- Cross-thread wakeup ---
+// wakeup() must unblock a loop parked in platform_poll from another thread. This
+// is the primitive every background-worker feature (async DNS, thread-pool
+// offload) relies on; it regressed silently before #74 because nothing exercised
+// it (a worker would write the wakeup fd but the poll never woke).
+
+wakeup_worker :: proc(data: rawptr) {
+	loop := cast(^Loop)data
+	// Give the main thread time to reach the blocking poll, then wake it.
+	time.sleep(50 * time.Millisecond)
+	wakeup(loop)
+}
+
+@(test)
+wakeup_unblocks_blocking_poll :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	thread.create_and_start_with_data(&loop, wakeup_worker, context, .Normal, true)
+
+	// Blocks until the worker calls wakeup(); reaching the next line proves the
+	// cross-thread wakeup woke the poll. (A regression hangs here — by design,
+	// since the whole point is that the poll must be wakeable.)
+	platform_poll(&loop, -1)
+	testing.expect(t, true)
 }

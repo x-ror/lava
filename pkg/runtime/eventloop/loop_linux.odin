@@ -1,19 +1,21 @@
 #+build linux
 package eventloop
 
-import "core:mem"
 import "core:sys/linux"
 import "core:sys/linux/uring"
 
 URING_TIMEOUT_USER_DATA :: u64(0)
-URING_EVENTFD_USER_DATA :: u64(1)
+URING_WAKEUP_USER_DATA :: u64(1)
 
 Platform_Loop :: struct {
-	use_uring: bool,
-	ring:      uring.Ring,
-	cqes:      [32]linux.IO_Uring_CQE,
-	epoll_fd:  linux.Fd,
-	event_fd:  linux.Fd,
+	use_uring:   bool,
+	ring:        uring.Ring,
+	cqes:        [32]linux.IO_Uring_CQE,
+	epoll_fd:    linux.Fd,
+	// Self-pipe used by wakeup() to kick the loop out of poll from another thread.
+	// A pipe (not an eventfd): io_uring POLL_ADD reliably completes on a pipe fd
+	// but not on an eventfd in our kernels (#74). [0] = read end, [1] = write end.
+	wakeup_pipe: [2]linux.Fd,
 }
 
 platform_name :: proc(loop: ^Loop) -> string {
@@ -25,32 +27,34 @@ platform_name :: proc(loop: ^Loop) -> string {
 
 platform_init :: proc(loop: ^Loop) -> bool {
 	loop.platform.epoll_fd = -1
-	loop.platform.event_fd = -1
+	loop.platform.wakeup_pipe = {-1, -1}
 
-	evt_fd, evt_err := linux.eventfd(0, {.CLOEXEC, .NONBLOCK})
-	if evt_err != nil do return false
-	loop.platform.event_fd = evt_fd
+	if pipe_err := linux.pipe2(&loop.platform.wakeup_pipe, {.CLOEXEC, .NONBLOCK});
+	   pipe_err != nil {
+		return false
+	}
 
 	params := uring.DEFAULT_PARAMS
 	uring_err := uring.init(&loop.platform.ring, &params, 256)
 	if uring_err == nil {
 		loop.platform.use_uring = true
 
-		arm_uring_poll(loop, u64(loop.platform.event_fd), URING_EVENTFD_USER_DATA, {.IN})
+		arm_uring_poll(loop, u64(loop.platform.wakeup_pipe[0]), URING_WAKEUP_USER_DATA, {.IN})
 		return true
 	}
 
 	fd, err := linux.epoll_create1({.FDCLOEXEC})
 	if err != nil {
-		linux.close(loop.platform.event_fd)
+		linux.close(loop.platform.wakeup_pipe[0])
+		linux.close(loop.platform.wakeup_pipe[1])
 		return false
 	}
 	loop.platform.epoll_fd = fd
 
 	ev: linux.EPoll_Event
 	ev.events = {.IN}
-	ev.data.fd = loop.platform.event_fd // Виправлено: обидва поля мають тип linux.Fd
-	linux.epoll_ctl(loop.platform.epoll_fd, .ADD, loop.platform.event_fd, &ev)
+	ev.data.fd = loop.platform.wakeup_pipe[0]
+	linux.epoll_ctl(loop.platform.epoll_fd, .ADD, loop.platform.wakeup_pipe[0], &ev)
 
 	return true
 }
@@ -66,16 +70,32 @@ platform_destroy :: proc(loop: ^Loop) {
 		loop.platform.epoll_fd = -1
 	}
 
-	if loop.platform.event_fd >= 0 {
-		linux.close(loop.platform.event_fd)
-		loop.platform.event_fd = -1
+	if loop.platform.wakeup_pipe[0] >= 0 {
+		linux.close(loop.platform.wakeup_pipe[0])
+		loop.platform.wakeup_pipe[0] = -1
+	}
+	if loop.platform.wakeup_pipe[1] >= 0 {
+		linux.close(loop.platform.wakeup_pipe[1])
+		loop.platform.wakeup_pipe[1] = -1
 	}
 }
 
 platform_wakeup :: proc(loop: ^Loop) {
-	val: u64 = 1
-	buf := mem.ptr_to_bytes(&val, size_of(val))
-	linux.write(loop.platform.event_fd, buf)
+	// One byte is enough to make the read end readable; coalesced wakeups are
+	// drained together. Called from any thread (write() is async-signal-safe and
+	// thread-safe); EAGAIN on a full pipe is fine — a wakeup is already pending.
+	b := [1]u8{1}
+	linux.write(loop.platform.wakeup_pipe[1], b[:])
+}
+
+// drain_wakeup empties the wakeup pipe's read end so it is not perpetually
+// readable (which would busy-spin the poll). The bytes carry no information.
+drain_wakeup :: proc(loop: ^Loop) {
+	buf: [64]u8
+	for {
+		n, err := linux.read(loop.platform.wakeup_pipe[0], buf[:])
+		if err != nil || n <= 0 do break
+	}
 }
 
 platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
@@ -144,10 +164,8 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 	for i in 0 ..< n {
 		ev := events[i]
 
-		if ev.data.fd == loop.platform.event_fd {
-			val: u64
-			buf := mem.ptr_to_bytes(&val, size_of(val))
-			linux.read(loop.platform.event_fd, buf)
+		if ev.data.fd == loop.platform.wakeup_pipe[0] {
+			drain_wakeup(loop)
 			continue
 		}
 
@@ -195,12 +213,10 @@ drain_uring_completions :: proc(loop: ^Loop) {
 				continue
 			}
 
-			if cqe.user_data == URING_EVENTFD_USER_DATA {
-				val: u64
-				buf := mem.ptr_to_bytes(&val, size_of(val))
-				linux.read(loop.platform.event_fd, buf)
-				// Перевикликаємо poll для eventfd на наступну ітерацію лупу
-				arm_uring_poll(loop, u64(loop.platform.event_fd), URING_EVENTFD_USER_DATA, {.IN})
+			if cqe.user_data == URING_WAKEUP_USER_DATA {
+				drain_wakeup(loop)
+				// Re-arm the one-shot poll on the wakeup pipe for the next wakeup.
+				arm_uring_poll(loop, u64(loop.platform.wakeup_pipe[0]), URING_WAKEUP_USER_DATA, {.IN})
 				continue
 			}
 
