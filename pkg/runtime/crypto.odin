@@ -103,14 +103,24 @@ crypto_algorithm :: proc(name: string) -> (hash.Algorithm, bool) {
 // Odin byte slice. The slice aliases JavaScriptCore-owned memory: valid only
 // for the duration of the native call, never stored or freed. A zero-length
 // array yields an empty slice (ok=true).
+//
+// The data start is computed as the ArrayBuffer's base pointer plus the view's
+// byteOffset rather than JSObjectGetTypedArrayBytesPtr, which on javascriptcoregtk
+// returns the buffer base and ignores the offset (so an offset view — e.g.
+// `buffer.subarray(8)` — was read/written at the wrong position; see issue #68).
+// base + byteOffset is correct regardless of whether a given JSC applies the
+// offset to BytesPtr, so this stays right across backends.
 typed_array_view :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> ([]byte, bool) {
 	if jsc.JSValueGetTypedArrayType(ctx, value, nil) == .None do return nil, false
 	obj := cast(jsc.JSObjectRef)value
 	n := int(jsc.JSObjectGetTypedArrayByteLength(ctx, obj, nil))
 	if n == 0 do return nil, true
-	ptr := jsc.JSObjectGetTypedArrayBytesPtr(ctx, obj, nil)
-	if ptr == nil do return nil, false
-	return (cast([^]byte)ptr)[:n], true
+	buffer := jsc.JSObjectGetTypedArrayBuffer(ctx, obj, nil)
+	if buffer == nil do return nil, false
+	base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, buffer, nil)
+	if base == nil do return nil, false
+	offset := int(jsc.JSObjectGetTypedArrayByteOffset(ctx, obj, nil))
+	return (cast([^]byte)base)[offset:][:n], true
 }
 
 // make_uint8_array hands a heap-allocated (context.allocator) byte slice to

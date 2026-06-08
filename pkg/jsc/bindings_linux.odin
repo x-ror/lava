@@ -84,6 +84,7 @@ foreign jsc_lib {
 	JSObjectGetTypedArrayBytesPtr :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---
 	JSObjectGetTypedArrayByteLength :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
 	JSObjectGetTypedArrayByteOffset :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
+	JSObjectGetTypedArrayBuffer :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> JSObjectRef ---
 
 	JSObjectMakeArrayBufferWithBytesNoCopy :: proc(ctx: JSContextRef, bytes: rawptr, byte_length: c.size_t, byte_deallocator: proc "c" (bytes: rawptr, deallocator_context: rawptr), deallocator_context: rawptr, exception: ^JSValueRef) -> JSObjectRef ---
 	JSObjectGetArrayBufferBytesPtr :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---

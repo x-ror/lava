@@ -230,12 +230,9 @@
 			);
 		}
 		if (typedArray.byteLength > 0) {
-			// native.randomFill ignores a view's byteOffset (issue #68), so fill a
-			// fresh offset-0 array and copy in via TypedArray.set (offset-correct in
-			// JS, and platform-independent).
-			var tmp = new Uint8Array(typedArray.byteLength);
-			native.randomFill(tmp);
-			new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength).set(tmp);
+			native.randomFill(
+				new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength)
+			);
 		}
 		return typedArray;
 	}
