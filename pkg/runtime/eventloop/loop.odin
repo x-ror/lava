@@ -1,6 +1,7 @@
 package eventloop
 
 import "core:mem"
+import "core:sync"
 import "core:time"
 
 Callback :: proc(loop: ^Loop, user_data: rawptr)
@@ -78,6 +79,15 @@ Loop :: struct {
 	// now_ms is a logical clock advanced explicitly via the run drivers.
 	real_time:       bool,
 	start_tick:      time.Tick, // monotonic origin for real_time mode
+	// Cross-thread completion handoff (like libuv's uv_async). A background worker
+	// (e.g. async DNS) runs off the loop, then post_async enqueues a completion
+	// callback under async_mutex and wakes the loop; the loop drains async_queue on
+	// its own thread. active_async (loop-thread only) counts in-flight off-loop ops
+	// so the loop stays alive and blocks in poll until they complete.
+	async_queue:     [dynamic]Task,
+	async_scratch:   [dynamic]Task, // swapped with async_queue under the lock to drain
+	async_mutex:     sync.Mutex,
+	active_async:    int,
 }
 
 Poll_Mode :: enum {
@@ -141,7 +151,52 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.close_callbacks)
 	delete(loop.timers)
 	delete(loop.cancelled_ids)
+	delete(loop.async_queue)
+	delete(loop.async_scratch)
 	loop^ = Loop{}
+}
+
+// --- Cross-thread async completion handoff ---
+//
+// async_begin marks one off-loop operation in flight. Called on the loop thread
+// before dispatching a background worker, it keeps the loop alive and makes the
+// poll phase block until the worker completes.
+async_begin :: proc(loop: ^Loop) {
+	loop.active_async += 1
+}
+
+// post_async delivers a completion callback from ANY thread: it enqueues the
+// callback under async_mutex and wakes the loop, which runs it on the loop thread
+// in the next tick (see drain_async) and decrements the in-flight count there. The
+// worker must finish writing any result the callback reads before calling this —
+// the lock/unlock publishes those writes.
+post_async :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) {
+	if callback == nil do return
+	sync.lock(&loop.async_mutex)
+	append(&loop.async_queue, Task{callback = callback, user_data = user_data})
+	sync.unlock(&loop.async_mutex)
+	wakeup(loop)
+}
+
+// drain_async runs queued completions on the loop thread, decrementing the
+// in-flight count per completion. Returns true if any ran.
+drain_async :: proc(loop: ^Loop) -> bool {
+	sync.lock(&loop.async_mutex)
+	if len(loop.async_queue) == 0 {
+		sync.unlock(&loop.async_mutex)
+		return false
+	}
+	// Swap producer queue with the scratch buffer (O(1)) so callbacks — which may
+	// post more async work — run without holding the lock.
+	loop.async_queue, loop.async_scratch = loop.async_scratch, loop.async_queue
+	sync.unlock(&loop.async_mutex)
+
+	for task in loop.async_scratch {
+		loop.active_async = max(0, loop.active_async - 1)
+		task.callback(loop, task.user_data)
+	}
+	clear(&loop.async_scratch)
+	return true
 }
 
 backend_name :: proc(loop: ^Loop) -> string {
@@ -168,7 +223,8 @@ pending_count :: proc(loop: ^Loop) -> int {
 		active_io_callback_count(loop) +
 		active_close_count(loop) +
 		active_timer_count(loop) +
-		loop.active_io_count \
+		loop.active_io_count +
+		loop.active_async \
 	)
 }
 
@@ -439,6 +495,12 @@ run_once :: proc(loop: ^Loop) -> bool {
 	// deadline has actually elapsed (no-op in virtual-clock mode).
 	sync_real_clock(loop)
 
+	// Cross-thread completions (e.g. async DNS) posted by worker threads run first
+	// so the work they unblock proceeds this tick.
+	if drain_async(loop) {
+		did_work = true
+	}
+
 	// Phase 1 & 2: next_tick + microtasks (before anything else)
 	if len(loop.next_ticks) > 0 || len(loop.microtasks) > 0 {
 		did_work = true
@@ -516,7 +578,7 @@ run_once :: proc(loop: ^Loop) -> bool {
 		timeout_ms := get_next_timer_timeout(loop)
 		// With no timers but pending I/O, block indefinitely until an fd is ready
 		// rather than spinning (get_next_timer_timeout returns -1 in that case).
-		if timeout_ms != 0 || loop.active_io_count > 0 {
+		if timeout_ms != 0 || loop.active_io_count > 0 || loop.active_async > 0 {
 			io_before := loop.io_events
 			platform_poll(loop, timeout_ms)
 			if loop.io_events != io_before {
@@ -536,6 +598,13 @@ run_once :: proc(loop: ^Loop) -> bool {
 				did_work = true
 			}
 		}
+	}
+
+	// A worker completion (async DNS) may have arrived during the poll block and
+	// woken us via the wakeup pipe; drain it now so the work it unblocks (and any
+	// immediate/close it schedules) runs this tick rather than idling out.
+	if drain_async(loop) {
+		did_work = true
 	}
 
 	// Phase 5: check — setImmediate
@@ -596,10 +665,10 @@ run_next :: proc(loop: ^Loop) -> bool {
 		return run_once(loop)
 	}
 
-	// Pending I/O with nothing else ready: run a tick so the poll phase blocks on
-	// the fd(s). Without this, a request whose only pending work is a socket would
-	// never be driven and the loop would exit prematurely.
-	if loop.active_io_count > 0 {
+	// Pending I/O — or an in-flight off-loop op (async DNS) — with nothing else
+	// ready: run a tick so the poll phase blocks on the fd(s)/wakeup. Without this
+	// the loop would exit before the socket or worker completion is driven.
+	if loop.active_io_count > 0 || loop.active_async > 0 {
 		return run_once(loop)
 	}
 

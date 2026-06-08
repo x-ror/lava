@@ -45,8 +45,14 @@ Fetch_Request :: struct {
 	host:          string,
 	path:          string,
 	method:        string,
+	port:          int,
 	request_bytes: []byte,
 	write_offset:  int,
+
+	// Async DNS result, written by the resolver worker thread and read by the loop
+	// after post_async publishes it (see fetch_linux.odin). IPv4-only for now.
+	dns_ip4:       [4]u8,
+	dns_ok:        bool,
 
 	response:      [dynamic]byte,
 
@@ -124,6 +130,7 @@ fetch_request_cb :: proc "c" (
 	req.url = strings.clone(url)
 	req.host = strings.clone(host)
 	req.path = strings.clone(path)
+	req.port = port // needed by the deferred connect after async DNS resolves
 	// Serialize while the JSC-borrowed `body`/`header_lines` are still valid; the
 	// resulting buffer is independent of them.
 	req.request_bytes = build_http_request(req.method, req.host, port, req.path, header_lines, body)

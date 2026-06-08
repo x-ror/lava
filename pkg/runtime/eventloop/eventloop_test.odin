@@ -498,3 +498,39 @@ wakeup_unblocks_blocking_poll :: proc(t: ^testing.T) {
 	platform_poll(&loop, -1)
 	testing.expect(t, true)
 }
+
+// --- Cross-thread async-completion handoff (the primitive async DNS uses) ---
+
+Async_Arg :: struct {
+	loop: ^Loop,
+	rec:  ^Recorder,
+}
+
+// async_worker runs off-loop, then posts a completion back to the loop. post_async
+// is the only loop call allowed from another thread.
+async_worker :: proc(data: rawptr) {
+	arg := cast(^Async_Arg)data
+	time.sleep(20 * time.Millisecond)
+	post_async(arg.loop, record, arg.rec)
+}
+
+@(test)
+async_handoff_runs_posted_callback :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+	arg := Async_Arg{loop = &loop, rec = &rec}
+
+	// One off-loop op in flight keeps the loop alive and parked in poll until the
+	// worker posts its completion via the wakeup.
+	async_begin(&loop)
+	testing.expect_value(t, pending_count(&loop), 1)
+	thread.create_and_start_with_data(&arg, async_worker, context, .Normal, true)
+
+	testing.expect(t, run_until_idle(&loop))
+	expect_events(t, rec.events[:], []int{1}) // posted callback ran on the loop thread
+	testing.expect_value(t, loop.active_async, 0)
+	testing.expect_value(t, pending_count(&loop), 0)
+}
