@@ -21,9 +21,17 @@
 		return (code >= 65 && code <= 90) || (code >= 97 && code <= 122); // A-Z a-z
 	}
 
-	function assertPath(path) {
+	function invalidArgType(name, expected, value) {
+		var err = new TypeError(
+			"The \"" + name + "\" argument must be of type " + expected + ". Received type " + typeof value,
+		);
+		err.code = "ERR_INVALID_ARG_TYPE";
+		return err;
+	}
+
+	function assertPath(path, name) {
 		if (typeof path !== "string") {
-			throw new TypeError("Path must be a string. Received " + JSON.stringify(path));
+			throw invalidArgType(name || "path", "string", path);
 		}
 	}
 
@@ -165,8 +173,8 @@
 		},
 
 		relative: function relative(from, to) {
-			assertPath(from);
-			assertPath(to);
+			assertPath(from, "from");
+			assertPath(to, "to");
 			if (from === to) return "";
 			from = posix.resolve(from);
 			to = posix.resolve(to);
@@ -197,7 +205,7 @@
 
 		basename: function basename(path, suffix) {
 			if (suffix !== undefined && typeof suffix !== "string") {
-				throw new TypeError("The \"suffix\" argument must be of type string.");
+				throw invalidArgType("suffix", "string", suffix);
 			}
 			assertPath(path);
 			return computeBasename(path, suffix, isPosixSep);
@@ -421,21 +429,16 @@
 		},
 
 		relative: function relative(from, to) {
-			assertPath(from);
-			assertPath(to);
+			assertPath(from, "from");
+			assertPath(to, "to");
 			if (from === to) return "";
-			from = win32.resolve(from);
-			to = win32.resolve(to);
-			if (from === to) return "";
-			var fromLower = from.toLowerCase();
-			var toLower = to.toLowerCase();
+			var fromOrig = win32.resolve(from);
+			var toOrig = win32.resolve(to);
+			if (fromOrig === toOrig) return "";
+			var fromLower = fromOrig.toLowerCase();
+			var toLower = toOrig.toLowerCase();
 			if (fromLower === toLower) return "";
-			// Different drive or UNC root: no relative path exists, so Node returns
-			// the (already absolute) target unchanged.
-			if (from.slice(0, parseWin32Root(from)).toLowerCase() !== to.slice(0, parseWin32Root(to)).toLowerCase()) {
-				return to;
-			}
-			return computeRelative(from, to, "\\", BACKSLASH, fromLower, toLower);
+			return computeWin32Relative(fromOrig, toOrig, fromLower, toLower);
 		},
 
 		dirname: function dirname(path) {
@@ -487,7 +490,7 @@
 
 		basename: function basename(path, suffix) {
 			if (suffix !== undefined && typeof suffix !== "string") {
-				throw new TypeError("The \"suffix\" argument must be of type string.");
+				throw invalidArgType("suffix", "string", suffix);
 			}
 			assertPath(path);
 			var start = 0;
@@ -581,13 +584,75 @@
 		return out + to.slice(toStart + lastCommonSep);
 	}
 
+	function computeWin32Relative(fromOrig, toOrig, fromLower, toLower) {
+		var fromStart = 0;
+		while (fromStart < fromLower.length && fromLower.charCodeAt(fromStart) === BACKSLASH) {
+			fromStart++;
+		}
+		var fromEnd = fromLower.length;
+		while (fromEnd - 1 > fromStart && fromLower.charCodeAt(fromEnd - 1) === BACKSLASH) {
+			fromEnd--;
+		}
+		var fromLen = fromEnd - fromStart;
+
+		var toStart = 0;
+		while (toStart < toLower.length && toLower.charCodeAt(toStart) === BACKSLASH) {
+			toStart++;
+		}
+		var toEnd = toLower.length;
+		while (toEnd - 1 > toStart && toLower.charCodeAt(toEnd - 1) === BACKSLASH) {
+			toEnd--;
+		}
+		var toLen = toEnd - toStart;
+
+		var length = fromLen < toLen ? fromLen : toLen;
+		var lastCommonSep = -1;
+		var i = 0;
+		for (; i < length; i++) {
+			var fc = fromLower.charCodeAt(fromStart + i);
+			if (fc !== toLower.charCodeAt(toStart + i)) break;
+			if (fc === BACKSLASH) lastCommonSep = i;
+		}
+
+		if (i !== length) {
+			if (lastCommonSep === -1) return toOrig;
+		} else {
+			if (toLen > length) {
+				if (toLower.charCodeAt(toStart + i) === BACKSLASH) {
+					return toOrig.slice(toStart + i + 1, toEnd);
+				}
+				if (i === 2) return toOrig.slice(toStart + i, toEnd);
+			}
+			if (fromLen > length) {
+				if (fromLower.charCodeAt(fromStart + i) === BACKSLASH) {
+					lastCommonSep = i;
+				} else if (i === 2) {
+					lastCommonSep = 3;
+				}
+			}
+			if (lastCommonSep === -1) lastCommonSep = 0;
+		}
+
+		var out = "";
+		for (i = fromStart + lastCommonSep + 1; i <= fromEnd; ++i) {
+			if (i === fromEnd || fromOrig.charCodeAt(i) === BACKSLASH) {
+				out += out.length === 0 ? ".." : "\\..";
+			}
+		}
+
+		toStart += lastCommonSep;
+		if (out.length > 0) return out + toOrig.slice(toStart, toEnd);
+		if (toOrig.charCodeAt(toStart) === BACKSLASH) ++toStart;
+		return toOrig.slice(toStart, toEnd);
+	}
+
 	function computeBasename(path, suffix, isSep, start) {
 		start = start || 0;
 		var end = -1;
 		var matchedSlash = true;
 		var i;
 		if (suffix !== undefined && suffix.length > 0 && suffix.length <= path.length) {
-			if (suffix === path && start === 0) return "";
+			if (suffix === path) return "";
 			var extIdx = suffix.length - 1;
 			var firstNonSlashEnd = -1;
 			for (i = path.length - 1; i >= start; --i) {
