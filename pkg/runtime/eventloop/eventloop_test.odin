@@ -534,3 +534,19 @@ async_handoff_runs_posted_callback :: proc(t: ^testing.T) {
 	testing.expect_value(t, loop.active_async, 0)
 	testing.expect_value(t, pending_count(&loop), 0)
 }
+
+@(test)
+async_cancel_undoes_begin :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	// async_begin marks an off-loop op in flight; if dispatch then fails (e.g. a
+	// worker thread couldn't spawn), async_cancel must undo it so the loop is not
+	// kept alive — and run_until_idle must return immediately, not block.
+	async_begin(&loop)
+	testing.expect_value(t, pending_count(&loop), 1)
+	async_cancel(&loop)
+	testing.expect_value(t, pending_count(&loop), 0)
+	testing.expect(t, !has_pending_work(&loop))
+	testing.expect(t, !run_until_idle(&loop))
+}

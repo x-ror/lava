@@ -38,8 +38,15 @@ fetch_transport_start :: proc(req: ^Fetch_Request, host: string, port: int) -> (
 
 	// A hostname: resolve off the loop. async_begin keeps the loop alive while the
 	// worker runs; the worker posts fetch_dns_complete_cb back to the loop thread.
+	// It must precede the spawn (the worker may post before this returns), so on a
+	// spawn failure we undo it — otherwise the loop would block forever on an
+	// in-flight count that never clears, and the fetch would never settle.
 	eventloop.async_begin(req.loop)
-	thread.create_and_start_with_data(req, fetch_dns_worker, nil, .Normal, true)
+	worker := thread.create_and_start_with_data(req, fetch_dns_worker, nil, .Normal, true)
+	if worker == nil {
+		eventloop.async_cancel(req.loop)
+		return false, "fetch: could not start DNS resolver thread"
+	}
 	return true, ""
 }
 

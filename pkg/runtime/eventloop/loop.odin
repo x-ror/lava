@@ -165,6 +165,14 @@ async_begin :: proc(loop: ^Loop) {
 	loop.active_async += 1
 }
 
+// async_cancel undoes an async_begin when the off-loop op could not be dispatched
+// (e.g. a worker thread failed to spawn), so the loop is not kept alive forever
+// waiting for a completion that will never arrive. Loop-thread only; must not be
+// called once post_async has been (or may be) invoked for that op.
+async_cancel :: proc(loop: ^Loop) {
+	loop.active_async = max(0, loop.active_async - 1)
+}
+
 // post_async delivers a completion callback from ANY thread: it enqueues the
 // callback under async_mutex and wakes the loop, which runs it on the loop thread
 // in the next tick (see drain_async) and decrements the in-flight count there. The
