@@ -290,11 +290,10 @@ sqlite_bind_cb :: proc "c" (
 		sqlite.bind_text(stmt, index, s)
 	case .Object:
 		if jsc.JSValueGetTypedArrayType(ctx, value, nil) != .None {
-			obj := cast(jsc.JSObjectRef)value
-			ptr := jsc.JSObjectGetTypedArrayBytesPtr(ctx, obj, nil)
-			n := int(jsc.JSObjectGetTypedArrayByteLength(ctx, obj, nil))
 			bytes: []byte = nil
-			if ptr != nil && n > 0 do bytes = (cast([^]byte)ptr)[:n]
+			if view, ok := typed_array_view(ctx, value); ok {
+				bytes = view
+			}
 			sqlite.bind_blob(stmt, index, bytes)
 		} else if exception != nil {
 			exception^ = make_js_error(ctx, "unsupported SQLite bind value type")

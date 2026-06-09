@@ -323,13 +323,10 @@ fs_errno_text :: proc(code: string) -> string {
 // any write error (the caller maps that to a thrown/forwarded fs error).
 fs_write_value :: proc(ctx: jsc.JSContextRef, path: string, value: jsc.JSValueRef) -> bool {
 	if jsc.JSValueGetTypedArrayType(ctx, value, nil) != .None {
-		obj := cast(jsc.JSObjectRef)value
-		ptr := jsc.JSObjectGetTypedArrayBytesPtr(ctx, obj, nil)
-		n := int(jsc.JSObjectGetTypedArrayByteLength(ctx, obj, nil))
-		if ptr == nil || n == 0 {
+		bytes, ok := typed_array_view(ctx, value)
+		if !ok || len(bytes) == 0 {
 			return os.write_entire_file_from_bytes(path, nil) == nil
 		}
-		bytes := (cast([^]byte)ptr)[:n]
 		return os.write_entire_file_from_bytes(path, bytes) == nil
 	}
 	// Strings and anything else are written via their string form (utf-8).
