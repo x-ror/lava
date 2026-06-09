@@ -278,6 +278,10 @@ fetch_settle_response :: proc(req: ^Fetch_Request) {
 
 	arg := cast(jsc.JSValueRef)result
 	exception: jsc.JSValueRef
+	// Callback BEFORE finish: a chained fetch() inside the callback calls
+	// async_begin before this token is dropped (count stays ≥1, never 0).
+	// Swapping these lines would cause a premature-idle exit and a use-after-free
+	// (fetch_request_finish nulls watcher.callback, which the caller reads on return).
 	jsc.JSObjectCallAsFunction(req.ctx, req.on_response, nil, 1, &arg, &exception)
 	if exception != nil {
 		report_uncaught(req.ctx, exception)
@@ -295,6 +299,7 @@ fetch_settle_error :: proc(req: ^Fetch_Request, message: string) {
 	}
 	arg := js_string_value(req.ctx, message)
 	exception: jsc.JSValueRef
+	// Callback BEFORE finish — same ordering invariant as fetch_settle_response.
 	jsc.JSObjectCallAsFunction(req.ctx, req.on_error, nil, 1, &arg, &exception)
 	if exception != nil {
 		report_uncaught(req.ctx, exception)
