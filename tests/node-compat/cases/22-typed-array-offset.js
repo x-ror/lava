@@ -6,6 +6,8 @@
 // macOS CI backend, whose JSC may handle the pointer differently from Linux.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
 // randomFillSync(buffer, offset, size) must fill exactly [offset, offset+size).
 const b = Buffer.alloc(16); // zeroed
@@ -18,3 +20,12 @@ const buf = new ArrayBuffer(24);
 crypto.getRandomValues(new Uint8Array(buf, 8, 8));
 assert.ok(new Uint8Array(buf, 0, 8).every((x) => x === 0), 'bytes before view untouched');
 assert.ok(new Uint8Array(buf, 16, 8).every((x) => x === 0), 'bytes after view untouched');
+
+// writeFileSync must borrow exactly the visible view, not the ArrayBuffer base.
+const out = path.join(__dirname, '..', 'fixtures', 'typed-array-offset.tmp');
+try {
+	fs.writeFileSync(out, Buffer.from('AAAAAAAABBBBBBBB').subarray(8));
+	assert.equal(fs.readFileSync(out, 'utf8'), 'BBBBBBBB');
+} finally {
+	fs.rmSync(out, {force: true});
+}
