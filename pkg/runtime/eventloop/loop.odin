@@ -714,15 +714,14 @@ run_until_idle :: proc(loop: ^Loop, max_iterations := 1024) -> bool {
 }
 
 // run drives the loop to completion with no iteration ceiling — the runtime's
-// entry point. It runs until the loop is genuinely idle (no pending work) or a
-// tick makes no progress, so a long-running program is not truncated and an
-// unbounded interval keeps running, matching Node. (run_until_idle keeps its
+// entry point. It runs until the loop is genuinely idle (no pending work).
+// Exit is solely on !has_pending_work: a no-progress tick (e.g. a stale wakeup
+// pipe byte waking platform_poll with no fd ready) must not terminate the loop
+// while active_io_count or active_async are nonzero. (run_until_idle keeps its
 // bounded form for deterministic tests.)
 run :: proc(loop: ^Loop) {
 	for has_pending_work(loop) {
-		if !run_next(loop) {
-			return
-		}
+		run_next(loop)
 	}
 }
 
