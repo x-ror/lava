@@ -89,6 +89,16 @@ async function main() {
 	}
 	console.log('refused rejected:', refused);
 
+	// A name that cannot resolve rejects (DNS now runs off the event loop, #30).
+	// .invalid is reserved (RFC 6761) and never resolves.
+	let dnsFailed = false;
+	try {
+		await fetch('http://does-not-exist.invalid/');
+	} catch (error) {
+		dnsFailed = true;
+	}
+	console.log('dns failure rejected:', dnsFailed);
+
 	console.log('FETCH SMOKE OK');
 }
 
