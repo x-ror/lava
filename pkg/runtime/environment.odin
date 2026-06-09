@@ -118,7 +118,12 @@ fs_read_file_sync_cb :: proc "c" (
 	defer if path_alloc do delete(path_str, context.allocator)
 
 	data, err := os.read_entire_file(path_str, context.allocator)
-	if err != os.ERROR_NONE do return jsc.JSValueMakeUndefined(ctx)
+	if err != os.ERROR_NONE {
+		if exception != nil {
+			exception^ = fs_make_error(ctx, fs_read_error_code(path_str), "open", path_str)
+		}
+		return jsc.JSValueMakeUndefined(ctx)
+	}
 
 	// With an explicit encoding (readFileSync(path, 'utf8')) Node returns a
 	// string; with no encoding it returns a Buffer. We model the latter as a
@@ -215,7 +220,7 @@ fs_read_file_cb :: proc "c" (
 	data, err := os.read_entire_file(path_str, context.allocator)
 	if err != os.ERROR_NONE {
 		req.ok = false
-		req.err_code = os.exists(path_str) ? "EIO" : "ENOENT"
+		req.err_code = fs_read_error_code(path_str)
 		req.err_path, _ = strings.clone(path_str, context.allocator)
 		req.err_msg = fmt.aprintf(
 			"%s: error reading file, open '%s'",
@@ -317,6 +322,12 @@ fs_errno_text :: proc(code: string) -> string {
 		return "illegal operation on a directory"
 	}
 	return "i/o error"
+}
+
+fs_read_error_code :: proc(path: string) -> string {
+	if !os.exists(path) do return "ENOENT"
+	if os.is_dir(path) do return "EISDIR"
+	return "EIO"
 }
 
 // fs_write_value writes a string or typed-array JS value to disk. Returns false on

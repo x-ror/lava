@@ -109,6 +109,10 @@ assert.deepEqual(fs.readdirSync(scratch).sort(), ['bytes.bin', 'nested', 'note.t
 
 // statSync on a missing path throws ENOENT.
 assert.throws(() => fs.statSync(path.join(scratch, 'nope')), (e) => e.code === 'ENOENT');
+assert.throws(
+	() => fs.readFileSync(path.join(scratch, 'nope')),
+	(e) => e.code === 'ENOENT' && e.syscall === 'open' && e.path.endsWith('/nope')
+);
 
 // Async writeFile -> readFile round-trip, then recursive cleanup. The sentinel
 // console.log proves the async chain ran (so a silent skip can't pass).
@@ -122,4 +126,3 @@ fs.writeFile(path.join(scratch, 'async.txt'), 'async fs', (writeErr) => {
 		console.log('fs-extended-ok');
 	});
 });
-

@@ -56,9 +56,17 @@
 			throw dataCloneError(tag.slice(8, -1) + " could not be cloned.");
 		}
 
-		if (tag === "[object Date]") return new Date(value.getTime());
+		if (tag === "[object Date]") {
+			var date = new Date(value.getTime());
+			seen.set(value, date);
+			return date;
+		}
 		// lastIndex is intentionally not carried (Node resets it to 0).
-		if (tag === "[object RegExp]") return new RegExp(value.source, value.flags);
+		if (tag === "[object RegExp]") {
+			var re = new RegExp(value.source, value.flags);
+			seen.set(value, re);
+			return re;
+		}
 
 		if (tag === "[object ArrayBuffer]") {
 			var bufCopy = value.slice(0);
@@ -130,6 +138,9 @@
 	}
 
 	function structuredClone(value, options) {
+		if (arguments.length === 0) {
+			throw new TypeError("structuredClone requires at least 1 argument");
+		}
 		if (options != null && options.transfer != null) {
 			var transfer = options.transfer;
 			var hasItems = typeof transfer.length === "number" ? transfer.length > 0 : false;

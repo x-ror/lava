@@ -60,6 +60,8 @@ const cdate = structuredClone(date);
 assert.equal(cdate instanceof Date, true);
 assert.equal(cdate.getTime(), date.getTime());
 assert.notEqual(cdate, date);
+const sharedDate = structuredClone({a: date, b: date});
+assert.equal(sharedDate.a, sharedDate.b);
 
 const re = /ab+/gi;
 re.lastIndex = 2;
@@ -67,6 +69,8 @@ const cre = structuredClone(re);
 assert.equal(cre.source, 'ab+');
 assert.equal(cre.flags, 'gi');
 assert.equal(cre.lastIndex, 0);
+const sharedRegExp = structuredClone({a: re, b: re});
+assert.equal(sharedRegExp.a, sharedRegExp.b);
 
 // Map and Set, deep-cloning entries.
 const map = new Map([['k', {n: 1}]]);
@@ -120,5 +124,6 @@ assert.equal(ccyclic.name, 'root');
 for (const bad of [() => {}, Symbol('x'), Promise.resolve(1), new WeakMap(), new WeakSet()]) {
 	assert.throws(() => structuredClone(bad), (e) => e.name === 'DataCloneError');
 }
+assert.throws(() => structuredClone(), TypeError);
 
 console.log('structured-clone-ok');
