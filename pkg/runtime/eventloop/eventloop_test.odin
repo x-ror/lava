@@ -536,6 +536,26 @@ async_handoff_runs_posted_callback :: proc(t: ^testing.T) {
 }
 
 @(test)
+run_ignores_stale_wakeup_while_async_is_active :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+	arg := Async_Arg{loop = &loop, rec = &rec}
+
+	async_begin(&loop)
+	wakeup(&loop)
+	thread.create_and_start_with_data(&arg, async_worker, context, .Normal, true)
+
+	run(&loop)
+
+	expect_events(t, rec.events[:], []int{1})
+	testing.expect_value(t, loop.active_async, 0)
+	testing.expect_value(t, pending_count(&loop), 0)
+}
+
+@(test)
 async_cancel_undoes_begin :: proc(t: ^testing.T) {
 	loop := init()
 	defer destroy(&loop)
