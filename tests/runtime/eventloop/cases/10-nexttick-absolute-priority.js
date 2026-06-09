@@ -10,15 +10,15 @@ const assert = require('node:assert/strict');
 // is skipped under `make test-lava` but still validated against Node; remove the
 // skip once the ordering can be matched.
 (async () => {
-	const events = [];
+  const events = [];
 
-	Promise.resolve().then(() => events.push('promise'));
-	process.nextTick(() => events.push('nextTick'));
+  Promise.resolve().then(() => events.push('promise'));
+  process.nextTick(() => events.push('nextTick'));
 
-	await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
 
-	assert.deepEqual(events, ['nextTick', 'promise']);
+  assert.deepEqual(events, ['nextTick', 'promise']);
 })().catch((error) => {
-	console.error(error);
-	process.exit(1);
+  console.error(error);
+  process.exit(1);
 });

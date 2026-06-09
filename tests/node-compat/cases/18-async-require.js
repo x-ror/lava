@@ -6,11 +6,11 @@
 const assert = require('node:assert/strict');
 
 async function main() {
-	const tag = await require('../fixtures/deferred/outer.js');
-	assert.equal(tag, 'inner-loaded-async');
+  const tag = await require('../fixtures/deferred/outer.js');
+  assert.equal(tag, 'inner-loaded-async');
 }
 
 main().catch((e) => {
-	console.error(e);
-	process.exit(1);
+  console.error(e);
+  process.exit(1);
 });

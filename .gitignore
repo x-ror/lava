@@ -1,5 +1,6 @@
 bin/
 build/
+node_modules/
 reports/
 
 # Raw upstream test corpus vendored only as copy-source for clean-room ports;

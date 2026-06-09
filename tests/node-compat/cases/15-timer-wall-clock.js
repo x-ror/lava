@@ -10,17 +10,17 @@ const DELAY = 60;
 const start = Date.now();
 
 setTimeout(() => {
-	const elapsed = Date.now() - start;
-	assert.ok(elapsed >= DELAY - 20, `timer fired too early: ${elapsed}ms (expected >= ${DELAY}ms)`);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= DELAY - 20, `timer fired too early: ${elapsed}ms (expected >= ${DELAY}ms)`);
 
-	// A repeating timer's deadlines also elapse in real time across ticks.
-	let ticks = 0;
-	const intervalStart = Date.now();
-	const id = setInterval(() => {
-		if (++ticks === 2) {
-			clearInterval(id);
-			const span = Date.now() - intervalStart;
-			assert.ok(span >= 2 * 20 - 20, `interval ran too fast: ${span}ms over 2 ticks`);
-		}
-	}, 20);
+  // A repeating timer's deadlines also elapse in real time across ticks.
+  let ticks = 0;
+  const intervalStart = Date.now();
+  const id = setInterval(() => {
+    if (++ticks === 2) {
+      clearInterval(id);
+      const span = Date.now() - intervalStart;
+      assert.ok(span >= 2 * 20 - 20, `interval ran too fast: ${span}ms over 2 ticks`);
+    }
+  }, 20);
 }, DELAY);

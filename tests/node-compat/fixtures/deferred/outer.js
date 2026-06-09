@@ -3,11 +3,11 @@
 // against THIS module's directory (fixtures/deferred), not the entry's. Pre-fix
 // Lava resolved deferred requires against the entry dir and threw MODULE_NOT_FOUND.
 module.exports = new Promise((resolve, reject) => {
-	setTimeout(() => {
-		try {
-			resolve(require('./inner').tag);
-		} catch (e) {
-			reject(e);
-		}
-	}, 0);
+  setTimeout(() => {
+    try {
+      resolve(require('./inner').tag);
+    } catch (e) {
+      reject(e);
+    }
+  }, 0);
 });

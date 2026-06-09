@@ -7,21 +7,21 @@
 const assert = require('node:assert/strict');
 
 async function main() {
-	const s = 'héllo café ☕ 日本語';
+  const s = 'héllo café ☕ 日本語';
 
-	assert.equal(await new Response(s).text(), s);
-	assert.equal(await new Request('http://example/', { method: 'POST', body: s }).text(), s);
+  assert.equal(await new Response(s).text(), s);
+  assert.equal(await new Request('http://example/', { method: 'POST', body: s }).text(), s);
 
-	// The encoded bytes are UTF-8 (é = C3 A9), not a latin1 truncation.
-	const bytes = new Uint8Array(await new Response('é').arrayBuffer());
-	assert.deepEqual(Array.from(bytes), [0xc3, 0xa9]);
+  // The encoded bytes are UTF-8 (é = C3 A9), not a latin1 truncation.
+  const bytes = new Uint8Array(await new Response('é').arrayBuffer());
+  assert.deepEqual(Array.from(bytes), [0xc3, 0xa9]);
 
-	// json() over a UTF-8 body.
-	const obj = await new Response(JSON.stringify({ msg: 'café ☕' })).json();
-	assert.equal(obj.msg, 'café ☕');
+  // json() over a UTF-8 body.
+  const obj = await new Response(JSON.stringify({ msg: 'café ☕' })).json();
+  assert.equal(obj.msg, 'café ☕');
 }
 
 main().catch((e) => {
-	console.error(e);
-	process.exit(1);
+  console.error(e);
+  process.exit(1);
 });

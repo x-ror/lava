@@ -45,78 +45,82 @@
 // Tracked as a follow-up; see tests/runtime/eventloop/cases/10-* and the
 // known-lava-gaps entry.
 (function (globalThis, process, reportUncaught) {
-	"use strict";
+  'use strict';
 
-	var PromiseCtor = Promise;
-	var bind = Function.prototype.bind;
-	var call = Function.prototype.call;
-	var uncurryThis = bind.bind(call);
-	var promiseResolve = uncurryThis(Promise.resolve);
-	var promiseThen = uncurryThis(Promise.prototype.then);
-	var arraySlice = uncurryThis(Array.prototype.slice);
-	var functionApply = Reflect.apply;
-	var EMPTY = [];
-	var resolved = promiseResolve(PromiseCtor);
+  var PromiseCtor = Promise;
+  var bind = Function.prototype.bind;
+  var call = Function.prototype.call;
+  var uncurryThis = bind.bind(call);
+  var promiseResolve = uncurryThis(Promise.resolve);
+  var promiseThen = uncurryThis(Promise.prototype.then);
+  var arraySlice = uncurryThis(Array.prototype.slice);
+  var functionApply = Reflect.apply;
+  var EMPTY = [];
+  var resolved = promiseResolve(PromiseCtor);
 
-	function schedule(fn) {
-		promiseThen(resolved, fn);
-	}
+  function schedule(fn) {
+    promiseThen(resolved, fn);
+  }
 
-	function runGuarded(fn, args) {
-		try {
-			functionApply(fn, undefined, args);
-		} catch (error) {
-			reportUncaught(error);
-		}
-	}
+  function runGuarded(fn, args) {
+    try {
+      functionApply(fn, undefined, args);
+    } catch (error) {
+      reportUncaught(error);
+    }
+  }
 
-	var queue = [];
-	var head = 0;
-	var tail = 0;
-	var armed = false;
-	var draining = false;
+  var queue = [];
+  var head = 0;
+  var tail = 0;
+  var armed = false;
+  var draining = false;
 
-	function drain() {
-		armed = false;
-		if (draining) return;
-		draining = true;
-		try {
-			while (head < tail) {
-				var task = queue[head];
-				queue[head] = undefined;
-				head = head + 1;
-				runGuarded(task.fn, task.args);
-			}
-			head = 0;
-			tail = 0;
-			queue.length = 0;
-		} finally {
-			draining = false;
-		}
-	}
+  function drain() {
+    armed = false;
+    if (draining) return;
+    draining = true;
+    try {
+      while (head < tail) {
+        var task = queue[head];
+        queue[head] = undefined;
+        head = head + 1;
+        runGuarded(task.fn, task.args);
+      }
+      head = 0;
+      tail = 0;
+      queue.length = 0;
+    } finally {
+      draining = false;
+    }
+  }
 
-	function nextTick(callback) {
-		if (typeof callback !== "function") {
-			throw new TypeError('The "callback" argument must be of type function. Received ' + typeof callback);
-		}
-		var args = arguments.length > 1 ? arraySlice(arguments, 1) : EMPTY;
-		queue[tail] = { fn: callback, args: args };
-		tail = tail + 1;
-		if (!armed && !draining) {
-			armed = true;
-			schedule(drain);
-		}
-	}
+  function nextTick(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError(
+        'The "callback" argument must be of type function. Received ' + typeof callback,
+      );
+    }
+    var args = arguments.length > 1 ? arraySlice(arguments, 1) : EMPTY;
+    queue[tail] = { fn: callback, args: args };
+    tail = tail + 1;
+    if (!armed && !draining) {
+      armed = true;
+      schedule(drain);
+    }
+  }
 
-	function queueMicrotask(callback) {
-		if (typeof callback !== "function") {
-			throw new TypeError('The "callback" argument must be of type function. Received ' + typeof callback);
-		}
-		schedule(function () {
-			runGuarded(callback, EMPTY);
-		});
-	}
+  function queueMicrotask(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError(
+        'The "callback" argument must be of type function. Received ' + typeof callback,
+      );
+    }
+    schedule(function () {
+      runGuarded(callback, EMPTY);
+    });
+  }
 
-	process.nextTick = nextTick;
-	globalThis.queueMicrotask = queueMicrotask;
-})
+  process.nextTick = nextTick;
+  globalThis.queueMicrotask = queueMicrotask;
+});

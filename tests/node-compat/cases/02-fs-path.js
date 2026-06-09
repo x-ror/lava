@@ -58,9 +58,15 @@ assert.equal(path.relative('/a/b', '/a/b'), '');
 
 // parse / format round-trip
 const parsed = path.parse('/home/user/file.txt');
-assert.deepEqual(parsed, {root: '/', dir: '/home/user', base: 'file.txt', ext: '.txt', name: 'file'});
+assert.deepEqual(parsed, {
+  root: '/',
+  dir: '/home/user',
+  base: 'file.txt',
+  ext: '.txt',
+  name: 'file',
+});
 assert.equal(path.format(parsed), '/home/user/file.txt');
-assert.equal(path.format({dir: '/a', base: 'b.js'}), '/a/b.js');
+assert.equal(path.format({ dir: '/a', base: 'b.js' }), '/a/b.js');
 
 // posix and win32 are always reachable as sub-namespaces
 assert.equal(path.posix.join('a', 'b'), 'a/b');
@@ -77,8 +83,14 @@ assert.equal(path.win32.relative('\\\\srv\\s1\\a', '\\\\srv\\s2\\b'), '..\\..\\s
 assert.equal(path.win32.relative('\\\\server\\share\\', '\\\\server\\share\\foo'), 'foo');
 assert.equal(path.win32.relative('\\\\server\\share\\foo', '\\\\server\\share\\'), '..');
 assert.equal(path.win32.basename('C:.js', 'C:.js'), '');
-assert.throws(() => path.win32.relative('C:\\', 1), (e) => e.code === 'ERR_INVALID_ARG_TYPE');
-assert.throws(() => path.win32.basename('x', 1), (e) => e.code === 'ERR_INVALID_ARG_TYPE');
+assert.throws(
+  () => path.win32.relative('C:\\', 1),
+  (e) => e.code === 'ERR_INVALID_ARG_TYPE',
+);
+assert.throws(
+  () => path.win32.basename('x', 1),
+  (e) => e.code === 'ERR_INVALID_ARG_TYPE',
+);
 assert.equal(path.win32.sep, '\\');
 assert.equal(path.posix.win32, path.win32);
 assert.equal(path.win32.posix, path.posix);
@@ -97,12 +109,15 @@ assert.equal(fs.readdirSync(fixturesDir).includes('hello.txt'), true);
 // Writes go to a pid-namespaced scratch dir so the node and lava runs never
 // collide; each run creates it fresh and removes it at the end.
 const scratch = path.join(process.env.TMPDIR || '/tmp', 'lava-fs-compat-' + process.pid);
-fs.rmSync(scratch, {recursive: true, force: true});
+fs.rmSync(scratch, { recursive: true, force: true });
 
 // mkdirSync (recursive) then a non-recursive mkdir on an existing dir throws.
-fs.mkdirSync(path.join(scratch, 'nested'), {recursive: true});
+fs.mkdirSync(path.join(scratch, 'nested'), { recursive: true });
 assert.equal(fs.existsSync(path.join(scratch, 'nested')), true);
-assert.throws(() => fs.mkdirSync(scratch), (e) => e.code === 'EEXIST');
+assert.throws(
+  () => fs.mkdirSync(scratch),
+  (e) => e.code === 'EEXIST',
+);
 
 // writeFileSync (string and Uint8Array) round-trips through readFileSync.
 const textFile = path.join(scratch, 'note.txt');
@@ -116,21 +131,24 @@ assert.equal(fs.statSync(textFile).size, 7);
 assert.deepEqual(fs.readdirSync(scratch).sort(), ['bytes.bin', 'nested', 'note.txt']);
 
 // statSync on a missing path throws ENOENT.
-assert.throws(() => fs.statSync(path.join(scratch, 'nope')), (e) => e.code === 'ENOENT');
 assert.throws(
-	() => fs.readFileSync(path.join(scratch, 'nope')),
-	(e) => e.code === 'ENOENT' && e.syscall === 'open' && e.path.endsWith('/nope')
+  () => fs.statSync(path.join(scratch, 'nope')),
+  (e) => e.code === 'ENOENT',
+);
+assert.throws(
+  () => fs.readFileSync(path.join(scratch, 'nope')),
+  (e) => e.code === 'ENOENT' && e.syscall === 'open' && e.path.endsWith('/nope'),
 );
 
 // Async writeFile -> readFile round-trip, then recursive cleanup. The sentinel
 // console.log proves the async chain ran (so a silent skip can't pass).
 fs.writeFile(path.join(scratch, 'async.txt'), 'async fs', (writeErr) => {
-	assert.equal(writeErr, null);
-	fs.readFile(path.join(scratch, 'async.txt'), 'utf8', (readErr, contents) => {
-		assert.equal(readErr, null);
-		assert.equal(contents, 'async fs');
-		fs.rmSync(scratch, {recursive: true, force: true});
-		assert.equal(fs.existsSync(scratch), false);
-		console.log('fs-extended-ok');
-	});
+  assert.equal(writeErr, null);
+  fs.readFile(path.join(scratch, 'async.txt'), 'utf8', (readErr, contents) => {
+    assert.equal(readErr, null);
+    assert.equal(contents, 'async fs');
+    fs.rmSync(scratch, { recursive: true, force: true });
+    assert.equal(fs.existsSync(scratch), false);
+    console.log('fs-extended-ok');
+  });
 });

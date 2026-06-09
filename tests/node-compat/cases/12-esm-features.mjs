@@ -2,9 +2,9 @@
 // import from an ESM module, aliased named import, and a re-export.
 import assert from 'node:assert/strict';
 import * as pathNS from 'node:path';
-import add, {tag} from '../fixtures/esm-default.mjs';
-import {basename as reBasename, extra} from '../fixtures/esm-reexport.mjs';
-import {fileURLToPath} from 'node:url';
+import add, { tag } from '../fixtures/esm-default.mjs';
+import { basename as reBasename, extra } from '../fixtures/esm-reexport.mjs';
+import { fileURLToPath } from 'node:url';
 
 // Namespace import exposes the module's named exports.
 assert.equal(typeof pathNS.basename, 'function');

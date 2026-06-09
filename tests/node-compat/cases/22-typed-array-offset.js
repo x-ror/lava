@@ -12,20 +12,32 @@ const path = require('node:path');
 // randomFillSync(buffer, offset, size) must fill exactly [offset, offset+size).
 const b = Buffer.alloc(16); // zeroed
 crypto.randomFillSync(b, 8, 8);
-assert.ok(Array.from(b.subarray(0, 8)).every((x) => x === 0), 'bytes before offset untouched');
-assert.ok(Array.from(b.subarray(8, 16)).some((x) => x !== 0), 'target region filled');
+assert.ok(
+  Array.from(b.subarray(0, 8)).every((x) => x === 0),
+  'bytes before offset untouched',
+);
+assert.ok(
+  Array.from(b.subarray(8, 16)).some((x) => x !== 0),
+  'target region filled',
+);
 
 // getRandomValues on an offset view: only the view's bytes change.
 const buf = new ArrayBuffer(24);
 crypto.getRandomValues(new Uint8Array(buf, 8, 8));
-assert.ok(new Uint8Array(buf, 0, 8).every((x) => x === 0), 'bytes before view untouched');
-assert.ok(new Uint8Array(buf, 16, 8).every((x) => x === 0), 'bytes after view untouched');
+assert.ok(
+  new Uint8Array(buf, 0, 8).every((x) => x === 0),
+  'bytes before view untouched',
+);
+assert.ok(
+  new Uint8Array(buf, 16, 8).every((x) => x === 0),
+  'bytes after view untouched',
+);
 
 // writeFileSync must borrow exactly the visible view, not the ArrayBuffer base.
 const out = path.join(__dirname, '..', 'fixtures', 'typed-array-offset.tmp');
 try {
-	fs.writeFileSync(out, Buffer.from('AAAAAAAABBBBBBBB').subarray(8));
-	assert.equal(fs.readFileSync(out, 'utf8'), 'BBBBBBBB');
+  fs.writeFileSync(out, Buffer.from('AAAAAAAABBBBBBBB').subarray(8));
+  assert.equal(fs.readFileSync(out, 'utf8'), 'BBBBBBBB');
 } finally {
-	fs.rmSync(out, {force: true});
+  fs.rmSync(out, { force: true });
 }

@@ -10,15 +10,15 @@ const THROW_LINE = '4'; // the `throw` in fixtures/stack-thrower.js
 
 let threw = false;
 try {
-	boom();
+  boom();
 } catch (e) {
-	threw = true;
-	const frame = String(e.stack)
-		.split('\n')
-		.find((l) => l.includes('stack-thrower.js'));
-	assert.ok(frame, 'expected a stack frame in stack-thrower.js');
-	const m = frame.match(/stack-thrower\.js:(\d+)/);
-	assert.ok(m, `could not parse a line number from frame: ${frame}`);
-	assert.equal(m[1], THROW_LINE);
+  threw = true;
+  const frame = String(e.stack)
+    .split('\n')
+    .find((l) => l.includes('stack-thrower.js'));
+  assert.ok(frame, 'expected a stack frame in stack-thrower.js');
+  const m = frame.match(/stack-thrower\.js:(\d+)/);
+  assert.ok(m, `could not parse a line number from frame: ${frame}`);
+  assert.equal(m[1], THROW_LINE);
 }
 assert.ok(threw, 'boom() should have thrown');

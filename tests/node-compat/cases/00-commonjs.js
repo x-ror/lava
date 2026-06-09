@@ -10,4 +10,3 @@ assert.equal(data.compat, 'node');
 assert.equal(path.basename(__filename), '00-commonjs.js');
 assert.equal(path.basename(__dirname), 'cases');
 assert.equal(module.children.length >= 1, true);
-

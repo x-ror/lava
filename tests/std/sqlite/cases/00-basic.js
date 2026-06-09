@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const {DatabaseSync} = require('node:sqlite');
+const { DatabaseSync } = require('node:sqlite');
 
 const db = new DatabaseSync(':memory:');
 
