@@ -25,4 +25,3 @@ assert.equal(a.compare(b, 0, 10, 0, 10), -1);
 
 assert.throws(() => a.compare(b, 0, 11, 0, 10));
 assert.throws(() => a.compare(b, 0, 10, 0, 11));
-

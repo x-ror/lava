@@ -12,4 +12,3 @@ assert.equal(INSPECT_MAX_BYTES, original);
 
 buffer.INSPECT_MAX_BYTES = original;
 assert.equal(buffer.INSPECT_MAX_BYTES, original);
-

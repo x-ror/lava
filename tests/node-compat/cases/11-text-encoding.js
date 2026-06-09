@@ -10,9 +10,9 @@ assert.deepEqual(encoder.encode('😀'), new Uint8Array([240, 159, 152, 128]));
 
 // encodeInto reports code units read and bytes written, and stops at capacity
 const dest = new Uint8Array(10);
-assert.deepEqual(encoder.encodeInto('abc€', dest), {read: 4, written: 6});
+assert.deepEqual(encoder.encodeInto('abc€', dest), { read: 4, written: 6 });
 assert.deepEqual(Array.from(dest.slice(0, 6)), [97, 98, 99, 226, 130, 172]);
-assert.deepEqual(encoder.encodeInto('a€b', new Uint8Array(4)), {read: 2, written: 4});
+assert.deepEqual(encoder.encodeInto('a€b', new Uint8Array(4)), { read: 2, written: 4 });
 
 // TextDecoder defaults and the common encodings
 const decoder = new TextDecoder();
@@ -30,11 +30,18 @@ assert.equal(new TextDecoder('windows-1252').decode(new Uint8Array([0x80, 0xe9])
 
 // BOM is stripped by default, kept with ignoreBOM
 assert.equal(new TextDecoder().decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])), 'A');
-assert.equal(new TextDecoder('utf-8', {ignoreBOM: true}).decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])).length, 2);
+assert.equal(
+  new TextDecoder('utf-8', { ignoreBOM: true }).decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41]))
+    .length,
+  2,
+);
 
 // error modes
 assert.throws(() => new TextDecoder('made-up'), RangeError);
-assert.throws(() => new TextDecoder('utf-8', {fatal: true}).decode(new Uint8Array([0xff])), TypeError);
+assert.throws(
+  () => new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xff])),
+  TypeError,
+);
 assert.equal(new TextDecoder().decode(new Uint8Array([0xff])), '�');
 
 // accepts ArrayBuffer and views, and is exposed as a global

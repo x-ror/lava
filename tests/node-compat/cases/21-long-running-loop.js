@@ -7,12 +7,12 @@ const N = 3000;
 let count = 0;
 
 function tick() {
-	count++;
-	if (count < N) {
-		setImmediate(tick);
-	} else {
-		console.log('done', count);
-	}
+  count++;
+  if (count < N) {
+    setImmediate(tick);
+  } else {
+    console.log('done', count);
+  }
 }
 
 setImmediate(tick);

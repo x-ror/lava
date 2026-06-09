@@ -3,7 +3,7 @@ LAVA ?= bin/lava
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help build run eval check check-cli check-runtime check-jsc check-native test test-lava test-report test-report-html api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
+.PHONY: help build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-lava test-report test-report-html api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -14,6 +14,8 @@ help:
 	@printf '%s\n' '  make check              Type-check Odin packages'
 	@printf '%s\n' '  make check-cli          Type-check the CLI package'
 	@printf '%s\n' '  make check-runtime      Type-check runtime packages'
+	@printf '%s\n' '  make check-js           Run Vite+ lint and formatting checks for JavaScript'
+	@printf '%s\n' '  make fix-js             Auto-fix JavaScript formatting/lint issues with Vite+'
 	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
 	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
 	@printf '%s\n' '  make test               Run Odin and Node compatibility tests'
@@ -61,6 +63,12 @@ check-runtime:
 	$(ODIN) check pkg/runtime -no-entry-point -collection:lava=.
 	$(ODIN) check pkg/runtime/eventloop -no-entry-point
 	$(ODIN) check pkg/std/sqlite -no-entry-point
+
+check-js:
+	vp run js:check
+
+fix-js:
+	vp run js:fix
 
 check-jsc:
 	./scripts/check-jsc.sh

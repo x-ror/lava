@@ -31,9 +31,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libjavascriptcoregtk-6.0-dev libsqlite3-dev pkg-config
 
-      - uses: actions/setup-node@v4
+      - uses: voidzero-dev/setup-vp@v1
         with:
           node-version: "22"
+          cache: true
+          run-install: true
 
       - name: Setup Odin
         uses: laytan/setup-odin@v2
@@ -43,6 +45,9 @@ jobs:
 
       - name: Type-check
         run: make check
+
+      - name: JavaScript lint and format
+        run: make check-js
 
       - name: Build
         run: make build

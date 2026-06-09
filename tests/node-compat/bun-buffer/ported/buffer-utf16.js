@@ -1,21 +1,21 @@
 const assert = require('node:assert/strict');
 
 const twoByteString = new Array(16)
-	.fill(0)
-	.map((_, i) =>
-		Buffer.from(
-			new Array(16)
-				.fill(0)
-				.map((_, j) => String.fromCharCode(i * 16 + j))
-				.join(''),
-			'utf-16le',
-		).toString('hex'),
-	)
-	.join('\n');
+  .fill(0)
+  .map((_, i) =>
+    Buffer.from(
+      new Array(16)
+        .fill(0)
+        .map((_, j) => String.fromCharCode(i * 16 + j))
+        .join(''),
+      'utf-16le',
+    ).toString('hex'),
+  )
+  .join('\n');
 
 assert.equal(
-	twoByteString,
-	`00000100020003000400050006000700080009000a000b000c000d000e000f00
+  twoByteString,
+  `00000100020003000400050006000700080009000a000b000c000d000e000f00
 10001100120013001400150016001700180019001a001b001c001d001e001f00
 20002100220023002400250026002700280029002a002b002c002d002e002f00
 30003100320033003400350036003700380039003a003b003c003d003e003f00
@@ -32,4 +32,3 @@ d000d100d200d300d400d500d600d700d800d900da00db00dc00dd00de00df00
 e000e100e200e300e400e500e600e700e800e900ea00eb00ec00ed00ee00ef00
 f000f100f200f300f400f500f600f700f800f900fa00fb00fc00fd00fe00ff00`,
 );
-
