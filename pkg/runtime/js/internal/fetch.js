@@ -278,6 +278,10 @@
   // success, or onError(message) on failure. The transport runs on the event
   // loop, so the returned promise resolves on a later tick. Only http:// is
   // wired today; https:// rejects from the native side.
+  //
+  // init.signal (AbortSignal) is honored: a pre-aborted signal rejects
+  // immediately; an abort that fires mid-flight cancels the native transport
+  // and rejects with the signal's reason.
   function fetch(input, init) {
     var req;
     try {
@@ -290,6 +294,15 @@
       return Promise.reject(new TypeError('fetch: native network backend unavailable'));
     }
 
+    // Extract signal from init (not from the Request object, which doesn't
+    // carry it — only the raw init dict does per the WHATWG fetch spec).
+    var signal = init && init.signal != null ? init.signal : null;
+
+    // Pre-aborted fast path: reject synchronously without touching the network.
+    if (signal && signal.aborted) {
+      return Promise.reject(signal.reason);
+    }
+
     var headerLines = '';
     req.headers.forEach(function (value, key) {
       if (TRANSPORT_OWNED_HEADERS[key]) return;
@@ -300,7 +313,17 @@
     var body = req._bodyBytes;
 
     return new Promise(function (resolve, reject) {
+      var abortListener = null;
+
+      function cleanup() {
+        if (abortListener && signal) {
+          signal.removeEventListener('abort', abortListener);
+          abortListener = null;
+        }
+      }
+
       function onResponse(raw) {
+        cleanup();
         var headers = new Headers();
         var pairs = raw.headers || [];
         for (var i = 0; i + 1 < pairs.length; i += 2) headers._append(pairs[i], pairs[i + 1]);
@@ -314,9 +337,21 @@
         );
       }
       function onError(message) {
+        cleanup();
         reject(new TypeError(String(message)));
       }
-      native.request(req.method, req.url, headerLines, body, onResponse, onError);
+
+      var cancelFn = native.request(req.method, req.url, headerLines, body, onResponse, onError);
+
+      if (signal) {
+        abortListener = function () {
+          cleanup();
+          // Tear down the native transport without invoking onResponse/onError.
+          if (typeof cancelFn === 'function') cancelFn();
+          reject(signal.reason);
+        };
+        signal.addEventListener('abort', abortListener);
+      }
     });
   }
 

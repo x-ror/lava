@@ -58,6 +58,10 @@ const handler = (req, res) => {
       res.writeHead(200);
       res.end('CCC');
       return;
+    case '/never':
+      // Accept the connection but never respond — used to test AbortSignal /
+      // timeout behaviour. The server holds the socket open indefinitely.
+      return;
     default:
       res.writeHead(404, { 'content-type': 'text/plain' });
       res.end('nope');
