@@ -61,6 +61,15 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 	// see signals_posix.odin. Installed per eval — the call is idempotent.
 	ignore_sigpipe()
 
+	// Per-eval temp arena boundary, mirroring the per-tick reset in
+	// eventloop.run_once and the per-require reset in native_require_cb. It
+	// reclaims the scratch allocated around the loop (setup_module_environment,
+	// the .mjs entry wrap, the script/source-name cstrings) — which the per-tick
+	// reset covers only when a loop is attached — so embedders calling eval
+	// repeatedly without a loop do not accumulate it. Result.message is on
+	// context.allocator, so nothing returned escapes through the temp arena.
+	defer free_all(context.temp_allocator)
+
 	// A custom global class gives the global object a private-data slot, where we
 	// stash Runtime_State (loop + module cache) out of reach of user JavaScript.
 	global_class := make_global_class()
