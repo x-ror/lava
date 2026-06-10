@@ -505,7 +505,16 @@ fs_mkdir_sync_cb :: proc "c" (
 }
 
 fs_remove_recursive :: proc(path: string) -> bool {
-	if os.is_dir(path) {
+	// Classify without following links (lstat): a symlink — even one pointing at
+	// a directory — must be unlinked, never descended into. os.is_dir follows
+	// links, so the recursion used to walk INTO the link target and delete its
+	// contents outside the removed tree (issue #88). Node removes only the link.
+	is_real_dir := false
+	if info, stat_err := os.lstat(path, context.allocator); stat_err == nil {
+		is_real_dir = info.type == .Directory
+		os.file_info_delete(info, context.allocator)
+	}
+	if is_real_dir {
 		handle, open_err := os.open(path)
 		if open_err == nil {
 			infos, read_err := os.read_directory(handle, -1, context.allocator)

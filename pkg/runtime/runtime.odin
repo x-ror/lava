@@ -57,6 +57,10 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 		}
 	}
 
+	// A JS runtime must survive writes to closed pipes/sockets (Node parity):
+	// see signals_posix.odin. Installed per eval — the call is idempotent.
+	ignore_sigpipe()
+
 	// A custom global class gives the global object a private-data slot, where we
 	// stash Runtime_State (loop + module cache) out of reach of user JavaScript.
 	global_class := make_global_class()
