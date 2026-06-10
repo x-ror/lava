@@ -172,7 +172,9 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 
 	case .Writing:
 		for req.write_offset < len(req.request_bytes) {
-			n, send_err := linux.send(fd, req.request_bytes[req.write_offset:], {})
+			// NOSIGNAL: a peer that resets mid-write must surface as EPIPE (a
+			// normally rejected fetch), not raise SIGPIPE and kill the process.
+			n, send_err := linux.send(fd, req.request_bytes[req.write_offset:], {.NOSIGNAL})
 			#partial switch send_err {
 			case .NONE:
 			case .EAGAIN: // == EWOULDBLOCK
