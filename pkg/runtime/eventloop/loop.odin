@@ -719,9 +719,17 @@ run_until_idle :: proc(loop: ^Loop, max_iterations := 1024) -> bool {
 // pipe byte waking platform_poll with no fd ready) must not terminate the loop
 // while active_io_count or active_async are nonzero. (run_until_idle keeps its
 // bounded form for deterministic tests.)
+//
+// Each tick ends with a free_all(context.temp_allocator): callbacks allocate
+// per-tick scratch on the loop thread's temp arena (fetch response parsing,
+// fs paths, JS string clones), and nothing temp-backed may outlive the tick
+// that allocated it — without the reset the arena grows for the life of the
+// process, linearly with e.g. fetch count. Callers that need temp data to
+// survive across ticks must copy it to a longer-lived allocator first.
 run :: proc(loop: ^Loop) {
 	for has_pending_work(loop) {
 		run_next(loop)
+		free_all(context.temp_allocator)
 	}
 }
 

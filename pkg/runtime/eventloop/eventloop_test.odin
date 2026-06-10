@@ -1,5 +1,6 @@
 package eventloop
 
+import "core:mem"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -553,6 +554,41 @@ run_ignores_stale_wakeup_while_async_is_active :: proc(t: ^testing.T) {
 	expect_events(t, rec.events[:], []int{1})
 	testing.expect_value(t, loop.active_async, 0)
 	testing.expect_value(t, pending_count(&loop), 0)
+}
+
+// --- Per-tick temp arena reset ---
+
+record_and_alloc_temp :: proc(loop: ^Loop, user_data: rawptr) {
+	rec := cast(^Recorder)user_data
+	append(&rec.events, 1)
+	// Per-tick scratch, like the runtime's fetch response parsing / fs paths.
+	_, _ = mem.alloc(4096, allocator = context.temp_allocator)
+}
+
+@(test)
+run_resets_temp_allocator_each_tick :: proc(t: ^testing.T) {
+	// A fixed 8 KiB arena as the temp allocator: four ticks each allocating
+	// 4 KiB of scratch only fit if run() resets the arena between ticks.
+	buf: [8192]byte
+	arena: mem.Arena
+	mem.arena_init(&arena, buf[:])
+	context.temp_allocator = mem.arena_allocator(&arena)
+
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// Distinct deadlines so each callback fires on its own tick.
+	for delay in 1 ..= 4 {
+		set_timeout(&loop, record_and_alloc_temp, u64(delay), &rec)
+	}
+
+	run(&loop)
+
+	expect_events(t, rec.events[:], []int{1, 1, 1, 1}) // no callback hit an exhausted arena
+	testing.expect_value(t, arena.offset, 0) // every tick's scratch was reclaimed
 }
 
 @(test)
