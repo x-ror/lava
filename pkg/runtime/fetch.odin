@@ -38,6 +38,7 @@ Fetch_Request :: struct {
 	loop:          ^eventloop.Loop,
 	on_response:   jsc.JSObjectRef, // GC-protected JS callback(resultObject)
 	on_error:      jsc.JSObjectRef, // GC-protected JS callback(messageString)
+	cancel_fn:     jsc.JSObjectRef, // GC-protected cancel handle returned to JS
 	settled:       bool,
 
 	// Owned copies (the JSC-derived strings they came from do not outlive the call).
@@ -60,6 +61,42 @@ Fetch_Request :: struct {
 	fd:            uintptr,
 	has_fd:        bool,
 	phase:         Fetch_Phase,
+}
+
+// fetch_cancel_class is a JSClass whose instances carry a ^Fetch_Request as
+// private data and are callable — calling them tears down the in-flight request
+// without invoking any JS callback (the JS side rejects the promise itself).
+// Created once and reused across all fetch calls on a given thread.
+@(private = "file")
+g_fetch_cancel_class: jsc.JSClassRef
+
+fetch_get_cancel_class :: proc() -> jsc.JSClassRef {
+	if g_fetch_cancel_class == nil {
+		def := jsc.JSClassDefinition {
+			class_name        = "FetchCancel",
+			call_as_function  = fetch_cancel_fn_cb,
+		}
+		g_fetch_cancel_class = jsc.JSClassCreate(&def)
+	}
+	return g_fetch_cancel_class
+}
+
+// fetch_cancel_fn_cb tears down the request without invoking any JS callback.
+// The JS caller rejects the promise with signal.reason after calling this.
+fetch_cancel_fn_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	req := cast(^Fetch_Request)jsc.JSObjectGetPrivate(function)
+	if req != nil && !req.settled {
+		fetch_request_finish(req)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
 }
 
 // make_fetch_bindings builds the `native` object handed to js/internal/fetch.js.
@@ -138,11 +175,17 @@ fetch_request_cb :: proc "c" (
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_response)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_error)
 
+	// Build and GC-protect the cancel handle before starting the transport so
+	// the JS caller can cancel even if the request settles synchronously.
+	cancel_fn := jsc.JSObjectMake(ctx, fetch_get_cancel_class(), req)
+	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)cancel_fn)
+	req.cancel_fn = cancel_fn
+
 	started, err := fetch_transport_start(req, host, port)
 	if !started {
 		fetch_settle_error(req, err)
 	}
-	return jsc.JSValueMakeUndefined(ctx)
+	return cast(jsc.JSValueRef)cancel_fn
 }
 
 // parse_http_url splits an absolute http(s) URL into host, port, path, scheme.
@@ -341,6 +384,10 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 	if req.on_error != nil {
 		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.on_error)
 		req.on_error = nil
+	}
+	if req.cancel_fn != nil {
+		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.cancel_fn)
+		req.cancel_fn = nil
 	}
 
 	if state := get_state_from_ctx(req.ctx); state != nil {

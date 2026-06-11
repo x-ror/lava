@@ -99,6 +99,35 @@ async function main() {
   }
   console.log('dns failure rejected:', dnsFailed);
 
+  // Pre-aborted signal rejects immediately with an AbortError, never connects.
+  let preAbortName = '';
+  try {
+    await fetch(base + '/hello.txt', { signal: AbortSignal.abort() });
+  } catch (error) {
+    preAbortName = error && error.name;
+  }
+  console.log('pre-aborted name:', preAbortName);
+
+  // AbortController.abort() mid-flight rejects with AbortError and exits promptly.
+  let midFlightName = '';
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 20);
+  try {
+    await fetch(base + '/never', { signal: ac.signal });
+  } catch (error) {
+    midFlightName = error && error.name;
+  }
+  console.log('mid-flight abort name:', midFlightName);
+
+  // AbortSignal.timeout() against a never-responding server rejects and exits.
+  let timeoutName = '';
+  try {
+    await fetch(base + '/never', { signal: AbortSignal.timeout(50) });
+  } catch (error) {
+    timeoutName = error && error.name;
+  }
+  console.log('timeout abort name:', timeoutName);
+
   console.log('FETCH SMOKE OK');
 }
 
