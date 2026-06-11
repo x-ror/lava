@@ -11,14 +11,24 @@
   function fileURLToPath(input) {
     var url = typeof input === 'string' ? input : String(input);
     if (url.slice(0, 5).toLowerCase() !== 'file:') {
-      throw new TypeError('The URL must be of scheme file');
+      var schemeErr = new TypeError('The URL must be of scheme file');
+      schemeErr.code = 'ERR_INVALID_FILE_URL_SCHEME';
+      throw schemeErr;
     }
     var rest = url.slice(5);
-    // Drop the authority component (file://host/path). On POSIX the host must be
-    // empty or "localhost"; either way the path begins at the first '/'.
+    // Drop the authority component (file://host/path). The host must be empty
+    // or "localhost" — anything else (e.g. file://evil.com/x) is rejected.
     if (rest.slice(0, 2) === '//') {
       rest = rest.slice(2);
       var slash = rest.indexOf('/');
+      var host = slash === -1 ? rest : rest.slice(0, slash);
+      if (host !== '' && host.toLowerCase() !== 'localhost') {
+        var hostErr = new TypeError(
+          'File URL host must be "localhost" or empty on ' + process.platform,
+        );
+        hostErr.code = 'ERR_INVALID_FILE_URL_HOST';
+        throw hostErr;
+      }
       rest = slash === -1 ? '/' : rest.slice(slash);
     }
     // A file path carries no query or fragment.
@@ -26,6 +36,13 @@
     if (hash !== -1) rest = rest.slice(0, hash);
     var query = rest.indexOf('?');
     if (query !== -1) rest = rest.slice(0, query);
+    // Reject encoded path separators (%2F / %2f) — decoding them would allow
+    // path-separator smuggling (Node throws ERR_INVALID_FILE_URL_PATH).
+    if (/%(2f)/i.test(rest)) {
+      var sepErr = new TypeError('File URL path must not include encoded / characters');
+      sepErr.code = 'ERR_INVALID_FILE_URL_PATH';
+      throw sepErr;
+    }
     return decodeURIComponent(rest);
   }
 

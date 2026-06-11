@@ -65,9 +65,55 @@
     options = options || {};
     var signal = options.signal;
     if (signal && signal.aborted) throw abortError(signal);
-    while (true) {
-      await setTimeoutPromise(delay, undefined, { signal: signal });
-      yield value;
+
+    // A single repeating setInterval buffers missed ticks so a slow consumer
+    // catches up immediately rather than drifting by one full delay per tick.
+    var queue = [];      // pending ticks not yet consumed
+    var waiting = null;  // resolve fn for a parked next() call, if any
+    var aborted = false;
+    var abortErr = null;
+    var timer = null;
+
+    function onTick() {
+      if (aborted) return;
+      if (waiting) {
+        var r = waiting; waiting = null;
+        r(false);
+      } else {
+        queue.push(true);
+      }
+    }
+
+    function stop() {
+      if (timer !== null) { clearInterval(timer); timer = null; }
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+
+    function onAbort() {
+      aborted = true;
+      abortErr = abortError(signal);
+      stop();
+      if (waiting) { var r = waiting; waiting = null; r(true); }
+    }
+
+    timer = setInterval(onTick, delay);
+    if (signal && typeof signal.addEventListener === 'function') {
+      signal.addEventListener('abort', onAbort);
+    }
+
+    try {
+      while (true) {
+        if (aborted) throw abortErr;
+        if (queue.length > 0) {
+          queue.shift();
+        } else {
+          var didAbort = await new Promise(function (r) { waiting = r; });
+          if (didAbort) throw abortErr;
+        }
+        yield value;
+      }
+    } finally {
+      stop();
     }
   }
 
