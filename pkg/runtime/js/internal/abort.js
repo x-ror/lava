@@ -37,9 +37,21 @@
 
   function fireAbort(signal) {
     var event = { type: ABORT, target: signal, currentTarget: signal };
-    if (typeof signal._onabort === 'function') signal._onabort.call(signal, event);
+    if (typeof signal._onabort === 'function') {
+      try { signal._onabort.call(signal, event); } catch (e) { reportOrIgnore(e); }
+    }
     var listeners = signal._listeners.slice();
-    for (var i = 0; i < listeners.length; i++) listeners[i].call(signal, event);
+    for (var i = 0; i < listeners.length; i++) {
+      try { listeners[i].call(signal, event); } catch (e) { reportOrIgnore(e); }
+    }
+  }
+
+  // Node calls reportError() for listener throws; surface via console.error as a
+  // best-effort equivalent (keeps throw from silently swallowing or propagating).
+  function reportOrIgnore(e) {
+    if (typeof console !== 'undefined' && typeof console.error === 'function') {
+      console.error('Unhandled error in abort listener:', e);
+    }
   }
 
   function runAbort(signal, reason) {
@@ -104,6 +116,9 @@
   };
 
   AbortSignal.any = function (signals) {
+    if (!signals || typeof signals[Symbol.iterator] !== 'function') {
+      throw new TypeError('AbortSignal.any requires an iterable');
+    }
     var combined = newSignal();
     var list = Array.from(signals);
     for (var i = 0; i < list.length; i++) {
@@ -112,11 +127,23 @@
         return combined;
       }
     }
-    list.forEach(function (source) {
-      source.addEventListener(ABORT, function () {
+    // Keep per-source listeners so we can unsubscribe them all once the combined
+    // signal fires — prevents a leak on long-lived parent signals.
+    var handlers = [];
+    function onSourceAbort(source) {
+      return function () {
+        // Remove all handlers from all sources before triggering the combined abort.
+        for (var j = 0; j < list.length; j++) {
+          list[j].removeEventListener(ABORT, handlers[j]);
+        }
         runAbort(combined, source._reason);
-      });
-    });
+      };
+    }
+    for (var k = 0; k < list.length; k++) {
+      var handler = onSourceAbort(list[k]);
+      handlers.push(handler);
+      list[k].addEventListener(ABORT, handler);
+    }
     return combined;
   };
 
