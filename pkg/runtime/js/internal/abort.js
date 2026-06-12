@@ -38,11 +38,19 @@
   function fireAbort(signal) {
     var event = { type: ABORT, target: signal, currentTarget: signal };
     if (typeof signal._onabort === 'function') {
-      try { signal._onabort.call(signal, event); } catch (e) { reportOrIgnore(e); }
+      try {
+        signal._onabort.call(signal, event);
+      } catch (e) {
+        reportOrIgnore(e);
+      }
     }
     var listeners = signal._listeners.slice();
     for (var i = 0; i < listeners.length; i++) {
-      try { listeners[i].call(signal, event); } catch (e) { reportOrIgnore(e); }
+      try {
+        listeners[i].call(signal, event);
+      } catch (e) {
+        reportOrIgnore(e);
+      }
     }
   }
 

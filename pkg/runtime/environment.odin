@@ -3,6 +3,7 @@ package lava_runtime
 import "base:runtime"
 import "core:c"
 import "core:fmt"
+import "core:io"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -117,19 +118,29 @@ fs_read_file_sync_cb :: proc "c" (
 	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
 	defer if path_alloc do delete(path_str, context.allocator)
 
-	data, err := os.read_entire_file(path_str, context.allocator)
-	if err != os.ERROR_NONE {
+	data, read_err := os.read_entire_file(path_str, context.allocator)
+	if read_err != os.ERROR_NONE {
 		if exception != nil {
-			exception^ = fs_make_error(ctx, fs_read_error_code(path_str), "open", path_str)
+			code, errno_val := fs_os_error_to_code(read_err)
+			exception^ = fs_make_error(ctx, code, "open", path_str, errno_val)
 		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
-	// With an explicit encoding (readFileSync(path, 'utf8')) Node returns a
-	// string; with no encoding it returns a Buffer. We model the latter as a
-	// Uint8Array so binary data survives intact instead of being mangled by a
-	// lossy UTF-8 decode.
-	if argument_count >= 2 && jsc.JSValueIsString(ctx, args[1]) {
+	// With an explicit encoding (readFileSync(path, 'utf8') or {encoding:'utf8'})
+	// Node returns a string; with no encoding it returns a Buffer. We model the
+	// latter as a Uint8Array so binary data survives intact.
+	as_string := false
+	if argument_count >= 2 {
+		opt := args[1]
+		if jsc.JSValueIsString(ctx, opt) {
+			as_string = true
+		} else if jsc.JSValueIsObject(ctx, opt) {
+			enc := get_named(ctx, cast(jsc.JSObjectRef)opt, "encoding")
+			if enc != nil && jsc.JSValueIsString(ctx, enc) do as_string = true
+		}
+	}
+	if as_string {
 		defer delete(data, context.allocator)
 		return js_string_value(ctx, string(data))
 	}
@@ -163,6 +174,7 @@ FS_Read_Request :: struct {
 	as_string: bool, // an encoding was supplied → deliver a string, else a Uint8Array
 	err_msg:   string,
 	err_code:  string,
+	err_errno: int,
 	err_path:  string,
 }
 
@@ -217,14 +229,15 @@ fs_read_file_cb :: proc "c" (
 	req.as_string = as_string
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)callback)
 
-	data, err := os.read_entire_file(path_str, context.allocator)
-	if err != os.ERROR_NONE {
+	data, read_err2 := os.read_entire_file(path_str, context.allocator)
+	if read_err2 != os.ERROR_NONE {
 		req.ok = false
-		req.err_code = fs_read_error_code(path_str)
+		req.err_code, req.err_errno = fs_os_error_to_code(read_err2)
 		req.err_path, _ = strings.clone(path_str, context.allocator)
 		req.err_msg = fmt.aprintf(
-			"%s: error reading file, open '%s'",
+			"%s: %s, open '%s'",
 			req.err_code,
+			fs_errno_text(req.err_code),
 			path_str,
 			allocator = context.allocator,
 		)
@@ -277,6 +290,9 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			set_named(ctx, err_obj, "code", js_string_value(ctx, req.err_code))
 			set_named(ctx, err_obj, "path", js_string_value(ctx, req.err_path))
 			set_named(ctx, err_obj, "syscall", js_string_value(ctx, "open"))
+			if req.err_errno != 0 {
+				set_named(ctx, err_obj, "errno", jsc.JSValueMakeNumber(ctx, f64(-req.err_errno)))
+			}
 		}
 		call_args[0] = err
 		call_args[1] = jsc.JSValueMakeUndefined(ctx)
@@ -298,7 +314,7 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 // --- node:fs: writes, directories, stat ---
 
 // fs_make_error builds a Node-style fs error: an Error with code/syscall/path.
-fs_make_error :: proc(ctx: jsc.JSContextRef, code, syscall, path: string) -> jsc.JSValueRef {
+fs_make_error :: proc(ctx: jsc.JSContextRef, code, syscall, path: string, errno_val := 0) -> jsc.JSValueRef {
 	msg := fmt.tprintf("%s: %s, %s '%s'", code, fs_errno_text(code), syscall, path)
 	err := make_js_error(ctx, msg)
 	if jsc.JSValueIsObject(ctx, err) {
@@ -306,44 +322,80 @@ fs_make_error :: proc(ctx: jsc.JSContextRef, code, syscall, path: string) -> jsc
 		set_named(ctx, obj, "code", js_string_value(ctx, code))
 		set_named(ctx, obj, "syscall", js_string_value(ctx, syscall))
 		set_named(ctx, obj, "path", js_string_value(ctx, path))
+		if errno_val != 0 {
+			set_named(ctx, obj, "errno", jsc.JSValueMakeNumber(ctx, f64(-errno_val)))
+		}
 	}
 	return err
 }
 
 fs_errno_text :: proc(code: string) -> string {
 	switch code {
-	case "ENOENT":
-		return "no such file or directory"
-	case "EEXIST":
-		return "file already exists"
-	case "ENOTDIR":
-		return "not a directory"
-	case "EISDIR":
-		return "illegal operation on a directory"
+	case "ENOENT":        return "no such file or directory"
+	case "EEXIST":        return "file already exists"
+	case "ENOTDIR":       return "not a directory"
+	case "EISDIR":        return "illegal operation on a directory"
+	case "EACCES":        return "permission denied"
+	case "EPERM":         return "operation not permitted"
+	case "ENOTEMPTY":     return "directory not empty"
+	case "EIO":           return "i/o error"
+	case "EROFS":         return "read-only file system"
+	case "ENOSPC":        return "no space left on device"
+	case "ERR_FS_EISDIR": return "Path is a directory"
 	}
 	return "i/o error"
 }
 
-fs_read_error_code :: proc(path: string) -> string {
-	if !os.exists(path) do return "ENOENT"
-	if os.is_dir(path) do return "EISDIR"
-	return "EIO"
+// Map an os.Error to a Node-compatible error code string and positive errno number.
+fs_os_error_to_code :: proc(err: os.Error) -> (code: string, errno_val: int) {
+	#partial switch e in err {
+	case os.General_Error:
+		#partial switch e {
+		case .Not_Exist:   return "ENOENT", 2
+		case .Exist:       return "EEXIST", 17
+		case .Invalid_Dir: return "EISDIR", 21
+		case:              return "EIO", 5
+		}
+	case io.Error:
+		#partial switch e {
+		case .Permission_Denied: return "EACCES", 13
+		case:                    return "EIO", 5
+		}
+	case os.Platform_Error:
+		switch i32(e) {
+		case 1:  return "EPERM", 1
+		case 2:  return "ENOENT", 2
+		case 5:  return "EIO", 5
+		case 13: return "EACCES", 13
+		case 17: return "EEXIST", 17
+		case 20: return "ENOTDIR", 20
+		case 21: return "EISDIR", 21
+		case 28: return "ENOSPC", 28
+		case 30: return "EROFS", 30
+		case 39: return "ENOTEMPTY", 39
+		case:    return "EIO", 5
+		}
+	case:
+		return "EIO", 5
+	}
 }
 
-// fs_write_value writes a string or typed-array JS value to disk. Returns false on
-// any write error (the caller maps that to a thrown/forwarded fs error).
-fs_write_value :: proc(ctx: jsc.JSContextRef, path: string, value: jsc.JSValueRef) -> bool {
+// fs_write_value writes a string or typed-array JS value to disk.
+// Returns (true, nil) on success or (false, err) with the actual OS error on failure.
+fs_write_value :: proc(ctx: jsc.JSContextRef, path: string, value: jsc.JSValueRef) -> (ok: bool, err: os.Error) {
 	if jsc.JSValueGetTypedArrayType(ctx, value, nil) != .None {
-		bytes, ok := typed_array_view(ctx, value)
-		if !ok || len(bytes) == 0 {
-			return os.write_entire_file_from_bytes(path, nil) == nil
+		bytes, typed_ok := typed_array_view(ctx, value)
+		if !typed_ok || len(bytes) == 0 {
+			err = os.write_entire_file_from_bytes(path, nil)
+		} else {
+			err = os.write_entire_file_from_bytes(path, bytes)
 		}
-		return os.write_entire_file_from_bytes(path, bytes) == nil
+	} else {
+		str, alloc := jsc_value_to_string_or_default(ctx, value)
+		defer if alloc do delete(str, context.allocator)
+		err = os.write_entire_file_from_string(path, str)
 	}
-	// Strings and anything else are written via their string form (utf-8).
-	str, alloc := jsc_value_to_string_or_default(ctx, value)
-	defer if alloc do delete(str, context.allocator)
-	return os.write_entire_file_from_string(path, str) == nil
+	return err == nil, err
 }
 
 fs_write_file_sync_cb :: proc "c" (
@@ -363,8 +415,11 @@ fs_write_file_sync_cb :: proc "c" (
 	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
 	defer if path_alloc do delete(path_str, context.allocator)
 
-	if !fs_write_value(ctx, path_str, args[1]) {
-		if exception != nil do exception^ = fs_make_error(ctx, "ENOENT", "open", path_str)
+	if write_ok, write_err := fs_write_value(ctx, path_str, args[1]); !write_ok {
+		if exception != nil {
+			code, errno_val := fs_os_error_to_code(write_err)
+			exception^ = fs_make_error(ctx, code, "open", path_str, errno_val)
+		}
 	}
 	return jsc.JSValueMakeUndefined(ctx)
 }
@@ -399,11 +454,11 @@ fs_write_file_cb :: proc "c" (
 	req.syscall = "open"
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)callback)
 
-	if fs_write_value(ctx, path_str, args[1]) {
+	if write_ok, write_err := fs_write_value(ctx, path_str, args[1]); write_ok {
 		req.ok = true
 	} else {
 		req.ok = false
-		req.err_code = "ENOENT"
+		req.err_code, req.err_errno = fs_os_error_to_code(write_err)
 		req.err_path, _ = strings.clone(path_str, context.allocator)
 	}
 
@@ -418,12 +473,13 @@ fs_write_file_cb :: proc "c" (
 
 // FS_Op_Request backs async fs operations whose callback takes only (err).
 FS_Op_Request :: struct {
-	ctx:      jsc.JSContextRef,
-	callback: jsc.JSObjectRef,
-	ok:       bool,
-	err_code: string,
-	err_path: string,
-	syscall:  string,
+	ctx:       jsc.JSContextRef,
+	callback:  jsc.JSObjectRef,
+	ok:        bool,
+	err_code:  string,
+	err_errno: int,
+	err_path:  string,
+	syscall:   string,
 }
 
 fs_op_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
@@ -436,7 +492,7 @@ fs_op_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	if req.ok {
 		call_args[0] = jsc.JSValueMakeNull(ctx)
 	} else {
-		call_args[0] = fs_make_error(ctx, req.err_code, req.syscall, req.err_path)
+		call_args[0] = fs_make_error(ctx, req.err_code, req.syscall, req.err_path, req.err_errno)
 		if len(req.err_path) > 0 do delete(req.err_path, context.allocator)
 	}
 
@@ -490,9 +546,10 @@ fs_mkdir_sync_cb :: proc "c" (
 	recursive := argument_count >= 2 && fs_options_recursive(ctx, args[1])
 
 	if os.exists(path_str) {
-		// Node: recursive mkdir on an existing dir is a no-op; non-recursive throws.
-		if !recursive && exception != nil {
-			exception^ = fs_make_error(ctx, "EEXIST", "mkdir", path_str)
+		// Node: recursive mkdir on an existing dir is a no-op; non-recursive or
+		// recursive on an existing *file* throws EEXIST.
+		if !recursive || !os.is_dir(path_str) {
+			if exception != nil do exception^ = fs_make_error(ctx, "EEXIST", "mkdir", path_str, 17)
 		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}
@@ -560,17 +617,37 @@ fs_rm_sync_cb :: proc "c" (
 		if f != nil do force = bool(jsc.JSValueToBoolean(ctx, f))
 	}
 
-	if !os.exists(path_str) {
-		// force suppresses the "missing path" error, matching Node.
+	// Use lstat so a dangling symlink is visible (os.exists follows links and
+	// would incorrectly treat a dangling symlink as "not found").
+	lstat_info, lstat_err := os.lstat(path_str, context.allocator)
+	path_missing := lstat_err != nil
+	is_dir := !path_missing && lstat_info.type == .Directory
+	if lstat_err == nil do os.file_info_delete(lstat_info, context.allocator)
+
+	if path_missing {
 		if !force && exception != nil {
-			exception^ = fs_make_error(ctx, "ENOENT", "stat", path_str)
+			exception^ = fs_make_error(ctx, "ENOENT", "stat", path_str, 2)
 		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
-	ok := recursive ? fs_remove_recursive(path_str) : (os.remove(path_str) == nil)
-	if !ok && !force && exception != nil {
-		exception^ = fs_make_error(ctx, "ENOTEMPTY", "rmdir", path_str)
+	if recursive {
+		ok := fs_remove_recursive(path_str)
+		if !ok && !force && exception != nil {
+			exception^ = fs_make_error(ctx, "ENOTEMPTY", "rmdir", path_str, 39)
+		}
+	} else {
+		// Non-recursive on a directory: Node 22 throws ERR_FS_EISDIR regardless of
+		// whether the dir is empty, because rm(1) requires --recursive/-r for dirs.
+		if is_dir && !force {
+			if exception != nil do exception^ = fs_make_error(ctx, "ERR_FS_EISDIR", "rm", path_str, 21)
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		remove_err := os.remove(path_str)
+		if remove_err != nil && !force && exception != nil {
+			code, errno_val := fs_os_error_to_code(remove_err)
+			exception^ = fs_make_error(ctx, code, "rm", path_str, errno_val)
+		}
 	}
 	return jsc.JSValueMakeUndefined(ctx)
 }
