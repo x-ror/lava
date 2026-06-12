@@ -140,6 +140,34 @@ assert.throws(
   (e) => e.code === 'ENOENT' && e.syscall === 'open' && e.path.endsWith('/nope'),
 );
 
+// readFileSync with {encoding} object form returns a string.
+assert.equal(fs.readFileSync(textFile, { encoding: 'utf8' }), 'lava fs');
+
+// readFileSync on a missing path: error has code, syscall, path, and errno.
+assert.throws(
+  () => fs.readFileSync(path.join(scratch, 'nope2')),
+  (e) => e.code === 'ENOENT' && e.syscall === 'open' && typeof e.errno === 'number' && e.errno < 0,
+);
+
+// mkdirSync recursive over an existing *file* should throw EEXIST.
+assert.throws(
+  () => fs.mkdirSync(textFile, { recursive: true }),
+  (e) => e.code === 'EEXIST',
+);
+
+// rmSync non-recursive on a directory throws ERR_FS_EISDIR.
+assert.throws(
+  () => fs.rmSync(path.join(scratch, 'nested')),
+  (e) => e.code === 'ERR_FS_EISDIR',
+);
+
+// writeFileSync on a read-only path reports a real error code (not always ENOENT).
+// We test this by writing to a path under a non-existent grandparent.
+assert.throws(
+  () => fs.writeFileSync(path.join(scratch, 'no-such-dir', 'file.txt'), 'x'),
+  (e) => typeof e.code === 'string' && e.code.length > 0 && typeof e.errno === 'number',
+);
+
 // Async writeFile -> readFile round-trip, then recursive cleanup. The sentinel
 // console.log proves the async chain ran (so a silent skip can't pass).
 fs.writeFile(path.join(scratch, 'async.txt'), 'async fs', (writeErr) => {
@@ -147,8 +175,16 @@ fs.writeFile(path.join(scratch, 'async.txt'), 'async fs', (writeErr) => {
   fs.readFile(path.join(scratch, 'async.txt'), 'utf8', (readErr, contents) => {
     assert.equal(readErr, null);
     assert.equal(contents, 'async fs');
-    fs.rmSync(scratch, { recursive: true, force: true });
-    assert.equal(fs.existsSync(scratch), false);
-    console.log('fs-extended-ok');
+
+    // Async readFile on missing path: error has correct code and errno.
+    fs.readFile(path.join(scratch, 'no-such'), (readErr2) => {
+      assert.ok(readErr2 !== null);
+      assert.equal(readErr2.code, 'ENOENT');
+      assert.ok(typeof readErr2.errno === 'number' && readErr2.errno < 0);
+
+      fs.rmSync(scratch, { recursive: true, force: true });
+      assert.equal(fs.existsSync(scratch), false);
+      console.log('fs-extended-ok');
+    });
   });
 });
