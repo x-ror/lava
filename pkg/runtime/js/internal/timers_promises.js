@@ -68,8 +68,8 @@
 
     // A single repeating setInterval buffers missed ticks so a slow consumer
     // catches up immediately rather than drifting by one full delay per tick.
-    var queue = [];      // pending ticks not yet consumed
-    var waiting = null;  // resolve fn for a parked next() call, if any
+    var queue = []; // pending ticks not yet consumed
+    var waiting = null; // resolve fn for a parked next() call, if any
     var aborted = false;
     var abortErr = null;
     var timer = null;
@@ -77,7 +77,8 @@
     function onTick() {
       if (aborted) return;
       if (waiting) {
-        var r = waiting; waiting = null;
+        var r = waiting;
+        waiting = null;
         r(false);
       } else {
         queue.push(true);
@@ -85,7 +86,10 @@
     }
 
     function stop() {
-      if (timer !== null) { clearInterval(timer); timer = null; }
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
       if (signal) signal.removeEventListener('abort', onAbort);
     }
 
@@ -93,7 +97,11 @@
       aborted = true;
       abortErr = abortError(signal);
       stop();
-      if (waiting) { var r = waiting; waiting = null; r(true); }
+      if (waiting) {
+        var r = waiting;
+        waiting = null;
+        r(true);
+      }
     }
 
     timer = setInterval(onTick, delay);
@@ -107,7 +115,9 @@
         if (queue.length > 0) {
           queue.shift();
         } else {
-          var didAbort = await new Promise(function (r) { waiting = r; });
+          var didAbort = await new Promise(function (r) {
+            waiting = r;
+          });
           if (didAbort) throw abortErr;
         }
         yield value;

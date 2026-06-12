@@ -85,4 +85,7 @@ async function main() {
   console.log('internals-parity ok');
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
