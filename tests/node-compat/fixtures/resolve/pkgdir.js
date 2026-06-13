@@ -1,1 +1,1 @@
-module.exports = "SIBLING_WINS";
+module.exports = 'SIBLING_WINS';

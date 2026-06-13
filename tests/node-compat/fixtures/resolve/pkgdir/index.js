@@ -1,1 +1,1 @@
-module.exports = "DIR_INDEX";
+module.exports = 'DIR_INDEX';
