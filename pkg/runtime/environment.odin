@@ -887,14 +887,22 @@ native_require_cb :: proc "c" (
 	// node:-prefixed / assert-strict aliases). The resolver returns undefined
 	// for anything it does not own, so we fall through to the native builtins
 	// and the filesystem below.
-	if builtin := require_builtin(ctx, args[0]); builtin != nil {
+	builtin_exception: jsc.JSValueRef
+	if builtin := require_builtin(ctx, args[0], &builtin_exception); builtin != nil {
 		module_cache_put(ctx, state, specifier, builtin)
 		return builtin
+	} else if builtin_exception != nil {
+		if exception != nil do exception^ = builtin_exception
+		return jsc.JSValueMakeUndefined(ctx)
 	}
 
 	// node:path is served by the JS internal-module loader above (require_builtin).
 
-	if specifier == "node:fs" {
+	// The native fs module answers both the bare and node:-prefixed specifiers;
+	// `require('fs')` is the dominant real-world form. A bare specifier never
+	// resolves to a filesystem path (only "./", "../" and absolute do), so this
+	// cannot shadow a user file named fs.js.
+	if specifier == "node:fs" || specifier == "fs" {
 		fs_obj := jsc.JSObjectMake(ctx, nil, nil)
 
 		inject_native_function(ctx, fs_obj, "readFile", fs_read_file_cb)
@@ -908,7 +916,10 @@ native_require_cb :: proc "c" (
 		inject_native_function(ctx, fs_obj, "readdirSync", fs_readdir_sync_cb)
 
 		value := cast(jsc.JSValueRef)fs_obj
-		module_cache_put(ctx, state, specifier, value)
+		// Cache under both specifiers so require('fs') and require('node:fs')
+		// return the identical object (Node memoizes the builtin once).
+		module_cache_put(ctx, state, "fs", value)
+		module_cache_put(ctx, state, "node:fs", value)
 		return value
 	}
 
@@ -951,11 +962,25 @@ native_require_cb :: proc "c" (
 		}
 		defer delete(data, context.allocator)
 
-		json_source := fmt.aprintf("(%s)", string(data), allocator = context.temp_allocator)
-		value := eval_source_value(ctx, json_source, resolved, exception)
-		if exception == nil || exception^ == nil {
-			module_cache_put(ctx, state, resolved, value)
+		// Parse as JSON (Node uses JSON.parse), NOT JSEvaluateScript — wrapping the
+		// file in (...) and evaluating it would execute arbitrary code from a .json
+		// file and accept non-JSON. JSValueMakeFromJSONString returns null on a
+		// malformed document, which we surface as a SyntaxError like Node.
+		json_str := js_string_from_string(string(data))
+		if json_str == nil do return jsc.JSValueMakeUndefined(ctx)
+		defer jsc.JSStringRelease(json_str)
+		value := jsc.JSValueMakeFromJSONString(ctx, json_str)
+		if value == nil {
+			if exception != nil {
+				exception^ = make_js_named_error(
+					ctx,
+					"SyntaxError",
+					fmt.tprintf("Unexpected token in JSON in %s", resolved),
+				)
+			}
+			return jsc.JSValueMakeUndefined(ctx)
 		}
+		module_cache_put(ctx, state, resolved, value)
 		return value
 	}
 
@@ -1030,6 +1055,12 @@ native_require_cb :: proc "c" (
 		return value
 	}
 
+	// A resolved path with an extension we don't load as a module (or any other
+	// fall-through) must not silently yield undefined — Node throws
+	// MODULE_NOT_FOUND, and the project guarantees the same.
+	if exception != nil {
+		exception^ = make_js_error(ctx, fmt.tprintf("Cannot find module '%s'", specifier))
+	}
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
@@ -1066,7 +1097,16 @@ resolve_module_path :: proc(specifier: string, base_dir: string) -> (string, boo
 
 	candidate: string
 	if is_absolute_path(specifier) {
-		candidate, _ = strings.clone(specifier, context.allocator)
+		// Canonicalize absolute specifiers too, so require('/a//x.js'),
+		// require('/a/./x.js') and a symlink all collapse to one cache key and
+		// load the module once. filepath.abs returns "" for a not-yet-existing
+		// path (an extensionless specifier), so fall back to a lexical clean.
+		if abs_path, abs_err := filepath.abs(specifier, context.allocator);
+		   abs_err == os.ERROR_NONE && len(abs_path) > 0 {
+			candidate = abs_path
+		} else {
+			candidate, _ = filepath.clean(specifier, context.allocator)
+		}
 	} else {
 		dir := base_dir
 		if len(dir) == 0 {
@@ -1089,14 +1129,17 @@ resolve_module_path :: proc(specifier: string, base_dir: string) -> (string, boo
 	}
 	if len(candidate) == 0 do return "", false
 
-	if module_file_exists(candidate) do return candidate, true
+	// Only a regular file resolves directly; a directory must not shadow a sibling
+	// `<name>.js` (and is not itself loadable without index/main resolution).
+	if module_resolvable_file(candidate) do return candidate, true
 
-	extensions := [?]string{".js", ".cjs", ".mjs", ".json"}
+	// Probe Node's order first (.js, .json), then Lava's CommonJS/ESM extras.
+	extensions := [?]string{".js", ".json", ".cjs", ".mjs"}
 	for ext in extensions {
 		ext_parts := [?]string{candidate, ext}
 		with_ext, with_ext_err := strings.concatenate(ext_parts[:], context.allocator)
 		if with_ext_err != nil do continue
-		if module_file_exists(with_ext) {
+		if module_resolvable_file(with_ext) {
 			delete(candidate, context.allocator)
 			return with_ext, true
 		}
@@ -1109,6 +1152,14 @@ resolve_module_path :: proc(specifier: string, base_dir: string) -> (string, boo
 
 module_file_exists :: proc(path: string) -> bool {
 	return os.exists(path)
+}
+
+// module_resolvable_file reports whether `path` is a regular file that can be
+// loaded as a module. Unlike module_file_exists (used by fs.existsSync, which is
+// true for directories), this excludes directories so a `lib/` directory does not
+// shadow a sibling `lib.js` during require resolution.
+module_resolvable_file :: proc(path: string) -> bool {
+	return os.exists(path) && !os.is_dir(path)
 }
 
 // global_dirname reads the global __dirname (the entry file's directory). It is

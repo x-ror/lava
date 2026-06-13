@@ -9,6 +9,7 @@
 
   var cache = Object.create(null);
   natives = natives || Object.create(null);
+  var hasOwn = Object.prototype.hasOwnProperty;
 
   function normalize(name) {
     var key = name.indexOf('node:') === 0 ? name.slice(5) : name;
@@ -20,8 +21,12 @@
   function req(name) {
     var key = normalize(name);
     if (key in cache) return cache[key];
+    // Look up own properties only: `factories` may inherit from Object.prototype,
+    // so a bracket lookup of 'constructor'/'toString' would otherwise return an
+    // inherited function and mis-resolve those specifiers instead of yielding the
+    // "not a builtin" (undefined) that lets native_require_cb fall through.
+    if (!hasOwn.call(factories, key)) return undefined;
     var factory = factories[key];
-    if (factory === undefined) return undefined;
     var module = { exports: {} };
     // Seed the cache before running the factory so a require cycle resolves
     // to the partially-built exports object instead of looping forever.
