@@ -26,6 +26,7 @@ foreign jsc_lib {
 	JSValueMakeBoolean :: proc(ctx: JSContextRef, boolean: b32) -> JSValueRef ---
 	JSValueMakeNumber :: proc(ctx: JSContextRef, number: f64) -> JSValueRef ---
 	JSValueMakeString :: proc(ctx: JSContextRef, string: JSStringRef) -> JSValueRef ---
+	JSValueMakeFromJSONString :: proc(ctx: JSContextRef, string: JSStringRef) -> JSValueRef ---
 
 	JSValueGetType :: proc(ctx: JSContextRef, value: JSValueRef) -> JSType ---
 	JSValueIsUndefined :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---

@@ -354,6 +354,18 @@ make_js_error :: proc(ctx: jsc.JSContextRef, message: string) -> jsc.JSValueRef 
 	return cast(jsc.JSValueRef)err
 }
 
+// make_js_named_error builds an Error whose `name` is overridden (e.g.
+// "SyntaxError"), so `err.name` and the default stringification match the
+// corresponding native error subclass even though JSObjectMakeError always
+// produces a base Error.
+make_js_named_error :: proc(ctx: jsc.JSContextRef, name, message: string) -> jsc.JSValueRef {
+	err := make_js_error(ctx, message)
+	if jsc.JSValueIsObject(ctx, err) {
+		set_named(ctx, cast(jsc.JSObjectRef)err, "name", js_string_value(ctx, name))
+	}
+	return err
+}
+
 // --- Timer / scheduling callbacks ---
 
 set_timeout_cb :: proc "c" (
@@ -720,7 +732,11 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 // require_builtin asks the JS resolver for an internal module by specifier.
 // Returns nil when the resolver is absent or the module is unknown (the latter
 // surfaces as `undefined`, which the caller treats as "not a builtin").
-require_builtin :: proc(ctx: jsc.JSContextRef, specifier: jsc.JSValueRef) -> jsc.JSValueRef {
+require_builtin :: proc(
+	ctx: jsc.JSContextRef,
+	specifier: jsc.JSValueRef,
+	out_exception: ^jsc.JSValueRef = nil,
+) -> jsc.JSValueRef {
 	state := get_state_from_ctx(ctx)
 	if state == nil || state.builtin_require == nil do return nil
 	args := [1]jsc.JSValueRef{specifier}
@@ -733,7 +749,13 @@ require_builtin :: proc(ctx: jsc.JSContextRef, specifier: jsc.JSValueRef) -> jsc
 		raw_data(args[:]),
 		&exception,
 	)
-	if exception != nil do return nil
+	// A builtin factory that threw (e.g. a lazy module failing to initialize) must
+	// surface that error, not be mistaken for "not a builtin" and fall through to
+	// filesystem resolution as a misleading MODULE_NOT_FOUND.
+	if exception != nil {
+		if out_exception != nil do out_exception^ = exception
+		return nil
+	}
 	if result == nil || jsc.JSValueIsUndefined(ctx, result) do return nil
 	return result
 }
