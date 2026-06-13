@@ -23,6 +23,7 @@ make_sqlite_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "reset", sqlite_reset_cb)
 	inject_native_function(ctx, bindings, "bind", sqlite_bind_cb)
 	inject_native_function(ctx, bindings, "bindParameterCount", sqlite_bind_parameter_count_cb)
+	inject_native_function(ctx, bindings, "bindParameterName", sqlite_bind_parameter_name_cb)
 	inject_native_function(ctx, bindings, "step", sqlite_step_cb)
 	inject_native_function(ctx, bindings, "row", sqlite_row_cb)
 	inject_native_function(ctx, bindings, "changes", sqlite_changes_cb)
@@ -242,6 +243,26 @@ sqlite_bind_parameter_count_cb :: proc "c" (
 	stmt := sqlite_get_stmt(state, sqlite_arg_id(ctx, arguments[0]))
 	if stmt == nil do return jsc.JSValueMakeNumber(ctx, 0)
 	return jsc.JSValueMakeNumber(ctx, f64(sqlite.bind_parameter_count(stmt)))
+}
+
+// sqlite_bind_parameter_name_cb(stmtId, index) -> the 1-based parameter's name
+// (with its ":"/"@"/"$" sigil), or "" for an anonymous "?" parameter. Lets the JS
+// wrapper map a named-parameter object's keys onto bind positions.
+sqlite_bind_parameter_name_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 2 do return js_string_value(ctx, "")
+	state := get_state_from_ctx(ctx)
+	stmt := sqlite_get_stmt(state, sqlite_arg_id(ctx, arguments[0]))
+	if stmt == nil do return js_string_value(ctx, "")
+	index := int(jsc.JSValueToNumber(ctx, arguments[1], nil))
+	return js_string_value(ctx, sqlite.bind_parameter_name(stmt, index))
 }
 
 // sqlite_bind_cb(stmtId, index, value): binds one 1-based parameter, inferring the

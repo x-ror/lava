@@ -100,6 +100,7 @@ when SQLITE_AVAILABLE {
 		sqlite3_bind_null :: proc(stmt: rawptr, i: c.int) -> c.int ---
 		sqlite3_bind_blob :: proc(stmt: rawptr, i: c.int, p: rawptr, n: c.int, destroy: rawptr) -> c.int ---
 		sqlite3_bind_parameter_count :: proc(stmt: rawptr) -> c.int ---
+		sqlite3_bind_parameter_name :: proc(stmt: rawptr, i: c.int) -> cstring ---
 		sqlite3_changes64 :: proc(db: rawptr) -> i64 ---
 		sqlite3_last_insert_rowid :: proc(db: rawptr) -> i64 ---
 	}
@@ -319,6 +320,21 @@ bind_parameter_count :: proc(stmt: ^Statement) -> int {
 	} else {
 		if stmt == nil || stmt.handle == nil do return 0
 		return int(sqlite3_bind_parameter_count(stmt.handle))
+	}
+}
+
+// bind_parameter_name returns the name of the 1-based bound parameter, including
+// its prefix sigil (":", "@" or "$"). Returns "" for anonymous ("?") parameters.
+// The returned string is borrowed from SQLite and stays valid for the statement's
+// lifetime.
+bind_parameter_name :: proc(stmt: ^Statement, index: int) -> string {
+	when !SQLITE_AVAILABLE {
+		return ""
+	} else {
+		if stmt == nil || stmt.handle == nil do return ""
+		name := sqlite3_bind_parameter_name(stmt.handle, c.int(index))
+		if name == nil do return ""
+		return string(name)
 	}
 }
 
