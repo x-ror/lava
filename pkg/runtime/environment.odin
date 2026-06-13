@@ -1270,11 +1270,43 @@ esm_file_url :: proc(abs_path: string) -> string {
 	}
 }
 
+// js_quote renders `value` as a double-quoted JS/JSON string literal, escaping
+// every character that would otherwise change the literal's meaning. The CJS
+// module wrapper splices resolved paths (__filename, __dirname, the precache key,
+// the require base) through this, so unescaped input would corrupt or break the
+// generated source: a Windows drive path's backslashes ("C:\utils") read as
+// string escapes (an invalid \u → SyntaxError for the whole module), and a path
+// component containing a quote or newline (legal on POSIX) terminates the literal
+// early and injects into the module text. Equivalent to JSON.stringify of a
+// string (which is what esm.js uses for the same job).
 js_quote :: proc(value: string) -> string {
-	parts := [?]string{"\"", value, "\""}
-	result, err := strings.concatenate(parts[:], context.temp_allocator)
-	if err != nil do return "\"\""
-	return result
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_byte(&b, '"')
+	for i := 0; i < len(value); i += 1 {
+		c := value[i]
+		switch c {
+		case '"':  strings.write_string(&b, "\\\"")
+		case '\\': strings.write_string(&b, "\\\\")
+		case '\b': strings.write_string(&b, "\\b")
+		case '\f': strings.write_string(&b, "\\f")
+		case '\n': strings.write_string(&b, "\\n")
+		case '\r': strings.write_string(&b, "\\r")
+		case '\t': strings.write_string(&b, "\\t")
+		case:
+			if c < 0x20 {
+				// Other control characters as \u00XX (JSON requires escaping these).
+				strings.write_string(&b, "\\u00")
+				hex := "0123456789abcdef"
+				strings.write_byte(&b, hex[(c >> 4) & 0xf])
+				strings.write_byte(&b, hex[c & 0xf])
+			} else {
+				// Pass bytes >= 0x20 through verbatim (UTF-8 stays intact).
+				strings.write_byte(&b, c)
+			}
+		}
+	}
+	strings.write_byte(&b, '"')
+	return strings.to_string(b)
 }
 
 js_string_value :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef {
