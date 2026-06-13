@@ -65,14 +65,48 @@
     if (stmtFinalizers) stmtFinalizers.unregister(this);
   };
 
+  // A leading plain object supplies named parameters (:id / @id / $id); any
+  // trailing values fill the statement's anonymous "?" placeholders positionally.
+  // A Uint8Array (blob) or null is a value, not a named-parameter bag.
+  function isNamedParams(arg) {
+    return (
+      typeof arg === 'object' &&
+      arg !== null &&
+      !ArrayBuffer.isView(arg) &&
+      !Array.isArray(arg)
+    );
+  }
+
   StatementSync.prototype._prime = function (args) {
     this._assertReady();
     // Reset clears any prior row cursor and bindings so the statement can be
     // re-run with fresh parameters (Node allows reusing a prepared statement).
     native.reset(this._stmtId);
+
+    var named = null;
+    var posStart = 0;
+    if (args.length > 0 && isNamedParams(args[0])) {
+      named = args[0];
+      posStart = 1;
+    }
+
     var count = native.bindParameterCount(this._stmtId);
+    var pos = posStart;
     for (var i = 0; i < count; i++) {
-      native.bind(this._stmtId, i + 1, args[i]);
+      var name = native.bindParameterName(this._stmtId, i + 1);
+      if (name) {
+        // Strip the leading sigil (":" / "@" / "$") to get the object key.
+        var key = name.slice(1);
+        // An unmatched named parameter binds as NULL, matching node:sqlite (an
+        // unbound parameter defaults to NULL rather than raising).
+        var value = named && Object.prototype.hasOwnProperty.call(named, key)
+          ? named[key]
+          : null;
+        native.bind(this._stmtId, i + 1, value);
+      } else {
+        // Anonymous "?" parameter — take the next positional argument.
+        native.bind(this._stmtId, i + 1, args[pos++]);
+      }
     }
   };
 
