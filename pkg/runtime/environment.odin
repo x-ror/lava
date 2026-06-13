@@ -64,8 +64,10 @@ setup_module_environment :: proc(ctx: jsc.JSContextRef, file_path: string, loop:
 
 	module_name := jsc.JSStringCreateWithUTF8CString("module")
 	children_name := jsc.JSStringCreateWithUTF8CString("children")
+	exports_name := jsc.JSStringCreateWithUTF8CString("exports")
 	defer jsc.JSStringRelease(module_name)
 	defer jsc.JSStringRelease(children_name)
+	defer jsc.JSStringRelease(exports_name)
 
 	// Виправлено: додано касти до JSValueRef для властивостей об'єкта
 	jsc.JSObjectSetProperty(
@@ -76,7 +78,18 @@ setup_module_environment :: proc(ctx: jsc.JSContextRef, file_path: string, loop:
 		{},
 		nil,
 	)
+
+	// Initialize module.exports = {} (and the `exports` alias) so the entry can do
+	// `module.exports.foo = …` / `exports.foo = …` without first reassigning
+	// module.exports, matching Node's CommonJS entry — the per-module wrapper does
+	// the same for required modules. Without this, `module.exports` is undefined on
+	// the entry and the partial-exports cache (register_entry_module) has nothing
+	// to register.
+	exports_obj := jsc.JSObjectMake(ctx, nil, nil)
+	jsc.JSObjectSetProperty(ctx, module_obj, exports_name, cast(jsc.JSValueRef)exports_obj, {}, nil)
+
 	jsc.JSObjectSetProperty(ctx, global_obj, module_name, cast(jsc.JSValueRef)module_obj, {}, nil)
+	jsc.JSObjectSetProperty(ctx, global_obj, exports_name, cast(jsc.JSValueRef)exports_obj, {}, nil)
 }
 
 inject_global_string :: proc(
@@ -1307,6 +1320,33 @@ js_quote :: proc(value: string) -> string {
 	}
 	strings.write_byte(&b, '"')
 	return strings.to_string(b)
+}
+
+// register_entry_module caches the entry module's exports under its resolved
+// absolute path, so a module that require()s the entry by path gets the same
+// instance instead of re-executing the entry's top level (and an entry-involved
+// require cycle terminates). The .mjs entry registers itself via __lava_precache
+// in its transformed body; this covers the CommonJS/script entry, whose body runs
+// raw against the global `module`. Call it before evaluating the entry (so a cycle
+// sees the partial exports, like Node) and again after (the body may reassign
+// module.exports).
+register_entry_module :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State, source_name: string) {
+	if state == nil do return
+	abs_path, abs_err := filepath.abs(source_name, context.temp_allocator)
+	if abs_err != os.ERROR_NONE || len(abs_path) == 0 do return
+
+	global_obj := jsc.JSContextGetGlobalObject(ctx)
+	mod_name := jsc.JSStringCreateWithUTF8CString("module")
+	defer jsc.JSStringRelease(mod_name)
+	mod_val := jsc.JSObjectGetProperty(ctx, global_obj, mod_name, nil)
+	if !jsc.JSValueIsObject(ctx, mod_val) do return
+
+	exp_name := jsc.JSStringCreateWithUTF8CString("exports")
+	defer jsc.JSStringRelease(exp_name)
+	exports := jsc.JSObjectGetProperty(ctx, cast(jsc.JSObjectRef)mod_val, exp_name, nil)
+	if exports == nil do return
+
+	module_cache_set(ctx, state, abs_path, exports)
 }
 
 js_string_value :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef {

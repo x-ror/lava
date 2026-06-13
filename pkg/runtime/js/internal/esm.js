@@ -274,6 +274,15 @@
       'var module = { exports: {}, children: [] };',
       'var exports = module.exports;',
       'Object.defineProperty(module.exports, "__esModule", { value: true });',
+      // Register this module's (still-empty) namespace in the loader cache BEFORE
+      // running the body, mirroring the CommonJS wrapper's __lava_precache. Without
+      // this an ESM<->ESM import cycle (A imports B imports A) re-enters require
+      // with nothing cached and recurses to a stack overflow; with it the cycle
+      // partner sees the partial namespace, matching Node. (__lava_precache is a
+      // no-op for `lava eval` sources, where the global is absent.)
+      'if (typeof __lava_precache === "function") __lava_precache(' +
+        jsonString(filename) +
+        ', module.exports);',
       'function __importDefault(m){ return (m && m.__esModule) ? m["default"] : m; }',
       'function __importStar(m){ if (m && m.__esModule) return m; var ns = {}; if (m) { for (var k in m) ns[k] = m[k]; } ns["default"] = m; return ns; }',
       '(function(require, module, exports, __filename, __dirname, __import_meta){',

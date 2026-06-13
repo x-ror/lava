@@ -119,6 +119,12 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 		eval_source = wrapped
 		mjs_wrapped = wrapped
 		mjs_allocated = true
+	} else {
+		// Register the CommonJS/script entry in the module cache before it runs, so
+		// requiring the entry by path returns the same instance (and an entry-
+		// involved require cycle terminates instead of re-executing the entry). The
+		// .mjs entry handles this itself via __lava_precache in its transformed body.
+		register_entry_module(cast(jsc.JSContextRef)ctx, state, source_name)
 	}
 
 	script := js_string_from_string(eval_source)
@@ -171,6 +177,12 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 			message = msg,
 			is_allocated = allocated,
 		}
+	}
+
+	// Refresh the cached entry exports: a CommonJS entry body may have reassigned
+	// module.exports, so the pre-eval partial registered above is now stale.
+	if !mjs_allocated {
+		register_entry_module(cast(jsc.JSContextRef)ctx, state, source_name)
 	}
 
 	if loop != nil {
