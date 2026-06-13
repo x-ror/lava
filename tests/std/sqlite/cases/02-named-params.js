@@ -16,7 +16,10 @@ assert.equal(db.prepare('SELECT name FROM t WHERE id = ?').get(1).name, 'Ada');
 
 // A leading named-parameter object plus a trailing anonymous "?" parameter.
 const mixed = db.prepare('SELECT id FROM t WHERE id = :id OR name = ? ORDER BY id');
-assert.deepEqual(mixed.all({ id: 1 }, 'Grace').map((r) => r.id), [1, 2]);
+assert.deepEqual(
+  mixed.all({ id: 1 }, 'Grace').map((r) => r.id),
+  [1, 2],
+);
 
 // An unmatched named parameter binds as NULL (no row, no throw).
 assert.equal(db.prepare('SELECT name FROM t WHERE id = :id').get({}), undefined);

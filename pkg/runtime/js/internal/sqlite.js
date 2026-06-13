@@ -70,10 +70,7 @@
   // A Uint8Array (blob) or null is a value, not a named-parameter bag.
   function isNamedParams(arg) {
     return (
-      typeof arg === 'object' &&
-      arg !== null &&
-      !ArrayBuffer.isView(arg) &&
-      !Array.isArray(arg)
+      typeof arg === 'object' && arg !== null && !ArrayBuffer.isView(arg) && !Array.isArray(arg)
     );
   }
 
@@ -99,9 +96,7 @@
         var key = name.slice(1);
         // An unmatched named parameter binds as NULL, matching node:sqlite (an
         // unbound parameter defaults to NULL rather than raising).
-        var value = named && Object.prototype.hasOwnProperty.call(named, key)
-          ? named[key]
-          : null;
+        var value = named && Object.prototype.hasOwnProperty.call(named, key) ? named[key] : null;
         native.bind(this._stmtId, i + 1, value);
       } else {
         // Anonymous "?" parameter — take the next positional argument.
