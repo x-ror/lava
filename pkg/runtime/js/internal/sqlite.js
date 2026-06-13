@@ -10,12 +10,63 @@
     throw new Error('node:sqlite is unavailable: Lava was built without libsqlite3');
   }
 
-  function StatementSync(dbId, stmtId) {
-    this._dbId = dbId;
+  // GC backstops so that wrappers dropped without an explicit close/finalize still
+  // release their native handle instead of leaking until context teardown. The
+  // held value carries only the integer id (and, for statements, the owning db's
+  // live-statement map) so the registry never keeps the wrapper itself alive.
+  var hasFinalizationRegistry = typeof FinalizationRegistry === 'function';
+  var stmtFinalizers = hasFinalizationRegistry
+    ? new FinalizationRegistry(function (held) {
+        if (held.stmts[held.stmtId]) {
+          native.finalize(held.stmtId);
+          delete held.stmts[held.stmtId];
+        }
+      })
+    : null;
+  var dbFinalizers = hasFinalizationRegistry
+    ? new FinalizationRegistry(function (dbId) {
+        // No-op on the native side if the connection was already closed.
+        native.close(dbId);
+      })
+    : null;
+
+  function StatementSync(db, stmtId) {
+    this._db = db;
+    this._dbId = db._id;
     this._stmtId = stmtId;
+    this._finalized = false;
+    // Track the live statement on its database so db.close() can finalize it.
+    db._stmts[stmtId] = true;
+    if (stmtFinalizers) {
+      stmtFinalizers.register(this, { stmtId: stmtId, stmts: db._stmts }, this);
+    }
   }
 
+  // Throws like Node when the statement can no longer be used. Closing the
+  // database finalizes its statements (see DatabaseSync.close), so a statement
+  // whose db is closed reports as finalized too — matching node:sqlite.
+  StatementSync.prototype._assertReady = function () {
+    if (this._finalized || !this._db._open) {
+      var err = new Error('statement has been finalized');
+      err.code = 'ERR_INVALID_STATE';
+      throw err;
+    }
+  };
+
+  // _finalize releases the native statement and drops it from the db's live set.
+  // Idempotent and safe to call after the owning db has been closed.
+  StatementSync.prototype._finalize = function () {
+    if (this._finalized) return;
+    this._finalized = true;
+    if (this._db._stmts[this._stmtId]) {
+      native.finalize(this._stmtId);
+      delete this._db._stmts[this._stmtId];
+    }
+    if (stmtFinalizers) stmtFinalizers.unregister(this);
+  };
+
   StatementSync.prototype._prime = function (args) {
+    this._assertReady();
     // Reset clears any prior row cursor and bindings so the statement can be
     // re-run with fresh parameters (Node allows reusing a prepared statement).
     native.reset(this._stmtId);
@@ -62,6 +113,9 @@
     }
     this._id = native.open(String(path));
     this._open = true;
+    // Map of live statement id -> true for statements prepared on this connection.
+    this._stmts = {};
+    if (dbFinalizers) dbFinalizers.register(this, this._id, this);
   }
 
   Object.defineProperty(DatabaseSync.prototype, 'isOpen', {
@@ -74,7 +128,9 @@
 
   DatabaseSync.prototype._assertOpen = function () {
     if (!this._open) {
-      throw new Error('database is not open');
+      var err = new Error('database is not open');
+      err.code = 'ERR_INVALID_STATE';
+      throw err;
     }
   };
 
@@ -85,14 +141,23 @@
 
   DatabaseSync.prototype.prepare = function (sql) {
     this._assertOpen();
-    return new StatementSync(this._id, native.prepare(this._id, String(sql)));
+    return new StatementSync(this, native.prepare(this._id, String(sql)));
   };
 
   DatabaseSync.prototype.close = function () {
-    if (this._open) {
-      native.close(this._id);
-      this._open = false;
+    this._assertOpen();
+    // Finalize every outstanding statement before closing the connection;
+    // sqlite3_close_v2 would otherwise leave the connection a zombie (fd + file
+    // locks held) until the last statement is finalized.
+    var ids = Object.keys(this._stmts);
+    for (var i = 0; i < ids.length; i++) {
+      var id = Number(ids[i]);
+      native.finalize(id);
+      delete this._stmts[id];
     }
+    native.close(this._id);
+    this._open = false;
+    if (dbFinalizers) dbFinalizers.unregister(this);
   };
 
   module.exports = { DatabaseSync: DatabaseSync, StatementSync: StatementSync };
