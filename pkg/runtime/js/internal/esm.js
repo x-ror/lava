@@ -8,10 +8,18 @@
 // resulting namespace with a non-enumerable `__esModule` flag so CJS<->ESM default
 // interop matches Node/Babel/TS conventions.
 //
-// It intentionally handles only static, statement-position import/export forms.
-// Anything it does not recognize (e.g. destructuring exports, top-level await) is
-// surfaced as an explicit error rather than silently mistranslated. Dynamic
-// `import()` and `import.meta` member access are left to JSC.
+// The scanner is string/template/comment-aware: a masking pass (buildMask) blanks
+// every character inside a string, template literal, or comment so structural
+// scanning (statement boundaries, brace depth, the import/export keywords
+// themselves) never trips over `{` in a string, an `import` line inside a template
+// literal, a commented-out `export`, or a trailing line comment.
+//
+// It handles only static, statement-position import/export forms. Anything it does
+// not recognize (e.g. destructuring exports, top-level await) is surfaced as an
+// explicit error rather than silently mistranslated. Dynamic `import()` and
+// `import.meta` member access are left to JSC. Note: named imports/exports are
+// value copies, not live bindings — a later mutation of an `export let` is not
+// reflected in importers (a transform limitation, not modeled here).
 //
 // Evaluates to a function: transform(source, url, filename, dirname) -> string.
 (function () {
@@ -21,15 +29,196 @@
     return JSON.stringify(String(value));
   }
 
-  function countChar(text, ch) {
-    var n = 0;
-    for (var i = 0; i < text.length; i++) {
-      if (text.charAt(i) === ch) n++;
+  var IDENT = '[A-Za-z_$][\\w$]*';
+
+  // buildMask returns a copy of `src` with every character inside a string, a
+  // template literal, a line comment, or a block comment replaced by a space
+  // (newlines preserved, so indices/line structure are unchanged). Template
+  // `${ ... }` expressions are kept as code so nested braces/strings are tracked
+  // correctly. The result is used only for structural scanning; the original
+  // source is what gets emitted.
+  function buildMask(src) {
+    var out = '';
+    // Stack of modes: 'code' (with brace depth for ${} tracking), 'line',
+    // 'block', 'sq' (single-quote), 'dq' (double-quote), 'tpl' (template).
+    var stack = [{ mode: 'code', brace: 0 }];
+    function top() {
+      return stack[stack.length - 1];
     }
-    return n;
+    var i = 0;
+    while (i < src.length) {
+      var c = src.charAt(i);
+      var d = i + 1 < src.length ? src.charAt(i + 1) : '';
+      var m = top().mode;
+
+      if (m === 'code') {
+        if (c === '/' && d === '/') {
+          stack.push({ mode: 'line' });
+          out += '  ';
+          i += 2;
+          continue;
+        }
+        if (c === '/' && d === '*') {
+          stack.push({ mode: 'block' });
+          out += '  ';
+          i += 2;
+          continue;
+        }
+        if (c === "'") {
+          stack.push({ mode: 'sq' });
+          out += ' ';
+          i++;
+          continue;
+        }
+        if (c === '"') {
+          stack.push({ mode: 'dq' });
+          out += ' ';
+          i++;
+          continue;
+        }
+        if (c === '`') {
+          stack.push({ mode: 'tpl' });
+          out += ' ';
+          i++;
+          continue;
+        }
+        if (c === '{') {
+          top().brace++;
+          out += c;
+          i++;
+          continue;
+        }
+        if (c === '}') {
+          if (top().brace === 0 && stack.length > 1 && stack[stack.length - 2].mode === 'tpl') {
+            // Closes a `${ ... }` template expression; the brace belongs to the
+            // template, so blank it (it is not a statement brace).
+            stack.pop();
+            out += ' ';
+            i++;
+            continue;
+          }
+          if (top().brace > 0) top().brace--;
+          out += c;
+          i++;
+          continue;
+        }
+        out += c;
+        i++;
+        continue;
+      }
+
+      if (m === 'line') {
+        if (c === '\n') {
+          stack.pop();
+          out += '\n';
+        } else {
+          out += ' ';
+        }
+        i++;
+        continue;
+      }
+
+      if (m === 'block') {
+        if (c === '*' && d === '/') {
+          stack.pop();
+          out += '  ';
+          i += 2;
+          continue;
+        }
+        out += c === '\n' ? '\n' : ' ';
+        i++;
+        continue;
+      }
+
+      if (m === 'sq' || m === 'dq') {
+        if (c === '\\' && d !== '') {
+          out += '  ';
+          i += 2;
+          continue;
+        }
+        if ((m === 'sq' && c === "'") || (m === 'dq' && c === '"')) {
+          stack.pop();
+        }
+        out += c === '\n' ? '\n' : ' ';
+        i++;
+        continue;
+      }
+
+      if (m === 'tpl') {
+        if (c === '\\' && d !== '') {
+          out += '  ';
+          i += 2;
+          continue;
+        }
+        if (c === '`') {
+          stack.pop();
+          out += ' ';
+          i++;
+          continue;
+        }
+        if (c === '$' && d === '{') {
+          // Enter a template expression: subsequent chars are code until the
+          // matching `}` (tracked via the code frame's brace depth above).
+          stack.push({ mode: 'code', brace: 0 });
+          out += '  ';
+          i += 2;
+          continue;
+        }
+        out += c === '\n' ? '\n' : ' ';
+        i++;
+        continue;
+      }
+
+      // Unreachable, but keep length parity defensively.
+      out += c === '\n' ? '\n' : ' ';
+      i++;
+    }
+    return out;
   }
 
-  var IDENT = '[A-Za-z_$][\\w$]*';
+  // preReplaceMeta rewrites `import.meta` -> `__import_meta` everywhere it appears
+  // as real code (per the mask), keeping src and mask in sync (the replacement is
+  // all code, so the mask copy is identical). Done up front so the statement
+  // scanner never mistakes `import.meta` for an import statement and so member
+  // access works inside any expression.
+  function preReplaceMeta(src, mask) {
+    var s = '';
+    var m = '';
+    var i = 0;
+    while (i < src.length) {
+      if (mask.substr(i, 11) === 'import.meta') {
+        s += '__import_meta';
+        m += '__import_meta';
+        i += 11;
+      } else {
+        s += src.charAt(i);
+        m += mask.charAt(i);
+        i++;
+      }
+    }
+    return { src: s, mask: m };
+  }
+
+  // splitTopLevel splits `text` on `sep` at brace/paren/bracket depth 0, ignoring
+  // separators inside strings/comments/templates (via a fresh mask).
+  function splitTopLevel(text, sep) {
+    var mask = buildMask(text);
+    var out = [];
+    var depth = 0;
+    var start = 0;
+    for (var k = 0; k < text.length; k++) {
+      var ch = mask.charAt(k);
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']' || ch === '}') {
+        if (depth > 0) depth--;
+      } else if (ch === sep && depth === 0) {
+        out.push(text.slice(start, k));
+        start = k + 1;
+      }
+    }
+    out.push(text.slice(start));
+    return out;
+  }
 
   // Split a `{ a, b as c }` binding list into trimmed, non-empty specifiers.
   function splitSpecs(inner) {
@@ -85,14 +274,75 @@
   }
 
   function transform(source, url, filename, dirname) {
-    var lines = String(source).split('\n');
-    var body = [];
-    var tail = [];
+    source = String(source);
+    var pre = preReplaceMeta(source, buildMask(source));
+    var src = pre.src;
+    var mask = pre.mask;
+    var n = src.length;
+
+    var pieces = []; // verbatim gaps + transformed statements, emitted in order
+    var tail = []; // deferred local named-export assignments (`export { ... }`)
     var counter = 0;
 
     function nextTemp(prefix) {
       counter++;
       return prefix + counter;
+    }
+
+    // --- statement-position detection over the mask ---
+
+    function isStmtStart(pos) {
+      for (var k = pos - 1; k >= 0; k--) {
+        var ch = mask.charAt(k);
+        if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') continue;
+        return ch === ';' || ch === '{' || ch === '}';
+      }
+      return true; // start of source
+    }
+
+    function keywordAt(pos) {
+      var kw = mask.substr(pos, 6);
+      if (kw !== 'import' && kw !== 'export') return null;
+      var after = pos + 6 < n ? mask.charAt(pos + 6) : '';
+      // Must be a word boundary (not `imported`, `exports`).
+      if (after !== '' && /[\w$]/.test(after)) return null;
+      return kw;
+    }
+
+    function firstNonSpaceAfter(pos) {
+      for (var k = pos; k < n; k++) {
+        var ch = mask.charAt(k);
+        if (ch !== ' ' && ch !== '\t' && ch !== '\r' && ch !== '\n') return ch;
+      }
+      return '';
+    }
+
+    // findStmtEnd scans from `from` to the end of the import/export statement: the
+    // first `;` at depth 0, or a newline at depth 0 that is not a continuation
+    // (the previous meaningful char is not an operator/comma). Returns the index
+    // just past the terminator (exclusive of a terminating newline).
+    function findStmtEnd(from) {
+      var depth = 0;
+      var lastMeaningful = '';
+      for (var k = from; k < n; k++) {
+        var ch = mask.charAt(k);
+        if (ch === '(' || ch === '[' || ch === '{') {
+          depth++;
+          lastMeaningful = ch;
+        } else if (ch === ')' || ch === ']' || ch === '}') {
+          if (depth > 0) depth--;
+          lastMeaningful = ch;
+        } else if (ch === ';' && depth === 0) {
+          return k + 1;
+        } else if (ch === '\n' && depth === 0) {
+          // Continuation if the line ended on an operator or comma.
+          if ('+-*/%=<>&|^,.?:('.indexOf(lastMeaningful) !== -1) continue;
+          return k;
+        } else if (ch !== ' ' && ch !== '\t' && ch !== '\r' && ch !== '\n') {
+          lastMeaningful = ch;
+        }
+      }
+      return n;
     }
 
     function transformImport(stmt) {
@@ -162,7 +412,19 @@
       // export default <expr|decl>
       var m = stmt.match(/^export\s+default\s+([\s\S]+)$/);
       if (m) {
-        return { body: 'module.exports["default"] = ' + m[1].replace(/;?\s*$/, '') + ';' };
+        var expr = m[1].replace(/;?\s*$/, '');
+        // A named function/class declaration keeps its binding: declare it (so a
+        // hoisted module-scope name exists) and assign it as the default — rather
+        // than turning it into an anonymous expression that loses `foo`.
+        var fn = expr.match(new RegExp('^(?:async\\s+)?function\\b\\s*\\*?\\s*(' + IDENT + ')'));
+        if (fn) {
+          return { body: expr + '; module.exports["default"] = ' + fn[1] + ';' };
+        }
+        var cls = expr.match(new RegExp('^class\\s+(' + IDENT + ')\\b'));
+        if (cls) {
+          return { body: expr + '; module.exports["default"] = ' + cls[1] + ';' };
+        }
+        return { body: 'module.exports["default"] = ' + expr + ';' };
       }
       // export { ... } from 'spec'  (re-export named)
       m = stmt.match(/^export\s+\{([\s\S]*)\}\s+from\s+(['"])([^'"]*)\2\s*;?\s*$/);
@@ -199,7 +461,8 @@
             '[__k]; } }',
         };
       }
-      // export { ... }  (local named export)
+      // export { ... }  (local named export) — deferred to the tail so names
+      // declared anywhere in the module body are in scope when assigned.
       m = stmt.match(/^export\s+\{([\s\S]*)\}\s*;?\s*$/);
       if (m) {
         var locals = parseExportSpecs(m[1]);
@@ -211,63 +474,116 @@
         }
         return { body: '', tail: t2 };
       }
-      // export const|let|var NAME = ...
-      m = stmt.match(new RegExp('^export\\s+((?:const|let|var)\\s+(' + IDENT + ')[\\s\\S]*)$'));
+      // export const|let|var NAME = ... (possibly multiple declarators) — declare
+      // and assign each exported name in place, so a multi-declarator list exports
+      // every name and a cycle partner sees them as the body runs.
+      m = stmt.match(/^export\s+((?:const|let|var)\b[\s\S]*)$/);
       if (m) {
-        return { body: m[1], tail: ['module.exports[' + jsonString(m[2]) + '] = ' + m[2] + ';'] };
+        var decl = m[1].replace(/;?\s*$/, '');
+        var names = declaratorNames(decl);
+        var assigns = '';
+        for (var d = 0; d < names.length; d++) {
+          assigns += ' module.exports[' + jsonString(names[d]) + '] = ' + names[d] + ';';
+        }
+        return { body: decl + ';' + assigns };
       }
-      // export [async] function NAME / export class NAME
+      // export [async] function NAME / export class NAME — declare and assign in
+      // place (function declarations hoist, so the export is visible eagerly).
       m = stmt.match(
         new RegExp(
           '^export\\s+((?:async\\s+function|function|class)\\s+(' + IDENT + ')[\\s\\S]*)$',
         ),
       );
       if (m) {
-        return { body: m[1], tail: ['module.exports[' + jsonString(m[2]) + '] = ' + m[2] + ';'] };
+        return {
+          body:
+            m[1].replace(/;?\s*$/, '') +
+            '; module.exports[' +
+            jsonString(m[2]) +
+            '] = ' +
+            m[2] +
+            ';',
+        };
       }
       return null;
     }
 
-    var i = 0;
-    while (i < lines.length) {
-      var line = lines[i];
-      var trimmed = line.replace(/^\s+/, '');
-
-      // Accumulate continuation lines for an import/export whose `{`...`}` (or
-      // function/class body) spans multiple physical lines.
-      if (/^(import|export)\b/.test(trimmed)) {
-        var j = i;
-        while (j + 1 < lines.length && countChar(line, '{') > countChar(line, '}')) {
-          j++;
-          line += '\n' + lines[j];
+    // declaratorNames extracts the bound names from a `const|let|var a = 1, b = 2`
+    // declaration (top-level comma split, leading identifier of each declarator).
+    function declaratorNames(decl) {
+      var rest = decl.replace(/^(?:const|let|var)\s+/, '');
+      var parts = splitTopLevel(rest, ',');
+      var names = [];
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i].trim();
+        var mm = p.match(new RegExp('^(' + IDENT + ')'));
+        if (!mm) {
+          throw new Error('lava ESM transform: unsupported export declaration: ' + p);
         }
-        trimmed = line.replace(/^\s+/, '');
-        i = j;
+        names.push(mm[1]);
       }
+      return names;
+    }
 
-      if (/^import\b/.test(trimmed)) {
-        var im = transformImport(trimmed);
-        if (im === null) {
-          throw new Error('lava ESM transform: unsupported import form: ' + trimmed.split('\n')[0]);
+    // --- main scan: copy verbatim, transform import/export statements in place ---
+
+    var i = 0;
+    var depth = 0;
+    var lastCopy = 0;
+    while (i < n) {
+      var c = mask.charAt(i);
+      if (c === '(' || c === '[' || c === '{') {
+        depth++;
+        i++;
+        continue;
+      }
+      if (c === ')' || c === ']' || c === '}') {
+        if (depth > 0) depth--;
+        i++;
+        continue;
+      }
+      if (depth === 0 && (c === 'i' || c === 'e')) {
+        var kw = keywordAt(i);
+        if (kw && isStmtStart(i)) {
+          var after = firstNonSpaceAfter(i + 6);
+          // Leave dynamic import() and import.meta (already rewritten) to JSC.
+          if (kw === 'import' && (after === '(' || after === '.')) {
+            i += 6;
+            continue;
+          }
+          var end = findStmtEnd(i + 6);
+          var stmt = src.slice(i, end).replace(/\s+$/, '');
+          // Emit the verbatim gap before this statement.
+          pieces.push(src.slice(lastCopy, i));
+          if (kw === 'import') {
+            var im = transformImport(stmt);
+            if (im === null) {
+              throw new Error(
+                'lava ESM transform: unsupported import form: ' + stmt.split('\n')[0],
+              );
+            }
+            pieces.push(im);
+          } else {
+            var ex = transformExport(stmt);
+            if (ex === null) {
+              throw new Error(
+                'lava ESM transform: unsupported export form: ' + stmt.split('\n')[0],
+              );
+            }
+            if (ex.body) pieces.push(ex.body);
+            if (ex.tail) tail = tail.concat(ex.tail);
+          }
+          lastCopy = end;
+          i = end;
+          continue;
         }
-        body.push(im);
-      } else if (/^export\b/.test(trimmed)) {
-        var ex = transformExport(trimmed);
-        if (ex === null) {
-          throw new Error('lava ESM transform: unsupported export form: ' + trimmed.split('\n')[0]);
-        }
-        if (ex.body) body.push(ex.body);
-        if (ex.tail) tail = tail.concat(ex.tail);
-      } else {
-        body.push(line);
       }
       i++;
     }
+    pieces.push(src.slice(lastCopy));
 
-    // `import.meta` is the only meta-property we model; map it to the injected
-    // binding. (A naive token replace; acceptable for the trusted compat corpus.)
-    var bodyStr = body.join('\n').replace(/\bimport\.meta\b/g, '__import_meta');
-    var tailStr = tail.join('\n').replace(/\bimport\.meta\b/g, '__import_meta');
+    var bodyStr = pieces.join('');
+    var tailStr = tail.join('\n');
 
     return [
       '(function(){',
