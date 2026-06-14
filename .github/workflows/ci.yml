@@ -13,11 +13,10 @@ concurrency:
 # Two things may need tuning over time:
 #   1. The Odin/LLVM version below (setup-odin inputs) as the project tracks
 #      newer Odin dev builds.
-#   2. Windows cannot link/run because the WebKit Windows port's
-#      JavaScriptCore.lib/.dll is not available on GitHub runners. The Windows
-#      job therefore type-checks, validates Windows codegen (-build-mode:obj),
-#      and runs the JSC-free event-loop unit tests — everything except the final
-#      JSC link.
+#   2. The Windows job links JavaScriptCore from the Bun WebKit fork (static
+#      libs, provisioned + cached via WEBKIT_TAG) and runs a real JSC-backed
+#      lava.exe smoke, in addition to type-check, Windows codegen, and the
+#      JSC-free event-loop unit tests.
 
 jobs:
   linux:
@@ -115,7 +114,7 @@ jobs:
           llvm-version: "18"
 
       # Type-check every package natively for the Windows target. This exercises
-      # pkg/jsc/bindings_windows.odin and the IOCP event-loop backend.
+      # pkg/jsc/bindings_windows.odin and the select() event-loop backend.
       - name: Type-check
         run: |
           odin check cmd/lava -collection:lava=.
@@ -129,20 +128,18 @@ jobs:
       - name: Event-loop unit tests
         run: odin test pkg/runtime/eventloop
 
-      # Full Windows codegen of the JSC-using runtime + CLI. Stops before the
-      # link step (which would need JavaScriptCore.lib), proving every Windows
-      # source path compiles.
+      # Fast canary: full Windows codegen of the JSC-using runtime + CLI without
+      # linking, so a source/codegen break is caught before the (heavier) JSC link
+      # step below provisions WebKit.
       - name: Windows codegen (no link)
         run: |
           mkdir -p build
           odin build cmd/lava -collection:lava=. -build-mode:obj -out:build/lava.obj
 
-      # --- Experimental: real link + JSC-backed smoke (#36) ---
+      # --- Real link + JSC-backed runtime smoke (#36) ---
       # JavaScriptCore is provisioned from the Bun project's WebKit fork (static
-      # libs; see scripts/fetch-webkit-windows.sh). The link is still being brought
-      # up (static-CRT/ABI reconciliation against Odin's toolchain), so this step is
-      # non-blocking (continue-on-error) — it must not regress the green
-      # type-check/codegen CI above while iterated. Make it required once reliable.
+      # libs; see scripts/fetch-webkit-windows.sh), statically linked into lava.exe,
+      # which then runs a JS file through JavaScriptCore for real on Windows.
       - name: Cache JavaScriptCore (bun-webkit)
         id: cache-webkit
         uses: actions/cache@v4
@@ -162,8 +159,7 @@ jobs:
         with:
           arch: x64
 
-      - name: Windows link + JSC smoke (experimental)
-        continue-on-error: true
+      - name: Windows link + JSC smoke
         run: |
           mkdir -p build
           # Resolve the JSC static libs via the linker's LIB search path rather than
@@ -211,11 +207,16 @@ jobs:
           # splits "C:\Program Files\..." → LNK1181).
           odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
             -extra-linker-flags:"$RT_OBJS WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
+          # JSC smoke: prove lava.exe links and JavaScriptCore evaluates JS. We
+          # assert on the OUTPUT, which is the real signal. lava.exe currently exits
+          # 127 on Windows after a correct run (a teardown/exit-code anomaly tracked
+          # in #157) — independent of JSC working — so we capture the code for the
+          # log but key the pass/fail off the output, not the exit status.
           echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
           set +e
           ./build/lava.exe run smoke.js > smoke.out 2>&1
           code=$?
           set -e
-          echo "lava.exe exit code: $code"
+          echo "lava.exe exit code: $code (see #157)"
           echo "--- output ---"; cat smoke.out
-          grep -q "jsc-smoke:42" smoke.out && echo "SMOKE PASS" || { echo "SMOKE FAIL"; exit 1; }
+          grep -q "jsc-smoke:42" smoke.out && echo "JSC SMOKE PASS" || { echo "JSC SMOKE FAIL"; exit 1; }
