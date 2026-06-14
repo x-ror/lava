@@ -1,16 +1,18 @@
-#+build linux
+#+build linux, darwin
 package lava_runtime
 
 import "core:c"
 import "core:net"
 import "core:strings"
 
-// Minimal OpenSSL client bindings for the Linux fetch HTTPS transport. We link
-// the system libssl/libcrypto (the same `system:` convention used for sqlite3
-// and javascriptcoregtk) and bind only the handful of client-side symbols the
-// non-blocking handshake/read/write needs. TLS records replace raw socket bytes
-// in fetch_linux.odin; everything else (HTTP framing, the event loop) is shared
-// with the plaintext path.
+// Minimal OpenSSL client bindings for the fetch HTTPS transport (Linux + Darwin).
+// We link the system libssl/libcrypto (the same `system:` convention used for
+// sqlite3 and javascriptcoregtk) and bind only the handful of client-side symbols
+// the non-blocking handshake/read/write needs. TLS records replace raw socket
+// bytes in fetch_transport.odin; everything else (HTTP framing, the event loop)
+// is shared with the plaintext path. On macOS, libssl comes from Homebrew OpenSSL
+// (the build adds its lib path); a native Security.framework backend is future
+// work (see the #32 follow-up).
 //
 // Non-blocking model: the socket is the same O_NONBLOCK fd the plaintext path
 // uses. SSL_connect/SSL_read/SSL_write return <= 0 with SSL_get_error reporting

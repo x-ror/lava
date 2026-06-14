@@ -68,6 +68,11 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install OpenSSL
+        # The fetch TLS transport links Homebrew OpenSSL on Darwin (keg-only;
+        # scripts/build.sh adds its lib path). brew is preinstalled on the runner.
+        run: brew install openssl@3
+
       - name: Setup Odin
         uses: laytan/setup-odin@v2
         with:

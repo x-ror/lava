@@ -18,7 +18,8 @@ sandboxed CI environment may disallow. The node-compat oracle
 (`tests/node-compat/cases/08-fetch.js`) covers the `Headers`/`Request`/`Response`
 surface without a network.
 
-The transport handles `http://` and `https://` (TLS via system OpenSSL on Linux)
+The transport handles `http://` and `https://` (TLS via system/Homebrew OpenSSL,
+on Linux and macOS)
 and resolves DNS off the event loop; the connect/handshake/write/read path is
 non-blocking. When the `openssl` CLI is available the smoke runner generates a
 self-signed cert and exercises the HTTPS path, teaching both runtimes to trust it

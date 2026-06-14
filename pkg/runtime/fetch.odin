@@ -19,9 +19,10 @@ import eventloop "lava:pkg/runtime/eventloop"
 // side needs no JSObjectMakeDeferredPromise binding; it simply invokes one of
 // those two callbacks exactly once when the request settles.
 //
-// Scope: http:// and https:// (TLS via system OpenSSL on Linux; see
-// tls_linux.odin), blocking DNS off the loop; the transport runs non-blocking on
-// the event loop. See ROADMAP.
+// Scope: http:// and https:// (TLS via system/Homebrew OpenSSL; see tls.odin) on
+// Linux and macOS, blocking DNS off the loop; the transport runs non-blocking on
+// the event loop. Windows still rejects (no functional fd watch yet, #101). See
+// ROADMAP.
 
 Fetch_Phase :: enum {
 	Connecting,
