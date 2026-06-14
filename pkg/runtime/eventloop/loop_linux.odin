@@ -139,30 +139,37 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 
 	events: [32]linux.EPoll_Event
 	n: int
+	errno: linux.Errno
 
 	if timeout_ms < 0 {
-		// Виправлено: передаємо raw_data(events), довжину як i32, та кастимо результат n_res
-		n_res, _ := linux.epoll_wait(
+		n_res, err := linux.epoll_wait(
 			loop.platform.epoll_fd,
 			raw_data(events[:]),
 			i32(len(events)),
 			-1,
 		)
-		n = int(n_res)
+		n, errno = int(n_res), err
 	} else {
 		ts := linux.Time_Spec {
 			time_sec  = uint(timeout_ms / 1000),
 			time_nsec = uint((timeout_ms % 1000) * 1_000_000),
 		}
-		// Виправлено: додано пропущений аргумент i32(len(events)) (maxevents) та raw_data(events)
-		n_res, _ := linux.epoll_pwait2(
+		n_res, err := linux.epoll_pwait2(
 			loop.platform.epoll_fd,
 			raw_data(events[:]),
 			i32(len(events)),
 			&ts,
 			nil,
 		)
-		n = int(n_res)
+		n, errno = int(n_res), err
+	}
+
+	// EINTR is benign — the next tick retries. Any other error is fatal (e.g.
+	// EBADF on a closed epoll fd): flag it so the run drivers stop instead of
+	// busy-spinning on a syscall that can never make progress.
+	if errno != nil && errno != .EINTR {
+		loop.backend_error = true
+		return
 	}
 
 	if n <= 0 do return

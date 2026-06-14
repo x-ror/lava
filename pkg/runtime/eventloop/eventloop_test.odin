@@ -606,3 +606,24 @@ async_cancel_undoes_begin :: proc(t: ^testing.T) {
 	testing.expect(t, !has_pending_work(&loop))
 	testing.expect(t, !run_until_idle(&loop))
 }
+
+@(test)
+backend_error_stops_run_drivers :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	// An in-flight off-loop op keeps the loop alive: has_pending_work stays true,
+	// so without the backend_error escape the run drivers would spin forever once
+	// platform_poll can no longer make progress (a fatal poll syscall error).
+	async_begin(&loop)
+	testing.expect(t, has_pending_work(&loop))
+
+	// Simulate platform_poll flagging a fatal backend error.
+	loop.backend_error = true
+
+	// Both drivers must return promptly rather than busy-spin. (A regression here
+	// shows up as the test hanging until the runner times out.)
+	testing.expect(t, !run_until_idle(&loop))
+	run(&loop)
+	testing.expect(t, loop.backend_error) // flag is preserved for the embedder
+}

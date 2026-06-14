@@ -109,7 +109,14 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 		timeout = &ts
 	}
 
-	n, _ := kqueue.kevent(loop.platform.kq, nil, events[:], timeout)
+	n, err := kqueue.kevent(loop.platform.kq, nil, events[:], timeout)
+	// EINTR is benign — the next tick retries. Any other error is fatal (e.g.
+	// EBADF on a closed kqueue fd): flag it so the run drivers stop instead of
+	// busy-spinning on a syscall that can never make progress.
+	if err != .NONE && err != .EINTR {
+		loop.backend_error = true
+		return
+	}
 	if n == 0 {
 		return
 	}

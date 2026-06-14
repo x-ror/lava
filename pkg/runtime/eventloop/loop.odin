@@ -78,6 +78,11 @@ Loop :: struct {
 	running_id:      Timer_ID,
 	active_io_count: int,
 	io_events:       u64, // bumped by platform_poll each time a watcher callback fires
+	// Set by platform_poll when the backend's blocking syscall fails fatally (any
+	// error other than EINTR — e.g. EBADF on a closed epoll/kqueue fd). The run
+	// drivers exit instead of busy-spinning on a syscall that can never make
+	// progress; the flag stays set so an embedder can inspect it after run returns.
+	backend_error:   bool,
 	allocator:       mem.Allocator,
 	platform:        Platform_Loop,
 	// When set (the lava runtime), now_ms tracks the monotonic wall clock so
@@ -754,7 +759,7 @@ run_until_idle :: proc(loop: ^Loop, max_iterations := 1024) -> bool {
 	did_work := false
 
 	for i in 0 ..< max_iterations {
-		if !has_pending_work(loop) {
+		if !has_pending_work(loop) || loop.backend_error {
 			return did_work
 		}
 
@@ -774,7 +779,10 @@ run_until_idle :: proc(loop: ^Loop, max_iterations := 1024) -> bool {
 // while active_io_count or active_async are nonzero. (run_until_idle keeps its
 // bounded form for deterministic tests.)
 run :: proc(loop: ^Loop) {
-	for has_pending_work(loop) {
+	// A fatal backend-poll error (see Loop.backend_error) stops the loop: the poll
+	// syscall can no longer make progress, so continuing would busy-spin while
+	// active_io_count/active_async keep has_pending_work true forever.
+	for has_pending_work(loop) && !loop.backend_error {
 		run_next(loop)
 	}
 }
