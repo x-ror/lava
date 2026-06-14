@@ -1,6 +1,7 @@
 package lava_runtime
 
 import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
@@ -44,7 +45,7 @@ result_destroy :: proc(res: ^Result) {
 // script's completion value is returned for printing. `lava run` passes false so
 // running a file never echoes a trailing expression value, matching `node file`
 // (and avoiding JSC-version-dependent completion values like `[object Promise]`).
-eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = nil, echo_result := false) -> Result {
+eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = nil, echo_result := false, script_args: []string = nil) -> Result {
 	if len(source) == 0 {
 		return Result{status = .Invalid_Input, exit_code = 2, message = "empty JavaScript source"}
 	}
@@ -82,6 +83,11 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 	defer jsc.JSGlobalContextRelease(ctx)
 
 	state := new_runtime_state(loop)
+	// Build Node's process.argv = [execPath, scriptPath, ...userArgs]. argv[0] is
+	// the lava binary (absolute, like Node's execPath); argv[1] is the absolute
+	// script path (omitted for `lava eval`, where there is no script file). Built in
+	// the per-eval temp arena, which outlives install_process (see the defer above).
+	state.script_argv = build_process_argv(source_name, script_args)
 	jsc.JSObjectSetPrivate(
 		jsc.JSContextGetGlobalObject(cast(jsc.JSContextRef)ctx),
 		cast(rawptr)state,
@@ -219,7 +225,7 @@ process_exit_code :: proc(ctx: jsc.JSContextRef) -> int {
 	return int(n)
 }
 
-run_file :: proc(path: string, loop: ^eventloop.Loop = nil) -> Result {
+run_file :: proc(path: string, loop: ^eventloop.Loop = nil, script_args: []string = nil) -> Result {
 	if len(path) == 0 {
 		return Result {
 			status = .Invalid_Input,
@@ -238,7 +244,37 @@ run_file :: proc(path: string, loop: ^eventloop.Loop = nil) -> Result {
 	}
 	defer delete(data)
 
-	return eval(string(data), path, loop)
+	return eval(string(data), path, loop, false, script_args)
+}
+
+// build_process_argv assembles Node's process.argv: [execPath, scriptPath,
+// ...userArgs]. execPath is the lava binary (absolutized like Node's execPath);
+// scriptPath is the absolute entry path, omitted for `lava eval` (no script file).
+// Allocated in the temp arena (valid for the duration of the eval call).
+build_process_argv :: proc(source_name: string, script_args: []string) -> []string {
+	argv := make([dynamic]string, 0, len(script_args) + 2, context.temp_allocator)
+
+	exec_path := "lava"
+	if len(os.args) > 0 {
+		exec_path = os.args[0]
+		if abs_exec, abs_err := filepath.abs(exec_path, context.temp_allocator);
+		   abs_err == os.ERROR_NONE && len(abs_exec) > 0 {
+			exec_path = abs_exec
+		}
+	}
+	append(&argv, exec_path)
+
+	if source_name != "<eval>" {
+		script_path := source_name
+		if abs_script, abs_err := filepath.abs(source_name, context.temp_allocator);
+		   abs_err == os.ERROR_NONE && len(abs_script) > 0 {
+			script_path = abs_script
+		}
+		append(&argv, script_path)
+	}
+
+	for arg in script_args do append(&argv, arg)
+	return argv[:]
 }
 
 native_runtime_unavailable :: proc() -> Result {

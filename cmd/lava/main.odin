@@ -67,7 +67,9 @@ run_command :: proc(args: []string) {
 	}
 
 	loop := eventloop.init(real_time = true)
-	result := lava_runtime.run_file(args[0], &loop)
+	// args is [scriptPath, ...userArgs]; everything after the script is forwarded to
+	// process.argv.slice(2) (Node parity).
+	result := lava_runtime.run_file(args[0], &loop, args[1:])
 	print_result(result)
 	exit_code := result.exit_code
 	lava_runtime.result_destroy(&result)

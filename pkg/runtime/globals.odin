@@ -30,6 +30,10 @@ Runtime_State :: struct {
 	sqlite_dbs:        map[u64]rawptr,
 	sqlite_stmts:      map[u64]rawptr,
 	next_sqlite_id:    u64,
+	// Node-style process.argv: [execPath, scriptPath, ...userArgs]. Built in eval()
+	// and read by install_process. Empty for embedders that don't set it (then
+	// install_process falls back to os.args).
+	script_argv:       []string,
 }
 
 // JS_Callback bridges a JS function into an event-loop Callback. The function
@@ -522,8 +526,36 @@ process_exit_cb :: proc "c" (
 	exception: ^jsc.JSValueRef,
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
-	code := 0
-	if argument_count >= 1 do code = int(jsc.JSValueToNumber(ctx, arguments[0], nil))
+	// process.exit([code]): with no argument (or explicit undefined) the default is
+	// process.exitCode (Node parity). An explicit numeric code overrides it; a NaN
+	// code is a RangeError (ERR_OUT_OF_RANGE) in Node, not a silent garbage exit.
+	code := process_exit_code(ctx)
+	// Gate on JSValueGetType, not JSValueIsUndefined: the b32-returning JSValueIs*
+	// calls are unreliable across the FFI in a `proc "c"` callback (see the sqlite
+	// readBigInts / bind heisenbugs).
+	if argument_count >= 1 && jsc.JSValueGetType(ctx, arguments[0]) != .Undefined {
+		n := jsc.JSValueToNumber(ctx, arguments[0], nil)
+		if n != n {
+			if exception != nil {
+				err := make_js_named_error(
+					ctx,
+					"RangeError",
+					"The value of \"code\" is out of range. It must be an integer. Received NaN",
+				)
+				if jsc.JSValueIsObject(ctx, err) {
+					set_named(
+						ctx,
+						cast(jsc.JSObjectRef)err,
+						"code",
+						js_string_value(ctx, "ERR_OUT_OF_RANGE"),
+					)
+				}
+				exception^ = err
+			}
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		code = int(n)
+	}
 	os.exit(code)
 }
 
@@ -849,7 +881,13 @@ install_process :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
 	set_named(ctx, versions, "node", js_string_value(ctx, NODE_BASELINE))
 	set_named(ctx, process, "versions", cast(jsc.JSValueRef)versions)
 
-	set_named(ctx, process, "argv", cast(jsc.JSValueRef)build_string_array(ctx, os.args))
+	// Node's argv layout is [execPath, scriptPath, ...userArgs] (eval() builds it
+	// on the state). Fall back to os.args only for embedders that never set it.
+	argv := os.args
+	if state := get_state_from_ctx(ctx); state != nil && len(state.script_argv) > 0 {
+		argv = state.script_argv
+	}
+	set_named(ctx, process, "argv", cast(jsc.JSValueRef)build_string_array(ctx, argv))
 	set_named(ctx, process, "env", cast(jsc.JSValueRef)build_env_object(ctx))
 
 	inject_native_function(ctx, process, "exit", process_exit_cb)
@@ -891,6 +929,11 @@ build_string_array :: proc(ctx: jsc.JSContextRef, items: []string) -> jsc.JSObje
 	return jsc.JSObjectMakeArray(ctx, c.size_t(len(items)), raw_data(values), nil)
 }
 
+// build_env_object snapshots the OS environment into a plain object. NOTE: unlike
+// Node's live magic `process.env`, this is a one-shot copy — writes/deletes do not
+// reach the real environment, so native code reading os.environ later (e.g. a future
+// child_process) will not see them. Tracked divergence; revisit when child processes
+// land.
 build_env_object :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	object := jsc.JSObjectMake(ctx, nil, nil)
 	environ, err := os.environ(context.temp_allocator)
