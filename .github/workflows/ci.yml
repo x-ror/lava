@@ -186,6 +186,12 @@ jobs:
           if [ -n "$RT_LIB" ]; then
             export LIB="$(cygpath -w "$(dirname "$RT_LIB")");$LIB"
             echo "compiler-rt: $RT_LIB"
+            AR="$(command -v llvm-ar || echo '/c/Program Files/LLVM/bin/llvm-ar.exe')"
+            NM="$(command -v llvm-nm || echo '/c/Program Files/LLVM/bin/llvm-nm.exe')"
+            echo "=== members (ar t) matching divti3/fixdfti ==="
+            "$AR" t "$RT_LIB" 2>/dev/null | grep -iE 'divti3|fixdfti' || echo "NO such member"
+            echo "=== armap (symbol index) for __divti3/__fixdfti ==="
+            "$NM" --print-armap "$RT_LIB" 2>/dev/null | grep -iE '__divti3|__fixdfti' || echo "NOT in armap"
           else
             echo "WARNING: clang_rt.builtins-x86_64.lib not found under C:\\Program Files\\LLVM"
           fi
