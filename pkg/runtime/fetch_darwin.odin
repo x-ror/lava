@@ -22,20 +22,29 @@ fetch_close_fd :: proc(fd: uintptr) {
 }
 
 // fetch_new_socket creates a non-blocking TCP socket of the given family with
-// SIGPIPE suppressed, returning -1 on failure.
+// SIGPIPE suppressed, returning -1 on failure. It fails closed: if the socket
+// cannot be made non-blocking (would block the event loop) or SO_NOSIGPIPE
+// cannot be set (a peer reset could raise SIGPIPE and kill the process), it
+// closes the fd and reports failure rather than proceeding unsafely.
 @(private = "file")
 fetch_new_socket :: proc(family: posix.AF) -> posix.FD {
 	fd := posix.socket(family, .STREAM)
 	if fd < 0 do return -1
-	posix.fcntl(fd, .SETFL, posix.O_Flags{.NONBLOCK})
+	if posix.fcntl(fd, .SETFL, posix.O_Flags{.NONBLOCK}) == -1 {
+		posix.close(fd)
+		return -1
+	}
 	one: c.int = 1
-	posix.setsockopt(
-		fd,
-		c.int(posix.SOL_SOCKET),
-		cast(posix.Sock_Option)SO_NOSIGPIPE,
-		&one,
-		posix.socklen_t(size_of(one)),
-	)
+	if posix.setsockopt(
+		   fd,
+		   c.int(posix.SOL_SOCKET),
+		   cast(posix.Sock_Option)SO_NOSIGPIPE,
+		   &one,
+		   posix.socklen_t(size_of(one)),
+	   ) != .OK {
+		posix.close(fd)
+		return -1
+	}
 	return fd
 }
 
