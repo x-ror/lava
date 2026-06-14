@@ -117,11 +117,7 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 		ts: posix.timespec
 		timeout: ^posix.timespec = nil
 		if timeout_ms >= 0 {
-			remaining := timeout_ms
-			if timeout_ms > 0 {
-				elapsed := int(time.duration_milliseconds(time.tick_since(poll_start)))
-				remaining = max(0, timeout_ms - elapsed)
-			}
+			remaining := poll_remaining_ms(poll_start, timeout_ms)
 			ts.tv_sec = posix.time_t(remaining / 1000)
 			ts.tv_nsec = i64((remaining % 1000) * 1_000_000)
 			timeout = &ts

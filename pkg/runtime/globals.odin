@@ -33,6 +33,9 @@ Runtime_State :: struct {
 	// because the io_uring watcher may reference a request once more after it is
 	// stopped; freeing only at destroy keeps that memory valid (see fetch.odin).
 	pending_free:      [dynamic]^Fetch_Request,
+	// Fetches currently owned by this runtime context. Used during abnormal eval
+	// teardown to stop requests and join any DNS worker before the loop/context die.
+	active_fetches:    [dynamic]^Fetch_Request,
 	// node:sqlite handle registries: opaque id -> ^sqlite.Database / ^sqlite.Statement
 	// (kept as rawptr so this struct need not import pkg/std/sqlite). See sqlite.odin.
 	sqlite_dbs:        map[u64]rawptr,
@@ -83,6 +86,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state := new(Runtime_State)
 	state.loop = loop
 	state.module_cache = make(map[string]jsc.JSValueRef)
+	state.active_fetches = make([dynamic]^Fetch_Request)
 	state.sqlite_dbs = make(map[u64]rawptr)
 	state.sqlite_stmts = make(map[u64]rawptr)
 	state.next_sqlite_id = 1
@@ -91,6 +95,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 
 destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	if state == nil do return
+	fetch_shutdown_active(state)
 	fetch_destroy_pending(state)
 	sqlite_destroy_state(state)
 	for key, value in state.module_cache {
@@ -382,6 +387,17 @@ TIMER_MAX_MS :: 2147483647.0
 // clear*: ids grow unbounded but stay exactly representable as f64 below 2^53.
 MAX_SAFE_HANDLE_ID :: 9007199254740992.0
 
+// clamp_timer_delay applies Node's [1, 2^31-1] ms clamp to a raw setTimeout/
+// setInterval delay and returns the u64 the event loop expects. Anything < 1
+// (including NaN) or > TIMER_MAX_MS becomes 1 — which also covers two guards:
+// flooring at 1 stops a 0ms timer from busy-spinning the loop and starving pending
+// I/O (and freezing the virtual clock), and the bounded value makes the u64()
+// conversion safe (float→int on NaN/Infinity/out-of-range is undefined in Odin).
+clamp_timer_delay :: proc(delay: f64) -> u64 {
+	if !(delay >= 1 && delay <= TIMER_MAX_MS) do return 1
+	return u64(delay)
+}
+
 set_timeout_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -399,16 +415,16 @@ set_timeout_cb :: proc "c" (
 
 	delay := 0.0
 	if argument_count >= 2 do delay = jsc.JSValueToNumber(ctx, arguments[1], nil)
-	// Node clamps timer delays to [1, 2^31-1] ms: anything < 1 (incl. NaN) or
-	// > TIMER_MAX_MS becomes 1. The single bounded test also guards the u64(delay)
-	// conversion below — float→int on NaN/Infinity/out-of-range is undefined in Odin.
-	// Flooring at 1 also stops a 0ms timer from busy-spinning the loop and starving
-	// pending I/O (and freezing the virtual clock) while a request is in flight.
-	if !(delay >= 1 && delay <= TIMER_MAX_MS) do delay = 1
 
 	// Trailing args (setTimeout(fn, delay, ...args)) are forwarded on fire.
 	cb := make_js_callback(ctx, fn, false, capture_timer_args(ctx, argument_count, arguments, 2))
-	id := eventloop.set_timeout(loop, js_callback_trampoline, u64(delay), cb, js_callback_dispose)
+	id := eventloop.set_timeout(
+		loop,
+		js_callback_trampoline,
+		clamp_timer_delay(delay),
+		cb,
+		js_callback_dispose,
+	)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
 
@@ -429,16 +445,13 @@ set_interval_cb :: proc "c" (
 
 	interval := 0.0
 	if argument_count >= 2 do interval = jsc.JSValueToNumber(ctx, arguments[1], nil)
-	// Match Node's [1, 2^31-1] ms clamp (and avoid a 0ms interval starving pending
-	// I/O); the bound also guards the u64(interval) conversion against NaN/Infinity.
-	if !(interval >= 1 && interval <= TIMER_MAX_MS) do interval = 1
 
 	// Trailing args (setInterval(fn, delay, ...args)) are forwarded on every fire.
 	cb := make_js_callback(ctx, fn, true, capture_timer_args(ctx, argument_count, arguments, 2))
 	id := eventloop.set_interval(
 		loop,
 		js_callback_trampoline,
-		u64(interval),
+		clamp_timer_delay(interval),
 		cb,
 		js_callback_dispose,
 	)

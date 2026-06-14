@@ -162,11 +162,7 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 				-1,
 			)
 		} else {
-			remaining := timeout_ms
-			if timeout_ms > 0 {
-				elapsed := int(time.duration_milliseconds(time.tick_since(poll_start)))
-				remaining = max(0, timeout_ms - elapsed)
-			}
+			remaining := poll_remaining_ms(poll_start, timeout_ms)
 			ts := linux.Time_Spec {
 				time_sec  = uint(remaining / 1000),
 				time_nsec = uint((remaining % 1000) * 1_000_000),
@@ -204,7 +200,7 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 			continue
 		}
 
-		// Обробка мережевого сокету / дескриптора файлу
+		// A registered socket / file-descriptor event.
 		watcher := cast(^IO_Watcher)ev.data.ptr
 		if watcher != nil && watcher.callback != nil {
 			loop.io_events += 1
@@ -274,7 +270,7 @@ drain_uring_completions :: proc(loop: ^Loop) {
 				continue
 			}
 
-			// Подія від зареєстрованого асинхронного вочера сокетів
+			// A completion from a registered async socket watcher.
 			watcher := cast(^IO_Watcher)uintptr(cqe.user_data)
 			if watcher != nil && watcher.callback != nil {
 				loop.io_events += 1
@@ -297,7 +293,12 @@ drain_uring_completions :: proc(loop: ^Loop) {
 	}
 }
 
-arm_uring_poll :: proc(loop: ^Loop, fd: u64, user_data: u64, events: linux.Fd_Poll_Events) -> bool {
+arm_uring_poll :: proc(
+	loop: ^Loop,
+	fd: u64,
+	user_data: u64,
+	events: linux.Fd_Poll_Events,
+) -> bool {
 	sqe, ok := uring.get_sqe(&loop.platform.ring)
 	if !ok do return false
 
@@ -305,7 +306,7 @@ arm_uring_poll :: proc(loop: ^Loop, fd: u64, user_data: u64, events: linux.Fd_Po
 	// ring entries and does not zero them.
 	sqe^ = {}
 	sqe.opcode = .POLL_ADD
-	sqe.fd = cast(linux.Fd)fd // явний cast до distinct типу linux.Fd
+	sqe.fd = cast(linux.Fd)fd // explicit cast to the distinct linux.Fd type
 	sqe.user_data = user_data
 	// POLL_ADD reads the interest mask from poll_events; writing it to addr (the
 	// previous behavior) left poll_events zero, so the poll never completed.

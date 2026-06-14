@@ -190,6 +190,12 @@ sync_real_clock :: proc(loop: ^Loop) {
 // per live handle: cancelled handles already had theirs run and nulled by
 // clear_timeout, and a fired one-shot freed its own binding, so neither is
 // double-released here.
+//
+// PRECONDITION: every off-loop producer that may call post_async (e.g. fetch's DNS
+// workers) must already be joined. destroy touches async_queue WITHOUT the mutex on
+// the assumption it is the sole surviving accessor; a still-running worker would
+// race the read here and could post into freed memory. The lava runtime enforces
+// this by calling fetch_shutdown_active (which joins the workers) before destroy.
 destroy :: proc(loop: ^Loop) {
 	dispose_pending_tasks(&loop.next_ticks)
 	dispose_pending_tasks(&loop.next_ticks_scratch)
@@ -1057,8 +1063,29 @@ discard_cancelled_immediates :: proc(loop: ^Loop) {
 	}
 }
 
+// poll_remaining_ms returns the time left until an absolute poll deadline, so a
+// platform_poll re-entering after EINTR waits the REMAINING interval rather than
+// restarting it: a storm of signals can neither restart the full timeout nor
+// extend it unboundedly. A non-positive timeout (0 = non-blocking, <0 = block
+// forever) has no deadline to track and is returned unchanged; a finite timeout
+// returns max(0, timeout_ms - elapsed). Shared by the epoll and kqueue backends.
+poll_remaining_ms :: proc(start: time.Tick, timeout_ms: int) -> int {
+	if timeout_ms <= 0 do return timeout_ms
+	elapsed := int(time.duration_milliseconds(time.tick_since(start)))
+	return max(0, timeout_ms - elapsed)
+}
+
 // --- I/O watcher API ---
 
+// watch_fd registers watcher with the backend and returns whether it is now the
+// caller's freshly-registered watch. RETURN CONTRACT: true means this call moved
+// the watcher into the registered set (and bumped active_io_count). false means
+// "not newly registered" and covers THREE distinct cases the caller cannot tell
+// apart: a nil/callback-less watcher, an already-watched watcher (a benign re-arm,
+// not an error), or a real backend failure. A caller that must react to a genuine
+// registration failure should therefore drive watch_fd off a freshly zeroed
+// watcher (watched == false), so a false return can only mean the backend failed.
+// fetch_set_watch_mode relies on this: it unwatch_fd's first, clearing the flag.
 watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	if watcher == nil || watcher.callback == nil do return false
 	// Already in the registered set: a re-arm, not a new watcher. Do not call the

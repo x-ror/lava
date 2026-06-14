@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:c"
 import "core:strconv"
 import "core:strings"
+import "core:thread"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 
@@ -57,9 +58,8 @@ Fetch_Request :: struct {
 	// after post_async publishes it (see fetch_linux.odin). IPv4-only for now.
 	dns_ip4:       [4]u8,
 	dns_ok:        bool,
-
+	dns_worker:    ^thread.Thread,
 	response:      [dynamic]byte,
-
 	watcher:       eventloop.IO_Watcher,
 	fd:            uintptr,
 	has_fd:        bool,
@@ -83,8 +83,8 @@ g_fetch_cancel_class: jsc.JSClassRef
 fetch_get_cancel_class :: proc() -> jsc.JSClassRef {
 	if g_fetch_cancel_class == nil {
 		def := jsc.JSClassDefinition {
-			class_name        = "FetchCancel",
-			call_as_function  = fetch_cancel_fn_cb,
+			class_name       = "FetchCancel",
+			call_as_function = fetch_cancel_fn_cb,
 		}
 		g_fetch_cancel_class = jsc.JSClassCreate(&def)
 	}
@@ -179,7 +179,15 @@ fetch_request_cb :: proc "c" (
 	req.is_https = scheme == "https"
 	// Serialize while the JSC-borrowed `body`/`header_lines` are still valid; the
 	// resulting buffer is independent of them.
-	req.request_bytes = build_http_request(req.method, req.host, port, req.path, header_lines, body, req.is_https)
+	req.request_bytes = build_http_request(
+		req.method,
+		req.host,
+		port,
+		req.path,
+		header_lines,
+		body,
+		req.is_https,
+	)
 
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_response)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_error)
@@ -189,6 +197,7 @@ fetch_request_cb :: proc "c" (
 	cancel_fn := jsc.JSObjectMake(ctx, fetch_get_cancel_class(), req)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)cancel_fn)
 	req.cancel_fn = cancel_fn
+	if state := get_state_from_ctx(ctx); state != nil do fetch_track_active(state, req)
 
 	started, err := fetch_transport_start(req, host, port)
 	if !started {
@@ -201,7 +210,15 @@ fetch_request_cb :: proc "c" (
 // An IPv6 literal host ([::1]) is returned bracket-stripped (host == "::1");
 // build_http_request re-brackets it for the Host header and the Linux transport
 // connects over AF_INET6.
-parse_http_url :: proc(url: string) -> (host: string, port: int, path: string, scheme: string, ok: bool) {
+parse_http_url :: proc(
+	url: string,
+) -> (
+	host: string,
+	port: int,
+	path: string,
+	scheme: string,
+	ok: bool,
+) {
 	rest := url
 	switch {
 	case strings.has_prefix(rest, "http://"):
@@ -379,7 +396,11 @@ fetch_reject_now :: proc(ctx: jsc.JSContextRef, on_error: jsc.JSObjectRef, messa
 // both safely past that read.
 fetch_request_finish :: proc(req: ^Fetch_Request) {
 	if req.settled do return
+	fetch_release_dns_worker(req)
 	req.settled = true
+	if state := get_state_from_ctx(req.ctx); state != nil {
+		fetch_untrack_active(state, req)
+	}
 
 	// Clearing the callback stops the io_uring drain from re-arming this watcher
 	// with live work; the epoll path is removed outright by unwatch_fd.
@@ -410,6 +431,61 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 	}
 }
 
+fetch_track_active :: proc(state: ^Runtime_State, req: ^Fetch_Request) {
+	if state == nil || req == nil do return
+	append(&state.active_fetches, req)
+}
+
+fetch_untrack_active :: proc(state: ^Runtime_State, req: ^Fetch_Request) {
+	if state == nil || req == nil do return
+	for i in 0 ..< len(state.active_fetches) {
+		if state.active_fetches[i] == req {
+			// active_fetches is an unordered bag (membership only — used for teardown),
+			// so swap-remove the slot in O(1) rather than shifting the tail.
+			unordered_remove(&state.active_fetches, i)
+			return
+		}
+	}
+}
+
+// fetch_release_dns_worker joins and frees a request's DNS resolver thread, and is
+// a no-op once released (idempotent across the completion, cancel, and shutdown
+// paths). Loop-thread only.
+//
+// COST: thread.join BLOCKS the loop thread until the worker's proc returns. On the
+// normal path the worker has already posted its completion and is about to exit, so
+// this is effectively free. But on cancel-while-resolving (clear via the cancel
+// handle) and teardown-while-resolving, the worker is still inside a blocking
+// getaddrinfo with no cancellation, so the loop — and the whole process — parks
+// until the system resolver returns or times out. fetch_shutdown_active joins
+// serially, so N in-flight lookups can serialize. This is the simplest CORRECT
+// guarantee that no worker posts into a freed loop; a non-blocking handoff (worker
+// owns its inputs + a refcounted loop guard, or a cancellable resolver) is the
+// proper fix and is left as a tracked follow-up.
+fetch_release_dns_worker :: proc(req: ^Fetch_Request) {
+	if req == nil || req.dns_worker == nil do return
+	thread.join(req.dns_worker)
+	thread.destroy(req.dns_worker)
+	req.dns_worker = nil
+}
+
+// fetch_shutdown_active stops every in-flight request without invoking its JS
+// callbacks. It is used while the JS context is still alive but eval is already
+// returning (for example after a top-level throw). DNS workers are joined before
+// the request is finished so no background thread can post into a destroyed loop.
+//
+// Idempotent and intentionally called from several teardown entry points (eval's
+// deferred teardown, destroy_runtime_state, and fetch_destroy_pending): each
+// fetch_request_finish untracks its request, so a second pass sees an empty set.
+fetch_shutdown_active :: proc(state: ^Runtime_State) {
+	if state == nil do return
+	for len(state.active_fetches) > 0 {
+		req := state.active_fetches[0]
+		fetch_release_dns_worker(req)
+		fetch_request_finish(req)
+	}
+}
+
 // fetch_reclaim_pending frees every settled request awaiting cleanup. Safe to
 // call any time after the settling loop iteration: a settled request has its
 // watcher callback cleared and no poll in flight, so no later completion can
@@ -430,8 +506,10 @@ fetch_reclaim_pending :: proc(state: ^Runtime_State) {
 
 // fetch_destroy_pending reclaims and releases the backing store at teardown.
 fetch_destroy_pending :: proc(state: ^Runtime_State) {
+	fetch_shutdown_active(state)
 	fetch_reclaim_pending(state)
 	delete(state.pending_free)
+	delete(state.active_fetches)
 }
 
 // parse_http_response splits a raw HTTP/1.1 response into status, status text,
@@ -441,11 +519,20 @@ fetch_destroy_pending :: proc(state: ^Runtime_State) {
 // ready to hand to JSC.
 parse_http_response :: proc(
 	data: []byte,
-) -> (status: int, status_text: string, headers: []string, body: []byte, ok: bool) {
+) -> (
+	status: int,
+	status_text: string,
+	headers: []string,
+	body: []byte,
+	ok: bool,
+) {
 	sep := -1
 	if len(data) >= 4 {
 		for i in 0 ..= len(data) - 4 {
-			if data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n' {
+			if data[i] == '\r' &&
+			   data[i + 1] == '\n' &&
+			   data[i + 2] == '\r' &&
+			   data[i + 3] == '\n' {
 				sep = i
 				break
 			}
