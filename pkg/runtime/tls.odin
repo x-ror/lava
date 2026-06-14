@@ -1,30 +1,39 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package lava_runtime
 
 import "core:c"
 import "core:net"
 import "core:strings"
 
-// Minimal OpenSSL client bindings for the fetch HTTPS transport (Linux + Darwin).
-// We link the system libssl/libcrypto (the same `system:` convention used for
-// sqlite3 and javascriptcoregtk) and bind only the handful of client-side symbols
-// the non-blocking handshake/read/write needs. TLS records replace raw socket
-// bytes in fetch_transport.odin; everything else (HTTP framing, the event loop)
-// is shared with the plaintext path. On macOS, libssl comes from Homebrew OpenSSL
-// (the build adds its lib path); a native Security.framework backend is future
-// work (see the #32 follow-up).
+// Minimal OpenSSL client bindings for the fetch HTTPS transport (Linux, Darwin,
+// Windows). We link libssl/libcrypto and bind only the handful of client-side
+// symbols the non-blocking handshake/read/write needs. TLS records replace raw
+// socket bytes in fetch_transport.odin; everything else (HTTP framing, the event
+// loop) is shared with the plaintext path. On macOS, libssl comes from Homebrew
+// OpenSSL (the build adds its lib path); a native Security.framework backend is
+// future work (see #143).
 //
-// Non-blocking model: the socket is the same O_NONBLOCK fd the plaintext path
+// Non-blocking model: the socket is the same non-blocking fd the plaintext path
 // uses. SSL_connect/SSL_read/SSL_write return <= 0 with SSL_get_error reporting
 // WANT_READ / WANT_WRITE; the caller re-arms the loop watcher for that direction
 // and resumes when the fd is ready again.
 
 // libssl provides the SSL_*/SSL_CTX_* symbols; libcrypto provides the X509
 // verification-parameter helpers (e.g. X509_VERIFY_PARAM_set1_ip_asc). Both must
-// be on the link line, so import them as a group.
-foreign import openssl_lib {
-	"system:ssl",
-	"system:crypto",
+// be on the link line, so import them as a group. The library names differ by
+// platform: the Unix linker's `system:` -l convention on Linux/Darwin (same as
+// sqlite3/javascriptcoregtk), and the import-lib filenames on Windows (as built
+// by vcpkg / the OpenSSL installer — the build supplies the /LIBPATH).
+when ODIN_OS == .Windows {
+	foreign import openssl_lib {
+		"libssl.lib",
+		"libcrypto.lib",
+	}
+} else {
+	foreign import openssl_lib {
+		"system:ssl",
+		"system:crypto",
+	}
 }
 
 SSL_CTX :: distinct rawptr
@@ -111,6 +120,9 @@ tls_new_client :: proc(fd: uintptr, host: string) -> SSL {
 	if ctx == nil do return nil
 	ssl := SSL_new(ctx)
 	if ssl == nil do return nil
+	// SSL_set_fd takes an int. On Windows req.fd is a SOCKET (a uintptr-wide
+	// kernel handle); narrowing to c.int is the documented OpenSSL-on-Windows
+	// convention (its BIO socket layer uses int) and real socket values fit.
 	if SSL_set_fd(ssl, c.int(fd)) != 1 {
 		SSL_free(ssl)
 		return nil

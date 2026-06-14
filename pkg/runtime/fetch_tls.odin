@@ -1,4 +1,4 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package lava_runtime
 
 import "core:c"
