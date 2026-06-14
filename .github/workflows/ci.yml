@@ -212,5 +212,10 @@ jobs:
           odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
             -extra-linker-flags:"$RT_OBJS WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
           echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
-          ./build/lava.exe run smoke.js | tee smoke.out
-          grep -q "jsc-smoke:42" smoke.out
+          set +e
+          ./build/lava.exe run smoke.js > smoke.out 2>&1
+          code=$?
+          set -e
+          echo "lava.exe exit code: $code"
+          echo "--- output ---"; cat smoke.out
+          grep -q "jsc-smoke:42" smoke.out && echo "SMOKE PASS" || { echo "SMOKE FAIL"; exit 1; }
