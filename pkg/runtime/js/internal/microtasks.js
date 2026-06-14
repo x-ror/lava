@@ -158,5 +158,18 @@
     configurable: false,
   });
 
+  // Pre-create the binding the top-level drain assigns to, as a non-enumerable
+  // property. The appended `var __lava_tl_drain = ...` (a VariableStatement, kept
+  // for its empty completion value — see runtime.odin) would otherwise create an
+  // *enumerable*, non-configurable global; redeclaring an existing own property
+  // instead writes through without changing this descriptor, so the internal name
+  // stays out of `Object.keys(globalThis)` / `for...in`.
+  objectDefineProperty(globalThis, '__lava_tl_drain', {
+    value: undefined,
+    writable: true,
+    enumerable: false,
+    configurable: false,
+  });
+
   return { drainNextTicks: drainNextTicks, dispatch: dispatch };
 });
