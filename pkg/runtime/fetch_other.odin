@@ -2,8 +2,9 @@
 #+build !darwin
 package lava_runtime
 
-// Fallback for platforms without a fetch transport (currently Windows — its
-// event-loop watch_fd is a non-functional readiness stub, see #101). The
+// Fallback for platforms without a fetch transport (currently Windows — the
+// event-loop readiness backend works there now via select (#101), but the Windows
+// Winsock fetch transport itself is not yet wired up, see #32). The
 // Headers/Request/Response surface still works everywhere; only the network call
 // rejects. Linux and Darwin use fetch_transport.odin + their platform primitives.
 
