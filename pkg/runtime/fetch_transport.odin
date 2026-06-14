@@ -7,11 +7,12 @@ import "core:thread"
 import eventloop "lava:pkg/runtime/eventloop"
 
 // Shared fetch transport for the readiness-based backends (Linux epoll/io_uring,
-// Darwin kqueue). The connect→[TLS handshake]→write→read state machine, the DNS
-// hand-off, and the OpenSSL plumbing live here; each platform supplies only the
-// socket primitives (create/connect, send/recv, SO_ERROR check, watch-mode flip,
-// close) in fetch_linux.odin / fetch_darwin.odin. Non-Linux/Darwin targets get
-// the rejecting stub in fetch_other.odin instead of this file.
+// Darwin kqueue, Windows select). The connect→[TLS handshake]→write→read state
+// machine and the DNS hand-off live here and are OpenSSL-free. Each platform
+// supplies only the socket primitives (create/connect, send/recv, SO_ERROR check,
+// watch-mode flip, close) in fetch_{linux,darwin,windows}.odin, plus a TLS backend
+// (fetch_tls.odin = OpenSSL; fetch_tls_stub.odin = reject) that the https branches
+// delegate to. Targets with no transport at all fall back to fetch_other.odin.
 
 // Fetch_IO_Result is the outcome of a raw (plaintext) socket read/write, mapped
 // by the platform primitives from the OS error so the state machine stays
@@ -36,6 +37,13 @@ fetch_transport_start :: proc(
 	ok: bool,
 	err: string,
 ) {
+	// Reject https:// up front on backends without TLS (fetch_tls_supported ==
+	// false), before any DNS lookup or outbound connect — so an unsupported
+	// request fails instantly and locally instead of after network work.
+	if req.is_https && !fetch_tls_supported {
+		return false, FETCH_HTTPS_UNSUPPORTED_MSG
+	}
+
 	// An IPv6 literal host (e.g. "::1") arrives bracket-stripped from
 	// parse_http_url and is the only host that can contain a colon.
 	if strings.index_byte(host, ':') >= 0 {

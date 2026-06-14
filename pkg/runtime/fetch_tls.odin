@@ -10,6 +10,14 @@ import eventloop "lava:pkg/runtime/eventloop"
 // (fetch_tls_stub.odin). The req.tls handle is an opaque ^SSL stored as rawptr so
 // the cross-platform Fetch_Request never names the OpenSSL binding.
 
+// fetch_tls_supported lets the shared transport reject https:// up front (before
+// DNS/connect) on backends that have no TLS. True here — OpenSSL is available.
+fetch_tls_supported :: true
+
+// FETCH_HTTPS_UNSUPPORTED_MSG is the rejection message used when TLS is absent.
+// Defined in both TLS backends so the transport can name it on every target.
+FETCH_HTTPS_UNSUPPORTED_MSG :: "fetch: HTTPS is not yet supported on this platform"
+
 // fetch_tls_cleanup frees the per-request SSL session. Called from
 // fetch_request_finish before the underlying fd is closed (SSL_free does not
 // close the fd). Safe to call when no TLS session was created.

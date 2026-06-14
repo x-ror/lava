@@ -35,10 +35,31 @@ fetch_new_socket :: proc(family: windows.c_int) -> windows.SOCKET {
 	return sock
 }
 
-// fetch_connect_ip4 / fetch_connect_ip6 open a non-blocking socket, kick off
-// connect(), and hand off to fetch_register_socket (which watches for writability
-// == connect completion). A non-blocking connect returns WSAEWOULDBLOCK, which is
-// expected; any other failure rejects. Both run on the loop thread.
+// fetch_start_connect kicks off a non-blocking connect on an already-created
+// socket and hands off to fetch_register_socket (which watches for writability ==
+// connect completion). A non-blocking connect returns WSAEWOULDBLOCK, which is
+// expected; any other failure rejects. The v4/v6 entry points differ only in
+// address construction, so they share this tail.
+@(private = "file")
+fetch_start_connect :: proc(
+	req: ^Fetch_Request,
+	sock: windows.SOCKET,
+	addr: ^windows.SOCKADDR_STORAGE_LH,
+	addr_len: windows.c_int,
+) -> (
+	ok: bool,
+	err: string,
+) {
+	if windows.connect(sock, addr, addr_len) == windows.SOCKET_ERROR &&
+	   windows.WSAGetLastError() != windows.WSAEWOULDBLOCK {
+		windows.closesocket(sock)
+		return false, "fetch: connect failed"
+	}
+	return fetch_register_socket(req, uintptr(sock))
+}
+
+// fetch_connect_ip4 / fetch_connect_ip6 open a non-blocking socket and start the
+// connect. Both run on the loop thread.
 fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: [4]u8, port: int) -> (ok: bool, err: string) {
 	sock := fetch_new_socket(windows.AF_INET)
 	if sock == windows.INVALID_SOCKET do return false, "fetch: could not create socket"
@@ -47,13 +68,7 @@ fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: [4]u8, port: int) -> (ok: bo
 		sin_port   = u16be(port),
 		sin_addr   = {s_addr = transmute(u32)ip4},
 	}
-	if windows.connect(sock, cast(^windows.SOCKADDR_STORAGE_LH)&addr, size_of(addr)) ==
-		   windows.SOCKET_ERROR &&
-	   windows.WSAGetLastError() != windows.WSAEWOULDBLOCK {
-		windows.closesocket(sock)
-		return false, "fetch: connect failed"
-	}
-	return fetch_register_socket(req, uintptr(sock))
+	return fetch_start_connect(req, sock, cast(^windows.SOCKADDR_STORAGE_LH)&addr, size_of(addr))
 }
 
 fetch_connect_ip6 :: proc(
@@ -73,13 +88,7 @@ fetch_connect_ip6 :: proc(
 		sin6_port   = u16be(port),
 	}
 	addr.sin6_addr.s6_addr = transmute([16]u8)ip6
-	if windows.connect(sock, cast(^windows.SOCKADDR_STORAGE_LH)&addr, size_of(addr)) ==
-		   windows.SOCKET_ERROR &&
-	   windows.WSAGetLastError() != windows.WSAEWOULDBLOCK {
-		windows.closesocket(sock)
-		return false, "fetch: connect failed"
-	}
-	return fetch_register_socket(req, uintptr(sock))
+	return fetch_start_connect(req, sock, cast(^windows.SOCKADDR_STORAGE_LH)&addr, size_of(addr))
 }
 
 // fetch_connect_succeeded reports whether the non-blocking connect completed
