@@ -109,12 +109,17 @@ implementations — no `primordials`, no `internalBinding` coupling.
       Lava accepts some that Node's static cjs-lexer rejects.
 - [x] **Native CSPRNG** — `crypto.randomBytes`/`randomUUID`/`randomFill*` now
       draw from the OS CSPRNG via `crypto.rand_bytes`, replacing `Math.random`.
-- [x] **Real network transport for `fetch()`** — `http://` over non-blocking
-      sockets on the event loop (`pkg/runtime/fetch*.odin`). Implemented for
-      Linux (io_uring/epoll); Darwin/Windows still reject. Follow-ups:
-      **`https://` (TLS)**, async DNS (currently a blocking `getaddrinfo`),
-      streaming bodies, IPv6/`[::1]` hosts, and a cross-platform transport via
-      `core:net` (only the non-blocking `connect` needs a per-OS shim).
+- [x] **Real network transport for `fetch()`** — `http://` and `https://` over
+      non-blocking sockets on the event loop. The connect→[TLS]→write→read state
+      machine and OpenSSL plumbing are shared (`pkg/runtime/fetch_transport.odin`);
+      each platform supplies narrow socket primitives. Implemented for **Linux**
+      (io_uring/epoll, `core:sys/linux`) and **macOS** (kqueue, `core:sys/posix`);
+      TLS uses system/Homebrew OpenSSL (`pkg/runtime/tls.odin`). DNS resolves off
+      the loop on a worker thread. **Windows** still rejects — its `watch_fd` is a
+      non-functional readiness stub (#101). Follow-ups: native Security.framework
+      TLS on macOS (#143), Windows transport (after #101), streaming bodies (#31),
+      a resolved-address list for IPv6 hostnames + Happy Eyeballs, and HTTP
+      correctness (#99).
 - [x] **Event-loop I/O driving** — fetch was the first real `watch_fd` consumer
       and exposed several gaps, now fixed (`pkg/runtime/eventloop/`):
       - io_uring `POLL_ADD` mask is written to `poll_events` (was `addr`, so no
