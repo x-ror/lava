@@ -1,6 +1,7 @@
 package eventloop
 
 import "core:mem"
+import "core:net"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -522,7 +523,10 @@ async_handoff_runs_posted_callback :: proc(t: ^testing.T) {
 
 	rec := Recorder{}
 	defer delete(rec.events)
-	arg := Async_Arg{loop = &loop, rec = &rec}
+	arg := Async_Arg {
+		loop = &loop,
+		rec  = &rec,
+	}
 
 	// One off-loop op in flight keeps the loop alive and parked in poll until the
 	// worker posts its completion via the wakeup.
@@ -543,7 +547,10 @@ run_ignores_stale_wakeup_while_async_is_active :: proc(t: ^testing.T) {
 
 	rec := Recorder{}
 	defer delete(rec.events)
-	arg := Async_Arg{loop = &loop, rec = &rec}
+	arg := Async_Arg {
+		loop = &loop,
+		rec  = &rec,
+	}
 
 	async_begin(&loop)
 	wakeup(&loop)
@@ -703,4 +710,77 @@ many_timers_fire_in_sorted_order :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(rec.events), N)
 	testing.expect_value(t, pending_count(&loop), 0)
 	testing.expect_value(t, loop.now_ms, u64(N * 10))
+}
+
+// IO_Probe records that a readiness watcher fired and stops watching so the loop
+// can go idle (active_io_count → 0).
+IO_Probe :: struct {
+	loop:    ^Loop,
+	watcher: ^IO_Watcher,
+	fired:   bool,
+}
+
+io_probe_cb :: proc(loop: ^Loop, user_data: rawptr) {
+	probe := cast(^IO_Probe)user_data
+	probe.fired = true
+	// Clear the callback before unwatching: the io_uring backend re-arms a watcher
+	// from watcher.callback after the callback returns, and the byte is left unread
+	// (so the fd stays readable), so without this the watcher would re-fire forever.
+	// Mirrors how the fetch transport stops a settled watcher.
+	probe.watcher.callback = nil
+	unwatch_fd(loop, probe.watcher)
+}
+
+// watch_fd fires its callback when a watched socket becomes readable. This is the
+// core readiness contract every backend must honour (epoll/kqueue/select); it is
+// the regression guard for #101, where the Windows IOCP stub reported success
+// from watch_fd but could never fire, parking the loop forever.
+@(test)
+watch_fd_fires_on_readable_socket :: proc(t: ^testing.T) {
+	// A connected loopback TCP pair: write on the client, watch the server end.
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expect_value(t, lerr, nil) do return
+	defer net.close(listener)
+
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expect_value(t, berr, nil) do return
+
+	client, cerr := net.dial_tcp_from_endpoint(
+		net.Endpoint{address = net.IP4_Loopback, port = bound.port},
+	)
+	if !testing.expect_value(t, cerr, nil) do return
+	defer net.close(client)
+
+	server, _, aerr := net.accept_tcp(listener)
+	if !testing.expect_value(t, aerr, nil) do return
+	defer net.close(server)
+
+	loop := init(real_time = true)
+	defer destroy(&loop)
+
+	probe := IO_Probe {
+		loop = &loop,
+	}
+	watcher := IO_Watcher {
+		fd        = uintptr(server),
+		mode      = .Read,
+		callback  = io_probe_cb,
+		user_data = &probe,
+	}
+	probe.watcher = &watcher
+
+	if !testing.expect(t, watch_fd(&loop, &watcher), "watch_fd should accept the socket") {
+		return
+	}
+	testing.expect_value(t, loop.active_io_count, 1)
+
+	// Make the server end readable, then drive the loop. The callback fires and
+	// unwatches, dropping active_io_count to 0 so run_until_idle returns.
+	_, serr := net.send_tcp(client, {42})
+	if !testing.expect_value(t, serr, nil) do return
+
+	run_until_idle(&loop)
+
+	testing.expect(t, probe.fired, "watcher callback should have fired on readable socket")
+	testing.expect_value(t, loop.active_io_count, 0)
 }
