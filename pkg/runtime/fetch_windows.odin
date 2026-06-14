@@ -10,8 +10,9 @@ import eventloop "lava:pkg/runtime/eventloop"
 // event loop's select backend (loop_windows.odin), then raw send/recv driven by
 // readiness. Winsock is already initialised process-wide by the event loop
 // (WSAStartup in platform_init), which outlives every in-flight request, so these
-// procs do not start it again. HTTPS is not wired here yet — see fetch_tls_stub.odin
-// and #32; only plaintext HTTP uses this path.
+// procs do not start it again. Both http:// and https:// use this path — TLS runs
+// over the same non-blocking SOCKET via the shared OpenSSL backend (fetch_tls.odin,
+// linked against libssl/libcrypto on Windows; see tls.odin and #150).
 
 // fetch_close_fd closes a socket created by this backend.
 fetch_close_fd :: proc(fd: uintptr) {
