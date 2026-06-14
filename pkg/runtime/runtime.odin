@@ -41,11 +41,33 @@ result_destroy :: proc(res: ^Result) {
 	res^ = Result{}
 }
 
+// release_global_context_after_eval frees the JSC global context when eval
+// returns — except on Windows. Releasing the context tears down the whole JSC VM
+// (JIT/GC threads, ICU); on Windows, doing that right before the CLI's os.exit()
+// poisons process teardown — the subsequent ExitProcess DLL-detach fails and the
+// process exits 127 (ERROR_PROC_NOT_FOUND), even though the script ran fine (#157).
+//
+// Today eval is a one-shot-per-process CLI entry, so leaking the VM on Windows is
+// harmless (the OS reclaims it on exit, as node/jsc/bun do). If Lava ever grows an
+// embedded / repeated-eval Windows use case, this is the policy to revisit: the
+// teardown ordering must be fixed rather than skipped.
+release_global_context_after_eval :: proc(ctx: jsc.JSGlobalContextRef) {
+	when ODIN_OS != .Windows {
+		jsc.JSGlobalContextRelease(ctx)
+	}
+}
+
 // echo_result mirrors REPL behavior: when true (the `lava eval` path) the
 // script's completion value is returned for printing. `lava run` passes false so
 // running a file never echoes a trailing expression value, matching `node file`
 // (and avoiding JSC-version-dependent completion values like `[object Promise]`).
-eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = nil, echo_result := false, script_args: []string = nil) -> Result {
+eval :: proc(
+	source: string,
+	source_name := "<eval>",
+	loop: ^eventloop.Loop = nil,
+	echo_result := false,
+	script_args: []string = nil,
+) -> Result {
 	if len(source) == 0 {
 		return Result{status = .Invalid_Input, exit_code = 2, message = "empty JavaScript source"}
 	}
@@ -80,17 +102,7 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 		return native_runtime_unavailable()
 	}
 	defer jsc.JSClassRelease(global_class)
-	// Releasing the global context tears down the whole JSC VM (JIT/GC threads,
-	// ICU). On Windows, doing that immediately before the CLI's os.exit() poisons
-	// process teardown: the subsequent ExitProcess DLL-detach fails and the process
-	// exits 127 (ERROR_PROC_NOT_FOUND) even though the script ran fine (#157). The
-	// process.exit() path never hit this because it exits from inside the callback,
-	// before this defer runs. eval is a one-shot-per-process CLI entry, so skipping
-	// the release on Windows is harmless — the OS reclaims the VM on exit, exactly
-	// as node/jsc/bun do. Other platforms tear down cleanly, so keep releasing there.
-	defer if ODIN_OS != .Windows {
-		jsc.JSGlobalContextRelease(ctx)
-	}
+	defer release_global_context_after_eval(ctx)
 
 	state := new_runtime_state(loop)
 	// Build Node's process.argv = [execPath, scriptPath, ...userArgs]. argv[0] is
@@ -152,8 +164,7 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 	// completion value) so it does not clobber the script's completion value used by
 	// `lava eval`'s echo; the leading "\n;" guards a trailing line comment / missing
 	// semicolon; typeof keeps it a no-op if the microtask shim failed to install.
-	TOP_LEVEL_DRAIN ::
-		"\n;var __lava_tl_drain = (typeof __lavaDrainNextTicks === 'function') && __lavaDrainNextTicks();\n"
+	TOP_LEVEL_DRAIN :: "\n;var __lava_tl_drain = (typeof __lavaDrainNextTicks === 'function') && __lavaDrainNextTicks();\n"
 	if combined, concat_err := strings.concatenate(
 		{eval_source, TOP_LEVEL_DRAIN},
 		context.temp_allocator,
@@ -254,9 +265,9 @@ process_exit_code :: proc(ctx: jsc.JSContextRef) -> int {
 	process := get_named(ctx, global, "process")
 	// Gate on JSValueGetType, not the b32-returning JSValueIs* calls, which are
 	// unreliable across the FFI (the same heisenbug process_exit_cb avoids; the
-	// sqlite readBigInts / bind bugs are the other instances). On Windows the
-	// JSValueIs* path corrupted this read so a clean `console.log` script exited
-	// 127 instead of 0 (#157).
+	// sqlite readBigInts / bind bugs are the other instances). Hardening — the #157
+	// exit-127 was VM teardown (see release_global_context_after_eval), not this
+	// read, but the unsafe predicates were latent here all the same.
 	if process == nil || jsc.JSValueGetType(ctx, process) != .Object do return 0
 	code := get_named(ctx, cast(jsc.JSObjectRef)process, "exitCode")
 	if code == nil do return 0
@@ -269,7 +280,11 @@ process_exit_code :: proc(ctx: jsc.JSContextRef) -> int {
 	return int(n)
 }
 
-run_file :: proc(path: string, loop: ^eventloop.Loop = nil, script_args: []string = nil) -> Result {
+run_file :: proc(
+	path: string,
+	loop: ^eventloop.Loop = nil,
+	script_args: []string = nil,
+) -> Result {
 	if len(path) == 0 {
 		return Result {
 			status = .Invalid_Input,
