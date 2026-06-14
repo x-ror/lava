@@ -213,10 +213,14 @@ jobs:
           # in #157) — independent of JSC working — so we capture the code for the
           # log but key the pass/fail off the output, not the exit status.
           echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
+          # --- #157 exit-code probe matrix (temporary diagnostics) ---
           set +e
-          ./build/lava.exe run smoke.js > smoke.out 2>&1
-          code=$?
+          ./build/lava.exe --version >/dev/null 2>&1;            echo "probe --version           exit=$?"
+          ./build/lava.exe eval 'console.log("e",1+1)' >/dev/null 2>&1; echo "probe eval console.log    exit=$?"
+          ./build/lava.exe run smoke.js > smoke.out 2>&1;         echo "probe run console.log     exit=$?"
+          printf 'process.exit(0)\n'   > z0.js; ./build/lava.exe run z0.js  >/dev/null 2>&1; echo "probe run process.exit(0) exit=$?"
+          printf 'process.exit(5)\n'   > z5.js; ./build/lava.exe run z5.js  >/dev/null 2>&1; echo "probe run process.exit(5) exit=$?"
+          printf ''                    > ze.js; ./build/lava.exe run ze.js  >/dev/null 2>&1; echo "probe run empty           exit=$?"
           set -e
-          echo "lava.exe exit code: $code (see #157)"
           echo "--- output ---"; cat smoke.out
           grep -q "jsc-smoke:42" smoke.out && echo "JSC SMOKE PASS" || { echo "JSC SMOKE FAIL"; exit 1; }
