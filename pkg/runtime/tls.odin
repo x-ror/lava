@@ -46,6 +46,8 @@ SSL_CTX :: distinct rawptr
 SSL :: distinct rawptr
 SSL_METHOD :: distinct rawptr
 X509_VERIFY_PARAM :: distinct rawptr
+X509 :: distinct rawptr
+X509_STORE :: distinct rawptr
 
 // SSL_get_error result codes (openssl/ssl.h) that the transport acts on.
 SSL_ERROR_WANT_READ :: 2
@@ -81,6 +83,14 @@ foreign openssl_lib {
 	SSL_read :: proc(ssl: SSL, buf: rawptr, num: c.int) -> c.int ---
 	SSL_write :: proc(ssl: SSL, buf: rawptr, num: c.int) -> c.int ---
 	SSL_get_error :: proc(ssl: SSL, ret: c.int) -> c.int ---
+
+	// X509 store access, used by the platform root-loading hook
+	// (tls_load_platform_roots) to inject CA certificates the OpenSSL default
+	// verify paths don't cover — notably the native Windows certificate store.
+	SSL_CTX_get_cert_store :: proc(ctx: SSL_CTX) -> X509_STORE ---
+	X509_STORE_add_cert :: proc(store: X509_STORE, x: X509) -> c.int ---
+	d2i_X509 :: proc(px: ^X509, in_: ^[^]byte, len: c.long) -> X509 ---
+	X509_free :: proc(x: X509) ---
 }
 
 // g_tls_ctx is a process-wide client context, created lazily on the first
@@ -98,14 +108,14 @@ g_tls_ctx: SSL_CTX
 // SSL_CERT_DIR environment variables, which the HTTPS smoke test uses to trust
 // its self-signed CA.
 //
-// TRUST STORE (#153): set_default_verify_paths reads OpenSSL's compiled-in
-// default cert locations. On Linux/macOS that finds the system roots. On Windows
-// OpenSSL does NOT read the native Windows certificate store, so unless
-// SSL_CERT_FILE (or an OpenSSL config) points at a CA bundle, default
-// `fetch("https://...")` verification will fail. The Windows root policy
-// (SSL_CERT_FILE-only, a bundled CA, or CertOpenSystemStore("ROOT") → X509_STORE
-// integration) is an open decision tracked in #153; until then Windows HTTPS
-// requires an explicit CA bundle.
+// TRUST STORE: set_default_verify_paths reads OpenSSL's compiled-in default cert
+// locations, which find the system roots on Linux/macOS but NOT the native
+// Windows certificate store (OpenSSL has no Windows-store backend). So we then
+// call the platform root hook (tls_load_platform_roots): a no-op on Linux/macOS,
+// and on Windows it loads the machine ROOT/CA stores into this context's
+// X509_STORE so a plain `fetch("https://...")` verifies against the OS roots.
+// SSL_CERT_FILE still works everywhere as an explicit override (both sources feed
+// the same store). See #153.
 tls_client_ctx :: proc() -> SSL_CTX {
 	if g_tls_ctx == nil {
 		method := TLS_client_method()
@@ -120,6 +130,11 @@ tls_client_ctx :: proc() -> SSL_CTX {
 			SSL_CTX_free(ctx)
 			return nil
 		}
+		// Add any platform-native roots (Windows cert store) on top of the OpenSSL
+		// defaults. Best-effort: if it loads nothing, verification simply falls back
+		// to whatever set_default_verify_paths / SSL_CERT_FILE provided and a missing
+		// root fails the handshake closed — it never weakens verification.
+		tls_load_platform_roots(ctx)
 		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
 		g_tls_ctx = ctx
 	}
