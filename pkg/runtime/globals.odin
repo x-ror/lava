@@ -21,6 +21,14 @@ Runtime_State :: struct {
 	// initial JSEvaluateScript returned cleanly (see resolve_exit_code).
 	async_failed:      bool,
 	rejection_handler: jsc.JSValueRef, // GC-protected fn registered with JSC; unprotected on destroy
+	// process.nextTick scheduling shim (js/internal/microtasks.js). JSC auto-drains
+	// its promise-job queue at every C boundary, so to keep nextTick callbacks
+	// ahead of those jobs (Node semantics) native must bracket the boundary itself:
+	// dispatch_fn runs an event-loop callback and drains nextTicks before returning,
+	// next_tick_drain re-drains after JSC's auto-drain. Both GC-protected; driven by
+	// invoke_user_callback.
+	dispatch_fn:       jsc.JSValueRef,
+	next_tick_drain:   jsc.JSValueRef,
 	// Settled fetch requests awaiting free. Their teardown is deferred to here
 	// because the io_uring watcher may reference a request once more after it is
 	// stopped; freeing only at destroy keeps that memory valid (see fetch.odin).
@@ -93,6 +101,8 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	if state.builtin_require != nil do jsc.JSValueUnprotect(ctx, state.builtin_require)
 	if state.esm_transform != nil do jsc.JSValueUnprotect(ctx, state.esm_transform)
 	if state.rejection_handler != nil do jsc.JSValueUnprotect(ctx, state.rejection_handler)
+	if state.dispatch_fn != nil do jsc.JSValueUnprotect(ctx, state.dispatch_fn)
+	if state.next_tick_drain != nil do jsc.JSValueUnprotect(ctx, state.next_tick_drain)
 	free(state)
 }
 
@@ -243,14 +253,7 @@ js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	if cb == nil do return
 
 	exception: jsc.JSValueRef
-	jsc.JSObjectCallAsFunction(
-		cb.ctx,
-		cb.func,
-		nil,
-		c.size_t(len(cb.args)),
-		raw_data(cb.args),
-		&exception,
-	)
+	invoke_user_callback(cb.ctx, cb.func, raw_data(cb.args), c.size_t(len(cb.args)), &exception)
 	if exception != nil {
 		report_uncaught(cb.ctx, exception)
 		mark_async_failed(cb.ctx)
@@ -660,8 +663,97 @@ install_microtasks :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
 
 	args := [3]jsc.JSValueRef{cast(jsc.JSValueRef)global, process, cast(jsc.JSValueRef)report}
 	exception: jsc.JSValueRef
-	jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)factory, nil, 3, raw_data(args[:]), &exception)
-	if exception != nil do report_internal_exception(ctx, "lava:microtasks", exception)
+	exports := jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)factory, nil, 3, raw_data(args[:]), &exception)
+	if exception != nil {
+		report_internal_exception(ctx, "lava:microtasks", exception)
+		return
+	}
+
+	// The factory returns { drainNextTicks, dispatch }. Stash both (GC-protected)
+	// on Runtime_State; invoke_user_callback drives them so process.nextTick keeps
+	// its priority over promise jobs across JSC's auto-draining promise queue (the
+	// "why" is in js/internal/microtasks.js).
+	if exports == nil || !jsc.JSValueIsObject(ctx, exports) do return
+	state := get_state_from_ctx(ctx)
+	if state == nil do return
+
+	dispatch := get_named(ctx, cast(jsc.JSObjectRef)exports, "dispatch")
+	drain := get_named(ctx, cast(jsc.JSObjectRef)exports, "drainNextTicks")
+	if dispatch != nil && jsc.JSValueIsObject(ctx, dispatch) {
+		jsc.JSValueProtect(ctx, dispatch)
+		state.dispatch_fn = dispatch
+	}
+	if drain != nil && jsc.JSValueIsObject(ctx, drain) {
+		jsc.JSValueProtect(ctx, drain)
+		state.next_tick_drain = drain
+	}
+}
+
+// invoke_user_callback runs a user JS callback at an event-loop boundary (timer /
+// immediate / I/O / fetch completion) with Node's process.nextTick ordering. It
+// calls the callback THROUGH the microtask shim's `dispatch`, which drains the
+// nextTick queue before returning — so nextTicks beat promise jobs queued earlier
+// in the same turn (checkpoint 1) — then re-drains the nextTicks queued by the
+// promise jobs JSC auto-drained on return (checkpoint 2). `args`/`argc` are the
+// callback's own arguments; there is no `this` parameter because every call site
+// used the default receiver (NULL thisObject → global), which `dispatch` mirrors.
+// Falls back to a direct call if the shim is absent (embedder bypass).
+invoke_user_callback :: proc(
+	ctx: jsc.JSContextRef,
+	fn: jsc.JSObjectRef,
+	args: [^]jsc.JSValueRef,
+	argc: c.size_t,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	state := get_state_from_ctx(ctx)
+	if state == nil || state.dispatch_fn == nil {
+		return jsc.JSObjectCallAsFunction(ctx, fn, nil, argc, args, exception)
+	}
+
+	// dispatch(fn, ...args): prepend the callback so the shim invokes it and then
+	// runs checkpoint 1 in its `finally`.
+	n := int(argc) + 1
+	dispatch_args := make([]jsc.JSValueRef, n, context.temp_allocator)
+	dispatch_args[0] = cast(jsc.JSValueRef)fn
+	for i in 0 ..< int(argc) {
+		dispatch_args[i + 1] = args[i]
+	}
+	result := jsc.JSObjectCallAsFunction(
+		ctx,
+		cast(jsc.JSObjectRef)state.dispatch_fn,
+		nil,
+		c.size_t(n),
+		raw_data(dispatch_args),
+		exception,
+	)
+	drain_next_ticks_settled(ctx, state)
+	return result
+}
+
+// drain_next_ticks_settled runs checkpoint 2: it drains the process.nextTick
+// queue, looping until a drain does no work. Each drain call is a C-API boundary,
+// so JSC auto-drains its promise jobs between iterations — recreating Node's
+// "drain nextTicks, run microtasks, repeat" loop. A throw cannot escape (the shim
+// runs nextTick callbacks guarded), but the exception arm is kept for safety.
+drain_next_ticks_settled :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
+	if state == nil || state.next_tick_drain == nil do return
+	for {
+		exc: jsc.JSValueRef
+		result := jsc.JSObjectCallAsFunction(
+			ctx,
+			cast(jsc.JSObjectRef)state.next_tick_drain,
+			nil,
+			0,
+			nil,
+			&exc,
+		)
+		if exc != nil {
+			report_uncaught(ctx, exc)
+			mark_async_failed(ctx)
+			return
+		}
+		if result == nil || !bool(jsc.JSValueToBoolean(ctx, result)) do return
+	}
 }
 
 // microtask_report_uncaught_cb(error) reports a throw from a nextTick or
