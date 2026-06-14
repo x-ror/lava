@@ -80,7 +80,17 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 		return native_runtime_unavailable()
 	}
 	defer jsc.JSClassRelease(global_class)
-	defer jsc.JSGlobalContextRelease(ctx)
+	// Releasing the global context tears down the whole JSC VM (JIT/GC threads,
+	// ICU). On Windows, doing that immediately before the CLI's os.exit() poisons
+	// process teardown: the subsequent ExitProcess DLL-detach fails and the process
+	// exits 127 (ERROR_PROC_NOT_FOUND) even though the script ran fine (#157). The
+	// process.exit() path never hit this because it exits from inside the callback,
+	// before this defer runs. eval is a one-shot-per-process CLI entry, so skipping
+	// the release on Windows is harmless — the OS reclaims the VM on exit, exactly
+	// as node/jsc/bun do. Other platforms tear down cleanly, so keep releasing there.
+	defer if ODIN_OS != .Windows {
+		jsc.JSGlobalContextRelease(ctx)
+	}
 
 	state := new_runtime_state(loop)
 	// Build Node's process.argv = [execPath, scriptPath, ...userArgs]. argv[0] is
@@ -242,9 +252,18 @@ resolve_exit_code :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) -> int {
 process_exit_code :: proc(ctx: jsc.JSContextRef) -> int {
 	global := jsc.JSContextGetGlobalObject(ctx)
 	process := get_named(ctx, global, "process")
-	if process == nil || !jsc.JSValueIsObject(ctx, process) do return 0
+	// Gate on JSValueGetType, not the b32-returning JSValueIs* calls, which are
+	// unreliable across the FFI (the same heisenbug process_exit_cb avoids; the
+	// sqlite readBigInts / bind bugs are the other instances). On Windows the
+	// JSValueIs* path corrupted this read so a clean `console.log` script exited
+	// 127 instead of 0 (#157).
+	if process == nil || jsc.JSValueGetType(ctx, process) != .Object do return 0
 	code := get_named(ctx, cast(jsc.JSObjectRef)process, "exitCode")
-	if code == nil || jsc.JSValueIsUndefined(ctx, code) || jsc.JSValueIsNull(ctx, code) do return 0
+	if code == nil do return 0
+	#partial switch jsc.JSValueGetType(ctx, code) {
+	case .Undefined, .Null:
+		return 0
+	}
 	n := jsc.JSValueToNumber(ctx, code, nil)
 	if n != n do return 0 // NaN guard (e.g. exitCode set to a non-numeric value)
 	return int(n)
