@@ -3,6 +3,7 @@ package eventloop
 
 import "core:sys/kqueue"
 import "core:sys/posix"
+import "core:time"
 
 Platform_Loop :: struct {
 	kq:          kqueue.KQ,
@@ -36,6 +37,11 @@ platform_init :: proc(loop: ^Loop) -> bool {
 	// (a wakeup is already pending in that case). Matches the Linux pipe2 flags.
 	posix.fcntl(loop.platform.wakeup_pipe[0], .SETFL, posix.O_Flags{.NONBLOCK})
 	posix.fcntl(loop.platform.wakeup_pipe[1], .SETFL, posix.O_Flags{.NONBLOCK})
+	// And close-on-exec on both ends so the internal wakeup pipe never leaks into a
+	// child process (posix.pipe, unlike Linux's pipe2, cannot set this atomically).
+	// Matches the {.CLOEXEC} half of the Linux pipe2 flags.
+	posix.fcntl(loop.platform.wakeup_pipe[0], .SETFD, i32(posix.FD_CLOEXEC))
+	posix.fcntl(loop.platform.wakeup_pipe[1], .SETFD, i32(posix.FD_CLOEXEC))
 
 	ev := kqueue.KEvent {
 		ident  = uintptr(loop.platform.wakeup_pipe[0]),
@@ -101,21 +107,39 @@ platform_unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 	events: [32]kqueue.KEvent
 
-	ts: posix.timespec
-	timeout: ^posix.timespec = nil
-	if timeout_ms >= 0 {
-		ts.tv_sec = posix.time_t(timeout_ms / 1000)
-		ts.tv_nsec = i64((timeout_ms % 1000) * 1_000_000)
-		timeout = &ts
-	}
+	// Re-enter on EINTR rather than returning a spurious idle wake: a signal that
+	// interrupts the wait must not be mistaken for "nothing to do". For a finite
+	// timeout the retry waits the REMAINING time (an absolute deadline), so a storm
+	// of signals can neither restart the full interval nor extend it unboundedly.
+	poll_start := time.tick_now()
+	n: i32
+	for {
+		ts: posix.timespec
+		timeout: ^posix.timespec = nil
+		if timeout_ms >= 0 {
+			remaining := timeout_ms
+			if timeout_ms > 0 {
+				elapsed := int(time.duration_milliseconds(time.tick_since(poll_start)))
+				remaining = max(0, timeout_ms - elapsed)
+			}
+			ts.tv_sec = posix.time_t(remaining / 1000)
+			ts.tv_nsec = i64((remaining % 1000) * 1_000_000)
+			timeout = &ts
+		}
 
-	n, err := kqueue.kevent(loop.platform.kq, nil, events[:], timeout)
-	// EINTR is benign — the next tick retries. Any other error is fatal (e.g.
-	// EBADF on a closed kqueue fd): flag it so the run drivers stop instead of
-	// busy-spinning on a syscall that can never make progress.
-	if err != .NONE && err != .EINTR {
-		loop.backend_error = true
-		return
+		res, err := kqueue.kevent(loop.platform.kq, nil, events[:], timeout)
+		if err == .EINTR {
+			continue
+		}
+		// Any other error is fatal (e.g. EBADF on a closed kqueue fd): flag it so the
+		// run drivers stop instead of busy-spinning on a syscall that can never
+		// make progress.
+		if err != .NONE {
+			loop.backend_error = true
+			return
+		}
+		n = res
+		break
 	}
 	if n == 0 {
 		return

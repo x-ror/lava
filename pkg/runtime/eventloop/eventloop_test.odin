@@ -492,7 +492,15 @@ wakeup_unblocks_blocking_poll :: proc(t: ^testing.T) {
 	loop := init()
 	defer destroy(&loop)
 
-	thread.create_and_start_with_data(&loop, wakeup_worker, context, .Normal, true)
+	// Keep the worker handle (self_cleanup=false) and join it before destroy. Defers
+	// run LIFO, so this join runs before `destroy(&loop)`: otherwise destroy could
+	// close (and the OS reuse) the wakeup pipe fd while the worker's wakeup() write
+	// is still in flight, writing to an unrelated fd.
+	worker := thread.create_and_start_with_data(&loop, wakeup_worker, context, .Normal, false)
+	defer {
+		thread.join(worker)
+		thread.destroy(worker)
+	}
 
 	// Blocks until the worker calls wakeup(); reaching the next line proves the
 	// cross-thread wakeup woke the poll. (A regression hangs here — by design,
@@ -784,4 +792,173 @@ watch_fd_fires_on_readable_socket :: proc(t: ^testing.T) {
 
 	testing.expect(t, probe.fired, "watcher callback should have fired on readable socket")
 	testing.expect_value(t, loop.active_io_count, 0)
+}
+
+// connect_loopback_pair builds a connected loopback TCP pair for the readiness
+// tests: `client` is the write end, `server` the accepted end to watch. The
+// listener is closed before returning (the established connection survives); the
+// caller closes client and server. ok=false (sockets zeroed) on any setup failure.
+connect_loopback_pair :: proc(t: ^testing.T) -> (client, server: net.TCP_Socket, ok: bool) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expect_value(t, lerr, nil) do return
+	defer net.close(listener)
+
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expect_value(t, berr, nil) do return
+
+	dialed, cerr := net.dial_tcp_from_endpoint(
+		net.Endpoint{address = net.IP4_Loopback, port = bound.port},
+	)
+	if !testing.expect_value(t, cerr, nil) do return
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if !testing.expect_value(t, aerr, nil) {
+		net.close(dialed)
+		return
+	}
+
+	client = dialed
+	server = accepted
+	ok = true
+	return
+}
+
+noop_io_cb :: proc(loop: ^Loop, user_data: rawptr) {}
+
+// active_io_count must track the LOGICAL registered set, not the platform syscall
+// result: a duplicate watch must not double-count (io_uring would otherwise arm a
+// second poll), and a no-op unwatch — an fd already removed by the kernel on close,
+// or io_uring's logical-only unwatch invoked twice — must not drive the count
+// negative (a spurious decrement can let the loop exit with I/O still pending).
+@(test)
+io_count_accounting_is_idempotent :: proc(t: ^testing.T) {
+	client, server, ok := connect_loopback_pair(t)
+	if !ok do return
+	defer net.close(client)
+	defer net.close(server)
+
+	loop := init(real_time = true)
+	defer destroy(&loop)
+
+	w := IO_Watcher {
+		fd       = uintptr(server),
+		mode     = .Read,
+		callback = noop_io_cb,
+	}
+
+	testing.expect(t, watch_fd(&loop, &w), "first watch should register")
+	testing.expect_value(t, loop.active_io_count, 1)
+
+	testing.expect(t, !watch_fd(&loop, &w), "duplicate watch should be rejected")
+	testing.expect_value(t, loop.active_io_count, 1)
+
+	testing.expect(t, unwatch_fd(&loop, &w), "unwatch of a watched fd should succeed")
+	testing.expect_value(t, loop.active_io_count, 0)
+
+	testing.expect(t, !unwatch_fd(&loop, &w), "double unwatch should be a no-op")
+	testing.expect_value(t, loop.active_io_count, 0)
+}
+
+// Immediate_Starvation drives the poll-starvation regression test: a setImmediate
+// chain that keeps rescheduling itself until the watched socket fires.
+Immediate_Starvation :: struct {
+	loop:      ^Loop,
+	watcher:   ^IO_Watcher,
+	chain_len: int,
+	io_fired:  bool,
+}
+
+starvation_immediate_cb :: proc(loop: ^Loop, user_data: rawptr) {
+	st := cast(^Immediate_Starvation)user_data
+	st.chain_len += 1
+	// Keep an immediate perpetually pending until the I/O watcher fires. If a
+	// did_work tick skips the poll phase entirely (the pre-fix behavior), the
+	// watcher never fires and this chain never ends.
+	if !st.io_fired {
+		set_immediate(loop, starvation_immediate_cb, st)
+	}
+}
+
+starvation_io_cb :: proc(loop: ^Loop, user_data: rawptr) {
+	st := cast(^Immediate_Starvation)user_data
+	st.io_fired = true
+	st.watcher.callback = nil
+	unwatch_fd(loop, st.watcher)
+}
+
+// A self-rescheduling setImmediate chain must not starve socket I/O: Node still
+// runs the poll phase (timeout 0) every iteration while immediates are pending, so
+// a ready fd is serviced rather than blocked until the chain ends. The regression
+// (poll only runs when there is nothing else to do) leaves io_fired false forever.
+@(test)
+immediate_chain_does_not_starve_io :: proc(t: ^testing.T) {
+	client, server, ok := connect_loopback_pair(t)
+	if !ok do return
+	defer net.close(client)
+	defer net.close(server)
+
+	loop := init(real_time = true)
+	defer destroy(&loop)
+
+	st := Immediate_Starvation {
+		loop = &loop,
+	}
+	w := IO_Watcher {
+		fd        = uintptr(server),
+		mode      = .Read,
+		callback  = starvation_io_cb,
+		user_data = &st,
+	}
+	st.watcher = &w
+
+	if !testing.expect(t, watch_fd(&loop, &w)) do return
+
+	// Make the server end readable, then give the loopback byte time to land so the
+	// very first non-blocking poll observes it.
+	_, serr := net.send_tcp(client, {7})
+	if !testing.expect_value(t, serr, nil) do return
+	time.sleep(20 * time.Millisecond)
+
+	set_immediate(&loop, starvation_immediate_cb, &st)
+	run_until_idle(&loop, 512)
+
+	testing.expect(t, st.io_fired, "I/O watcher must fire despite a busy setImmediate chain")
+	testing.expect_value(t, loop.active_io_count, 0)
+	testing.expect_value(t, pending_count(&loop), 0)
+}
+
+// Interval_Self_Cancel drives the running_id-vs-microtask regression test.
+Interval_Self_Cancel :: struct {
+	id:         Timer_ID,
+	fire_count: int,
+}
+
+cancel_interval_microtask :: proc(loop: ^Loop, user_data: rawptr) {
+	sc := cast(^Interval_Self_Cancel)user_data
+	clear_interval(loop, sc.id)
+}
+
+interval_queue_self_cancel_cb :: proc(loop: ^Loop, user_data: rawptr) {
+	sc := cast(^Interval_Self_Cancel)user_data
+	sc.fire_count += 1
+	// Cancel from a microtask the callback queues, not synchronously. The cancel
+	// only takes effect if running_id still names this timer when the microtask
+	// runs — i.e. the post-callback microtask checkpoint happens before running_id
+	// is cleared. Otherwise clear_interval finds nothing to cancel and the repeating
+	// timer is wrongly re-armed.
+	queue_microtask(loop, cancel_interval_microtask, sc)
+}
+
+@(test)
+interval_cancelled_from_its_microtask_does_not_rearm :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	sc := Interval_Self_Cancel{}
+	sc.id = set_interval(&loop, interval_queue_self_cancel_cb, 10, &sc)
+
+	run_until_idle(&loop)
+
+	testing.expect_value(t, sc.fire_count, 1) // fired once, then cancelled — never re-armed
+	testing.expect_value(t, pending_count(&loop), 0)
 }

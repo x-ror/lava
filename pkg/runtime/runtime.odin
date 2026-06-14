@@ -239,6 +239,14 @@ eval :: proc(
 
 	if loop != nil {
 		eventloop.run(loop)
+		// Tear the loop down here, while the context its handle callbacks are bound to
+		// is still alive (it is released by the defer above, on return). Any handle
+		// still pending after the loop goes idle — e.g. an unref'd timer, which does
+		// not keep the loop alive — runs its dispose hook now, unprotecting its
+		// GC-protected JS callback. Deferring this to the caller (after eval returns)
+		// would unprotect against a freed context. eval thus owns the loop's teardown;
+		// callers that pass a loop must not destroy it again.
+		eventloop.destroy(loop)
 	}
 
 	exit_code := resolve_exit_code(cast(jsc.JSContextRef)ctx, state)
