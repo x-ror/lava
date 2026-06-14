@@ -80,7 +80,17 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 		return native_runtime_unavailable()
 	}
 	defer jsc.JSClassRelease(global_class)
-	defer jsc.JSGlobalContextRelease(ctx)
+	// Releasing the global context tears down the whole JSC VM (JIT/GC threads,
+	// ICU). On Windows, doing that immediately before the CLI's os.exit() poisons
+	// process teardown: the subsequent ExitProcess DLL-detach fails and the process
+	// exits 127 (ERROR_PROC_NOT_FOUND) even though the script ran fine (#157). The
+	// process.exit() path never hit this because it exits from inside the callback,
+	// before this defer runs. eval is a one-shot-per-process CLI entry, so skipping
+	// the release on Windows is harmless — the OS reclaims the VM on exit, exactly
+	// as node/jsc/bun do. Other platforms tear down cleanly, so keep releasing there.
+	defer if ODIN_OS != .Windows {
+		jsc.JSGlobalContextRelease(ctx)
+	}
 
 	state := new_runtime_state(loop)
 	// Build Node's process.argv = [execPath, scriptPath, ...userArgs]. argv[0] is

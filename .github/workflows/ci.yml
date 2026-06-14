@@ -212,15 +212,15 @@ jobs:
           # 127 on Windows after a correct run (a teardown/exit-code anomaly tracked
           # in #157) — independent of JSC working — so we capture the code for the
           # log but key the pass/fail off the output, not the exit status.
+          # JSC smoke: prove lava.exe links and JavaScriptCore evaluates JS, and
+          # that a clean script exits 0 (regression guard for #157).
           echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
-          # --- #157 diagnostics ---
           set +e
-          ./build/lava.exe run smoke.js > smoke.out 2>&1; echo "run console.log     exit=$?"
-          echo 'console.log("ec="+process.exitCode+" t="+(typeof process.exitCode))' > d.js
-          ./build/lava.exe run d.js;                       echo "(^ exitCode value)  exit=$?"
-          printf 'process.exitCode=0\n' > z.js; ./build/lava.exe run z.js >/dev/null 2>&1; echo "set exitCode=0      exit=$?"
-          printf 'process.exitCode=undefined\n' > u.js; ./build/lava.exe run u.js >/dev/null 2>&1; echo "set exitCode=undef  exit=$?"
+          ./build/lava.exe run smoke.js > smoke.out 2>&1
+          code=$?
           set -e
+          echo "lava.exe exit code: $code"
           echo "--- output ---"; cat smoke.out
           grep -q "jsc-smoke:42" smoke.out || { echo "JSC SMOKE FAIL: bad output"; exit 1; }
-          echo "JSC SMOKE PASS (output)"
+          [ "$code" = "0" ] || { echo "JSC SMOKE FAIL: expected exit 0, got $code"; exit 1; }
+          echo "JSC SMOKE PASS"
