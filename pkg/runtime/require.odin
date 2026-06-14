@@ -1,0 +1,283 @@
+package lava_runtime
+
+import "base:runtime"
+import "core:c"
+import "core:fmt"
+import "core:os"
+import "core:path/filepath"
+import "core:strings"
+import jsc "lava:pkg/jsc"
+
+noop_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// module_precache_cb implements the global __lava_precache(resolvedPath, exports)
+// the CommonJS wrapper invokes before running a module body. It registers the
+// module's (initially empty) exports in the cache so a require() cycle that
+// re-enters this module gets the partial exports instead of recursing forever.
+// native_require_cb overwrites the entry with the final exports after the body
+// runs (handling module.exports reassignment).
+module_precache_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 2 do return jsc.JSValueMakeUndefined(ctx)
+	state := get_state_from_ctx(ctx)
+	if state == nil do return jsc.JSValueMakeUndefined(ctx)
+	path, allocated := jsc_value_to_string_or_default(ctx, arguments[0])
+	defer if allocated do delete(path, context.allocator)
+	if !allocated do return jsc.JSValueMakeUndefined(ctx)
+	module_cache_set(ctx, state, path, arguments[1])
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+native_require_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	// All the path/wrapper scratch in this call is temporary; reclaim it on exit
+	// instead of letting the per-thread arena grow unbounded across requires.
+	defer free_all(context.temp_allocator)
+	if argument_count < 1 do return jsc.JSValueMakeUndefined(ctx)
+
+	state := get_state_from_ctx(ctx)
+
+	args := arguments[:int(argument_count)]
+	specifier, alloc := jsc_value_to_string_or_default(ctx, args[0])
+	defer if alloc do delete(specifier, context.allocator)
+
+	// Module cache: a previously-loaded module (by specifier or resolved path)
+	// returns its existing exports so top-level code runs exactly once.
+	if cached, ok := module_cache_get(state, specifier); ok {
+		return cached
+	}
+
+	// 0. JS-implemented built-ins (util, events, assert, buffer, and their
+	// node:-prefixed / assert-strict aliases). The resolver returns undefined
+	// for anything it does not own, so we fall through to the native builtins
+	// and the filesystem below.
+	builtin_exception: jsc.JSValueRef
+	if builtin := require_builtin(ctx, args[0], &builtin_exception); builtin != nil {
+		module_cache_put(ctx, state, specifier, builtin)
+		return builtin
+	} else if builtin_exception != nil {
+		if exception != nil do exception^ = builtin_exception
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	// node:path is served by the JS internal-module loader above (require_builtin).
+
+	// The native fs module answers both the bare and node:-prefixed specifiers;
+	// `require('fs')` is the dominant real-world form. A bare specifier never
+	// resolves to a filesystem path (only "./", "../" and absolute do), so this
+	// cannot shadow a user file named fs.js.
+	if specifier == "node:fs" || specifier == "fs" {
+		fs_obj := jsc.JSObjectMake(ctx, nil, nil)
+
+		inject_native_function(ctx, fs_obj, "readFile", fs_read_file_cb)
+		inject_native_function(ctx, fs_obj, "readFileSync", fs_read_file_sync_cb)
+		inject_native_function(ctx, fs_obj, "writeFile", fs_write_file_cb)
+		inject_native_function(ctx, fs_obj, "writeFileSync", fs_write_file_sync_cb)
+		inject_native_function(ctx, fs_obj, "existsSync", fs_exists_sync_cb)
+		inject_native_function(ctx, fs_obj, "mkdirSync", fs_mkdir_sync_cb)
+		inject_native_function(ctx, fs_obj, "rmSync", fs_rm_sync_cb)
+		inject_native_function(ctx, fs_obj, "statSync", fs_stat_sync_cb)
+		inject_native_function(ctx, fs_obj, "readdirSync", fs_readdir_sync_cb)
+
+		value := cast(jsc.JSValueRef)fs_obj
+		// Cache under both specifiers so require('fs') and require('node:fs')
+		// return the identical object (Node memoizes the builtin once).
+		module_cache_put(ctx, state, "fs", value)
+		module_cache_put(ctx, state, "node:fs", value)
+		return value
+	}
+
+	// Relative specifiers resolve against the requiring module's own directory,
+	// which its bound require passes as args[1] (see the wrapper in the .cjs/.js
+	// and .mjs branches). The entry's global require has no such argument and
+	// falls back to the global __dirname. Because the directory is captured in the
+	// module's require closure — not read from a call stack — a deferred/async
+	// require resolves identically to a synchronous one.
+	base_dir: string
+	base_dir_alloc: bool
+	if len(args) >= 2 && jsc.JSValueIsString(ctx, args[1]) {
+		base_dir, base_dir_alloc = jsc_value_to_string_or_default(ctx, args[1])
+	} else {
+		base_dir, base_dir_alloc = global_dirname(ctx)
+	}
+	defer if base_dir_alloc do delete(base_dir, context.allocator)
+
+	resolved, resolved_ok := resolve_module_path(specifier, base_dir)
+	if !resolved_ok {
+		// Node throws MODULE_NOT_FOUND rather than silently yielding undefined.
+		if exception != nil {
+			exception^ = make_module_not_found(ctx, specifier)
+		}
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	defer delete(resolved, context.allocator)
+
+	if cached, ok := module_cache_get(state, resolved); ok {
+		return cached
+	}
+
+	if strings.has_suffix(resolved, ".json") {
+		data, err := os.read_entire_file(resolved, context.allocator)
+		if err != os.ERROR_NONE {
+			if exception != nil {
+				exception^ = make_js_error(ctx, fmt.tprintf("Cannot read module '%s'", resolved))
+			}
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		defer delete(data, context.allocator)
+
+		// Parse as JSON (Node uses JSON.parse), NOT JSEvaluateScript — wrapping the
+		// file in (...) and evaluating it would execute arbitrary code from a .json
+		// file and accept non-JSON. JSValueMakeFromJSONString returns null on a
+		// malformed document, which we surface as a SyntaxError like Node.
+		json_str := js_string_from_string(string(data))
+		if json_str == nil do return jsc.JSValueMakeUndefined(ctx)
+		defer jsc.JSStringRelease(json_str)
+		value := jsc.JSValueMakeFromJSONString(ctx, json_str)
+		if value == nil {
+			if exception != nil {
+				exception^ = make_js_named_error(
+					ctx,
+					"SyntaxError",
+					fmt.tprintf("Unexpected token in JSON in %s", resolved),
+				)
+			}
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		module_cache_put(ctx, state, resolved, value)
+		return value
+	}
+
+	if strings.has_suffix(resolved, ".mjs") {
+		data, err := os.read_entire_file(resolved, context.allocator)
+		if err != os.ERROR_NONE {
+			if exception != nil {
+				exception^ = make_js_error(ctx, fmt.tprintf("Cannot read module '%s'", resolved))
+			}
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		defer delete(data, context.allocator)
+
+		wrapped, wrap_ok := esm_wrap_source(ctx, string(data), resolved, exception)
+		if !wrap_ok do return jsc.JSValueMakeUndefined(ctx)
+		defer delete(wrapped, context.allocator)
+
+		value := eval_source_value(ctx, wrapped, resolved, exception)
+		if exception == nil || exception^ == nil {
+			module_cache_put(ctx, state, resolved, value)
+		}
+		return value
+	}
+
+	if strings.has_suffix(resolved, ".cjs") || strings.has_suffix(resolved, ".js") {
+		data, err := os.read_entire_file(resolved, context.allocator)
+		if err != os.ERROR_NONE {
+			if exception != nil {
+				exception^ = make_js_error(ctx, fmt.tprintf("Cannot read module '%s'", resolved))
+			}
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		defer delete(data, context.allocator)
+
+		dirname := filepath.dir(resolved)
+		// __lava_precache registers this module's exports in the cache BEFORE the
+		// body runs, so a circular require() that re-enters this module gets the
+		// partial exports instead of recursing forever (then we overwrite with the
+		// final exports below). The wrapper prefix must NOT end with a newline: the
+		// module body has to start on line 1 so JSEvaluateScript (startingLineNumber
+		// 1) reports the user's own source lines in stack traces, not a
+		// wrapper-shifted line. (Matches Node's Module.wrap, whose prefix ends "{ ".)
+		// The module body receives a `require` bound to this module's directory
+		// (function(s){return require(s, dirname)}) — captured in its closure, so a
+		// deferred/async require resolves against this module's dir, not the entry's.
+		wrapper_parts := [?]string {
+			"(function(){var module={exports:{},children:[]};var exports=module.exports;__lava_precache(",
+			js_quote(resolved),
+			",module.exports);(function(exports,require,module,__filename,__dirname){ ",
+			string(data),
+			"\n})(exports,function(s){return require(s,",
+			js_quote(dirname),
+			");},module,",
+			js_quote(resolved),
+			",",
+			js_quote(dirname),
+			");return module.exports;})()",
+		}
+		wrapped, wrapped_err := strings.concatenate(wrapper_parts[:], context.temp_allocator)
+		if wrapped_err != nil do return jsc.JSValueMakeUndefined(ctx)
+
+		value := eval_source_value(ctx, wrapped, resolved, exception)
+		if exception == nil || exception^ == nil {
+			// Overwrite the pre-registered partial entry with the final exports
+			// (the body may have reassigned module.exports).
+			module_cache_set(ctx, state, resolved, value)
+		} else {
+			// Module threw while loading: drop the partial so a later require
+			// re-loads it rather than getting half-initialised exports.
+			module_cache_remove(ctx, state, resolved)
+		}
+		return value
+	}
+
+	// A resolved path with an extension we don't load as a module (or any other
+	// fall-through) must not silently yield undefined — Node throws
+	// MODULE_NOT_FOUND, and the project guarantees the same.
+	if exception != nil {
+		exception^ = make_module_not_found(ctx, specifier)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// make_module_not_found builds the Error Node throws for an unresolved require,
+// including the `code: 'MODULE_NOT_FOUND'` property user code commonly checks.
+make_module_not_found :: proc(ctx: jsc.JSContextRef, specifier: string) -> jsc.JSValueRef {
+	err := make_js_error(ctx, fmt.tprintf("Cannot find module '%s'", specifier))
+	if jsc.JSValueIsObject(ctx, err) {
+		set_named(ctx, cast(jsc.JSObjectRef)err, "code", js_string_value(ctx, "MODULE_NOT_FOUND"))
+	}
+	return err
+}
+
+inject_native_function :: proc(
+	ctx: jsc.JSContextRef,
+	object: jsc.JSObjectRef,
+	name: string,
+	callback: jsc.JSObjectCallAsFunctionCallback,
+) {
+	c_name, err := strings.clone_to_cstring(name, context.temp_allocator)
+	if err != nil do return
+
+	js_name := jsc.JSStringCreateWithUTF8CString(c_name)
+	defer jsc.JSStringRelease(js_name)
+
+	fn := jsc.JSObjectMakeFunctionWithCallback(ctx, js_name, callback)
+	jsc.JSObjectSetProperty(ctx, object, js_name, cast(jsc.JSValueRef)fn, {}, nil)
+}
+
+// resolve_module_path resolves a relative or absolute `specifier` to a real file
+// path. Relative specifiers resolve against `base_dir` — the requiring module's
+// own directory, supplied by its bound require (see native_require_cb) — so a
+// deferred/async require resolves the same as a synchronous one.
