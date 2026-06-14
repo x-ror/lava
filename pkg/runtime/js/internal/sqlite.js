@@ -49,6 +49,10 @@
     this._dbId = db._id;
     this._stmtId = stmtId;
     this._finalized = false;
+    // When true, INTEGER columns and run()'s changes/lastInsertRowid are returned
+    // as BigInt (node:sqlite setReadBigInts). Default false: out-of-range column
+    // reads throw ERR_OUT_OF_RANGE rather than silently losing precision.
+    this._readBigInts = false;
     // Track the live statement on its database so db.close() can finalize it.
     db._stmts[stmtId] = true;
     if (stmtFinalizers) {
@@ -85,6 +89,12 @@
   // neither on StatementSync — added for explicit resource management; see #128.)
   StatementSync.prototype.finalize = function () {
     this._finalize();
+  };
+
+  // setReadBigInts(enabled): read INTEGER columns (and run()'s numeric results) as
+  // BigInt. Matches node:sqlite, which returns undefined.
+  StatementSync.prototype.setReadBigInts = function (enabled) {
+    this._readBigInts = !!enabled;
   };
   if (disposeSymbol) {
     StatementSync.prototype[disposeSymbol] = StatementSync.prototype._finalize;
@@ -134,7 +144,7 @@
   StatementSync.prototype.get = function () {
     this._prime(arguments);
     if (native.step(this._stmtId, this._dbId) === 0) {
-      return native.row(this._stmtId);
+      return native.row(this._stmtId, this._readBigInts);
     }
     return undefined;
   };
@@ -144,7 +154,7 @@
     this._prime(arguments);
     var rows = [];
     while (native.step(this._stmtId, this._dbId) === 0) {
-      rows.push(native.row(this._stmtId));
+      rows.push(native.row(this._stmtId, this._readBigInts));
     }
     return rows;
   };
@@ -156,8 +166,8 @@
       // drain any rows a write statement might yield (e.g. RETURNING)
     }
     return {
-      changes: native.changes(this._dbId),
-      lastInsertRowid: native.lastInsertRowid(this._dbId),
+      changes: native.changes(this._dbId, this._readBigInts),
+      lastInsertRowid: native.lastInsertRowid(this._dbId, this._readBigInts),
     };
   };
 
