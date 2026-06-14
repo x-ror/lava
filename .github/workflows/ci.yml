@@ -165,13 +165,21 @@ jobs:
       - name: Windows link + JSC smoke (experimental)
         continue-on-error: true
         run: |
-          WK="$PWD/webkit/bun-webkit"
           mkdir -p build
+          # Resolve the JSC static libs via the linker's LIB search path rather than
+          # a /LIBPATH on the command line, so no path-with-spaces reaches the link
+          # line. msvc-dev-cmd already populated LIB with the CRT/SDK dirs.
+          WK_WIN="$(cygpath -w "$PWD/webkit/bun-webkit/lib")"
+          export LIB="$WK_WIN;$LIB"
           # Static JSC pulls in WTF, bmalloc, ICU and a broad set of Win32 system
-          # libraries (WTF threading/crypto/networking shims).
+          # libraries (WTF threading/crypto/networking shims). JavaScriptCore.lib
+          # itself comes from the foreign import in bindings_windows.odin.
           SYSLIBS="user32.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib advapi32.lib winmm.lib bcrypt.lib crypt32.lib ws2_32.lib userenv.lib dbghelp.lib iphlpapi.lib version.lib comctl32.lib rpcrt4.lib secur32.lib usp10.lib windowscodecs.lib"
-          odin build cmd/lava -collection:lava=. -out:build/lava.exe \
-            -extra-linker-flags:"/LIBPATH:$WK/lib WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
+          # Use Odin's bundled lld linker (from the setup-odin LLVM) — its invocation
+          # quotes the MSVC toolchain paths correctly (link.exe via the default path
+          # split "C:\Program Files\..." → LNK1181).
+          odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
+            -extra-linker-flags:"WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
           echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
           ./build/lava.exe run smoke.js | tee smoke.out
           grep -q "jsc-smoke:42" smoke.out
