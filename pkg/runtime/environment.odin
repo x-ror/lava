@@ -1,14 +1,9 @@
 package lava_runtime
 
 import "base:runtime"
-import "core:c"
-import "core:encoding/json"
-import "core:fmt"
-import "core:io"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
-import "core:time"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 
@@ -87,10 +82,24 @@ setup_module_environment :: proc(ctx: jsc.JSContextRef, file_path: string, loop:
 	// the entry and the partial-exports cache (register_entry_module) has nothing
 	// to register.
 	exports_obj := jsc.JSObjectMake(ctx, nil, nil)
-	jsc.JSObjectSetProperty(ctx, module_obj, exports_name, cast(jsc.JSValueRef)exports_obj, {}, nil)
+	jsc.JSObjectSetProperty(
+		ctx,
+		module_obj,
+		exports_name,
+		cast(jsc.JSValueRef)exports_obj,
+		{},
+		nil,
+	)
 
 	jsc.JSObjectSetProperty(ctx, global_obj, module_name, cast(jsc.JSValueRef)module_obj, {}, nil)
-	jsc.JSObjectSetProperty(ctx, global_obj, exports_name, cast(jsc.JSValueRef)exports_obj, {}, nil)
+	jsc.JSObjectSetProperty(
+		ctx,
+		global_obj,
+		exports_name,
+		cast(jsc.JSValueRef)exports_obj,
+		{},
+		nil,
+	)
 }
 
 inject_global_string :: proc(
@@ -230,13 +239,20 @@ js_quote :: proc(value: string) -> string {
 	for i := 0; i < len(value); i += 1 {
 		c := value[i]
 		switch c {
-		case '"':  strings.write_string(&b, "\\\"")
-		case '\\': strings.write_string(&b, "\\\\")
-		case '\b': strings.write_string(&b, "\\b")
-		case '\f': strings.write_string(&b, "\\f")
-		case '\n': strings.write_string(&b, "\\n")
-		case '\r': strings.write_string(&b, "\\r")
-		case '\t': strings.write_string(&b, "\\t")
+		case '"':
+			strings.write_string(&b, "\\\"")
+		case '\\':
+			strings.write_string(&b, "\\\\")
+		case '\b':
+			strings.write_string(&b, "\\b")
+		case '\f':
+			strings.write_string(&b, "\\f")
+		case '\n':
+			strings.write_string(&b, "\\n")
+		case '\r':
+			strings.write_string(&b, "\\r")
+		case '\t':
+			strings.write_string(&b, "\\t")
 		case:
 			if c < 0x20 {
 				// Other control characters as \u00XX (JSON requires escaping these).

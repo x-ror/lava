@@ -73,7 +73,15 @@ Loop :: struct {
 	immediates:      [dynamic]Task,
 	io_callbacks:    [dynamic]Task, // poll-phase completions (e.g. fs.readFile); run before check
 	close_callbacks: [dynamic]Task,
+	// timers is a binary min-heap keyed on (due_ms, seq): the root is the earliest
+	// deadline, seq breaking ties to preserve Node's FIFO order for equal due_ms.
+	// Push/pop are O(log n); cancelled entries are removed lazily (skipped/popped
+	// when they reach the root) rather than compacted each tick.
 	timers:          [dynamic]Timer,
+	// reffed_timer_count mirrors the number of heap timers that are ref'd and not
+	// cancelled, so pending_count is O(1) instead of walking the heap every tick.
+	// Maintained at every site a timer enters/leaves the heap or flips ref state.
+	reffed_timer_count: int,
 	cancelled_ids:   map[Timer_ID]bool,
 	running_id:      Timer_ID,
 	active_io_count: int,
@@ -296,13 +304,7 @@ active_io_callback_count :: proc(loop: ^Loop) -> int {
 }
 
 active_timer_count :: proc(loop: ^Loop) -> int {
-	count := 0
-	for &timer in loop.timers {
-		if !timer.cancelled && !is_cancel_requested(loop, timer.id) && !timer.unreffed {
-			count += 1
-		}
-	}
-	return count
+	return loop.reffed_timer_count
 }
 
 active_immediate_count :: proc(loop: ^Loop) -> int {
@@ -426,6 +428,9 @@ queue_close_callback :: proc(loop: ^Loop, callback: Callback, user_data: rawptr 
 timer_ref :: proc(loop: ^Loop, id: Timer_ID) {
 	for &timer in loop.timers {
 		if timer.id == id {
+			if timer.unreffed && !timer.cancelled {
+				loop.reffed_timer_count += 1
+			}
 			timer.unreffed = false
 			return
 		}
@@ -436,6 +441,9 @@ timer_ref :: proc(loop: ^Loop, id: Timer_ID) {
 timer_unref :: proc(loop: ^Loop, id: Timer_ID) {
 	for &timer in loop.timers {
 		if timer.id == id {
+			if !timer.unreffed && !timer.cancelled {
+				loop.reffed_timer_count -= 1
+			}
 			timer.unreffed = true
 			return
 		}
@@ -469,7 +477,9 @@ set_timer :: proc(
 		seq       = next_sequence(loop),
 	}
 
-	insert_timer(loop, timer)
+	// New timers start ref'd; account for it before the heap push.
+	loop.reffed_timer_count += 1
+	timer_heap_push(loop, timer)
 	return timer.id
 }
 
@@ -486,6 +496,9 @@ clear_timeout :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 	// nulled so no later path can release it twice.
 	for i in 0 ..< len(loop.timers) {
 		if loop.timers[i].id == id && !loop.timers[i].cancelled {
+			if !loop.timers[i].unreffed {
+				loop.reffed_timer_count -= 1
+			}
 			loop.timers[i].cancelled = true
 			run_dispose(loop.timers[i].dispose, loop.timers[i].user_data)
 			loop.timers[i].dispose = nil
@@ -575,20 +588,25 @@ run_once :: proc(loop: ^Loop) -> bool {
 	drain_microtasks(loop)
 
 	// Phase 3: timers
-	// sequence_limit ensures timers scheduled *during* this phase run next iteration
+	// sequence_limit ensures timers scheduled *during* this phase run next iteration.
+	// The heap root is the earliest (due_ms, seq); a timer with seq >= the limit was
+	// scheduled this phase and (since its due_ms >= now_ms, delays being >= 0) sorts
+	// no earlier than every already-due seq < limit timer — so stopping at the first
+	// such root cannot starve an earlier-scheduled due timer.
 	timer_phase_sequence_limit := loop.next_sequence
-	for {
-		index := next_due_timer_index(loop, timer_phase_sequence_limit)
-		if index < 0 {
-			break
-		}
-
-		timer := loop.timers[index]
-		ordered_remove(&loop.timers, index)
-		if timer.cancelled || is_cancel_requested(loop, timer.id) {
+	for len(loop.timers) > 0 {
+		// Lazily drop a cancelled root: its binding was already disposed and its
+		// count already adjusted at cancel time, so just discard it.
+		if loop.timers[0].cancelled || is_cancel_requested(loop, loop.timers[0].id) {
+			timer_heap_pop_min(loop)
 			continue
 		}
 
+		root := loop.timers[0]
+		if root.seq >= timer_phase_sequence_limit do break
+		if root.due_ms > loop.now_ms do break
+
+		timer := timer_heap_pop_min(loop)
 		did_work = true
 		loop.running_id = timer.id
 		timer.callback(loop, timer.user_data)
@@ -596,15 +614,21 @@ run_once :: proc(loop: ^Loop) -> bool {
 		drain_microtasks(loop)
 
 		if timer.repeating && !is_cancel_requested(loop, timer.id) {
+			// Re-armed: stays active, so reffed_timer_count is unchanged.
 			timer.due_ms = loop.now_ms + timer.repeat_ms
 			timer.seq = next_sequence(loop)
-			insert_timer(loop, timer)
-		} else if timer.repeating {
-			// Repeating timer cancelled from within its own callback: it already
-			// fired (so, unlike a one-shot, its callback did NOT free the binding)
-			// and is not being re-armed, so release it here. A non-repeating timer
-			// freed its binding when it fired, so it is intentionally not disposed.
-			run_dispose(timer.dispose, timer.user_data)
+			timer_heap_push(loop, timer)
+		} else {
+			// Leaving the heap for good. A repeating timer cancelled from within its
+			// own callback already fired (so its callback did NOT free the binding)
+			// and is not re-armed, so release it here; a one-shot freed its binding
+			// when it fired, so it is intentionally not disposed.
+			if timer.repeating {
+				run_dispose(timer.dispose, timer.user_data)
+			}
+			if !timer.unreffed {
+				loop.reffed_timer_count -= 1
+			}
 		}
 	}
 
@@ -714,7 +738,9 @@ run_once :: proc(loop: ^Loop) -> bool {
 		drain_microtasks(loop)
 	}
 
-	discard_cancelled_timers(loop)
+	// Cancelled timers are dropped lazily from the heap root (see the timer phase),
+	// so there is no per-tick compaction pass for them — only the array-backed
+	// immediates still need one.
 	discard_cancelled_immediates(loop)
 	clear(&loop.cancelled_ids)
 	return did_work
@@ -845,42 +871,76 @@ is_cancel_requested :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 	return loop.cancelled_ids[id]
 }
 
-// insert_timer inserts into the sorted timers slice (sorted by due_ms, then seq).
-insert_timer :: proc(loop: ^Loop, timer: Timer) {
-	insert_at := len(loop.timers)
-	for i in 0 ..< len(loop.timers) {
-		other := loop.timers[i]
-		if timer.due_ms < other.due_ms || (timer.due_ms == other.due_ms && timer.seq < other.seq) {
-			insert_at = i
+// --- Timer min-heap (keyed on due_ms, then seq) ---
+
+// timer_less orders the heap: earliest due_ms first, seq breaking ties so equal
+// deadlines fire in scheduling (FIFO) order, matching Node.
+timer_less :: proc(a, b: Timer) -> bool {
+	return a.due_ms < b.due_ms || (a.due_ms == b.due_ms && a.seq < b.seq)
+}
+
+timer_heap_push :: proc(loop: ^Loop, timer: Timer) {
+	append(&loop.timers, timer)
+	// sift-up
+	i := len(loop.timers) - 1
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !timer_less(loop.timers[i], loop.timers[parent]) {
 			break
 		}
+		loop.timers[i], loop.timers[parent] = loop.timers[parent], loop.timers[i]
+		i = parent
 	}
+}
 
-	append(&loop.timers, Timer{}) // grow by one
-	for j := len(loop.timers) - 1; j > insert_at; j -= 1 {
-		loop.timers[j] = loop.timers[j - 1]
+// timer_heap_pop_min removes and returns the earliest timer. Callers guarantee the
+// heap is non-empty.
+timer_heap_pop_min :: proc(loop: ^Loop) -> Timer {
+	n := len(loop.timers)
+	root := loop.timers[0]
+	last := loop.timers[n - 1]
+	ordered_remove(&loop.timers, n - 1) // pop the tail (O(1) on the last element)
+	if n - 1 > 0 {
+		loop.timers[0] = last
+		timer_heap_sift_down(loop, 0)
 	}
-	loop.timers[insert_at] = timer
+	return root
+}
+
+timer_heap_sift_down :: proc(loop: ^Loop, start: int) {
+	n := len(loop.timers)
+	i := start
+	for {
+		left := 2 * i + 1
+		right := 2 * i + 2
+		smallest := i
+		if left < n && timer_less(loop.timers[left], loop.timers[smallest]) {
+			smallest = left
+		}
+		if right < n && timer_less(loop.timers[right], loop.timers[smallest]) {
+			smallest = right
+		}
+		if smallest == i {
+			break
+		}
+		loop.timers[i], loop.timers[smallest] = loop.timers[smallest], loop.timers[i]
+		i = smallest
+	}
+}
+
+// timer_heap_clean_root pops cancelled timers off the root so a peek sees a live
+// timer. Cancelled timers were already disposed and uncounted at cancel time, so
+// no further bookkeeping is needed here.
+timer_heap_clean_root :: proc(loop: ^Loop) {
+	for len(loop.timers) > 0 &&
+	    (loop.timers[0].cancelled || is_cancel_requested(loop, loop.timers[0].id)) {
+		timer_heap_pop_min(loop)
+	}
 }
 
 has_due_timer :: proc(loop: ^Loop) -> bool {
-	return next_due_timer_index(loop, loop.next_sequence) >= 0
-}
-
-next_due_timer_index :: proc(loop: ^Loop, sequence_limit: u64) -> int {
-	for i in 0 ..< len(loop.timers) {
-		timer := loop.timers[i]
-		if timer.cancelled || is_cancel_requested(loop, timer.id) {
-			continue
-		}
-		if timer.seq >= sequence_limit {
-			continue
-		}
-		if timer.due_ms <= loop.now_ms {
-			return i
-		}
-	}
-	return -1
+	timer_heap_clean_root(loop)
+	return len(loop.timers) > 0 && loop.timers[0].due_ms <= loop.now_ms
 }
 
 next_immediate_index :: proc(loop: ^Loop, sequence_limit: u64) -> int {
@@ -925,13 +985,14 @@ next_close_index :: proc(loop: ^Loop, sequence_limit: u64) -> int {
 	return -1
 }
 
+// next_timer_due returns the earliest live deadline (the heap root after pruning
+// any cancelled timers off it), or false if no timer is pending.
 next_timer_due :: proc(loop: ^Loop) -> (u64, bool) {
-	for timer in loop.timers {
-		if !timer.cancelled && !is_cancel_requested(loop, timer.id) {
-			return timer.due_ms, true
-		}
+	timer_heap_clean_root(loop)
+	if len(loop.timers) == 0 {
+		return 0, false
 	}
-	return 0, false
+	return loop.timers[0].due_ms, true
 }
 
 // run_dispose invokes a handle's dispose hook (if any) to release its user_data.
@@ -941,17 +1002,6 @@ next_timer_due :: proc(loop: ^Loop) -> (u64, bool) {
 run_dispose :: proc(dispose: Dispose, user_data: rawptr) {
 	if dispose != nil {
 		dispose(user_data)
-	}
-}
-
-discard_cancelled_timers :: proc(loop: ^Loop) {
-	i := 0
-	for i < len(loop.timers) {
-		if loop.timers[i].cancelled || is_cancel_requested(loop, loop.timers[i].id) {
-			ordered_remove(&loop.timers, i)
-			continue
-		}
-		i += 1
 	}
 }
 
