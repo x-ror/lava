@@ -45,7 +45,7 @@ result_destroy :: proc(res: ^Result) {
 // returns — except on Windows. Releasing the context tears down the whole JSC VM
 // (JIT/GC threads, ICU); on Windows, doing that right before the CLI's os.exit()
 // poisons process teardown — the subsequent ExitProcess DLL-detach fails and the
-// process exits 127 (ERROR_PROC_NOT_FOUND), even though the script ran fine (#157).
+// process exits 127 (ERROR_PROC_NOT_FOUND) even though the script ran fine.
 //
 // Today eval is a one-shot-per-process CLI entry, so leaking the VM on Windows is
 // harmless (the OS reclaims it on exit, as node/jsc/bun do). If Lava ever grows an
@@ -265,9 +265,7 @@ process_exit_code :: proc(ctx: jsc.JSContextRef) -> int {
 	process := get_named(ctx, global, "process")
 	// Gate on JSValueGetType, not the b32-returning JSValueIs* calls, which are
 	// unreliable across the FFI (the same heisenbug process_exit_cb avoids; the
-	// sqlite readBigInts / bind bugs are the other instances). Hardening — the #157
-	// exit-127 was VM teardown (see release_global_context_after_eval), not this
-	// read, but the unsafe predicates were latent here all the same.
+	// sqlite readBigInts / bind bugs are the other instances).
 	if process == nil || jsc.JSValueGetType(ctx, process) != .Object do return 0
 	code := get_named(ctx, cast(jsc.JSObjectRef)process, "exitCode")
 	if code == nil do return 0

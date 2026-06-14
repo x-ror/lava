@@ -23,13 +23,9 @@ import "core:strings"
 // be on the link line, so import them as a group. The library names differ by
 // platform: the Unix linker's `system:` -l convention on Linux/Darwin (same as
 // sqlite3/javascriptcoregtk), and the import-lib filenames on Windows (as built
-// by vcpkg / the OpenSSL installer).
-//
-// NOTE (Windows, #153): the Windows link path is NOT wired up yet — scripts/
-// build.sh only adds the macOS OpenSSL flags, and CI's Windows job stops at
-// no-link object codegen. So these names compile but are not yet link-verified;
-// a Windows build must supply the OpenSSL /LIBPATH. The Windows default trust
-// store is also unresolved — see tls_client_ctx below.
+// by vcpkg / the OpenSSL installer). All three use the `system:` prefix so the
+// names resolve via the linker's library search path — the build (CI Windows job)
+// is responsible for putting the OpenSSL lib dir on that path.
 when ODIN_OS == .Windows {
 	// `system:` makes Odin search these via the linker's LIB path (like JSC's
 	// import in pkg/jsc/bindings_windows.odin); a bare "libssl.lib" would instead
@@ -118,7 +114,7 @@ g_tls_ctx: SSL_CTX
 // and on Windows it loads the machine ROOT/CA stores into this context's
 // X509_STORE so a plain `fetch("https://...")` verifies against the OS roots.
 // SSL_CERT_FILE still works everywhere as an explicit override (both sources feed
-// the same store). See #153.
+// the same store).
 tls_client_ctx :: proc() -> SSL_CTX {
 	if g_tls_ctx == nil {
 		method := TLS_client_method()

@@ -733,8 +733,9 @@ io_probe_cb :: proc(loop: ^Loop, user_data: rawptr) {
 
 // watch_fd fires its callback when a watched socket becomes readable. This is the
 // core readiness contract every backend must honour (epoll/kqueue/select); it is
-// the regression guard for #101, where the Windows IOCP stub reported success
-// from watch_fd but could never fire, parking the loop forever.
+// the regression guard against a backend that reports success from watch_fd but
+// can never fire (the original Windows IOCP stub did exactly that, parking the
+// loop forever).
 @(test)
 watch_fd_fires_on_readable_socket :: proc(t: ^testing.T) {
 	// A connected loopback TCP pair: write on the client, watch the server end.

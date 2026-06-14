@@ -11,7 +11,7 @@ import win "core:sys/windows"
 // "CA" (intermediate) stores via CryptoAPI and adds each DER certificate to the
 // OpenSSL context's X509_STORE. It runs once, when the shared SSL_CTX is built
 // (tls_client_ctx). Best-effort and additive — it never removes or weakens
-// verification; certs already provided via SSL_CERT_FILE remain in force. See #153.
+// verification; certs already provided via SSL_CERT_FILE remain in force.
 
 // Minimal CryptoAPI cert-store bindings (core:sys/windows has none). Layout per
 // <wincrypt.h>: only the fields we read are typed precisely.
