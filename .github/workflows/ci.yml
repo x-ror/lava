@@ -180,38 +180,35 @@ jobs:
           else
             echo "WARNING: libssl.lib not found under C:\\Program Files\\OpenSSL*"
           fi
-          # clang emits 128-bit int builtins (__divti3, __fixdfti) into JSC/WTF;
-          # supply LLVM's compiler-rt builtins lib so lld can resolve them.
+          # compiler-rt int128 builtins (__divti3/__fixdfti and helpers): JSC
+          # references these but doesn't bundle them. The archive defines and indexes
+          # them, yet lld won't pull them here via any archive mechanism (/INCLUDE,
+          # on-demand, and /WHOLEARCHIVE all fail or clash with the half-float
+          # routines JSC *does* bundle). So extract the specific object files and link
+          # them directly — objects are always included, no index/ordering involved.
           RT_LIB="$(find '/c/Program Files/LLVM' -iname 'clang_rt.builtins-x86_64.lib' 2>/dev/null | head -1 || true)"
+          RT_OBJS=""
           if [ -n "$RT_LIB" ]; then
-            export LIB="$(cygpath -w "$(dirname "$RT_LIB")");$LIB"
-            echo "compiler-rt: $RT_LIB"
             AR="$(command -v llvm-ar || echo '/c/Program Files/LLVM/bin/llvm-ar.exe')"
-            NM="$(command -v llvm-nm || echo '/c/Program Files/LLVM/bin/llvm-nm.exe')"
-            echo "=== members (ar t) matching divti3/fixdfti ==="
-            "$AR" t "$RT_LIB" 2>/dev/null | grep -iE 'divti3|fixdfti' || echo "NO such member"
-            echo "=== armap (symbol index) for __divti3/__fixdfti ==="
-            "$NM" --print-armap "$RT_LIB" 2>/dev/null | grep -iE '__divti3|__fixdfti' || echo "NOT in armap"
+            mkdir -p build/rt && ( cd build/rt && "$AR" x "$RT_LIB" )
+            for sym in divti3 fixdfti udivmodti4 udivti3 umodti3 modti3 multi3 clzti2 ctzti2; do
+              f="$(find build/rt -name "${sym}.c.obj" | head -1)"
+              [ -n "$f" ] && RT_OBJS="$RT_OBJS $(cygpath -w "$f")"
+            done
+            echo "extracted compiler-rt builtins:$RT_OBJS"
           else
             echo "WARNING: clang_rt.builtins-x86_64.lib not found under C:\\Program Files\\LLVM"
           fi
-          # Static JSC pulls in WTF, bmalloc, ICU, the compiler-rt builtins, and a
-          # broad set of Win32 system libraries (WTF threading/crypto/networking
-          # shims; Synchronization.lib for WaitOnAddress/WakeByAddressSingle).
-          # JavaScriptCore.lib itself comes from bindings_windows.odin's import.
-          SYSLIBS="clang_rt.builtins-x86_64.lib Synchronization.lib user32.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib advapi32.lib winmm.lib bcrypt.lib crypt32.lib ws2_32.lib userenv.lib dbghelp.lib iphlpapi.lib version.lib comctl32.lib rpcrt4.lib secur32.lib usp10.lib windowscodecs.lib"
+          # Static JSC pulls in WTF, bmalloc, ICU and a broad set of Win32 system
+          # libraries (WTF threading/crypto/networking shims; Synchronization.lib for
+          # WaitOnAddress/WakeByAddressSingle). JavaScriptCore.lib itself comes from
+          # bindings_windows.odin's import.
+          SYSLIBS="Synchronization.lib user32.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib advapi32.lib winmm.lib bcrypt.lib crypt32.lib ws2_32.lib userenv.lib dbghelp.lib iphlpapi.lib version.lib comctl32.lib rpcrt4.lib secur32.lib usp10.lib windowscodecs.lib"
           # Use Odin's bundled lld linker (from the setup-odin LLVM) — its invocation
-          # quotes the MSVC toolchain paths correctly (link.exe via the default path
-          # split "C:\Program Files\..." → LNK1181).
-          # compiler-rt builtins: JSC references __divti3/__fixdfti but doesn't
-          # provide them, and this archive's symbol index omits them (so /INCLUDE
-          # and on-demand resolution both miss them). /WHOLEARCHIVE force-includes
-          # the tiny archive; that re-defines ~6 half-float routines JSC also bundles
-          # (identical compiler-rt implementations), so /force:multiple lets lld pick
-          # one instead of erroring. The only multiply-defined symbols are these
-          # builtins — verified from the duplicate-symbol output.
+          # quotes the MSVC toolchain paths correctly (the default link.exe path
+          # splits "C:\Program Files\..." → LNK1181).
           odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
-            -extra-linker-flags:"/WHOLEARCHIVE:clang_rt.builtins-x86_64.lib /force:multiple WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
+            -extra-linker-flags:"$RT_OBJS WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
           echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
           ./build/lava.exe run smoke.js | tee smoke.out
           grep -q "jsc-smoke:42" smoke.out
