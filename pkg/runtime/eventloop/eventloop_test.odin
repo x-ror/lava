@@ -627,3 +627,80 @@ backend_error_stops_run_drivers :: proc(t: ^testing.T) {
 	run(&loop)
 	testing.expect(t, loop.backend_error) // flag is preserved for the embedder
 }
+
+@(test)
+timers_fire_in_due_order_regardless_of_insertion :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// Inserted out of deadline order; the min-heap must still fire by due_ms.
+	set_timeout(&loop, record_3, 30, &rec) // -> 3
+	set_timeout(&loop, record, 10, &rec) // -> 1
+	set_timeout(&loop, record_2, 20, &rec) // -> 2
+
+	run_until_idle(&loop)
+	expect_events(t, rec.events[:], []int{1, 2, 3})
+	testing.expect_value(t, pending_count(&loop), 0)
+}
+
+@(test)
+equal_deadline_timers_fire_fifo :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// Same deadline: seq must break the tie in scheduling order (Node FIFO).
+	set_timeout(&loop, record, 10, &rec)
+	set_timeout(&loop, record_2, 10, &rec)
+	set_timeout(&loop, record_3, 10, &rec)
+
+	run_until_idle(&loop)
+	expect_events(t, rec.events[:], []int{1, 2, 3})
+}
+
+@(test)
+cancelled_heap_timer_is_skipped_and_uncounted :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	set_timeout(&loop, record, 10, &rec) // -> 1
+	mid := set_timeout(&loop, record_2, 20, &rec) // cancelled
+	set_timeout(&loop, record_3, 30, &rec) // -> 3
+	testing.expect_value(t, pending_count(&loop), 3)
+
+	clear_timeout(&loop, mid)
+	testing.expect_value(t, pending_count(&loop), 2) // O(1) counter dropped it
+
+	run_until_idle(&loop)
+	expect_events(t, rec.events[:], []int{1, 3})
+	testing.expect_value(t, pending_count(&loop), 0)
+}
+
+@(test)
+many_timers_fire_in_sorted_order :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	// Insert 64 timers with descending deadlines; the heap must emit ascending.
+	N :: 64
+	for i in 0 ..< N {
+		set_timeout(&loop, record, u64((N - i) * 10), &rec)
+	}
+	testing.expect_value(t, pending_count(&loop), N)
+
+	run_until_idle(&loop)
+	testing.expect_value(t, len(rec.events), N)
+	testing.expect_value(t, pending_count(&loop), 0)
+	testing.expect_value(t, loop.now_ms, u64(N * 10))
+}
