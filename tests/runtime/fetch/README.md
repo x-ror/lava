@@ -18,9 +18,12 @@ sandboxed CI environment may disallow. The node-compat oracle
 (`tests/node-compat/cases/08-fetch.js`) covers the `Headers`/`Request`/`Response`
 surface without a network.
 
-The transport handles `http://` and `https://` (TLS via system/Homebrew OpenSSL,
-on Linux and macOS)
-and resolves DNS off the event loop; the connect/handshake/write/read path is
-non-blocking. When the `openssl` CLI is available the smoke runner generates a
-self-signed cert and exercises the HTTPS path, teaching both runtimes to trust it
-(`NODE_EXTRA_CA_CERTS` for Node, `SSL_CERT_FILE` for Lava). See `ROADMAP.md`.
+The transport handles `http://` and `https://` (TLS via OpenSSL) and resolves DNS
+off the event loop; the connect/handshake/write/read path is non-blocking. It is
+implemented on Linux, macOS, and Windows, though this smoke test only runs on
+Linux/macOS — Windows can't yet link/run the binary (no JavaScriptCore on the CI
+runner, #36), so Windows HTTPS is codegen-verified only. When the `openssl` CLI is
+available the smoke runner generates a self-signed cert and exercises the HTTPS
+path, teaching both runtimes to trust it (`NODE_EXTRA_CA_CERTS` for Node,
+`SSL_CERT_FILE` for Lava). Note this proves the explicit-CA path, not a platform's
+default system trust store. See `ROADMAP.md`.

@@ -3,6 +3,11 @@ build/
 node_modules/
 reports/
 
+# Odin `odin test` drops a test binary named after the package in the cwd
+# (repo root for the make test-* targets). Build artifacts, not source.
+/eventloop
+/lava
+
 # Raw upstream test corpus vendored only as copy-source for clean-room ports;
 # the adapted tests live under tests/node-compat/. Do not commit (~25M).
 tests/vendor/

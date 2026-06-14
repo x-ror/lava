@@ -136,9 +136,10 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			return
 		}
 		if req.is_https {
-			// TLS is a platform-swappable backend (real OpenSSL on Linux/Darwin, a
-			// reject stub where it is not yet wired up): set up the session and run
-			// the first handshake step, settling on its own error if unsupported.
+			// TLS is a platform-swappable backend (real OpenSSL on Linux/Darwin/
+			// Windows, a reject stub on transport-less platforms): set up the session
+			// and run the first handshake step, settling on its own error if
+			// unsupported.
 			fetch_tls_start_handshake(loop, req)
 			return
 		}
