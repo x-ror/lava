@@ -171,6 +171,15 @@ jobs:
           # line. msvc-dev-cmd already populated LIB with the CRT/SDK dirs.
           WK_WIN="$(cygpath -w "$PWD/webkit/bun-webkit/lib")"
           export LIB="$WK_WIN;$LIB"
+          # OpenSSL (tls.odin foreign-imports libssl.lib/libcrypto.lib). The runner
+          # ships OpenSSL; add the dir that actually holds the import libs to LIB.
+          OSSL_LIB="$(find '/c/Program Files/OpenSSL' '/c/Program Files/OpenSSL-Win64' -iname 'libssl.lib' 2>/dev/null | head -1 || true)"
+          if [ -n "$OSSL_LIB" ]; then
+            export LIB="$(cygpath -w "$(dirname "$OSSL_LIB")");$LIB"
+            echo "OpenSSL libs: $(dirname "$OSSL_LIB")"
+          else
+            echo "WARNING: libssl.lib not found under C:\\Program Files\\OpenSSL*"
+          fi
           # Static JSC pulls in WTF, bmalloc, ICU and a broad set of Win32 system
           # libraries (WTF threading/crypto/networking shims). JavaScriptCore.lib
           # itself comes from the foreign import in bindings_windows.odin.
