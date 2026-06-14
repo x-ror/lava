@@ -31,9 +31,12 @@ import "core:strings"
 // a Windows build must supply the OpenSSL /LIBPATH. The Windows default trust
 // store is also unresolved — see tls_client_ctx below.
 when ODIN_OS == .Windows {
+	// `system:` makes Odin search these via the linker's LIB path (like JSC's
+	// import in pkg/jsc/bindings_windows.odin); a bare "libssl.lib" would instead
+	// be resolved relative to this source file and fail to link.
 	foreign import openssl_lib {
-		"libssl.lib",
-		"libcrypto.lib",
+		"system:libssl.lib",
+		"system:libcrypto.lib",
 	}
 } else {
 	foreign import openssl_lib {

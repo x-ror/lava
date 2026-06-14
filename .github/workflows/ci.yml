@@ -13,11 +13,10 @@ concurrency:
 # Two things may need tuning over time:
 #   1. The Odin/LLVM version below (setup-odin inputs) as the project tracks
 #      newer Odin dev builds.
-#   2. Windows cannot link/run because the WebKit Windows port's
-#      JavaScriptCore.lib/.dll is not available on GitHub runners. The Windows
-#      job therefore type-checks, validates Windows codegen (-build-mode:obj),
-#      and runs the JSC-free event-loop unit tests — everything except the final
-#      JSC link.
+#   2. The Windows job links JavaScriptCore from the Bun WebKit fork (static
+#      libs, provisioned + cached via WEBKIT_TAG) and runs a real JSC-backed
+#      lava.exe smoke, in addition to type-check, Windows codegen, and the
+#      JSC-free event-loop unit tests.
 
 jobs:
   linux:
@@ -97,6 +96,10 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Pinned oven-sh/WebKit release providing the prebuilt Windows JavaScriptCore
+      # (see scripts/fetch-webkit-windows.sh). Bump to re-provision a newer JSC.
+      WEBKIT_TAG: autobuild-9cb85a0716065c461bea14a0de9fe7139e5323aa
     steps:
       - uses: actions/checkout@v4
 
@@ -111,7 +114,7 @@ jobs:
           llvm-version: "18"
 
       # Type-check every package natively for the Windows target. This exercises
-      # pkg/jsc/bindings_windows.odin and the IOCP event-loop backend.
+      # pkg/jsc/bindings_windows.odin and the select() event-loop backend.
       - name: Type-check
         run: |
           odin check cmd/lava -collection:lava=.
@@ -125,10 +128,95 @@ jobs:
       - name: Event-loop unit tests
         run: odin test pkg/runtime/eventloop
 
-      # Full Windows codegen of the JSC-using runtime + CLI. Stops before the
-      # link step (which would need JavaScriptCore.lib), proving every Windows
-      # source path compiles.
+      # Fast canary: full Windows codegen of the JSC-using runtime + CLI without
+      # linking, so a source/codegen break is caught before the (heavier) JSC link
+      # step below provisions WebKit.
       - name: Windows codegen (no link)
         run: |
           mkdir -p build
           odin build cmd/lava -collection:lava=. -build-mode:obj -out:build/lava.obj
+
+      # --- Real link + JSC-backed runtime smoke (#36) ---
+      # JavaScriptCore is provisioned from the Bun project's WebKit fork (static
+      # libs; see scripts/fetch-webkit-windows.sh), statically linked into lava.exe,
+      # which then runs a JS file through JavaScriptCore for real on Windows.
+      - name: Cache JavaScriptCore (bun-webkit)
+        id: cache-webkit
+        uses: actions/cache@v4
+        with:
+          path: webkit
+          key: bun-webkit-windows-amd64-${{ env.WEBKIT_TAG }}
+
+      - name: Provision JavaScriptCore
+        if: steps.cache-webkit.outputs.cache-hit != 'true'
+        run: WEBKIT_TAG="$WEBKIT_TAG" DEST=webkit scripts/fetch-webkit-windows.sh
+
+      # Set up the MSVC x64 developer environment (LIB/INCLUDE/PATH) so the linker
+      # resolves system import libs via $LIB rather than absolute "C:\Program
+      # Files\..." paths on the command line (which split on the space → LNK1181).
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Windows link + JSC smoke
+        run: |
+          mkdir -p build
+          # Resolve the JSC static libs via the linker's LIB search path rather than
+          # a /LIBPATH on the command line, so no path-with-spaces reaches the link
+          # line. msvc-dev-cmd already populated LIB with the CRT/SDK dirs.
+          WK_WIN="$(cygpath -w "$PWD/webkit/bun-webkit/lib")"
+          export LIB="$WK_WIN;$LIB"
+          # OpenSSL (tls.odin foreign-imports libssl.lib/libcrypto.lib). The runner
+          # ships OpenSSL; add the dir that actually holds the import libs to LIB.
+          OSSL_LIB="$(find '/c/Program Files/OpenSSL' '/c/Program Files/OpenSSL-Win64' -iname 'libssl.lib' 2>/dev/null | head -1 || true)"
+          if [ -n "$OSSL_LIB" ]; then
+            export LIB="$(cygpath -w "$(dirname "$OSSL_LIB")");$LIB"
+            echo "OpenSSL libs: $(dirname "$OSSL_LIB")"
+          else
+            echo "WARNING: libssl.lib not found under C:\\Program Files\\OpenSSL*"
+          fi
+          # compiler-rt int128 builtins (__divti3/__fixdfti and helpers): JSC
+          # references these but doesn't bundle them. The archive defines and indexes
+          # them, yet lld won't pull them here via any archive mechanism (/INCLUDE,
+          # on-demand, and /WHOLEARCHIVE all fail or clash with the half-float
+          # routines JSC *does* bundle). So extract the specific object files and link
+          # them directly — objects are always included, no index/ordering involved.
+          RT_LIB="$(find '/c/Program Files/LLVM' -iname 'clang_rt.builtins-x86_64.lib' 2>/dev/null | head -1 || true)"
+          RT_OBJS=""
+          if [ -n "$RT_LIB" ]; then
+            AR="$(command -v llvm-ar || echo '/c/Program Files/LLVM/bin/llvm-ar.exe')"
+            mkdir -p build/rt && ( cd build/rt && "$AR" x "$RT_LIB" )
+            # JSC bundles most builtins; only __divti3/__fixdfti are missing. Their
+            # helper __udivmodti4 resolves from JSC, so extracting more just clashes.
+            for sym in divti3 fixdfti; do
+              f="$(find build/rt -name "${sym}.c.obj" | head -1)"
+              [ -n "$f" ] && RT_OBJS="$RT_OBJS $(cygpath -w "$f")"
+            done
+            echo "extracted compiler-rt builtins:$RT_OBJS"
+          else
+            echo "WARNING: clang_rt.builtins-x86_64.lib not found under C:\\Program Files\\LLVM"
+          fi
+          # Static JSC pulls in WTF, bmalloc, ICU and a broad set of Win32 system
+          # libraries (WTF threading/crypto/networking shims; Synchronization.lib for
+          # WaitOnAddress/WakeByAddressSingle). JavaScriptCore.lib itself comes from
+          # bindings_windows.odin's import.
+          SYSLIBS="Synchronization.lib user32.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib advapi32.lib winmm.lib bcrypt.lib crypt32.lib ws2_32.lib userenv.lib dbghelp.lib iphlpapi.lib version.lib comctl32.lib rpcrt4.lib secur32.lib usp10.lib windowscodecs.lib"
+          # Use Odin's bundled lld linker (from the setup-odin LLVM) — its invocation
+          # quotes the MSVC toolchain paths correctly (the default link.exe path
+          # splits "C:\Program Files\..." → LNK1181).
+          odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
+            -extra-linker-flags:"$RT_OBJS WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
+          # JSC smoke: prove lava.exe links and JavaScriptCore evaluates JS. We
+          # assert on the OUTPUT, which is the real signal. lava.exe currently exits
+          # 127 on Windows after a correct run (a teardown/exit-code anomaly tracked
+          # in #157) — independent of JSC working — so we capture the code for the
+          # log but key the pass/fail off the output, not the exit status.
+          echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
+          set +e
+          ./build/lava.exe run smoke.js > smoke.out 2>&1
+          code=$?
+          set -e
+          echo "lava.exe exit code: $code (see #157)"
+          echo "--- output ---"; cat smoke.out
+          grep -q "jsc-smoke:42" smoke.out && echo "JSC SMOKE PASS" || { echo "JSC SMOKE FAIL"; exit 1; }
