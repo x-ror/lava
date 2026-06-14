@@ -180,10 +180,20 @@ jobs:
           else
             echo "WARNING: libssl.lib not found under C:\\Program Files\\OpenSSL*"
           fi
-          # Static JSC pulls in WTF, bmalloc, ICU and a broad set of Win32 system
-          # libraries (WTF threading/crypto/networking shims). JavaScriptCore.lib
-          # itself comes from the foreign import in bindings_windows.odin.
-          SYSLIBS="user32.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib advapi32.lib winmm.lib bcrypt.lib crypt32.lib ws2_32.lib userenv.lib dbghelp.lib iphlpapi.lib version.lib comctl32.lib rpcrt4.lib secur32.lib usp10.lib windowscodecs.lib"
+          # clang emits 128-bit int builtins (__divti3, __fixdfti) into JSC/WTF;
+          # supply LLVM's compiler-rt builtins lib so lld can resolve them.
+          RT_LIB="$(find '/c/Program Files/LLVM' -iname 'clang_rt.builtins-x86_64.lib' 2>/dev/null | head -1 || true)"
+          if [ -n "$RT_LIB" ]; then
+            export LIB="$(cygpath -w "$(dirname "$RT_LIB")");$LIB"
+            echo "compiler-rt: $(dirname "$RT_LIB")"
+          else
+            echo "WARNING: clang_rt.builtins-x86_64.lib not found under C:\\Program Files\\LLVM"
+          fi
+          # Static JSC pulls in WTF, bmalloc, ICU, the compiler-rt builtins, and a
+          # broad set of Win32 system libraries (WTF threading/crypto/networking
+          # shims; Synchronization.lib for WaitOnAddress/WakeByAddressSingle).
+          # JavaScriptCore.lib itself comes from bindings_windows.odin's import.
+          SYSLIBS="clang_rt.builtins-x86_64.lib Synchronization.lib user32.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib advapi32.lib winmm.lib bcrypt.lib crypt32.lib ws2_32.lib userenv.lib dbghelp.lib iphlpapi.lib version.lib comctl32.lib rpcrt4.lib secur32.lib usp10.lib windowscodecs.lib"
           # Use Odin's bundled lld linker (from the setup-odin LLVM) — its invocation
           # quotes the MSVC toolchain paths correctly (link.exe via the default path
           # split "C:\Program Files\..." → LNK1181).
