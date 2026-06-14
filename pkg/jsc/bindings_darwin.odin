@@ -19,7 +19,7 @@ foreign jsc_lib {
 	JSStringGetMaximumUTF8CStringSize :: proc(string: JSStringRef) -> c.size_t ---
 	JSStringGetUTF8CString :: proc(string: JSStringRef, buffer: [^]byte, buffer_size: c.size_t) -> c.size_t ---
 	JSStringRelease :: proc(string: JSStringRef) ---
-	JSStringIsEqualToUTF8CString :: proc(a: JSStringRef, b: cstring) -> b32 ---
+	JSStringIsEqualToUTF8CString :: proc(a: JSStringRef, b: cstring) -> bool ---
 
 	JSValueMakeUndefined :: proc(ctx: JSContextRef) -> JSValueRef ---
 	JSValueMakeNull :: proc(ctx: JSContextRef) -> JSValueRef ---
@@ -29,16 +29,16 @@ foreign jsc_lib {
 	JSValueMakeFromJSONString :: proc(ctx: JSContextRef, string: JSStringRef) -> JSValueRef ---
 
 	JSValueGetType :: proc(ctx: JSContextRef, value: JSValueRef) -> JSType ---
-	JSValueIsUndefined :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
-	JSValueIsNull :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
-	JSValueIsBoolean :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
-	JSValueIsNumber :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
-	JSValueIsString :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
-	JSValueIsObject :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
-	JSValueIsArray :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
-	JSValueIsStrictEqual :: proc(ctx: JSContextRef, a: JSValueRef, b: JSValueRef) -> b32 ---
+	JSValueIsUndefined :: proc(ctx: JSContextRef, value: JSValueRef) -> bool ---
+	JSValueIsNull :: proc(ctx: JSContextRef, value: JSValueRef) -> bool ---
+	JSValueIsBoolean :: proc(ctx: JSContextRef, value: JSValueRef) -> bool ---
+	JSValueIsNumber :: proc(ctx: JSContextRef, value: JSValueRef) -> bool ---
+	JSValueIsString :: proc(ctx: JSContextRef, value: JSValueRef) -> bool ---
+	JSValueIsObject :: proc(ctx: JSContextRef, value: JSValueRef) -> bool ---
+	JSValueIsArray :: proc(ctx: JSContextRef, value: JSValueRef) -> bool ---
+	JSValueIsStrictEqual :: proc(ctx: JSContextRef, a: JSValueRef, b: JSValueRef) -> bool ---
 
-	JSValueToBoolean :: proc(ctx: JSContextRef, value: JSValueRef) -> b32 ---
+	JSValueToBoolean :: proc(ctx: JSContextRef, value: JSValueRef) -> bool ---
 	JSValueToNumber :: proc(ctx: JSContextRef, value: JSValueRef, exception: ^JSValueRef) -> f64 ---
 	JSValueToStringCopy :: proc(ctx: JSContextRef, value: JSValueRef, exception: ^JSValueRef) -> JSStringRef ---
 
@@ -51,25 +51,25 @@ foreign jsc_lib {
 
 	JSObjectGetProperty :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef, exception: ^JSValueRef) -> JSValueRef ---
 	JSObjectSetProperty :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef, value: JSValueRef, attributes: JSPropertyAttributes, exception: ^JSValueRef) ---
-	JSObjectHasProperty :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef) -> b32 ---
-	JSObjectDeleteProperty :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef, exception: ^JSValueRef) -> b32 ---
+	JSObjectHasProperty :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef) -> bool ---
+	JSObjectDeleteProperty :: proc(ctx: JSContextRef, object: JSObjectRef, property_name: JSStringRef, exception: ^JSValueRef) -> bool ---
 	JSObjectGetPropertyAtIndex :: proc(ctx: JSContextRef, object: JSObjectRef, property_index: c.uint, exception: ^JSValueRef) -> JSValueRef ---
 	JSObjectSetPropertyAtIndex :: proc(ctx: JSContextRef, object: JSObjectRef, property_index: c.uint, value: JSValueRef, exception: ^JSValueRef) ---
 
 	JSObjectCallAsFunction :: proc(ctx: JSContextRef, object: JSObjectRef, this_object: JSObjectRef, argument_count: c.size_t, arguments: [^]JSValueRef, exception: ^JSValueRef) -> JSValueRef ---
 	JSObjectCallAsConstructor :: proc(ctx: JSContextRef, object: JSObjectRef, argument_count: c.size_t, arguments: [^]JSValueRef, exception: ^JSValueRef) -> JSObjectRef ---
-	JSObjectIsFunction :: proc(ctx: JSContextRef, object: JSObjectRef) -> b32 ---
-	JSObjectIsConstructor :: proc(ctx: JSContextRef, object: JSObjectRef) -> b32 ---
+	JSObjectIsFunction :: proc(ctx: JSContextRef, object: JSObjectRef) -> bool ---
+	JSObjectIsConstructor :: proc(ctx: JSContextRef, object: JSObjectRef) -> bool ---
 
 	JSObjectGetPrivate :: proc(object: JSObjectRef) -> rawptr ---
-	JSObjectSetPrivate :: proc(object: JSObjectRef, data: rawptr) -> b32 ---
+	JSObjectSetPrivate :: proc(object: JSObjectRef, data: rawptr) -> bool ---
 
 	JSClassCreate :: proc(definition: ^JSClassDefinition) -> JSClassRef ---
 	JSClassRetain :: proc(js_class: JSClassRef) -> JSClassRef ---
 	JSClassRelease :: proc(js_class: JSClassRef) ---
 
 	JSEvaluateScript :: proc(ctx: JSContextRef, script: JSStringRef, this_object: JSObjectRef, source_url: JSStringRef, starting_line_number: c.int, exception: ^JSValueRef) -> JSValueRef ---
-	JSCheckScriptSyntax :: proc(ctx: JSContextRef, script: JSStringRef, source_url: JSStringRef, starting_line_number: c.int, exception: ^JSValueRef) -> b32 ---
+	JSCheckScriptSyntax :: proc(ctx: JSContextRef, script: JSStringRef, source_url: JSStringRef, starting_line_number: c.int, exception: ^JSValueRef) -> bool ---
 	JSGarbageCollect :: proc(ctx: JSContextRef) ---
 
 	// GC protection — required to keep JS values (e.g. timer callbacks) alive
