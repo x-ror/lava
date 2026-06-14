@@ -136,21 +136,23 @@ fetch_register_socket :: proc(req: ^Fetch_Request, fd: linux.Fd) -> (ok: bool, e
 	return true, ""
 }
 
-// fetch_set_watch_mode points the socket's watch at readability or writability.
+// fetch_set_watch_mode points the socket's watch at readability or writability,
+// returning false if the re-registration fails (so the caller can fail the
+// request instead of stalling forever waiting for an event that won't come).
 // The io_uring backend re-arms from watcher.mode after this callback returns, so
 // mutating the field is enough; epoll needs an explicit re-registration. A no-op
 // when the mode is unchanged. Used both to flip write→read after the request is
 // sent and to follow OpenSSL's WANT_READ/WANT_WRITE during the TLS handshake and
 // encrypted I/O.
-fetch_set_watch_mode :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, mode: eventloop.Poll_Mode) {
-	if req.watcher.mode == mode do return
+fetch_set_watch_mode :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, mode: eventloop.Poll_Mode) -> bool {
+	if req.watcher.mode == mode do return true
 	if loop.platform.use_uring {
 		req.watcher.mode = mode
-		return
+		return true
 	}
 	eventloop.unwatch_fd(loop, &req.watcher)
 	req.watcher.mode = mode
-	eventloop.watch_fd(loop, &req.watcher)
+	return eventloop.watch_fd(loop, &req.watcher)
 }
 
 // fetch_tls_cleanup frees the per-request SSL session. Called from
@@ -221,11 +223,10 @@ Fetch_TLS_Outcome :: enum {
 fetch_tls_classify :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, ret: c.int) -> Fetch_TLS_Outcome {
 	switch SSL_get_error(cast(SSL)req.tls, ret) {
 	case SSL_ERROR_WANT_READ:
-		fetch_set_watch_mode(loop, req, .Read)
-		return .Pending
+		// A failed re-arm becomes Fatal so the caller settles instead of stalling.
+		return fetch_set_watch_mode(loop, req, .Read) ? .Pending : .Fatal
 	case SSL_ERROR_WANT_WRITE:
-		fetch_set_watch_mode(loop, req, .Write)
-		return .Pending
+		return fetch_set_watch_mode(loop, req, .Write) ? .Pending : .Fatal
 	case SSL_ERROR_ZERO_RETURN:
 		return .Eof
 	case SSL_ERROR_SYSCALL:
@@ -278,7 +279,9 @@ fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 		#partial switch send_err {
 		case .NONE:
 		case .EAGAIN: // == EWOULDBLOCK
-			fetch_set_watch_mode(loop, req, .Write)
+			if !fetch_set_watch_mode(loop, req, .Write) {
+				fetch_settle_error(req, "fetch: event loop watch failed")
+			}
 			return // wait for the next writable event
 		case:
 			fetch_settle_error(req, "fetch: send failed")
@@ -287,7 +290,10 @@ fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 		if n <= 0 do return
 		req.write_offset += n
 	}
-	fetch_set_watch_mode(loop, req, .Read)
+	if !fetch_set_watch_mode(loop, req, .Read) {
+		fetch_settle_error(req, "fetch: event loop watch failed")
+		return
+	}
 	req.phase = .Reading // next readable event reads the response
 }
 
@@ -316,7 +322,9 @@ fetch_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 		#partial switch recv_err {
 		case .NONE:
 		case .EAGAIN: // == EWOULDBLOCK
-			fetch_set_watch_mode(loop, req, .Read)
+			if !fetch_set_watch_mode(loop, req, .Read) {
+				fetch_settle_error(req, "fetch: event loop watch failed")
+			}
 			return // wait for more data
 		case:
 			fetch_settle_error(req, "fetch: receive failed")

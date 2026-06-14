@@ -30,12 +30,9 @@ SSL :: distinct rawptr
 SSL_METHOD :: distinct rawptr
 X509_VERIFY_PARAM :: distinct rawptr
 
-// SSL_get_error result codes (openssl/ssl.h).
-SSL_ERROR_NONE :: 0
-SSL_ERROR_SSL :: 1
+// SSL_get_error result codes (openssl/ssl.h) that the transport acts on.
 SSL_ERROR_WANT_READ :: 2
 SSL_ERROR_WANT_WRITE :: 3
-SSL_ERROR_WANT_X509_LOOKUP :: 4
 SSL_ERROR_SYSCALL :: 5
 SSL_ERROR_ZERO_RETURN :: 6
 
@@ -46,8 +43,6 @@ SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
 SSL_CTRL_SET_MIN_PROTO_VERSION :: 123
 TLSEXT_NAMETYPE_host_name :: 0
 TLS1_2_VERSION :: 0x0303
-
-X509_V_OK :: 0
 
 @(default_calling_convention = "c")
 foreign openssl_lib {
@@ -69,7 +64,6 @@ foreign openssl_lib {
 	SSL_read :: proc(ssl: SSL, buf: rawptr, num: c.int) -> c.int ---
 	SSL_write :: proc(ssl: SSL, buf: rawptr, num: c.int) -> c.int ---
 	SSL_get_error :: proc(ssl: SSL, ret: c.int) -> c.int ---
-	SSL_get_verify_result :: proc(ssl: SSL) -> c.long ---
 }
 
 // g_tls_ctx is a process-wide client context, created lazily on the first
@@ -92,9 +86,15 @@ tls_client_ctx :: proc() -> SSL_CTX {
 		if method == nil do return nil
 		ctx := SSL_CTX_new(method)
 		if ctx == nil do return nil
-		SSL_CTX_set_default_verify_paths(ctx)
+		// Fail closed if the trust store can't be loaded (verification would have
+		// nothing to check against) or the TLS 1.2 floor can't be set. Both return
+		// 1 on success; SSL_CTX_ctrl(SET_MIN_PROTO_VERSION) returns 1 likewise.
+		if SSL_CTX_set_default_verify_paths(ctx) != 1 ||
+		   SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, nil) != 1 {
+			SSL_CTX_free(ctx)
+			return nil
+		}
 		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
-		SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, nil)
 		g_tls_ctx = ctx
 	}
 	return g_tls_ctx
