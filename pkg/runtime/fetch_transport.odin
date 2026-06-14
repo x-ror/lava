@@ -1,7 +1,6 @@
-#+build linux, darwin
+#+build linux, darwin, windows
 package lava_runtime
 
-import "core:c"
 import "core:net"
 import "core:strings"
 import "core:thread"
@@ -115,16 +114,6 @@ fetch_register_socket :: proc(req: ^Fetch_Request, fd: uintptr) -> (ok: bool, er
 	return true, ""
 }
 
-// fetch_tls_cleanup frees the per-request SSL session. Called from
-// fetch_request_finish before the underlying fd is closed (SSL_free does not
-// close the fd). Safe to call when no TLS session was created.
-fetch_tls_cleanup :: proc(req: ^Fetch_Request) {
-	if req.tls != nil {
-		SSL_free(cast(SSL)req.tls)
-		req.tls = nil
-	}
-}
-
 // fetch_watcher_cb advances the request whenever the socket is ready. Connect →
 // (TLS handshake for https) → write the whole request → read until EOF, then
 // settle. EAGAIN / WANT_* means "not ready, wait for the next event".
@@ -139,14 +128,10 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			return
 		}
 		if req.is_https {
-			ssl := tls_new_client(req.fd, req.host)
-			if ssl == nil {
-				fetch_settle_error(req, "fetch: TLS setup failed")
-				return
-			}
-			req.tls = rawptr(ssl)
-			req.phase = .TLS_Handshake
-			fetch_tls_handshake(loop, req) // try the handshake immediately
+			// TLS is a platform-swappable backend (real OpenSSL on Linux/Darwin, a
+			// reject stub where it is not yet wired up): set up the session and run
+			// the first handshake step, settling on its own error if unsupported.
+			fetch_tls_start_handshake(loop, req)
 			return
 		}
 		req.phase = .Writing
@@ -163,74 +148,16 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	}
 }
 
-// Fetch_TLS_Outcome classifies a non-positive SSL_connect/SSL_read/SSL_write result.
-Fetch_TLS_Outcome :: enum {
-	Pending, // OpenSSL wants more I/O; the watcher has been re-armed
-	Eof, // the peer closed (clean close_notify, or an EOF without one)
-	Fatal, // a real TLS or socket error
-}
-
-// fetch_tls_classify maps an SSL op's SSL_get_error onto a Fetch_TLS_Outcome,
-// re-arming the loop watcher for WANT_READ/WANT_WRITE. ZERO_RETURN is a clean
-// close_notify; SSL_ERROR_SYSCALL with ret == 0 is an EOF without one (common
-// for HTTP/1.1 Connection: close), while ret < 0 is a genuine syscall failure
-// and stays Fatal so truncation is not silently treated as completion.
-fetch_tls_classify :: proc(
-	loop: ^eventloop.Loop,
-	req: ^Fetch_Request,
-	ret: c.int,
-) -> Fetch_TLS_Outcome {
-	switch SSL_get_error(cast(SSL)req.tls, ret) {
-	case SSL_ERROR_WANT_READ:
-		// A failed re-arm becomes Fatal so the caller settles instead of stalling.
-		return fetch_set_watch_mode(loop, req, .Read) ? .Pending : .Fatal
-	case SSL_ERROR_WANT_WRITE:
-		return fetch_set_watch_mode(loop, req, .Write) ? .Pending : .Fatal
-	case SSL_ERROR_ZERO_RETURN:
-		return .Eof
-	case SSL_ERROR_SYSCALL:
-		return ret == 0 ? .Eof : .Fatal
-	case:
-		return .Fatal
-	}
-}
-
-// fetch_tls_handshake drives the non-blocking SSL_connect. On completion it
-// advances to Writing and attempts the first send; otherwise it re-arms the
-// watcher for the direction OpenSSL is waiting on and returns. Certificate and
-// hostname verification are enforced by the context (SSL_VERIFY_PEER) and
-// SSL_set1_host, so a bad/mismatched cert surfaces here as a handshake failure.
-// An EOF mid-handshake is fatal — there is no response to complete yet.
-fetch_tls_handshake :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
-	ret := SSL_connect(cast(SSL)req.tls)
-	if ret == 1 {
-		req.phase = .Writing
-		fetch_write(loop, req)
+// fetch_write sends the request bytes over the plaintext socket. When the whole
+// request is out it flips the watch to reading. https takes the parallel TLS path
+// (fetch_tls_write) supplied by the platform TLS backend.
+fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+	if req.is_https {
+		fetch_tls_write(loop, req)
 		return
 	}
-	if fetch_tls_classify(loop, req, ret) != .Pending {
-		fetch_settle_error(req, "fetch: TLS handshake failed")
-	}
-}
-
-// fetch_write sends the request bytes — as TLS records for https, raw socket
-// writes for http. When the whole request is out it flips the watch to reading.
-fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 	for req.write_offset < len(req.request_bytes) {
 		chunk := req.request_bytes[req.write_offset:]
-		if req.is_https {
-			n := SSL_write(cast(SSL)req.tls, raw_data(chunk), c.int(len(chunk)))
-			if n <= 0 {
-				// An EOF while still sending the request is a failure, not
-				// completion, so .Eof falls in with .Fatal here.
-				if fetch_tls_classify(loop, req, n) != .Pending {
-					fetch_settle_error(req, "fetch: TLS write failed")
-				}
-				return
-			}
-			req.write_offset += int(n)
-			continue
-		}
 		n, res := fetch_raw_send(req, chunk)
 		switch res {
 		case .Ok:
@@ -253,26 +180,16 @@ fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 	req.phase = .Reading // next readable event reads the response
 }
 
-// fetch_read drains the response — decrypting TLS records for https, reading raw
-// socket bytes for http — until EOF, then settles.
+// fetch_read drains the response from the plaintext socket until EOF, then
+// settles. https takes the parallel TLS path (fetch_tls_read) supplied by the
+// platform TLS backend.
 fetch_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+	if req.is_https {
+		fetch_tls_read(loop, req)
+		return
+	}
 	buf: [16384]byte
 	for {
-		if req.is_https {
-			n := SSL_read(cast(SSL)req.tls, raw_data(buf[:]), c.int(len(buf)))
-			if n <= 0 {
-				switch fetch_tls_classify(loop, req, n) {
-				case .Pending:
-				case .Eof:
-					fetch_settle_response(req) // response complete
-				case .Fatal:
-					fetch_settle_error(req, "fetch: TLS read failed")
-				}
-				return
-			}
-			append(&req.response, ..buf[:n])
-			continue
-		}
 		n, res := fetch_raw_recv(req, buf[:])
 		switch res {
 		case .Ok:
