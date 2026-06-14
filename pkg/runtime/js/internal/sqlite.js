@@ -10,6 +10,20 @@
     throw new Error('node:sqlite is unavailable: Lava was built without libsqlite3');
   }
 
+  // This JSC build exposes neither `Symbol.dispose` nor `using` declarations.
+  // Define a stable well-known `Symbol.dispose` if it is absent so the dispose
+  // methods below are reachable for manual cleanup now (`obj[Symbol.dispose]()`)
+  // and participate in `using` automatically once the engine supports it.
+  // Idempotent: a real engine/global polyfill takes precedence.
+  if (typeof Symbol === 'function' && !Symbol.dispose) {
+    try {
+      Symbol.dispose = Symbol('Symbol.dispose');
+    } catch (e) {
+      // Symbol is non-extensible here; dispose-by-symbol is simply unavailable.
+    }
+  }
+  var disposeSymbol = typeof Symbol === 'function' ? Symbol.dispose : null;
+
   // GC backstops so that wrappers dropped without an explicit close/finalize still
   // release their native handle instead of leaking until context teardown. The
   // held value carries only the integer id (and, for statements, the owning db's
@@ -64,6 +78,17 @@
     }
     if (stmtFinalizers) stmtFinalizers.unregister(this);
   };
+
+  // Public deterministic cleanup. finalize() releases the native statement now
+  // instead of waiting for db.close() or GC; [Symbol.dispose] lets a statement be
+  // managed with `using`. (Beyond Node's current node:sqlite surface, which has
+  // neither on StatementSync — added for explicit resource management; see #128.)
+  StatementSync.prototype.finalize = function () {
+    this._finalize();
+  };
+  if (disposeSymbol) {
+    StatementSync.prototype[disposeSymbol] = StatementSync.prototype._finalize;
+  }
 
   // A leading plain object supplies named parameters (:id / @id / $id); any
   // trailing values fill the statement's anonymous "?" placeholders positionally.
@@ -143,7 +168,10 @@
     this._id = native.open(String(path));
     this._open = true;
     // Map of live statement id -> true for statements prepared on this connection.
-    this._stmts = {};
+    // Null-proto so a statement id can never collide with an Object.prototype key.
+    // (The FinalizationRegistry held value references this object by identity, so
+    // it must stay a plain object, not a Set.)
+    this._stmts = Object.create(null);
     if (dbFinalizers) dbFinalizers.register(this, this._id, this);
   }
 
@@ -188,6 +216,12 @@
     this._open = false;
     if (dbFinalizers) dbFinalizers.unregister(this);
   };
+
+  // [Symbol.dispose] closes the connection, matching node:sqlite — lets a
+  // DatabaseSync be managed with `using`.
+  if (disposeSymbol) {
+    DatabaseSync.prototype[disposeSymbol] = DatabaseSync.prototype.close;
+  }
 
   module.exports = { DatabaseSync: DatabaseSync, StatementSync: StatementSync };
 });
