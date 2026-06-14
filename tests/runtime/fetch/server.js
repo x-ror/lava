@@ -96,4 +96,21 @@ if (process.env.LAVA_TLS_CERT && process.env.LAVA_TLS_KEY) {
   );
   tlsServer.on('error', () => {});
   tlsServer.listen(tlsPort, '127.0.0.1');
+
+  // Optional second HTTPS listener presenting a cert whose SAN does NOT cover
+  // 127.0.0.1 (but is signed/trusted via the same CA bundle), so the suite can
+  // prove the client rejects a hostname mismatch rather than a mere untrusted
+  // cert. Started only when the runner provides the mismatched cert/key.
+  if (process.env.LAVA_TLS_BADCERT && process.env.LAVA_TLS_BADKEY) {
+    const badPort = Number(process.env.LAVA_TLS_BADPORT || tlsPort + 1);
+    const badServer = https.createServer(
+      {
+        cert: fs.readFileSync(process.env.LAVA_TLS_BADCERT),
+        key: fs.readFileSync(process.env.LAVA_TLS_BADKEY),
+      },
+      handler,
+    );
+    badServer.on('error', () => {});
+    badServer.listen(badPort, '127.0.0.1');
+  }
 }

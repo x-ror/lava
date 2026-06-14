@@ -122,12 +122,23 @@ tls_new_client :: proc(fd: uintptr, host: string) -> SSL {
 	}
 	// An IP-literal host verifies against the certificate's iPAddress SAN (not a
 	// DNS name) and must NOT be sent as SNI (RFC 6066 forbids IP literals there).
-	// A DNS name uses SNI + DNS-name verification.
+	// A DNS name uses SNI + DNS-name verification. Fail closed: if any of these
+	// setup calls fails we must not proceed with weaker (or no) verification.
 	if tls_host_is_ip(host) {
-		X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), chost)
+		if X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), chost) != 1 {
+			SSL_free(ssl)
+			return nil
+		}
 	} else {
-		SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, rawptr(chost))
-		SSL_set1_host(ssl, chost)
+		// SSL_ctrl returns 1 on a successful SET_TLSEXT_HOSTNAME.
+		if SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, rawptr(chost)) != 1 {
+			SSL_free(ssl)
+			return nil
+		}
+		if SSL_set1_host(ssl, chost) != 1 {
+			SSL_free(ssl)
+			return nil
+		}
 	}
 	return ssl
 }

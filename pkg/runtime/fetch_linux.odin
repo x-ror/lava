@@ -206,25 +206,49 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	}
 }
 
+// TLS_Outcome classifies a non-positive SSL_connect/SSL_read/SSL_write result.
+Fetch_TLS_Outcome :: enum {
+	Pending, // OpenSSL wants more I/O; the watcher has been re-armed
+	Eof, // the peer closed (clean close_notify, or an EOF without one)
+	Fatal, // a real TLS or socket error
+}
+
+// fetch_tls_classify maps an SSL op's SSL_get_error onto a Fetch_TLS_Outcome,
+// re-arming the loop watcher for WANT_READ/WANT_WRITE. ZERO_RETURN is a clean
+// close_notify; SSL_ERROR_SYSCALL with ret == 0 is an EOF without one (common
+// for HTTP/1.1 Connection: close), while ret < 0 is a genuine syscall failure
+// and stays Fatal so truncation is not silently treated as completion.
+fetch_tls_classify :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, ret: c.int) -> Fetch_TLS_Outcome {
+	switch SSL_get_error(cast(SSL)req.tls, ret) {
+	case SSL_ERROR_WANT_READ:
+		fetch_set_watch_mode(loop, req, .Read)
+		return .Pending
+	case SSL_ERROR_WANT_WRITE:
+		fetch_set_watch_mode(loop, req, .Write)
+		return .Pending
+	case SSL_ERROR_ZERO_RETURN:
+		return .Eof
+	case SSL_ERROR_SYSCALL:
+		return ret == 0 ? .Eof : .Fatal
+	case:
+		return .Fatal
+	}
+}
+
 // fetch_tls_handshake drives the non-blocking SSL_connect. On completion it
 // advances to Writing and attempts the first send; otherwise it re-arms the
 // watcher for the direction OpenSSL is waiting on and returns. Certificate and
 // hostname verification are enforced by the context (SSL_VERIFY_PEER) and
 // SSL_set1_host, so a bad/mismatched cert surfaces here as a handshake failure.
+// An EOF mid-handshake is fatal — there is no response to complete yet.
 fetch_tls_handshake :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
-	ssl := cast(SSL)req.tls
-	ret := SSL_connect(ssl)
+	ret := SSL_connect(cast(SSL)req.tls)
 	if ret == 1 {
 		req.phase = .Writing
 		fetch_write(loop, req)
 		return
 	}
-	switch SSL_get_error(ssl, ret) {
-	case SSL_ERROR_WANT_READ:
-		fetch_set_watch_mode(loop, req, .Read)
-	case SSL_ERROR_WANT_WRITE:
-		fetch_set_watch_mode(loop, req, .Write)
-	case:
+	if fetch_tls_classify(loop, req, ret) != .Pending {
 		fetch_settle_error(req, "fetch: TLS handshake failed")
 	}
 }
@@ -236,15 +260,11 @@ fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 	for req.write_offset < len(req.request_bytes) {
 		chunk := req.request_bytes[req.write_offset:]
 		if req.is_https {
-			ssl := cast(SSL)req.tls
-			n := SSL_write(ssl, raw_data(chunk), c.int(len(chunk)))
+			n := SSL_write(cast(SSL)req.tls, raw_data(chunk), c.int(len(chunk)))
 			if n <= 0 {
-				switch SSL_get_error(ssl, n) {
-				case SSL_ERROR_WANT_READ:
-					fetch_set_watch_mode(loop, req, .Read)
-				case SSL_ERROR_WANT_WRITE:
-					fetch_set_watch_mode(loop, req, .Write)
-				case:
+				// An EOF while still sending the request is a failure, not
+				// completion, so .Eof falls in with .Fatal here.
+				if fetch_tls_classify(loop, req, n) != .Pending {
 					fetch_settle_error(req, "fetch: TLS write failed")
 				}
 				return
@@ -278,20 +298,13 @@ fetch_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 	buf: [16384]byte
 	for {
 		if req.is_https {
-			ssl := cast(SSL)req.tls
-			n := SSL_read(ssl, raw_data(buf[:]), c.int(len(buf)))
+			n := SSL_read(cast(SSL)req.tls, raw_data(buf[:]), c.int(len(buf)))
 			if n <= 0 {
-				switch SSL_get_error(ssl, n) {
-				case SSL_ERROR_WANT_READ:
-					fetch_set_watch_mode(loop, req, .Read)
-				case SSL_ERROR_WANT_WRITE:
-					fetch_set_watch_mode(loop, req, .Write)
-				case SSL_ERROR_ZERO_RETURN, SSL_ERROR_SYSCALL:
-					// Clean close_notify, or a server that closed without one
-					// (common for HTTP/1.1 Connection: close) — either way the
-					// response is complete.
-					fetch_settle_response(req)
-				case:
+				switch fetch_tls_classify(loop, req, n) {
+				case .Pending:
+				case .Eof:
+					fetch_settle_response(req) // response complete
+				case .Fatal:
 					fetch_settle_error(req, "fetch: TLS read failed")
 				}
 				return

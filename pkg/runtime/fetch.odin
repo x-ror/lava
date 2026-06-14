@@ -178,7 +178,7 @@ fetch_request_cb :: proc "c" (
 	req.is_https = scheme == "https"
 	// Serialize while the JSC-borrowed `body`/`header_lines` are still valid; the
 	// resulting buffer is independent of them.
-	req.request_bytes = build_http_request(req.method, req.host, port, req.path, header_lines, body)
+	req.request_bytes = build_http_request(req.method, req.host, port, req.path, header_lines, body, req.is_https)
 
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_response)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_error)
@@ -272,6 +272,7 @@ build_http_request :: proc(
 	port: int,
 	path, header_lines: string,
 	body: []byte,
+	is_https: bool,
 ) -> []byte {
 	b := strings.builder_make(context.allocator)
 	strings.write_string(&b, method)
@@ -289,7 +290,10 @@ build_http_request :: proc(
 	if host_is_ip6 do strings.write_byte(&b, '[')
 	strings.write_string(&b, host)
 	if host_is_ip6 do strings.write_byte(&b, ']')
-	if port != 80 {
+	// Omit the port when it is the scheme's default (Node sends `Host: host`, not
+	// `host:80` / `host:443`, when the default port was implicit in the URL).
+	default_port := is_https ? 443 : 80
+	if port != default_port {
 		strings.write_byte(&b, ':')
 		strings.write_int(&b, port)
 	}

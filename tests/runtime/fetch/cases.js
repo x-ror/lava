@@ -105,6 +105,21 @@ async function main() {
     console.log('https concurrent:', sa, sb);
   }
 
+  // Negative TLS: a server whose certificate is trusted (same CA bundle) but
+  // whose SAN does not cover 127.0.0.1. The fetch must reject on the hostname
+  // mismatch, proving certificate verification is actually enforced (not just
+  // that trusted certs are accepted). Only runs when the runner started it.
+  const baseHttpsBad = process.env.FETCH_BASE_HTTPS_BAD;
+  if (baseHttpsBad) {
+    let tlsRejected = false;
+    try {
+      await fetch(baseHttpsBad + '/hello.txt');
+    } catch (error) {
+      tlsRejected = true;
+    }
+    console.log('https hostname-mismatch rejected:', tlsRejected);
+  }
+
   // Connection refused rejects (port 9 is the discard port, closed here)
   let refused = false;
   try {
