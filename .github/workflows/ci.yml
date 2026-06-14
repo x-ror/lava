@@ -97,6 +97,10 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Pinned oven-sh/WebKit release providing the prebuilt Windows JavaScriptCore
+      # (see scripts/fetch-webkit-windows.sh). Bump to re-provision a newer JSC.
+      WEBKIT_TAG: autobuild-9cb85a0716065c461bea14a0de9fe7139e5323aa
     steps:
       - uses: actions/checkout@v4
 
@@ -132,3 +136,34 @@ jobs:
         run: |
           mkdir -p build
           odin build cmd/lava -collection:lava=. -build-mode:obj -out:build/lava.obj
+
+      # --- Experimental: real link + JSC-backed smoke (#36) ---
+      # JavaScriptCore is provisioned from the Bun project's WebKit fork (static
+      # libs; see scripts/fetch-webkit-windows.sh). The link is still being brought
+      # up (static-CRT/ABI reconciliation against Odin's toolchain), so this step is
+      # non-blocking (continue-on-error) — it must not regress the green
+      # type-check/codegen CI above while iterated. Make it required once reliable.
+      - name: Cache JavaScriptCore (bun-webkit)
+        id: cache-webkit
+        uses: actions/cache@v4
+        with:
+          path: webkit
+          key: bun-webkit-windows-amd64-${{ env.WEBKIT_TAG }}
+
+      - name: Provision JavaScriptCore
+        if: steps.cache-webkit.outputs.cache-hit != 'true'
+        run: WEBKIT_TAG="$WEBKIT_TAG" DEST=webkit scripts/fetch-webkit-windows.sh
+
+      - name: Windows link + JSC smoke (experimental)
+        continue-on-error: true
+        run: |
+          WK="$PWD/webkit/bun-webkit"
+          mkdir -p build
+          # Static JSC pulls in WTF, bmalloc, ICU and a broad set of Win32 system
+          # libraries (WTF threading/crypto/networking shims).
+          SYSLIBS="user32.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib advapi32.lib winmm.lib bcrypt.lib crypt32.lib ws2_32.lib userenv.lib dbghelp.lib iphlpapi.lib version.lib comctl32.lib rpcrt4.lib secur32.lib usp10.lib windowscodecs.lib"
+          odin build cmd/lava -collection:lava=. -out:build/lava.exe \
+            -extra-linker-flags:"/LIBPATH:$WK/lib WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
+          echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
+          ./build/lava.exe run smoke.js | tee smoke.out
+          grep -q "jsc-smoke:42" smoke.out
