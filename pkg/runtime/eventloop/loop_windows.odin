@@ -105,14 +105,32 @@ make_wakeup_pair :: proc(loop: ^Loop) -> bool {
 		return false
 	}
 
-	nonblock: windows.c_ulong = 1
-	// FIONBIO has its high bit set (0x8004667e), so a checked cast to signed c_long
-	// overflows; reinterpret the bits instead.
-	windows.ioctlsocket(recv_sock, transmute(windows.c_long)windows.FIONBIO, &nonblock)
+	// Both ends are non-blocking: the read end so draining it in platform_poll
+	// never stalls the loop, the write end so a wakeup() burst that fills the send
+	// buffer can never block a worker thread (a byte is already pending, which is
+	// all a wakeup needs). Bail cleanly if either cannot be configured — a blocking
+	// drain or wakeup would be a latent hang in backend infrastructure.
+	if !set_nonblocking(recv_sock) || !set_nonblocking(send_sock) {
+		windows.closesocket(send_sock)
+		windows.closesocket(recv_sock)
+		return false
+	}
 
 	loop.platform.wake_recv = recv_sock
 	loop.platform.wake_send = send_sock
 	return true
+}
+
+// set_nonblocking puts a socket into non-blocking mode (FIONBIO).
+@(private = "file")
+set_nonblocking :: proc(sock: windows.SOCKET) -> bool {
+	nonblock: windows.c_ulong = 1
+	// FIONBIO has its high bit set (0x8004667e), so a checked cast to signed c_long
+	// overflows; reinterpret the bits instead.
+	return(
+		windows.ioctlsocket(sock, transmute(windows.c_long)windows.FIONBIO, &nonblock) !=
+		windows.SOCKET_ERROR \
+	)
 }
 
 platform_destroy :: proc(loop: ^Loop) {
@@ -133,26 +151,35 @@ platform_destroy :: proc(loop: ^Loop) {
 
 platform_wakeup :: proc(loop: ^Loop) {
 	// One byte breaks select out of its wait; the read end is drained in
-	// platform_poll. Safe to call from any thread (send is socket-atomic).
+	// platform_poll. Safe to call from any thread. The write end is non-blocking, so
+	// if the send buffer is already full (a wakeup is pending and undrained) the call
+	// returns WSAEWOULDBLOCK harmlessly — the pending byte already does the job.
 	if loop.platform.wake_send != windows.INVALID_SOCKET {
 		b: byte = 1
 		windows.send(loop.platform.wake_send, &b, 1, 0)
 	}
 }
 
-// platform_watch_fd records a readiness watcher. select's fd_set holds at most
-// FD_SETSIZE sockets per set; reserve one read slot for the wakeup socket and
-// reject (honestly, returning false) once the watcher set is full, rather than
-// silently dropping a watcher that could then never fire.
+// platform_watch_fd records a readiness watcher. The bool return is a real state
+// transition (mirroring epoll's EEXIST / kqueue's add result): true ONLY when a
+// new watcher is added, so the shared watch_fd wrapper's active_io_count stays in
+// lockstep with the set and cannot drift. A duplicate registration returns false
+// (nothing was added — the watcher is already counted). select's fd_set holds at
+// most FD_SETSIZE sockets per set; reserve one read slot for the wakeup socket and
+// reject (honestly, returning false) once the set is full, rather than silently
+// dropping a watcher that could then never fire.
 platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	if len(loop.platform.watchers) >= windows.FD_SETSIZE - 1 do return false
 	for w in loop.platform.watchers {
-		if w == watcher do return true // already registered
+		if w == watcher do return false // already registered, already counted
 	}
 	append(&loop.platform.watchers, watcher)
 	return true
 }
 
+// platform_unwatch_fd removes a watcher. Like watch, the bool is a real state
+// transition: true ONLY when a watcher is actually removed, so active_io_count is
+// never decremented for a watcher that was not registered.
 platform_unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	for w, i in loop.platform.watchers {
 		if w == watcher {
@@ -160,7 +187,7 @@ platform_unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 			return true
 		}
 	}
-	return true
+	return false
 }
 
 @(private = "file")
