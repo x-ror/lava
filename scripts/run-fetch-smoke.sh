@@ -22,6 +22,40 @@ trap cleanup EXIT
 
 "$NODE_BIN" --version >/dev/null
 
+# Optional HTTPS case: generate a self-signed cert for 127.0.0.1 and tell both
+# runtimes to trust it (Node via NODE_EXTRA_CA_CERTS, Lava via OpenSSL's
+# SSL_CERT_FILE). Skipped if the openssl CLI is unavailable; the HTTP cases
+# still run and the suite stays green.
+TLS_PORT=$((PORT + 1))
+TLS_BADPORT=$((PORT + 2))
+TLS_CERT="$TMP_DIR/cert.pem"
+TLS_KEY="$TMP_DIR/key.pem"
+TLS_BADCERT="$TMP_DIR/badcert.pem"
+TLS_BADKEY="$TMP_DIR/badkey.pem"
+TLS_CA="$TMP_DIR/ca.pem" # CA bundle trusting BOTH certs
+FETCH_BASE_HTTPS=""
+FETCH_BASE_HTTPS_BAD=""
+if command -v openssl >/dev/null 2>&1; then
+	# Good cert: SAN covers 127.0.0.1 — the positive HTTPS case connects to it.
+	if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_KEY" -out "$TLS_CERT" \
+		-days 2 -subj "/CN=127.0.0.1" \
+		-addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1; then
+		FETCH_BASE_HTTPS="https://127.0.0.1:$TLS_PORT"
+		export LAVA_TLS_CERT="$TLS_CERT" LAVA_TLS_KEY="$TLS_KEY" LAVA_TLS_PORT="$TLS_PORT"
+		cp "$TLS_CERT" "$TLS_CA"
+		# Mismatched cert: trusted via the same CA bundle, but its SAN is a
+		# different host — so connecting to 127.0.0.1 must fail hostname
+		# verification (the negative case). Only enabled if it too generates.
+		if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_BADKEY" -out "$TLS_BADCERT" \
+			-days 2 -subj "/CN=example.com" \
+			-addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; then
+			cat "$TLS_BADCERT" >>"$TLS_CA"
+			FETCH_BASE_HTTPS_BAD="https://127.0.0.1:$TLS_BADPORT"
+			export LAVA_TLS_BADCERT="$TLS_BADCERT" LAVA_TLS_BADKEY="$TLS_BADKEY" LAVA_TLS_BADPORT="$TLS_BADPORT"
+		fi
+	fi
+fi
+
 "$NODE_BIN" "$SERVER" "$PORT" &
 SRV_PID=$!
 
@@ -42,8 +76,20 @@ if "$NODE_BIN" -e "require('net').connect($PORT,'::1').on('connect',function(){p
 	FETCH_BASE6="http://[::1]:$PORT"
 fi
 
-FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" "$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>&1 || true
-FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" "$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>&1 || true
+# Both runtimes trust the self-signed CA bundle (good + mismatched certs): Node
+# via NODE_EXTRA_CA_CERTS, Lava's OpenSSL via SSL_CERT_FILE (honoured by
+# SSL_CTX_set_default_verify_paths). Trusting both certs isolates the negative
+# case to a hostname mismatch rather than an untrusted issuer.
+CA_FILE="$TLS_CA"
+[ -f "$CA_FILE" ] || CA_FILE="$TLS_CERT"
+NODE_EXTRA_CA_CERTS="$CA_FILE" \
+	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" \
+	FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" FETCH_BASE_HTTPS_BAD="$FETCH_BASE_HTTPS_BAD" \
+	"$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>&1 || true
+SSL_CERT_FILE="$CA_FILE" \
+	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" \
+	FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" FETCH_BASE_HTTPS_BAD="$FETCH_BASE_HTTPS_BAD" \
+	"$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>&1 || true
 
 if diff -u "$TMP_DIR/node.out" "$TMP_DIR/lava.out"; then
 	printf '%s\n' 'fetch smoke passed (lava output matches node)'

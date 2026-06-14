@@ -19,11 +19,13 @@ import eventloop "lava:pkg/runtime/eventloop"
 // side needs no JSObjectMakeDeferredPromise binding; it simply invokes one of
 // those two callbacks exactly once when the request settles.
 //
-// v1 scope: http:// only (https:// rejects — no TLS yet), blocking DNS, the
-// transport runs non-blocking on the event loop. See ROADMAP.
+// Scope: http:// and https:// (TLS via system OpenSSL on Linux; see
+// tls_linux.odin), blocking DNS off the loop; the transport runs non-blocking on
+// the event loop. See ROADMAP.
 
 Fetch_Phase :: enum {
 	Connecting,
+	TLS_Handshake, // https only: drive SSL_connect between Connecting and Writing
 	Writing,
 	Reading,
 }
@@ -61,6 +63,13 @@ Fetch_Request :: struct {
 	fd:            uintptr,
 	has_fd:        bool,
 	phase:         Fetch_Phase,
+
+	// TLS state for https:// requests. is_https gates the TLS path in the
+	// transport; tls is an opaque ^SSL (rawptr so this cross-platform struct
+	// stays free of the OpenSSL binding), set at handshake start and released by
+	// fetch_tls_cleanup in fetch_request_finish.
+	is_https:      bool,
+	tls:           rawptr,
 }
 
 // fetch_cancel_class is a JSClass whose instances carry a ^Fetch_Request as
@@ -138,10 +147,8 @@ fetch_request_cb :: proc "c" (
 		fetch_reject_now(ctx, on_error, "fetch: invalid URL")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
-	if scheme != "http" {
-		msg := "fetch: only http:// is supported (https:// needs TLS, not yet implemented)"
-		if scheme != "https" do msg = "fetch: unsupported URL scheme"
-		fetch_reject_now(ctx, on_error, msg)
+	if scheme != "http" && scheme != "https" {
+		fetch_reject_now(ctx, on_error, "fetch: unsupported URL scheme")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
@@ -168,9 +175,10 @@ fetch_request_cb :: proc "c" (
 	req.host = strings.clone(host)
 	req.path = strings.clone(path)
 	req.port = port // needed by the deferred connect after async DNS resolves
+	req.is_https = scheme == "https"
 	// Serialize while the JSC-borrowed `body`/`header_lines` are still valid; the
 	// resulting buffer is independent of them.
-	req.request_bytes = build_http_request(req.method, req.host, port, req.path, header_lines, body)
+	req.request_bytes = build_http_request(req.method, req.host, port, req.path, header_lines, body, req.is_https)
 
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_response)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_error)
@@ -264,6 +272,7 @@ build_http_request :: proc(
 	port: int,
 	path, header_lines: string,
 	body: []byte,
+	is_https: bool,
 ) -> []byte {
 	b := strings.builder_make(context.allocator)
 	strings.write_string(&b, method)
@@ -281,7 +290,10 @@ build_http_request :: proc(
 	if host_is_ip6 do strings.write_byte(&b, '[')
 	strings.write_string(&b, host)
 	if host_is_ip6 do strings.write_byte(&b, ']')
-	if port != 80 {
+	// Omit the port when it is the scheme's default (Node sends `Host: host`, not
+	// `host:80` / `host:443`, when the default port was implicit in the URL).
+	default_port := is_https ? 443 : 80
+	if port != default_port {
 		strings.write_byte(&b, ':')
 		strings.write_int(&b, port)
 	}
@@ -371,6 +383,8 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 	// Clearing the callback stops the io_uring drain from re-arming this watcher
 	// with live work; the epoll path is removed outright by unwatch_fd.
 	req.watcher.callback = nil
+	// Free the TLS session (if any) before closing the fd it was bound to.
+	fetch_tls_cleanup(req)
 	if req.has_fd {
 		eventloop.unwatch_fd(req.loop, &req.watcher)
 		fetch_close_fd(req.fd)

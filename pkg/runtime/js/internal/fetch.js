@@ -276,8 +276,8 @@
   // to the Odin transport. native.request settles by invoking one of the two
   // callbacks we pass: onResponse({status, statusText, headers, body}) on
   // success, or onError(message) on failure. The transport runs on the event
-  // loop, so the returned promise resolves on a later tick. Only http:// is
-  // wired today; https:// rejects from the native side.
+  // loop, so the returned promise resolves on a later tick. http:// and https://
+  // (TLS) are both wired; other schemes reject from the native side.
   //
   // init.signal (AbortSignal) is honored: a pre-aborted signal rejects
   // immediately; an abort that fires mid-flight cancels the native transport
