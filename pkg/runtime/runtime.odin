@@ -242,9 +242,18 @@ resolve_exit_code :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) -> int {
 process_exit_code :: proc(ctx: jsc.JSContextRef) -> int {
 	global := jsc.JSContextGetGlobalObject(ctx)
 	process := get_named(ctx, global, "process")
-	if process == nil || !jsc.JSValueIsObject(ctx, process) do return 0
+	// Gate on JSValueGetType, not the b32-returning JSValueIs* calls, which are
+	// unreliable across the FFI (the same heisenbug process_exit_cb avoids; the
+	// sqlite readBigInts / bind bugs are the other instances). On Windows the
+	// JSValueIs* path corrupted this read so a clean `console.log` script exited
+	// 127 instead of 0 (#157).
+	if process == nil || jsc.JSValueGetType(ctx, process) != .Object do return 0
 	code := get_named(ctx, cast(jsc.JSObjectRef)process, "exitCode")
-	if code == nil || jsc.JSValueIsUndefined(ctx, code) || jsc.JSValueIsNull(ctx, code) do return 0
+	if code == nil do return 0
+	#partial switch jsc.JSValueGetType(ctx, code) {
+	case .Undefined, .Null:
+		return 0
+	}
 	n := jsc.JSValueToNumber(ctx, code, nil)
 	if n != n do return 0 // NaN guard (e.g. exitCode set to a non-numeric value)
 	return int(n)
