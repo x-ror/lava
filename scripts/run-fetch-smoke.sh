@@ -22,6 +22,23 @@ trap cleanup EXIT
 
 "$NODE_BIN" --version >/dev/null
 
+# Optional HTTPS case: generate a self-signed cert for 127.0.0.1 and tell both
+# runtimes to trust it (Node via NODE_EXTRA_CA_CERTS, Lava via OpenSSL's
+# SSL_CERT_FILE). Skipped if the openssl CLI is unavailable; the HTTP cases
+# still run and the suite stays green.
+TLS_PORT=$((PORT + 1))
+TLS_CERT="$TMP_DIR/cert.pem"
+TLS_KEY="$TMP_DIR/key.pem"
+FETCH_BASE_HTTPS=""
+if command -v openssl >/dev/null 2>&1; then
+	if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_KEY" -out "$TLS_CERT" \
+		-days 2 -subj "/CN=127.0.0.1" \
+		-addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1; then
+		FETCH_BASE_HTTPS="https://127.0.0.1:$TLS_PORT"
+		export LAVA_TLS_CERT="$TLS_CERT" LAVA_TLS_KEY="$TLS_KEY" LAVA_TLS_PORT="$TLS_PORT"
+	fi
+fi
+
 "$NODE_BIN" "$SERVER" "$PORT" &
 SRV_PID=$!
 
@@ -42,8 +59,14 @@ if "$NODE_BIN" -e "require('net').connect($PORT,'::1').on('connect',function(){p
 	FETCH_BASE6="http://[::1]:$PORT"
 fi
 
-FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" "$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>&1 || true
-FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" "$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>&1 || true
+# Node trusts the self-signed CA via NODE_EXTRA_CA_CERTS; Lava's OpenSSL via
+# SSL_CERT_FILE (honoured by SSL_CTX_set_default_verify_paths).
+NODE_EXTRA_CA_CERTS="$TLS_CERT" \
+	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" \
+	"$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>&1 || true
+SSL_CERT_FILE="$TLS_CERT" \
+	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" \
+	"$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>&1 || true
 
 if diff -u "$TMP_DIR/node.out" "$TMP_DIR/lava.out"; then
 	printf '%s\n' 'fetch smoke passed (lava output matches node)'

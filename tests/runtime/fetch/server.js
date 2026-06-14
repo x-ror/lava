@@ -2,6 +2,10 @@
 //   node tests/runtime/fetch/server.js [port]
 // Exercises both Content-Length and chunked framing, plus POST body echo, so
 // the Lava transport is compared against Node over a real socket.
+//
+// When LAVA_TLS_CERT/LAVA_TLS_KEY are set it also starts an HTTPS listener on
+// LAVA_TLS_PORT (same request handler), so the suite can exercise the TLS
+// transport against a self-signed cert (see scripts/run-fetch-smoke.sh).
 const http = require('node:http');
 
 const port = Number(process.argv[2] || 8799);
@@ -76,3 +80,20 @@ http.createServer(handler).listen(port, '127.0.0.1');
 const server6 = http.createServer(handler);
 server6.on('error', () => {});
 server6.listen(port, '::1');
+
+// Optional HTTPS listener for the TLS transport case. Only started when the
+// runner has generated a cert/key and points LAVA_TLS_* at them.
+if (process.env.LAVA_TLS_CERT && process.env.LAVA_TLS_KEY) {
+  const fs = require('node:fs');
+  const https = require('node:https');
+  const tlsPort = Number(process.env.LAVA_TLS_PORT || port + 1);
+  const tlsServer = https.createServer(
+    {
+      cert: fs.readFileSync(process.env.LAVA_TLS_CERT),
+      key: fs.readFileSync(process.env.LAVA_TLS_KEY),
+    },
+    handler,
+  );
+  tlsServer.on('error', () => {});
+  tlsServer.listen(tlsPort, '127.0.0.1');
+}

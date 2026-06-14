@@ -80,6 +80,31 @@ async function main() {
     console.log('ipv6 host header:', host6.host === base6.slice('http://'.length));
   }
 
+  // HTTPS over TLS: same assertions as the plaintext path, against a self-signed
+  // origin the runner taught both runtimes to trust (NODE_EXTRA_CA_CERTS for
+  // Node, SSL_CERT_FILE for Lava's OpenSSL). Only runs when the runner started
+  // the TLS listener, so Node and Lava take this branch identically.
+  const baseHttps = process.env.FETCH_BASE_HTTPS;
+  if (baseHttps) {
+    const s1 = await fetch(baseHttps + '/hello.txt');
+    console.log('https hello:', s1.status, JSON.stringify(await s1.text()));
+    const s2 = await fetch(baseHttps + '/data.json');
+    console.log('https json:', JSON.stringify(await s2.json()));
+    const s3 = await fetch(baseHttps + '/submit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tls: true, n: 7 }),
+    });
+    const se = await s3.json();
+    console.log('https POST:', se.method, se.echo, se.len);
+    // Concurrent HTTPS requests each get their own TLS session.
+    const [sa, sb] = await Promise.all([
+      fetch(baseHttps + '/a').then((r) => r.text()),
+      fetch(baseHttps + '/b').then((r) => r.text()),
+    ]);
+    console.log('https concurrent:', sa, sb);
+  }
+
   // Connection refused rejects (port 9 is the discard port, closed here)
   let refused = false;
   try {

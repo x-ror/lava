@@ -1,6 +1,7 @@
 #+build linux
 package lava_runtime
 
+import "core:c"
 import "core:net"
 import "core:strings"
 import "core:sys/linux"
@@ -135,23 +136,36 @@ fetch_register_socket :: proc(req: ^Fetch_Request, fd: linux.Fd) -> (ok: bool, e
 	return true, ""
 }
 
-// fetch_switch_to_read flips the socket's watch from writability to readability
-// once the request has been fully written. The io_uring backend re-arms from
-// watcher.mode after this callback returns, so mutating the field is enough;
-// epoll needs an explicit re-registration.
-fetch_switch_to_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+// fetch_set_watch_mode points the socket's watch at readability or writability.
+// The io_uring backend re-arms from watcher.mode after this callback returns, so
+// mutating the field is enough; epoll needs an explicit re-registration. A no-op
+// when the mode is unchanged. Used both to flip write→read after the request is
+// sent and to follow OpenSSL's WANT_READ/WANT_WRITE during the TLS handshake and
+// encrypted I/O.
+fetch_set_watch_mode :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, mode: eventloop.Poll_Mode) {
+	if req.watcher.mode == mode do return
 	if loop.platform.use_uring {
-		req.watcher.mode = .Read
+		req.watcher.mode = mode
 		return
 	}
 	eventloop.unwatch_fd(loop, &req.watcher)
-	req.watcher.mode = .Read
+	req.watcher.mode = mode
 	eventloop.watch_fd(loop, &req.watcher)
 }
 
+// fetch_tls_cleanup frees the per-request SSL session. Called from
+// fetch_request_finish before the underlying fd is closed (SSL_free does not
+// close the fd). Safe to call when no TLS session was created.
+fetch_tls_cleanup :: proc(req: ^Fetch_Request) {
+	if req.tls != nil {
+		SSL_free(cast(SSL)req.tls)
+		req.tls = nil
+	}
+}
+
 // fetch_watcher_cb advances the request whenever the socket is ready. Connect →
-// write the whole request → read until EOF, then settle. EAGAIN means "not
-// ready, wait for the next event".
+// (TLS handshake for https) → write the whole request → read until EOF, then
+// settle. EAGAIN / WANT_* means "not ready, wait for the next event".
 fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	req := cast(^Fetch_Request)user_data
 	if req == nil || req.settled do return
@@ -167,45 +181,138 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			fetch_settle_error(req, "fetch: connection failed")
 			return
 		}
+		if req.is_https {
+			ssl := tls_new_client(req.fd, req.host)
+			if ssl == nil {
+				fetch_settle_error(req, "fetch: TLS setup failed")
+				return
+			}
+			req.tls = rawptr(ssl)
+			req.phase = .TLS_Handshake
+			fetch_tls_handshake(loop, req) // try the handshake immediately
+			return
+		}
 		req.phase = .Writing
-		fallthrough // socket is writable now, try sending immediately
+		fetch_write(loop, req) // socket is writable now, try sending immediately
+
+	case .TLS_Handshake:
+		fetch_tls_handshake(loop, req)
 
 	case .Writing:
-		for req.write_offset < len(req.request_bytes) {
-			// NOSIGNAL: a peer that resets mid-write must surface as EPIPE (a
-			// normally rejected fetch), not raise SIGPIPE and kill the process.
-			n, send_err := linux.send(fd, req.request_bytes[req.write_offset:], {.NOSIGNAL})
-			#partial switch send_err {
-			case .NONE:
-			case .EAGAIN: // == EWOULDBLOCK
-				return // wait for the next writable event
-			case:
-				fetch_settle_error(req, "fetch: send failed")
-				return
-			}
-			if n <= 0 do return
-			req.write_offset += n
-		}
-		fetch_switch_to_read(loop, req)
-		req.phase = .Reading // next readable event reads the response
+		fetch_write(loop, req)
 
 	case .Reading:
-		buf: [16384]byte
-		for {
-			n, recv_err := linux.recv(fd, buf[:], {})
-			#partial switch recv_err {
-			case .NONE:
-			case .EAGAIN: // == EWOULDBLOCK
-				return // wait for more data
-			case:
-				fetch_settle_error(req, "fetch: receive failed")
+		fetch_read(loop, req)
+	}
+}
+
+// fetch_tls_handshake drives the non-blocking SSL_connect. On completion it
+// advances to Writing and attempts the first send; otherwise it re-arms the
+// watcher for the direction OpenSSL is waiting on and returns. Certificate and
+// hostname verification are enforced by the context (SSL_VERIFY_PEER) and
+// SSL_set1_host, so a bad/mismatched cert surfaces here as a handshake failure.
+fetch_tls_handshake :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+	ssl := cast(SSL)req.tls
+	ret := SSL_connect(ssl)
+	if ret == 1 {
+		req.phase = .Writing
+		fetch_write(loop, req)
+		return
+	}
+	switch SSL_get_error(ssl, ret) {
+	case SSL_ERROR_WANT_READ:
+		fetch_set_watch_mode(loop, req, .Read)
+	case SSL_ERROR_WANT_WRITE:
+		fetch_set_watch_mode(loop, req, .Write)
+	case:
+		fetch_settle_error(req, "fetch: TLS handshake failed")
+	}
+}
+
+// fetch_write sends the request bytes — as TLS records for https, raw socket
+// writes for http. When the whole request is out it flips the watch to reading.
+fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+	fd := linux.Fd(req.fd)
+	for req.write_offset < len(req.request_bytes) {
+		chunk := req.request_bytes[req.write_offset:]
+		if req.is_https {
+			ssl := cast(SSL)req.tls
+			n := SSL_write(ssl, raw_data(chunk), c.int(len(chunk)))
+			if n <= 0 {
+				switch SSL_get_error(ssl, n) {
+				case SSL_ERROR_WANT_READ:
+					fetch_set_watch_mode(loop, req, .Read)
+				case SSL_ERROR_WANT_WRITE:
+					fetch_set_watch_mode(loop, req, .Write)
+				case:
+					fetch_settle_error(req, "fetch: TLS write failed")
+				}
 				return
 			}
-			if n == 0 {
-				fetch_settle_response(req) // EOF — server closed, response complete
+			req.write_offset += int(n)
+			continue
+		}
+		// NOSIGNAL: a peer that resets mid-write must surface as EPIPE (a normally
+		// rejected fetch), not raise SIGPIPE and kill the process.
+		n, send_err := linux.send(fd, chunk, {.NOSIGNAL})
+		#partial switch send_err {
+		case .NONE:
+		case .EAGAIN: // == EWOULDBLOCK
+			fetch_set_watch_mode(loop, req, .Write)
+			return // wait for the next writable event
+		case:
+			fetch_settle_error(req, "fetch: send failed")
+			return
+		}
+		if n <= 0 do return
+		req.write_offset += n
+	}
+	fetch_set_watch_mode(loop, req, .Read)
+	req.phase = .Reading // next readable event reads the response
+}
+
+// fetch_read drains the response — decrypting TLS records for https, reading raw
+// socket bytes for http — until EOF, then settles.
+fetch_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+	fd := linux.Fd(req.fd)
+	buf: [16384]byte
+	for {
+		if req.is_https {
+			ssl := cast(SSL)req.tls
+			n := SSL_read(ssl, raw_data(buf[:]), c.int(len(buf)))
+			if n <= 0 {
+				switch SSL_get_error(ssl, n) {
+				case SSL_ERROR_WANT_READ:
+					fetch_set_watch_mode(loop, req, .Read)
+				case SSL_ERROR_WANT_WRITE:
+					fetch_set_watch_mode(loop, req, .Write)
+				case SSL_ERROR_ZERO_RETURN, SSL_ERROR_SYSCALL:
+					// Clean close_notify, or a server that closed without one
+					// (common for HTTP/1.1 Connection: close) — either way the
+					// response is complete.
+					fetch_settle_response(req)
+				case:
+					fetch_settle_error(req, "fetch: TLS read failed")
+				}
 				return
 			}
 			append(&req.response, ..buf[:n])
+			continue
 		}
+		n, recv_err := linux.recv(fd, buf[:], {})
+		#partial switch recv_err {
+		case .NONE:
+		case .EAGAIN: // == EWOULDBLOCK
+			fetch_set_watch_mode(loop, req, .Read)
+			return // wait for more data
+		case:
+			fetch_settle_error(req, "fetch: receive failed")
+			return
+		}
+		if n == 0 {
+			fetch_settle_response(req) // EOF — server closed, response complete
+			return
+		}
+		append(&req.response, ..buf[:n])
 	}
 }

@@ -26,10 +26,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install JavaScriptCoreGTK (6.0) and SQLite
+      - name: Install JavaScriptCoreGTK (6.0), SQLite and OpenSSL
         run: |
           sudo apt-get update
-          sudo apt-get install -y libjavascriptcoregtk-6.0-dev libsqlite3-dev pkg-config
+          sudo apt-get install -y libjavascriptcoregtk-6.0-dev libsqlite3-dev libssl-dev pkg-config
 
       - uses: voidzero-dev/setup-vp@v1
         with:

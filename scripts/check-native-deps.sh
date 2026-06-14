@@ -16,6 +16,7 @@ check_pkg() {
 
 check_pkg javascriptcoregtk-6.0
 check_pkg sqlite3
+check_pkg openssl
 
 if [ "$missing" -ne 0 ]; then
 	printf '%s\n' 'Install the missing development package before enabling native JSC runtime execution.'
