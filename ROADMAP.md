@@ -80,20 +80,22 @@ implementations — no `primordials`, no `internalBinding` coupling.
 
 - [x] **Promise ↔ event-loop ordering.** JSC drains its own promise microtask
       queue at every C-API boundary, so `Promise.then` used to run *before*
-      `process.nextTick` (Node is the reverse). `process.nextTick` and
-      `queueMicrotask` now live in a JS shim (`js/internal/microtasks.js`) on top
-      of JSC's queue: both schedule a JSC microtask so `queueMicrotask` shares one
-      FIFO with promise jobs, and `nextTick` funnels each batch through a single
-      drain microtask armed when the batch's first `nextTick` is queued, so it
-      runs ahead of promise jobs queued later in the turn and drains fully
-      (incl. nested). Passes `01-nexttick-and-microtasks` + `09-nexttick-
-      microtask-interleave`. _Residual:_ Node's **absolute** nextTick priority (a
-      nextTick queued *after* a promise in the same turn, or *first* inside a
-      microtask, still preempting it) is not matched — it needs suppressing JSC's
-      automatic microtask drain (`JSC::VM::DrainMicrotaskDelayScope`), a C++-ABI
-      symbol absent from Apple's JavaScriptCore.framework, so it is not portable.
-      Tracked as a follow-up. _(`fetch` never needed this — it settles a
-      JS-created promise via native callbacks.)_
+      `process.nextTick` (Node is the reverse). `queueMicrotask` lives in a JS shim
+      (`js/internal/microtasks.js`) that schedules a JSC microtask, so it shares one
+      FIFO with promise jobs. `process.nextTick` keeps Node's **absolute** priority
+      by *not* living in JSC's queue: nextTick callbacks accumulate in a JS-owned
+      queue, and native drains it at two checkpoints that recreate Node's
+      `do { drain nextTicks; run microtasks } while (nextTicks)` loop on top of
+      JSC's auto-drain — checkpoint 1 (`dispatch`) runs every event-loop callback
+      and drains nextTicks before returning across the C boundary (so a nextTick
+      beats a promise job queued earlier in the same turn); checkpoint 2 re-drains
+      after JSC auto-drains the promise jobs (so a nextTick queued *first inside a
+      microtask* still runs after the microtask queue empties). The top-level turn
+      gets checkpoint 1 via a drain appended to the entry source. Passes the full
+      `01`/`09`/`10` set, including absolute priority — fully portable, no
+      `JSC::VM::DrainMicrotaskDelayScope`. See issue #16 and
+      `globals.odin:invoke_user_callback`. _(`fetch`/`fs` completions route through
+      the same dispatch path so callbacks they run get the same ordering.)_
 - [x] **ESM** — `.mjs` files, static `import` / `export`, `import.meta.url`, and
       `node:url` `fileURLToPath` now work. JSC's classic C API
       (`JSEvaluateScript`) only runs script-goal source, so an ESM→CommonJS

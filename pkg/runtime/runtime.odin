@@ -133,6 +133,24 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 		register_entry_module(cast(jsc.JSContextRef)ctx, state, source_name)
 	}
 
+	// Drain the top-level turn's process.nextTick queue *before* JSEvaluateScript
+	// returns: JSC auto-drains its promise jobs at that boundary, so a nextTick
+	// queued at top level would otherwise lose to a promise job queued before it
+	// (Node runs nextTick first). There is no native hook between "script body done"
+	// and "JSC drains", so we append the drain as a trailing statement — the same
+	// role dispatch plays for event-loop callbacks. It is a VariableStatement (empty
+	// completion value) so it does not clobber the script's completion value used by
+	// `lava eval`'s echo; the leading "\n;" guards a trailing line comment / missing
+	// semicolon; typeof keeps it a no-op if the microtask shim failed to install.
+	TOP_LEVEL_DRAIN ::
+		"\n;var __lava_tl_drain = (typeof __lavaDrainNextTicks === 'function') && __lavaDrainNextTicks();\n"
+	if combined, concat_err := strings.concatenate(
+		{eval_source, TOP_LEVEL_DRAIN},
+		context.temp_allocator,
+	); concat_err == nil {
+		eval_source = combined
+	}
+
 	script := js_string_from_string(eval_source)
 	if script == nil {
 		return Result {
@@ -190,6 +208,13 @@ eval :: proc(source: string, source_name := "<eval>", loop: ^eventloop.Loop = ni
 	if !mjs_allocated {
 		register_entry_module(cast(jsc.JSContextRef)ctx, state, source_name)
 	}
+
+	// The drain appended above ran nextTicks queued synchronously by the top-level
+	// body; this runs the ones queued by the promise jobs JSC auto-drained when
+	// JSEvaluateScript returned — so the nextTick queue is empty before the loop's
+	// first timer/I/O phase, since Node drains nextTicks ahead of timers. Same
+	// after-the-boundary re-drain that invoke_user_callback does per callback.
+	drain_next_ticks_settled(cast(jsc.JSContextRef)ctx, state)
 
 	if loop != nil {
 		eventloop.run(loop)

@@ -209,7 +209,7 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	}
 
 	exception: jsc.JSValueRef
-	jsc.JSObjectCallAsFunction(ctx, req.callback, nil, 2, raw_data(call_args[:]), &exception)
+	invoke_user_callback(ctx, req.callback, raw_data(call_args[:]), 2, &exception)
 	if exception != nil {
 		report_uncaught(ctx, exception)
 		mark_async_failed(ctx)
@@ -405,7 +405,7 @@ fs_op_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	}
 
 	exception: jsc.JSValueRef
-	jsc.JSObjectCallAsFunction(ctx, req.callback, nil, 1, raw_data(call_args[:]), &exception)
+	invoke_user_callback(ctx, req.callback, raw_data(call_args[:]), 1, &exception)
 	if exception != nil {
 		report_uncaught(ctx, exception)
 		mark_async_failed(ctx)

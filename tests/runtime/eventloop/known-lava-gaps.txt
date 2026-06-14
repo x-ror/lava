@@ -2,8 +2,4 @@
 # Each entry is a real Lava gap to fix, not a permanent exclusion — remove the
 # line once the underlying behavior matches Node.
 #
-# 10-nexttick-absolute-priority: Node drains the nextTick queue ahead of a
-#   promise job queued earlier in the turn (absolute priority). Lava layers
-#   nextTick on JSC's microtask queue and cannot reorder ahead of an already-
-#   queued promise job. Not portably fixable via the JSC C API; see issue #16.
-tests/runtime/eventloop/cases/10-nexttick-absolute-priority.js
+# (none)
