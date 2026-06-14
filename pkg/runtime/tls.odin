@@ -23,7 +23,13 @@ import "core:strings"
 // be on the link line, so import them as a group. The library names differ by
 // platform: the Unix linker's `system:` -l convention on Linux/Darwin (same as
 // sqlite3/javascriptcoregtk), and the import-lib filenames on Windows (as built
-// by vcpkg / the OpenSSL installer — the build supplies the /LIBPATH).
+// by vcpkg / the OpenSSL installer).
+//
+// NOTE (Windows, #153): the Windows link path is NOT wired up yet — scripts/
+// build.sh only adds the macOS OpenSSL flags, and CI's Windows job stops at
+// no-link object codegen. So these names compile but are not yet link-verified;
+// a Windows build must supply the OpenSSL /LIBPATH. The Windows default trust
+// store is also unresolved — see tls_client_ctx below.
 when ODIN_OS == .Windows {
 	foreign import openssl_lib {
 		"libssl.lib",
@@ -91,6 +97,15 @@ g_tls_ctx: SSL_CTX
 // not be created. set_default_verify_paths honours the SSL_CERT_FILE /
 // SSL_CERT_DIR environment variables, which the HTTPS smoke test uses to trust
 // its self-signed CA.
+//
+// TRUST STORE (#153): set_default_verify_paths reads OpenSSL's compiled-in
+// default cert locations. On Linux/macOS that finds the system roots. On Windows
+// OpenSSL does NOT read the native Windows certificate store, so unless
+// SSL_CERT_FILE (or an OpenSSL config) points at a CA bundle, default
+// `fetch("https://...")` verification will fail. The Windows root policy
+// (SSL_CERT_FILE-only, a bundled CA, or CertOpenSystemStore("ROOT") → X509_STORE
+// integration) is an open decision tracked in #153; until then Windows HTTPS
+// requires an explicit CA bundle.
 tls_client_ctx :: proc() -> SSL_CTX {
 	if g_tls_ctx == nil {
 		method := TLS_client_method()

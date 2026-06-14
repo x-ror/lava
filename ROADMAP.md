@@ -111,14 +111,17 @@ implementations — no `primordials`, no `internalBinding` coupling.
       draw from the OS CSPRNG via `crypto.rand_bytes`, replacing `Math.random`.
 - [x] **Real network transport for `fetch()`** — `http://` and `https://` over
       non-blocking sockets on the event loop. The connect→[TLS]→write→read state
-      machine and OpenSSL plumbing are shared (`pkg/runtime/fetch_transport.odin`);
-      each platform supplies narrow socket primitives. Implemented for **Linux**
-      (io_uring/epoll, `core:sys/linux`) and **macOS** (kqueue, `core:sys/posix`);
-      TLS uses system/Homebrew OpenSSL (`pkg/runtime/tls.odin`). DNS resolves off
-      the loop on a worker thread. **Windows** still rejects — its `watch_fd` is a
-      non-functional readiness stub (#101). Follow-ups: native Security.framework
-      TLS on macOS (#143), Windows transport (after #101), streaming bodies (#31),
-      a resolved-address list for IPv6 hostnames + Happy Eyeballs, and HTTP
+      machine is shared (`pkg/runtime/fetch_transport.odin`); each platform
+      supplies narrow socket primitives plus a swappable TLS backend
+      (`pkg/runtime/fetch_tls.odin`). Implemented for **Linux** (io_uring/epoll,
+      `core:sys/linux`), **macOS** (kqueue, `core:sys/posix`), and **Windows**
+      (`select`, Winsock — #101, #149). TLS uses OpenSSL (`pkg/runtime/tls.odin`).
+      DNS resolves off the loop on a worker thread. **Windows HTTPS is
+      source-enabled and codegen-verified but not yet link/runtime-tested** — the
+      Windows JSC build + CI (#36) and the Windows OpenSSL link + trust-store
+      decision (#153) are still open. Follow-ups: native Security.framework TLS on
+      macOS (#143), Windows runtime/link (#36, #153), streaming bodies (#31), a
+      resolved-address list for IPv6 hostnames + Happy Eyeballs (#145), and HTTP
       correctness (#99).
 - [x] **Event-loop I/O driving** — fetch was the first real `watch_fd` consumer
       and exposed several gaps, now fixed (`pkg/runtime/eventloop/`):
