@@ -154,6 +154,14 @@ jobs:
         if: steps.cache-webkit.outputs.cache-hit != 'true'
         run: WEBKIT_TAG="$WEBKIT_TAG" DEST=webkit scripts/fetch-webkit-windows.sh
 
+      # Set up the MSVC x64 developer environment (LIB/INCLUDE/PATH) so the linker
+      # resolves system import libs via $LIB rather than absolute "C:\Program
+      # Files\..." paths on the command line (which split on the space → LNK1181).
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Windows link + JSC smoke (experimental)
         continue-on-error: true
         run: |
