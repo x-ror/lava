@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download + extract a prebuilt JavaScriptCore for Windows so the Lava CLI can be
-# linked there (issue #36). We use the Bun project's WebKit fork, which publishes
+# linked there. We use the Bun project's WebKit fork, which publishes
 # redistributable Windows build archives that ship the JavaScriptCore C API
 # headers (including JSContextRefPrivate.h, which our bindings need) plus the
 # static libs: JavaScriptCore.lib, WTF.lib, bmalloc.lib and static ICU

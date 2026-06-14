@@ -12,7 +12,7 @@ import eventloop "lava:pkg/runtime/eventloop"
 // (WSAStartup in platform_init), which outlives every in-flight request, so these
 // procs do not start it again. Both http:// and https:// use this path — TLS runs
 // over the same non-blocking SOCKET via the shared OpenSSL backend (fetch_tls.odin,
-// linked against libssl/libcrypto on Windows; see tls.odin and #150).
+// linked against libssl/libcrypto on Windows; see tls.odin).
 
 // fetch_close_fd closes a socket created by this backend.
 fetch_close_fd :: proc(fd: uintptr) {

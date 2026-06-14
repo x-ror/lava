@@ -11,7 +11,7 @@ import "core:sys/windows"
 // Why select and not IOCP: the loop's I/O contract is readiness-based (a watcher
 // fires when its fd is readable/writable), but IOCP is completion-based — it only
 // reports finished overlapped operations, so a readiness watcher layered on a
-// bare IOCP association can never fire (the bug this backend replaces, #101).
+// bare IOCP association can never fire (the bug this backend replaces).
 // select reports a failed non-blocking connect in exceptfds, which the fetch
 // transport needs; WSAPoll famously does not, so select is the correct primitive
 // here. The FD_SETSIZE (64) cap is acceptable for current consumers (fetch); an

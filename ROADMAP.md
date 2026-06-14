@@ -36,11 +36,12 @@ The original runtime plan (PR #1) is complete:
 - [x] **Memory** — `free_all` the temp arena at the require boundary;
       single-allocation JS→string conversion.
 - [x] **Windows support** — `pkg/jsc/bindings_windows.odin`
-      (`system:JavaScriptCore.lib`), OS-aware path helpers; IOCP backend already
-      existed.
+      (`system:JavaScriptCore.lib`), OS-aware path helpers; `select`-based
+      event-loop backend.
 - [x] **CI** — `.github/workflows/ci.yml`: full check/build/test on Linux
-      (`javascriptcoregtk-6.0`) and macOS; type-check + codegen + JSC-free
-      event-loop tests on Windows.
+      (`javascriptcoregtk-6.0`) and macOS; on Windows, type-check + codegen, the
+      event-loop tests, and a real JavaScriptCore-linked `lava.exe` runtime smoke
+      (JSC provisioned from the Bun WebKit fork).
 
 ## Remaining
 
@@ -115,14 +116,13 @@ implementations — no `primordials`, no `internalBinding` coupling.
       supplies narrow socket primitives plus a swappable TLS backend
       (`pkg/runtime/fetch_tls.odin`). Implemented for **Linux** (io_uring/epoll,
       `core:sys/linux`), **macOS** (kqueue, `core:sys/posix`), and **Windows**
-      (`select`, Winsock — #101, #149). TLS uses OpenSSL (`pkg/runtime/tls.odin`).
-      DNS resolves off the loop on a worker thread. **Windows HTTPS is
-      source-enabled and codegen-verified but not yet link/runtime-tested** — the
-      Windows JSC build + CI (#36) and the Windows OpenSSL link + trust-store
-      decision (#153) are still open. Follow-ups: native Security.framework TLS on
-      macOS (#143), Windows runtime/link (#36, #153), streaming bodies (#31), a
-      resolved-address list for IPv6 hostnames + Happy Eyeballs (#145), and HTTP
-      correctness (#99).
+      (`select`, Winsock). TLS uses OpenSSL (`pkg/runtime/tls.odin`); on Windows the
+      machine certificate store is loaded into OpenSSL's trust store. DNS resolves
+      off the loop on a worker thread. All three platforms build and run for real in
+      CI — the Windows job links a JavaScriptCore-backed `lava.exe` and runs it.
+      Follow-ups: native Security.framework TLS on macOS (#143), streaming bodies
+      (#31), a resolved-address list for IPv6 hostnames + Happy Eyeballs (#145), and
+      HTTP correctness (#99).
 - [x] **Event-loop I/O driving** — fetch was the first real `watch_fd` consumer
       and exposed several gaps, now fixed (`pkg/runtime/eventloop/`):
       - io_uring `POLL_ADD` mask is written to `poll_events` (was `addr`, so no
@@ -175,5 +175,6 @@ implementations — no `primordials`, no `internalBinding` coupling.
       reproducibility, and bump `llvm-version` if a newer Odin needs it.
 - [ ] Update `actions/checkout` / `actions/setup-node` past the Node 20
       deprecation warning.
-- [ ] Add a real `odin build` + run job for Windows once a prebuilt WebKit
-      `JavaScriptCore.dll`/`.lib` is vendored (today: type-check + codegen only).
+- [x] Real `odin build` + run job for Windows: the CI Windows job links a
+      JavaScriptCore-backed `lava.exe` (JSC from the Bun WebKit fork) and runs a
+      runtime smoke, on top of type-check + codegen.
