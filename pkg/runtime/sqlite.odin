@@ -2,6 +2,7 @@ package lava_runtime
 
 import "base:runtime"
 import "core:c"
+import "core:fmt"
 import jsc "lava:pkg/jsc"
 import sqlite "lava:pkg/std/sqlite"
 
@@ -377,6 +378,7 @@ sqlite_row_cb :: proc "c" (
 	stmt := sqlite_get_stmt(state, sqlite_arg_id(ctx, arguments[0]))
 	if stmt == nil do return jsc.JSValueMakeUndefined(ctx)
 
+	read_big_ints := sqlite_read_big_ints(ctx, argument_count, arguments, 1)
 	row := jsc.JSObjectMake(ctx, nil, nil)
 	count := sqlite.column_count(stmt)
 	for i in 0 ..< count {
@@ -384,7 +386,9 @@ sqlite_row_cb :: proc "c" (
 		value: jsc.JSValueRef
 		switch sqlite.column_type(stmt, i) {
 		case .Integer:
-			value = jsc.JSValueMakeNumber(ctx, f64(sqlite.column_int(stmt, i)))
+			value = sqlite_int_value(ctx, sqlite.column_int(stmt, i), read_big_ints, true, exception)
+			// An out-of-range INTEGER throws (ERR_OUT_OF_RANGE) — abandon the row.
+			if exception != nil && exception^ != nil do return jsc.JSValueMakeUndefined(ctx)
 		case .Float:
 			value = jsc.JSValueMakeNumber(ctx, sqlite.column_double(stmt, i))
 		case .Text:
@@ -412,7 +416,9 @@ sqlite_changes_cb :: proc "c" (
 	state := get_state_from_ctx(ctx)
 	db := sqlite_get_db(state, sqlite_arg_id(ctx, arguments[0]))
 	if db == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	return jsc.JSValueMakeNumber(ctx, f64(sqlite.changes(db)))
+	read_big_ints := sqlite_read_big_ints(ctx, argument_count, arguments, 1)
+	// changes/lastInsertRowid never throw (Node returns a lossy number by default).
+	return sqlite_int_value(ctx, sqlite.changes(db), read_big_ints, false, exception)
 }
 
 sqlite_last_insert_rowid_cb :: proc "c" (
@@ -428,10 +434,75 @@ sqlite_last_insert_rowid_cb :: proc "c" (
 	state := get_state_from_ctx(ctx)
 	db := sqlite_get_db(state, sqlite_arg_id(ctx, arguments[0]))
 	if db == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	return jsc.JSValueMakeNumber(ctx, f64(sqlite.last_insert_rowid(db)))
+	read_big_ints := sqlite_read_big_ints(ctx, argument_count, arguments, 1)
+	return sqlite_int_value(ctx, sqlite.last_insert_rowid(db), read_big_ints, false, exception)
 }
 
 // --- helpers ---
+
+// SQLite stores INTEGER columns as i64; JS numbers are exact only up to 2^53-1.
+SQLITE_MAX_SAFE_INTEGER :: i64(9007199254740991)
+
+// sqlite_read_big_ints reads the optional readBigInts flag (the StatementSync's
+// setReadBigInts() state) threaded as the trailing argument of row/changes/rowid.
+sqlite_read_big_ints :: proc(
+	ctx: jsc.JSContextRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	index: int,
+) -> bool {
+	if int(argument_count) <= index do return false
+	// Read via JSValueToNumber (0/1), NOT JSValueToBoolean: the latter's b32 return
+	// is unreliable across the FFI in a JSC `proc "c"` callback (a JS `false` comes
+	// back true), the same heisenbug seen in the bind path. A JS boolean converts
+	// to 0/1, so a nonzero number is `true`.
+	return jsc.JSValueToNumber(ctx, arguments[index], nil) != 0
+}
+
+// sqlite_int_value converts an i64 column/rowid value to a JS value honoring the
+// statement's readBigInts flag. With read_big_ints it returns a BigInt; otherwise
+// a JS number — throwing ERR_OUT_OF_RANGE (like node:sqlite) when throw_on_unsafe
+// is set and the value is not exactly representable. run()'s changes/lastInsertRowid
+// pass throw_on_unsafe=false: Node returns those as a lossy number, never throwing.
+sqlite_int_value :: proc(
+	ctx: jsc.JSContextRef,
+	v: i64,
+	read_big_ints: bool,
+	throw_on_unsafe: bool,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	if read_big_ints do return sqlite_make_bigint(ctx, v)
+	if throw_on_unsafe && (v > SQLITE_MAX_SAFE_INTEGER || v < -SQLITE_MAX_SAFE_INTEGER) {
+		if exception != nil {
+			msg := fmt.tprintf(
+				"Value is too large to be represented as a JavaScript number: %d",
+				v,
+			)
+			err := make_js_named_error(ctx, "RangeError", msg)
+			if jsc.JSValueIsObject(ctx, err) {
+				set_named(ctx, cast(jsc.JSObjectRef)err, "code", js_string_value(ctx, "ERR_OUT_OF_RANGE"))
+			}
+			exception^ = err
+		}
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	return jsc.JSValueMakeNumber(ctx, f64(v))
+}
+
+// sqlite_make_bigint builds a JS BigInt for an exact i64 by calling the global
+// BigInt() with the decimal string (the JSC C API has no BigInt constructor).
+sqlite_make_bigint :: proc(ctx: jsc.JSContextRef, v: i64) -> jsc.JSValueRef {
+	s := fmt.tprintf("%d", v)
+	global := jsc.JSContextGetGlobalObject(ctx)
+	name := jsc.JSStringCreateWithUTF8CString("BigInt")
+	defer jsc.JSStringRelease(name)
+	fn := jsc.JSObjectGetProperty(ctx, global, name, nil)
+	if !jsc.JSValueIsObject(ctx, fn) do return jsc.JSValueMakeNumber(ctx, f64(v))
+	args := [1]jsc.JSValueRef{js_string_value(ctx, s)}
+	result := jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)fn, nil, 1, raw_data(args[:]), nil)
+	if result == nil do return jsc.JSValueMakeNumber(ctx, f64(v))
+	return result
+}
 
 // sqlite_error_text returns the live SQLite error string when available, falling
 // back to the Result's static message. The returned string is freed before return
