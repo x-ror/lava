@@ -197,13 +197,15 @@ jobs:
           # Use Odin's bundled lld linker (from the setup-odin LLVM) — its invocation
           # quotes the MSVC toolchain paths correctly (link.exe via the default path
           # split "C:\Program Files\..." → LNK1181).
-          # Force-pull just the two compiler-rt members JSC references but doesn't
-          # provide (__divti3/__fixdfti). lld processes the builtins archive before
-          # those symbols become undefined, so it skips them on a normal pass;
-          # /INCLUDE seeds them as required up front. (/WHOLEARCHIVE would instead
-          # pull the whole archive and clash with half-float routines JSC bundles.)
+          # compiler-rt builtins: JSC references __divti3/__fixdfti but doesn't
+          # provide them, and this archive's symbol index omits them (so /INCLUDE
+          # and on-demand resolution both miss them). /WHOLEARCHIVE force-includes
+          # the tiny archive; that re-defines ~6 half-float routines JSC also bundles
+          # (identical compiler-rt implementations), so /force:multiple lets lld pick
+          # one instead of erroring. The only multiply-defined symbols are these
+          # builtins — verified from the duplicate-symbol output.
           odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
-            -extra-linker-flags:"/INCLUDE:__divti3 /INCLUDE:__fixdfti WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
+            -extra-linker-flags:"/WHOLEARCHIVE:clang_rt.builtins-x86_64.lib /force:multiple WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
           echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
           ./build/lava.exe run smoke.js | tee smoke.out
           grep -q "jsc-smoke:42" smoke.out
