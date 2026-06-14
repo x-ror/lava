@@ -14,6 +14,11 @@ platform_name :: proc(loop: ^Loop) -> string {
 }
 
 platform_init :: proc(loop: ^Loop) -> bool {
+	// Sentinels so a failed init leaves no fd 0 defaults that platform_destroy
+	// would close (closing fd 0 = stdin). Mirrors loop_linux.odin.
+	loop.platform.kq = -1
+	loop.platform.wakeup_pipe = {-1, -1}
+
 	kq, kq_err := kqueue.kqueue()
 	if kq_err != .NONE {
 		return false
@@ -22,10 +27,15 @@ platform_init :: proc(loop: ^Loop) -> bool {
 
 	if posix.pipe(&loop.platform.wakeup_pipe) != .OK {
 		posix.close(loop.platform.kq)
+		loop.platform.kq = -1
 		return false
 	}
 
+	// Both ends nonblocking: the read end so draining never blocks the loop, the
+	// write end so a cross-thread wakeup() never blocks a worker if the pipe fills
+	// (a wakeup is already pending in that case). Matches the Linux pipe2 flags.
 	posix.fcntl(loop.platform.wakeup_pipe[0], .SETFL, posix.O_Flags{.NONBLOCK})
+	posix.fcntl(loop.platform.wakeup_pipe[1], .SETFL, posix.O_Flags{.NONBLOCK})
 
 	ev := kqueue.KEvent {
 		ident  = uintptr(loop.platform.wakeup_pipe[0]),
@@ -37,6 +47,8 @@ platform_init :: proc(loop: ^Loop) -> bool {
 		posix.close(loop.platform.wakeup_pipe[0])
 		posix.close(loop.platform.wakeup_pipe[1])
 		posix.close(loop.platform.kq)
+		loop.platform.wakeup_pipe = {-1, -1}
+		loop.platform.kq = -1
 		return false
 	}
 
@@ -44,12 +56,23 @@ platform_init :: proc(loop: ^Loop) -> bool {
 }
 
 platform_destroy :: proc(loop: ^Loop) {
-	posix.close(loop.platform.wakeup_pipe[0])
-	posix.close(loop.platform.wakeup_pipe[1])
-	posix.close(loop.platform.kq)
+	if loop.platform.wakeup_pipe[0] >= 0 {
+		posix.close(loop.platform.wakeup_pipe[0])
+		loop.platform.wakeup_pipe[0] = -1
+	}
+	if loop.platform.wakeup_pipe[1] >= 0 {
+		posix.close(loop.platform.wakeup_pipe[1])
+		loop.platform.wakeup_pipe[1] = -1
+	}
+	if loop.platform.kq >= 0 {
+		posix.close(loop.platform.kq)
+		loop.platform.kq = -1
+	}
 }
 
 platform_wakeup :: proc(loop: ^Loop) {
+	// EAGAIN on a full pipe is fine — the read end is already readable, so a
+	// wakeup is already pending. The write end is nonblocking (see platform_init).
 	dummy: byte = 1
 	posix.write(loop.platform.wakeup_pipe[1], &dummy, 1)
 }

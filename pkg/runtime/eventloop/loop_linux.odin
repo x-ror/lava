@@ -115,6 +115,12 @@ platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 
 platform_unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	if loop.platform.use_uring {
+		// io_uring unwatch is LOGICAL ONLY: a POLL_ADD already submitted is not
+		// cancelled, so its completion can still surface in a later platform_poll.
+		// The watcher may therefore be observed once more after unwatch returns —
+		// callers must null watcher.callback (the dispatch skips a nil callback) to
+		// make the watcher truly inert. A real cancellation path
+		// (IORING_OP_POLL_REMOVE / generation tokens) is tracked separately.
 		return true
 	}
 

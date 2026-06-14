@@ -64,6 +64,12 @@ Loop :: struct {
 	next_sequence:   u64,
 	next_ticks:      [dynamic]Task,
 	microtasks:      [dynamic]Task,
+	// Scratch buffers swapped with next_ticks/microtasks while draining, so a
+	// drain reuses capacity instead of allocating a fresh queue every checkpoint
+	// (same double-buffer trick as async_queue/async_scratch). Tasks appended by
+	// callbacks during a drain land in the now-empty live queue.
+	next_ticks_scratch: [dynamic]Task,
+	microtasks_scratch: [dynamic]Task,
 	immediates:      [dynamic]Task,
 	io_callbacks:    [dynamic]Task, // poll-phase completions (e.g. fs.readFile); run before check
 	close_callbacks: [dynamic]Task,
@@ -142,10 +148,33 @@ sync_real_clock :: proc(loop: ^Loop) {
 	}
 }
 
+// destroy tears the loop down. Any handle still pending (the embedder is
+// destroying a loop that has not run to idle) is released via its dispose hook
+// first, so JS-protected callback bindings do not leak. dispose runs exactly once
+// per live handle: cancelled handles already had theirs run and nulled by
+// clear_timeout, and a fired one-shot freed its own binding, so neither is
+// double-released here.
 destroy :: proc(loop: ^Loop) {
+	dispose_pending_tasks(&loop.next_ticks)
+	dispose_pending_tasks(&loop.next_ticks_scratch)
+	dispose_pending_tasks(&loop.microtasks)
+	dispose_pending_tasks(&loop.microtasks_scratch)
+	dispose_pending_tasks(&loop.immediates)
+	dispose_pending_tasks(&loop.io_callbacks)
+	dispose_pending_tasks(&loop.close_callbacks)
+	dispose_pending_tasks(&loop.async_queue)
+	dispose_pending_tasks(&loop.async_scratch)
+	for &timer in loop.timers {
+		if !timer.cancelled {
+			run_dispose(timer.dispose, timer.user_data)
+		}
+	}
+
 	platform_destroy(loop)
 	delete(loop.next_ticks)
+	delete(loop.next_ticks_scratch)
 	delete(loop.microtasks)
+	delete(loop.microtasks_scratch)
 	delete(loop.immediates)
 	delete(loop.io_callbacks)
 	delete(loop.close_callbacks)
@@ -154,6 +183,16 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.async_queue)
 	delete(loop.async_scratch)
 	loop^ = Loop{}
+}
+
+// dispose_pending_tasks releases the user_data of every not-yet-fired, not-cancelled
+// task in a queue via its dispose hook. Used only on teardown (see destroy).
+dispose_pending_tasks :: proc(queue: ^[dynamic]Task) {
+	for &task in queue^ {
+		if !task.cancelled {
+			run_dispose(task.dispose, task.user_data)
+		}
+	}
 }
 
 // --- Cross-thread async completion handoff ---
@@ -178,6 +217,11 @@ async_cancel :: proc(loop: ^Loop) {
 // in the next tick (see drain_async) and decrements the in-flight count there. The
 // worker must finish writing any result the callback reads before calling this —
 // the lock/unlock publishes those writes.
+//
+// The append may grow async_queue, which allocates via the queue's bound allocator
+// off the loop thread while the loop thread allocates concurrently. loop.allocator
+// (passed to init) must therefore be thread-safe — the default heap allocator is.
+// Do not back a loop with a non-thread-safe arena if any worker calls post_async.
 post_async :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) {
 	if callback == nil do return
 	sync.lock(&loop.async_mutex)
@@ -486,12 +530,12 @@ drain_microtasks :: proc(loop: ^Loop) {
 	for {
 		// Always drain all next_ticks before touching microtasks
 		for len(loop.next_ticks) > 0 {
-			drain_task_queue(loop, &loop.next_ticks)
+			drain_task_queue(loop, &loop.next_ticks, &loop.next_ticks_scratch)
 		}
 		if len(loop.microtasks) == 0 {
 			break
 		}
-		drain_task_queue(loop, &loop.microtasks)
+		drain_task_queue(loop, &loop.microtasks, &loop.microtasks_scratch)
 	}
 }
 
@@ -750,21 +794,24 @@ get_next_timer_timeout :: proc(loop: ^Loop) -> int {
 
 // --- Internal helpers ---
 
-drain_task_queue :: proc(loop: ^Loop, queue: ^[dynamic]Task) {
+drain_task_queue :: proc(loop: ^Loop, queue: ^[dynamic]Task, scratch: ^[dynamic]Task) {
 	if len(queue^) == 0 {
 		return
 	}
 
-	processing := queue^
-	queue^ = make([dynamic]Task, 0, cap(processing), loop.allocator)
-	defer delete(processing)
+	// Swap the live queue with its scratch buffer (O(1)): callbacks run from the
+	// scratch copy while anything they newly enqueue accumulates in the now-empty
+	// live queue. clear() keeps the scratch capacity for the next drain so we do
+	// not reallocate per checkpoint.
+	queue^, scratch^ = scratch^, queue^
 
-	for task in processing {
+	for task in scratch^ {
 		if task.cancelled || (task.id != 0 && is_cancel_requested(loop, task.id)) {
 			continue
 		}
 		task.callback(loop, task.user_data)
 	}
+	clear(scratch)
 }
 
 next_handle_id :: proc(loop: ^Loop) -> Timer_ID {
