@@ -197,12 +197,13 @@ jobs:
           # Use Odin's bundled lld linker (from the setup-odin LLVM) — its invocation
           # quotes the MSVC toolchain paths correctly (link.exe via the default path
           # split "C:\Program Files\..." → LNK1181).
-          # /WHOLEARCHIVE force-includes the tiny compiler-rt builtins archive: lld
-          # processes it before the JSC members that reference __divti3/__fixdfti are
-          # pulled, so on-demand resolution misses them; force-include sidesteps the
-          # archive ordering entirely.
+          # Force-pull just the two compiler-rt members JSC references but doesn't
+          # provide (__divti3/__fixdfti). lld processes the builtins archive before
+          # those symbols become undefined, so it skips them on a normal pass;
+          # /INCLUDE seeds them as required up front. (/WHOLEARCHIVE would instead
+          # pull the whole archive and clash with half-float routines JSC bundles.)
           odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
-            -extra-linker-flags:"/WHOLEARCHIVE:clang_rt.builtins-x86_64.lib WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
+            -extra-linker-flags:"/INCLUDE:__divti3 /INCLUDE:__fixdfti WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
           echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
           ./build/lava.exe run smoke.js | tee smoke.out
           grep -q "jsc-smoke:42" smoke.out
