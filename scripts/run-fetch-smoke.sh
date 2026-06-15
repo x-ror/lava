@@ -18,10 +18,12 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lava-fetch-smoke.XXXXXX")
 # Windows CI runner this script runs under Git Bash, but the programs it hands
 # cert paths to are native Win32 and reject "/tmp/..." paths: Node
 # (NODE_EXTRA_CA_CERTS and server.js fs.readFileSync) and lava's OpenSSL
-# (SSL_CERT_FILE). cygpath -w rewrites them to "C:\..."; a no-op on Linux/macOS,
-# where cygpath does not exist and the path is already native.
+# (SSL_CERT_FILE). `cygpath -w -l` rewrites them to a long "C:\..." form; -l is
+# required because the bare -w form can emit an 8.3 short name (RUNNER~1) that
+# does not resolve when 8.3 generation is disabled on the volume. A no-op on
+# Linux/macOS, where cygpath does not exist and the path is already native.
 winpath() {
-	if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
+	if command -v cygpath >/dev/null 2>&1; then cygpath -w -l "$1"; else printf '%s' "$1"; fi
 }
 
 cleanup() {
@@ -93,18 +95,26 @@ fi
 CA_FILE="$TLS_CA"
 [ -f "$CA_FILE" ] || CA_FILE="$TLS_CERT"
 CA_FILE_NATIVE="$(winpath "$CA_FILE")"
+# Compare STDOUT only — the test's contract is the cases' console.log output.
+# stderr is diagnostic noise that diverges per runtime/platform (e.g. Node's
+# "Ignoring extra certs ..." CA-load warning on Windows) and must not fail the
+# comparison; capture it separately so a genuine failure can still be inspected.
 NODE_EXTRA_CA_CERTS="$CA_FILE_NATIVE" \
 	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" \
 	FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" FETCH_BASE_HTTPS_BAD="$FETCH_BASE_HTTPS_BAD" \
-	"$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>&1 || true
+	"$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>"$TMP_DIR/node.err" || true
 SSL_CERT_FILE="$CA_FILE_NATIVE" \
 	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" \
 	FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" FETCH_BASE_HTTPS_BAD="$FETCH_BASE_HTTPS_BAD" \
-	"$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>&1 || true
+	"$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>"$TMP_DIR/lava.err" || true
 
 if diff -u "$TMP_DIR/node.out" "$TMP_DIR/lava.out"; then
 	printf '%s\n' 'fetch smoke passed (lava output matches node)'
 else
 	printf '%s\n' 'fetch smoke FAILED: lava output differs from node' >&2
+	printf '%s\n' '--- node stderr ---' >&2
+	cat "$TMP_DIR/node.err" >&2 || true
+	printf '%s\n' '--- lava stderr ---' >&2
+	cat "$TMP_DIR/lava.err" >&2 || true
 	exit 1
 fi
