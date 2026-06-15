@@ -28,7 +28,7 @@ bridge_pattern_bind :: proc(t: ^testing.T) {
 	stmts[2] = cast(rawptr)stmt
 
 	got_stmt := cast(^Statement)stmts[2]
-	bind_int(got_stmt, 1, 42)
+	testing.expect_value(t, bind_int(got_stmt, 1, 42).status, Status.Ok)
 	testing.expect_value(t, step(got_stmt), Step_Result.Row)
 	testing.expect_value(t, column_type(got_stmt, 0), Column_Type.Integer)
 	testing.expect_value(t, column_int(got_stmt, 0), i64(42))
@@ -63,7 +63,7 @@ in_memory_roundtrip :: proc(t: ^testing.T) {
 	defer finalize(&stmt)
 	testing.expect_value(t, bind_parameter_count(&stmt), 1)
 
-	bind_text(&stmt, 1, "Ada")
+	testing.expect_value(t, bind_text(&stmt, 1, "Ada").status, Status.Ok)
 	testing.expect_value(t, step(&stmt), Step_Result.Row)
 	testing.expect_value(t, column_count(&stmt), 2)
 	testing.expect_value(t, column_type(&stmt, 0), Column_Type.Integer)
@@ -72,4 +72,61 @@ in_memory_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, column_text(&stmt, 1), "Ada")
 	testing.expect_value(t, column_name(&stmt, 1), "name")
 	testing.expect_value(t, step(&stmt), Step_Result.Done)
+}
+
+// A bind to an out-of-range parameter index is no longer silently discarded: it
+// reports SQLITE_RANGE so the bridge can throw (this is how node:sqlite surfaces
+// too many positional parameters).
+@(test)
+bind_out_of_range_reports_error :: proc(t: ^testing.T) {
+	when !SQLITE_AVAILABLE {
+		return
+	}
+
+	db, _ := open(":memory:")
+	defer close(&db)
+	stmt, prep_res := prepare(&db, "SELECT ? AS v")
+	testing.expect_value(t, prep_res.status, Status.Ok)
+	defer finalize(&stmt)
+
+	testing.expect_value(t, bind_int(&stmt, 1, 1).status, Status.Ok)
+	// Index 2 does not exist (one placeholder) -> SQLITE_RANGE.
+	testing.expect_value(t, bind_int(&stmt, 2, 1).status, Status.Error)
+}
+
+// SQLite TEXT may contain embedded NULs; column_text returns the full byte slice
+// (via sqlite3_column_bytes) rather than truncating at the first NUL.
+@(test)
+text_with_embedded_nul_roundtrips :: proc(t: ^testing.T) {
+	when !SQLITE_AVAILABLE {
+		return
+	}
+
+	db, _ := open(":memory:")
+	defer close(&db)
+	testing.expect_value(t, exec(&db, "CREATE TABLE t (x TEXT)").status, Status.Ok)
+
+	ins, _ := prepare(&db, "INSERT INTO t VALUES (?)")
+	testing.expect_value(t, bind_text(&ins, 1, "a\x00b").status, Status.Ok)
+	testing.expect_value(t, step(&ins), Step_Result.Done)
+	finalize(&ins)
+
+	sel, _ := prepare(&db, "SELECT x FROM t")
+	defer finalize(&sel)
+	testing.expect_value(t, step(&sel), Step_Result.Row)
+	got := column_text(&sel, 0)
+	testing.expect_value(t, len(got), 3)
+	testing.expect_value(t, got, "a\x00b")
+}
+
+// Empty SQL is a no-op rather than an error, matching node:sqlite's db.exec('').
+@(test)
+exec_empty_is_noop :: proc(t: ^testing.T) {
+	when !SQLITE_AVAILABLE {
+		return
+	}
+
+	db, _ := open(":memory:")
+	defer close(&db)
+	testing.expect_value(t, exec(&db, "").status, Status.Ok)
 }

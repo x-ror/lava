@@ -80,6 +80,9 @@ when SQLITE_AVAILABLE {
 		// closes a db before finalizing its statements.
 		sqlite3_close_v2 :: proc(db: rawptr) -> c.int ---
 		sqlite3_errmsg :: proc(db: rawptr) -> cstring ---
+		// Static English text for a result code (e.g. SQLITE_RANGE ->
+		// "column index out of range"); valid for the program's lifetime.
+		sqlite3_errstr :: proc(rc: c.int) -> cstring ---
 		sqlite3_exec :: proc(db: rawptr, sql: cstring, cb: rawptr, arg: rawptr, errmsg: ^cstring) -> c.int ---
 		sqlite3_prepare_v2 :: proc(db: rawptr, zSql: cstring, nByte: c.int, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int ---
 		sqlite3_step :: proc(stmt: rawptr) -> c.int ---
@@ -160,8 +163,10 @@ exec :: proc(db: ^Database, sql: string) -> Result {
 	if db == nil || !db.is_open {
 		return Result{status = .Invalid_Input, message = "database is not open"}
 	}
+	// Empty SQL is a no-op, matching node:sqlite (`db.exec('')`); sqlite3_exec on
+	// an empty/whitespace string also returns SQLITE_OK without running anything.
 	if len(sql) == 0 {
-		return Result{status = .Invalid_Input, message = "missing SQL"}
+		return Result{status = .Ok}
 	}
 	when !SQLITE_AVAILABLE {
 		return unavailable()
@@ -338,41 +343,81 @@ bind_parameter_name :: proc(stmt: ^Statement, index: int) -> string {
 	}
 }
 
+// bind_result maps a sqlite3_bind_* return code to a Result. A non-OK code (e.g.
+// SQLITE_RANGE for an out-of-range index) is surfaced instead of being discarded,
+// so the node:sqlite bridge can throw rather than silently execute with the slot
+// unbound. The message borrows sqlite's static errstr text (no free needed).
+bind_result :: proc(rc: c.int) -> Result {
+	when SQLITE_AVAILABLE {
+		if rc == SQLITE_OK do return Result{status = .Ok}
+		text := sqlite3_errstr(rc)
+		return Result{status = .Error, message = text != nil ? string(text) : "bind failed"}
+	} else {
+		return Result{status = .Ok}
+	}
+}
+
 // Bind parameters are 1-based, matching the SQLite C API.
-bind_int :: proc(stmt: ^Statement, index: int, value: i64) {
-	when SQLITE_AVAILABLE {
-		if stmt == nil || stmt.handle == nil do return
-		sqlite3_bind_int64(stmt.handle, c.int(index), value)
+bind_int :: proc(stmt: ^Statement, index: int, value: i64) -> Result {
+	when !SQLITE_AVAILABLE {
+		return unavailable()
+	} else {
+		if stmt == nil || stmt.handle == nil {
+			return Result{status = .Invalid_Input, message = "statement is not prepared"}
+		}
+		return bind_result(sqlite3_bind_int64(stmt.handle, c.int(index), value))
 	}
 }
 
-bind_double :: proc(stmt: ^Statement, index: int, value: f64) {
-	when SQLITE_AVAILABLE {
-		if stmt == nil || stmt.handle == nil do return
-		sqlite3_bind_double(stmt.handle, c.int(index), value)
+bind_double :: proc(stmt: ^Statement, index: int, value: f64) -> Result {
+	when !SQLITE_AVAILABLE {
+		return unavailable()
+	} else {
+		if stmt == nil || stmt.handle == nil {
+			return Result{status = .Invalid_Input, message = "statement is not prepared"}
+		}
+		return bind_result(sqlite3_bind_double(stmt.handle, c.int(index), value))
 	}
 }
 
-bind_null :: proc(stmt: ^Statement, index: int) {
-	when SQLITE_AVAILABLE {
-		if stmt == nil || stmt.handle == nil do return
-		sqlite3_bind_null(stmt.handle, c.int(index))
+bind_null :: proc(stmt: ^Statement, index: int) -> Result {
+	when !SQLITE_AVAILABLE {
+		return unavailable()
+	} else {
+		if stmt == nil || stmt.handle == nil {
+			return Result{status = .Invalid_Input, message = "statement is not prepared"}
+		}
+		return bind_result(sqlite3_bind_null(stmt.handle, c.int(index)))
 	}
 }
 
-bind_text :: proc(stmt: ^Statement, index: int, value: string) {
-	when SQLITE_AVAILABLE {
-		if stmt == nil || stmt.handle == nil do return
+bind_text :: proc(stmt: ^Statement, index: int, value: string) -> Result {
+	when !SQLITE_AVAILABLE {
+		return unavailable()
+	} else {
+		if stmt == nil || stmt.handle == nil {
+			return Result{status = .Invalid_Input, message = "statement is not prepared"}
+		}
+		// Explicit length (not strlen): an embedded NUL is a legal byte in SQLite
+		// TEXT, so the whole slice is bound, not just up to the first NUL.
 		cval := strings.clone_to_cstring(value, context.temp_allocator)
-		sqlite3_bind_text(stmt.handle, c.int(index), cval, c.int(len(value)), sqlite_transient())
+		return bind_result(
+			sqlite3_bind_text(stmt.handle, c.int(index), cval, c.int(len(value)), sqlite_transient()),
+		)
 	}
 }
 
-bind_blob :: proc(stmt: ^Statement, index: int, value: []byte) {
-	when SQLITE_AVAILABLE {
-		if stmt == nil || stmt.handle == nil do return
+bind_blob :: proc(stmt: ^Statement, index: int, value: []byte) -> Result {
+	when !SQLITE_AVAILABLE {
+		return unavailable()
+	} else {
+		if stmt == nil || stmt.handle == nil {
+			return Result{status = .Invalid_Input, message = "statement is not prepared"}
+		}
 		ptr := len(value) > 0 ? raw_data(value) : nil
-		sqlite3_bind_blob(stmt.handle, c.int(index), ptr, c.int(len(value)), sqlite_transient())
+		return bind_result(
+			sqlite3_bind_blob(stmt.handle, c.int(index), ptr, c.int(len(value)), sqlite_transient()),
+		)
 	}
 }
 
