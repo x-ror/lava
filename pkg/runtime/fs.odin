@@ -560,6 +560,157 @@ fs_rm_sync_cb :: proc "c" (
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
+// fs.unlinkSync(path) — remove a file or symlink. Unlike rmSync, unlink never
+// removes a directory: POSIX unlink(2) fails with EISDIR there, and Node surfaces
+// that. os.remove would happily rmdir an empty directory, so classify with lstat
+// first. A symlink — even one pointing at a directory — reports .Symlink (not
+// .Directory) under lstat and is correctly unlinked rather than followed.
+fs_unlink_sync_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 {
+		if exception != nil do exception^ = make_js_error(ctx, "fs.unlinkSync requires a path")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	args := arguments[:int(argument_count)]
+	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
+	defer if path_alloc do delete(path_str, context.allocator)
+
+	info, lstat_err := os.lstat(path_str, context.allocator)
+	if lstat_err != nil {
+		if exception != nil do exception^ = fs_make_error(ctx, "ENOENT", "unlink", path_str, 2)
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	is_dir := info.type == .Directory
+	os.file_info_delete(info, context.allocator)
+	if is_dir {
+		if exception != nil do exception^ = fs_make_error(ctx, "EISDIR", "unlink", path_str, 21)
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	if remove_err := os.remove(path_str); remove_err != nil && exception != nil {
+		code, errno_val := fs_os_error_to_code(remove_err)
+		exception^ = fs_make_error(ctx, code, "unlink", path_str, errno_val)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// fs.rmdirSync(path) — remove an empty directory. Node throws ENOTDIR when the
+// path is not a directory and ENOTEMPTY when it still has entries. os.remove on a
+// plain file would unlink it, so classify with lstat first; a non-empty directory
+// surfaces the OS error (ENOTEMPTY on POSIX) through fs_os_error_to_code.
+// (fs.rmSync({recursive:true}) is the modern replacement for recursive removal;
+// rmdirSync stays non-recursive to match Node 22+, whose `recursive` option here
+// is removed/throwing.)
+fs_rmdir_sync_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 {
+		if exception != nil do exception^ = make_js_error(ctx, "fs.rmdirSync requires a path")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	args := arguments[:int(argument_count)]
+	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
+	defer if path_alloc do delete(path_str, context.allocator)
+
+	info, lstat_err := os.lstat(path_str, context.allocator)
+	if lstat_err != nil {
+		if exception != nil do exception^ = fs_make_error(ctx, "ENOENT", "rmdir", path_str, 2)
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	is_dir := info.type == .Directory
+	os.file_info_delete(info, context.allocator)
+	if !is_dir {
+		if exception != nil do exception^ = fs_make_error(ctx, "ENOTDIR", "rmdir", path_str, 20)
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	if remove_err := os.remove(path_str); remove_err != nil && exception != nil {
+		code, errno_val := fs_os_error_to_code(remove_err)
+		exception^ = fs_make_error(ctx, code, "rmdir", path_str, errno_val)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// fs.renameSync(oldPath, newPath) — rename/move a path. Thin wrapper over
+// os.rename; the OS error (e.g. ENOENT for a missing source) is mapped to Node's
+// code/errno. Node reports the syscall as "rename" and the source as `path`.
+fs_rename_sync_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 2 {
+		if exception != nil do exception^ = make_js_error(ctx, "fs.renameSync requires oldPath and newPath")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	args := arguments[:int(argument_count)]
+	old_str, old_alloc := jsc_value_to_string_or_default(ctx, args[0])
+	defer if old_alloc do delete(old_str, context.allocator)
+	new_str, new_alloc := jsc_value_to_string_or_default(ctx, args[1])
+	defer if new_alloc do delete(new_str, context.allocator)
+
+	if rename_err := os.rename(old_str, new_str); rename_err != nil && exception != nil {
+		code, errno_val := fs_os_error_to_code(rename_err)
+		exception^ = fs_make_error(ctx, code, "rename", old_str, errno_val)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// fs.mkdtempSync(prefix[, options]) — create a uniquely-named temp directory and
+// return its path. Node appends random characters directly to `prefix`
+// ("/tmp/foo-" -> "/tmp/foo-a1b2c3"). os.make_directory_temp does the create+retry
+// loop for us; it takes a (dir, name-prefix) pair and re-joins them with the OS
+// separator, so splitting `prefix` with filepath.dir/base reproduces
+// "<prefix><random>" for the common case. The random-suffix length is unspecified
+// by Node's contract (callers must not parse it); STD uses 10 chars, Node uses 6.
+fs_mkdtemp_sync_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 {
+		if exception != nil do exception^ = make_js_error(ctx, "fs.mkdtempSync requires a prefix")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	args := arguments[:int(argument_count)]
+	prefix_str, prefix_alloc := jsc_value_to_string_or_default(ctx, args[0])
+	defer if prefix_alloc do delete(prefix_str, context.allocator)
+
+	dir := filepath.dir(prefix_str)
+	base := filepath.base(prefix_str)
+	created, mk_err := os.make_directory_temp(dir, base, context.allocator)
+	if mk_err != nil {
+		if exception != nil {
+			code, errno_val := fs_os_error_to_code(mk_err)
+			exception^ = fs_make_error(ctx, code, "mkdtemp", prefix_str, errno_val)
+		}
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	defer delete(created, context.allocator)
+	return js_string_value(ctx, created)
+}
+
 fs_time_ms :: proc(t: time.Time) -> f64 {
 	return f64(time.to_unix_nanoseconds(t)) / 1.0e6
 }

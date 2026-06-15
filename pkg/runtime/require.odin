@@ -98,7 +98,11 @@ native_require_cb :: proc "c" (
 		inject_native_function(ctx, fs_obj, "writeFileSync", fs_write_file_sync_cb)
 		inject_native_function(ctx, fs_obj, "existsSync", fs_exists_sync_cb)
 		inject_native_function(ctx, fs_obj, "mkdirSync", fs_mkdir_sync_cb)
+		inject_native_function(ctx, fs_obj, "mkdtempSync", fs_mkdtemp_sync_cb)
 		inject_native_function(ctx, fs_obj, "rmSync", fs_rm_sync_cb)
+		inject_native_function(ctx, fs_obj, "rmdirSync", fs_rmdir_sync_cb)
+		inject_native_function(ctx, fs_obj, "unlinkSync", fs_unlink_sync_cb)
+		inject_native_function(ctx, fs_obj, "renameSync", fs_rename_sync_cb)
 		inject_native_function(ctx, fs_obj, "statSync", fs_stat_sync_cb)
 		inject_native_function(ctx, fs_obj, "readdirSync", fs_readdir_sync_cb)
 
