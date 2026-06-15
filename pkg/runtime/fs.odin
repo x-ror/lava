@@ -1,6 +1,7 @@
 package lava_runtime
 
 import "base:runtime"
+import "core:crypto"
 import "core:io"
 import "core:c"
 import "core:fmt"
@@ -237,6 +238,25 @@ fs_make_error :: proc(ctx: jsc.JSContextRef, code, syscall, path: string, errno_
 	return err
 }
 
+// fs_make_rename_error builds Node's rename error, which differs from the generic
+// fs error in two ways: the message names both paths ("rename 'old' -> 'new'")
+// and the error carries a `dest` property in addition to `path`.
+fs_make_rename_error :: proc(ctx: jsc.JSContextRef, code, old_path, new_path: string, errno_val := 0) -> jsc.JSValueRef {
+	msg := fmt.tprintf("%s: %s, rename '%s' -> '%s'", code, fs_errno_text(code), old_path, new_path)
+	err := make_js_error(ctx, msg)
+	if jsc.JSValueIsObject(ctx, err) {
+		obj := cast(jsc.JSObjectRef)err
+		set_named(ctx, obj, "code", js_string_value(ctx, code))
+		set_named(ctx, obj, "syscall", js_string_value(ctx, "rename"))
+		set_named(ctx, obj, "path", js_string_value(ctx, old_path))
+		set_named(ctx, obj, "dest", js_string_value(ctx, new_path))
+		if errno_val != 0 {
+			set_named(ctx, obj, "errno", jsc.JSValueMakeNumber(ctx, f64(-errno_val)))
+		}
+	}
+	return err
+}
+
 fs_errno_text :: proc(code: string) -> string {
 	switch code {
 	case "ENOENT":        return "no such file or directory"
@@ -270,18 +290,35 @@ fs_os_error_to_code :: proc(err: os.Error) -> (code: string, errno_val: int) {
 		case:                    return "EIO", 5
 		}
 	case os.Platform_Error:
-		switch i32(e) {
-		case 1:  return "EPERM", 1
-		case 2:  return "ENOENT", 2
-		case 5:  return "EIO", 5
-		case 13: return "EACCES", 13
-		case 17: return "EEXIST", 17
-		case 20: return "ENOTDIR", 20
-		case 21: return "EISDIR", 21
-		case 28: return "ENOSPC", 28
-		case 30: return "EROFS", 30
-		case 39: return "ENOTEMPTY", 39
-		case:    return "EIO", 5
+		when ODIN_OS == .Windows {
+			// On Windows os.Platform_Error carries a Win32 GetLastError code, not a
+			// POSIX errno, so map the codes the fs paths actually produce. (Best
+			// effort: the node-compat fs suite does not yet run on Windows CI.)
+			switch i32(e) {
+			case 2, 3:    return "ENOENT", 2    // FILE_NOT_FOUND / PATH_NOT_FOUND
+			case 5:       return "EACCES", 13   // ACCESS_DENIED
+			case 80, 183: return "EEXIST", 17   // FILE_EXISTS / ALREADY_EXISTS
+			case 145:     return "ENOTEMPTY", 41 // DIR_NOT_EMPTY (CRT errno 41 on Win32)
+			case 267:     return "ENOTDIR", 20  // DIRECTORY
+			case:         return "EIO", 5
+			}
+		} else {
+			// Linux + Darwin/BSD: i32(e) is the platform errno, so it is the
+			// authoritative errno_val. Only the numeric values that differ across
+			// these platforms need both arms — notably ENOTEMPTY (Linux 39, BSD 66).
+			errno := int(i32(e))
+			switch errno {
+			case 1:      return "EPERM", errno
+			case 2:      return "ENOENT", errno
+			case 13:     return "EACCES", errno
+			case 17:     return "EEXIST", errno
+			case 20:     return "ENOTDIR", errno
+			case 21:     return "EISDIR", errno
+			case 28:     return "ENOSPC", errno
+			case 30:     return "EROFS", errno
+			case 39, 66: return "ENOTEMPTY", errno
+			case:        return "EIO", 5
+			}
 		}
 	case:
 		return "EIO", 5
@@ -561,10 +598,13 @@ fs_rm_sync_cb :: proc "c" (
 }
 
 // fs.unlinkSync(path) — remove a file or symlink. Unlike rmSync, unlink never
-// removes a directory: POSIX unlink(2) fails with EISDIR there, and Node surfaces
-// that. os.remove would happily rmdir an empty directory, so classify with lstat
-// first. A symlink — even one pointing at a directory — reports .Symlink (not
-// .Directory) under lstat and is correctly unlinked rather than followed.
+// removes a directory; os.remove would happily rmdir an empty one, so classify
+// with lstat first. A symlink — even one pointing at a directory — reports
+// .Symlink (not .Directory) under lstat and is correctly unlinked, not followed.
+// unlink(2) on a directory fails with EISDIR on Linux but EPERM on Darwin/BSD and
+// Windows, so the directory error is branched per platform. lstat failures (a
+// missing path, or a non-directory component → ENOTDIR) keep their real code via
+// fs_os_error_to_code rather than collapsing to ENOENT.
 fs_unlink_sync_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -584,13 +624,22 @@ fs_unlink_sync_cb :: proc "c" (
 
 	info, lstat_err := os.lstat(path_str, context.allocator)
 	if lstat_err != nil {
-		if exception != nil do exception^ = fs_make_error(ctx, "ENOENT", "unlink", path_str, 2)
+		if exception != nil {
+			code, errno_val := fs_os_error_to_code(lstat_err)
+			exception^ = fs_make_error(ctx, code, "unlink", path_str, errno_val)
+		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	is_dir := info.type == .Directory
 	os.file_info_delete(info, context.allocator)
 	if is_dir {
-		if exception != nil do exception^ = fs_make_error(ctx, "EISDIR", "unlink", path_str, 21)
+		if exception != nil {
+			when ODIN_OS == .Linux {
+				exception^ = fs_make_error(ctx, "EISDIR", "unlink", path_str, 21)
+			} else {
+				exception^ = fs_make_error(ctx, "EPERM", "unlink", path_str, 1)
+			}
+		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
@@ -627,7 +676,10 @@ fs_rmdir_sync_cb :: proc "c" (
 
 	info, lstat_err := os.lstat(path_str, context.allocator)
 	if lstat_err != nil {
-		if exception != nil do exception^ = fs_make_error(ctx, "ENOENT", "rmdir", path_str, 2)
+		if exception != nil {
+			code, errno_val := fs_os_error_to_code(lstat_err)
+			exception^ = fs_make_error(ctx, code, "rmdir", path_str, errno_val)
+		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	is_dir := info.type == .Directory
@@ -646,7 +698,7 @@ fs_rmdir_sync_cb :: proc "c" (
 
 // fs.renameSync(oldPath, newPath) — rename/move a path. Thin wrapper over
 // os.rename; the OS error (e.g. ENOENT for a missing source) is mapped to Node's
-// code/errno. Node reports the syscall as "rename" and the source as `path`.
+// code/errno. Node reports the syscall as "rename" with `path`=old and `dest`=new.
 fs_rename_sync_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -668,18 +720,38 @@ fs_rename_sync_cb :: proc "c" (
 
 	if rename_err := os.rename(old_str, new_str); rename_err != nil && exception != nil {
 		code, errno_val := fs_os_error_to_code(rename_err)
-		exception^ = fs_make_error(ctx, code, "rename", old_str, errno_val)
+		exception^ = fs_make_rename_error(ctx, code, old_str, new_str, errno_val)
 	}
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
+// fs_mkdtemp_alphabet is the character set for mkdtempSync's random suffix. Node's
+// exact alphabet is an unspecified implementation detail; [A-Za-z0-9] is filename-
+// safe on every platform and avoids the path separators '/' and '\'.
+@(rodata)
+fs_mkdtemp_alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+// fs_mkdtemp_wants_buffer reports whether the options arg requests a Buffer return
+// ('buffer' or { encoding: 'buffer' }); otherwise mkdtempSync returns a string.
+fs_mkdtemp_wants_buffer :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> bool {
+	enc := value
+	if jsc.JSValueIsObject(ctx, value) {
+		enc = get_named(ctx, cast(jsc.JSObjectRef)value, "encoding")
+	}
+	if enc == nil || !jsc.JSValueIsString(ctx, enc) do return false
+	s, alloc := jsc_value_to_string_or_default(ctx, enc)
+	defer if alloc do delete(s, context.allocator)
+	return s == "buffer"
+}
+
 // fs.mkdtempSync(prefix[, options]) — create a uniquely-named temp directory and
-// return its path. Node appends random characters directly to `prefix`
-// ("/tmp/foo-" -> "/tmp/foo-a1b2c3"). os.make_directory_temp does the create+retry
-// loop for us; it takes a (dir, name-prefix) pair and re-joins them with the OS
-// separator, so splitting `prefix` with filepath.dir/base reproduces
-// "<prefix><random>" for the common case. The random-suffix length is unspecified
-// by Node's contract (callers must not parse it); STD uses 10 chars, Node uses 6.
+// return its path. Node appends exactly six random characters to the LITERAL
+// prefix ("/tmp/foo-" -> "/tmp/foo-a1b2c3"); a '*' in the prefix is kept verbatim.
+// os.make_directory_temp can't be reused: it treats '*' as a placeholder and
+// re-joins a (dir, name) pair with a path separator, neither of which matches
+// Node. So build "<prefix><random>" directly and retry on the rare collision.
+// With { encoding: 'buffer' } (or 'buffer') the path is returned as bytes, modeled
+// as a Uint8Array like the rest of Lava's Buffer surface.
 fs_mkdtemp_sync_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -697,17 +769,55 @@ fs_mkdtemp_sync_cb :: proc "c" (
 	prefix_str, prefix_alloc := jsc_value_to_string_or_default(ctx, args[0])
 	defer if prefix_alloc do delete(prefix_str, context.allocator)
 
-	dir := filepath.dir(prefix_str)
-	base := filepath.base(prefix_str)
-	created, mk_err := os.make_directory_temp(dir, base, context.allocator)
-	if mk_err != nil {
-		if exception != nil {
-			code, errno_val := fs_os_error_to_code(mk_err)
-			exception^ = fs_make_error(ctx, code, "mkdtemp", prefix_str, errno_val)
+	as_buffer := argument_count >= 2 && fs_mkdtemp_wants_buffer(ctx, args[1])
+
+	created: string
+	created_ok := false
+	rand_buf: [6]byte
+	suffix: [6]byte
+	for _ in 0 ..< 64 {
+		crypto.rand_bytes(rand_buf[:])
+		for b, i in rand_buf {
+			suffix[i] = fs_mkdtemp_alphabet[int(b) % len(fs_mkdtemp_alphabet)]
 		}
+		candidate := strings.concatenate({prefix_str, string(suffix[:])}, context.allocator)
+		mk_err := os.make_directory(candidate)
+		if mk_err == nil {
+			created = candidate
+			created_ok = true
+			break
+		}
+		delete(candidate, context.allocator)
+		// EEXIST → collision, try another suffix; anything else (e.g. ENOENT for a
+		// missing parent) is terminal and reported with Node's mkdtemp semantics.
+		code, errno_val := fs_os_error_to_code(mk_err)
+		if code != "EEXIST" {
+			if exception != nil do exception^ = fs_make_error(ctx, code, "mkdtemp", prefix_str, errno_val)
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+	}
+	if !created_ok {
+		if exception != nil do exception^ = fs_make_error(ctx, "EEXIST", "mkdtemp", prefix_str, 17)
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	defer delete(created, context.allocator)
+
+	if as_buffer {
+		// Hand a private copy of the path bytes to JSC as a Uint8Array; the original
+		// `created` is freed by the defer above, the copy by fs_buffer_deallocator.
+		bytes := make([]byte, len(created), context.allocator)
+		copy(bytes, created)
+		array := jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
+			ctx,
+			.Uint8Array,
+			raw_data(bytes),
+			c.size_t(len(bytes)),
+			fs_buffer_deallocator,
+			nil,
+			nil,
+		)
+		return cast(jsc.JSValueRef)array
+	}
 	return js_string_value(ctx, created)
 }
 
