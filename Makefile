@@ -1,5 +1,9 @@
 ODIN ?= odin
+ifeq ($(OS),Windows_NT)
+LAVA ?= build/lava.exe
+else
 LAVA ?= bin/lava
+endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
@@ -57,8 +61,13 @@ build-sqlite-windows:
 	bash ./scripts/build-sqlite-windows.sh
 endif
 
+ifeq ($(OS),Windows_NT)
+build:
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+else
 build:
 	./scripts/build.sh
+endif
 
 run: build
 	@test -n "$(FILE)" || { printf '%s\n' 'usage: make run FILE=app.js'; exit 2; }
