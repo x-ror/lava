@@ -6,8 +6,11 @@
 #   LAVA_BIN              lava binary
 #   TMP_DIR               writable scratch dir (already created)
 #   RUN_LAVA              "1" to compare node vs lava, else node-only
-#   SKIP_KNOWN_LAVA_GAPS  "1" to skip paths listed in KNOWN_GAPS_FILE
-#   KNOWN_GAPS_FILE       optional path to a gaps list (one relative path/line, # comments)
+#
+# Optional (run_case reads these defensively, so suites with no gaps need not
+# set them — important under `set -u`):
+#   SKIP_KNOWN_LAVA_GAPS  "1" to skip paths listed in KNOWN_GAPS_FILE (default 0)
+#   KNOWN_GAPS_FILE       path to a gaps list (one relative path/line, # comments)
 
 run_node_case() {
 	case_file=$1
@@ -55,13 +58,13 @@ compare_case() {
 run_case() {
 	case_file=$1
 	rel_path=${case_file#$ROOT_DIR/}
-	if [ "$RUN_LAVA" = "1" ] && [ "$SKIP_KNOWN_LAVA_GAPS" = "1" ] && [ -n "${KNOWN_GAPS_FILE:-}" ] && [ -f "$KNOWN_GAPS_FILE" ]; then
+	if [ "${RUN_LAVA:-0}" = "1" ] && [ "${SKIP_KNOWN_LAVA_GAPS:-0}" = "1" ] && [ -n "${KNOWN_GAPS_FILE:-}" ] && [ -f "$KNOWN_GAPS_FILE" ]; then
 		if grep -v '^[[:space:]]*#' "$KNOWN_GAPS_FILE" | grep -qx "$rel_path"; then
 			printf 'skip-known-gap %s\n' "$rel_path"
 			return 0
 		fi
 	fi
-	if [ "$RUN_LAVA" = "1" ]; then
+	if [ "${RUN_LAVA:-0}" = "1" ]; then
 		compare_case "$case_file"
 	else
 		run_node_case "$case_file"

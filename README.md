@@ -24,9 +24,13 @@ On macOS, JSC is provided by the `JavaScriptCore` framework and SQLite by the
 system `libsqlite3`; OpenSSL comes from Homebrew (`brew install openssl@3`) and
 `scripts/build.sh` adds its keg-only lib path to the link line.
 
-## Build
+On Windows, Lava keeps third-party native payloads out of git. Run
+`make bootstrap-windows-deps` (or `bash scripts/bootstrap-windows-deps.sh`) to
+fetch JavaScriptCore/WebKit and the SQLite amalgamation into the ignored `.deps/`
+cache. `scripts/build-sqlite-windows.sh` then compiles SQLite into
+`build/sqlite3.lib`; WebKit is linked from `.deps/webkit/bun-webkit/lib`.
 
-The starter CLI does not link JSC yet:
+## Build
 
 ```sh
 make build
@@ -43,7 +47,9 @@ Useful project commands:
 
 ```sh
 make help
+make bootstrap-windows-deps
 make check
+make test-all
 make check-jsc
 make check-native
 make test

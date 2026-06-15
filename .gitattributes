@@ -1,0 +1,30 @@
+# Normalize all text files to LF in the repository, and check them out as LF in
+# the working tree too. The Unix toolchain this project relies on (sh/bash
+# scripts, the Odin build, CI on Linux/macOS) requires LF; pinning eol=lf here
+# overrides per-machine core.autocrlf so a Windows checkout can't reintroduce
+# CRLF (which breaks shebangs and heredocs in the shell scripts).
+* text=auto eol=lf
+
+# Shell scripts must always be LF, even on Windows — a CRLF in the shebang or a
+# heredoc makes them fail under sh/bash.
+*.sh    text eol=lf
+
+# Windows-native scripts use CRLF, which is what cmd.exe/PowerShell expect.
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary assets — never run eol conversion or diff as text.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.gz    binary
+*.zip   binary
+*.tar   binary
+*.lib   binary
+*.exe   binary
+*.dll   binary
+*.dylib binary
+*.so    binary

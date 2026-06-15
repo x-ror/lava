@@ -1,28 +1,19 @@
-bin/
-build/
+# Dependencies and local caches
 node_modules/
-reports/
-
-# Odin `odin test` drops a test binary named after the package in the cwd
-# (repo root for the make test-* targets). Build artifacts, not source.
-/eventloop
-/lava
-
-# Raw upstream test corpus vendored only as copy-source for clean-room ports;
-# the adapted tests live under tests/node-compat/. Do not commit (~25M).
+.deps/
 tests/vendor/
 
-# Provisioned prebuilt JavaScriptCore for the Windows link (bun-webkit, ~245M).
-# Fetched by scripts/fetch-webkit-windows.sh; a build dependency, not source.
-webkit/
-
-# Scratch files written by the Windows JSC smoke (the CI link step and
-# scripts/link-windows-local.sh) at the repo root.
-/smoke.js
-/smoke.out
+# Build outputs
+bin/
+build/
+reports/
 *.bin
+*.dll
+*.dylib
 *.exe
 *.o
 *.so
-*.dylib
-*.dll
+
+# Odin test binaries emitted at the repo root by make test-* targets.
+/eventloop
+/lava
