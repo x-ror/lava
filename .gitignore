@@ -11,6 +11,15 @@ reports/
 # Raw upstream test corpus vendored only as copy-source for clean-room ports;
 # the adapted tests live under tests/node-compat/. Do not commit (~25M).
 tests/vendor/
+
+# Provisioned prebuilt JavaScriptCore for the Windows link (bun-webkit, ~245M).
+# Fetched by scripts/fetch-webkit-windows.sh; a build dependency, not source.
+webkit/
+
+# Scratch files written by the Windows JSC smoke (the CI link step and
+# scripts/link-windows-local.sh) at the repo root.
+/smoke.js
+/smoke.out
 *.bin
 *.exe
 *.o
