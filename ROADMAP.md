@@ -1,6 +1,6 @@
 # Lava roadmap
 
-Status of the Node.js port. Baseline target: Node 22 on JavaScriptCore, with a
+Status of the Node.js port. Baseline target: Node 24 on JavaScriptCore, with a
 native event loop (kqueue / io_uring+epoll / IOCP).
 
 ## Done
