@@ -295,12 +295,11 @@ fs_os_error_to_code :: proc(err: os.Error) -> (code: string, errno_val: int) {
 			// POSIX errno, so map the codes the fs paths actually produce. (Best
 			// effort: the node-compat fs suite does not yet run on Windows CI.)
 			switch i32(e) {
-			case 2, 3:    return "ENOENT", 2    // FILE_NOT_FOUND / PATH_NOT_FOUND
-			case 5:       return "EACCES", 13   // ACCESS_DENIED
-			case 80, 183: return "EEXIST", 17   // FILE_EXISTS / ALREADY_EXISTS
-			case 145:     return "ENOTEMPTY", 41 // DIR_NOT_EMPTY (CRT errno 41 on Win32)
-			case 267:     return "ENOTDIR", 20  // DIRECTORY
-			case:         return "EIO", 5
+			case 2, 3, 267: return "ENOENT", 2  // FILE_NOT_FOUND / PATH_NOT_FOUND / DIRECTORY (libuv maps ERROR_DIRECTORY -> ENOENT)
+			case 5:         return "EACCES", 13 // ACCESS_DENIED
+			case 80, 183:   return "EEXIST", 17 // FILE_EXISTS / ALREADY_EXISTS
+			case 145:       return "ENOTEMPTY", 41 // DIR_NOT_EMPTY (CRT errno 41 on Win32)
+			case:           return "EIO", 5
 			}
 		} else {
 			// Linux + Darwin/BSD: i32(e) is the platform errno, so it is the
@@ -685,7 +684,16 @@ fs_rmdir_sync_cb :: proc "c" (
 	is_dir := info.type == .Directory
 	os.file_info_delete(info, context.allocator)
 	if !is_dir {
-		if exception != nil do exception^ = fs_make_error(ctx, "ENOTDIR", "rmdir", path_str, 20)
+		// rmdir of a non-directory: POSIX reports ENOTDIR, but on Windows
+		// RemoveDirectoryW fails with ERROR_DIRECTORY, which libuv/Node surface as
+		// ENOENT (verified against Node 24 on the Windows CI runner).
+		if exception != nil {
+			when ODIN_OS == .Windows {
+				exception^ = fs_make_error(ctx, "ENOENT", "rmdir", path_str, 2)
+			} else {
+				exception^ = fs_make_error(ctx, "ENOTDIR", "rmdir", path_str, 20)
+			}
+		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
