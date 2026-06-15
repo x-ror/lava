@@ -234,12 +234,14 @@ jobs:
           [ "$code" = "0" ] || { echo "JSC SMOKE FAIL: expected exit 0, got $code"; exit 1; }
           echo "JSC SMOKE PASS"
 
-      # node:fs cross-platform oracle against the JSC-linked lava.exe. This is the
-      # only place fs behavior is gated on Windows: the node-compat suite is
-      # POSIX-path-shaped and does not run here. It validates the Win32
-      # GetLastError -> errno code mapping (fs_os_error_to_code) end to end.
-      - name: node:fs oracle
-        run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-fs-oracle.sh
+      # Every oracle suite supported on Windows (event-loop + node:fs) against the
+      # JSC-linked lava.exe, via the same scripts/run-oracles.sh that `make
+      # test-lava` uses on Linux/macOS. node:sqlite is compiled out on Windows and
+      # the node-compat suite is POSIX-path-shaped, so run-oracles.sh skips both
+      # here; they run on the Linux/macOS jobs. The fs leg validates the Win32
+      # GetLastError -> errno mapping (fs_os_error_to_code) end to end.
+      - name: Oracle suites (event-loop + fs)
+        run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-oracles.sh
 
       # Fetch transport smoke over the real Winsock + select() backend, reusing the
       # build/lava.exe linked above (not `make test-fetch-smoke`, whose `build`

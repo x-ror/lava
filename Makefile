@@ -19,7 +19,7 @@ help:
 	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
 	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
 	@printf '%s\n' '  make test               Run Odin and Node compatibility tests'
-	@printf '%s\n' '  make test-lava          Compare node-compat + event-loop suites through Lava (skips known gaps)'
+	@printf '%s\n' '  make test-lava          Compare every supported oracle suite through Lava (run-oracles.sh)'
 	@printf '%s\n' '  make test-report        Run tests and write benchmark report'
 	@printf '%s\n' '  make test-report-html   Write Node.js vs Lava HTML compatibility report'
 	@printf '%s\n' '  make api-surface        Report Buffer/Crypto API surface differences vs Node'
@@ -134,7 +134,11 @@ test-eventloop-lava: build
 test-fetch-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-fetch-smoke.sh
 
-test-lava: test-compat-lava test-eventloop-lava test-sqlite-lava test-fs-lava
+# test-lava runs every oracle suite the platform supports through one entry point
+# (scripts/run-oracles.sh) — the same script the Windows CI job runs against
+# lava.exe. The per-suite test-*-lava targets above remain for granular runs.
+test-lava: build
+	RUN_LAVA=1 LAVA_BIN="$(LAVA)" ./scripts/run-oracles.sh
 
 fmt:
 	$(ODIN) strip-semicolon cmd/lava
