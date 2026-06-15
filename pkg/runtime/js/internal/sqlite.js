@@ -109,6 +109,35 @@
     );
   }
 
+  // The signed 64-bit range SQLite INTEGER (and thus a bound BigInt) can hold.
+  var I64_MIN = -(2n ** 63n);
+  var I64_MAX = 2n ** 63n - 1n;
+
+  // bindOne binds a single value, enforcing node:sqlite's accepted types. Only
+  // null, number, string, BigInt, and TypedArray/DataView (blob) are bindable;
+  // anything else (undefined, boolean, plain object, symbol, function) throws
+  // instead of being silently coerced. BigInt binds as INTEGER when it fits in
+  // i64, otherwise throws — Node accepts neither a lossy nor an overflowing bind.
+  function bindOne(stmtId, index, value) {
+    var t = typeof value;
+    if (value === null || t === 'number' || t === 'string') {
+      native.bind(stmtId, index, value);
+    } else if (t === 'bigint') {
+      if (value < I64_MIN || value > I64_MAX) {
+        var ov = new TypeError('BigInt value is too large to bind.');
+        ov.code = 'ERR_INVALID_ARG_VALUE';
+        throw ov;
+      }
+      native.bindBigInt(stmtId, index, value.toString());
+    } else if (ArrayBuffer.isView(value)) {
+      native.bind(stmtId, index, value);
+    } else {
+      var err = new TypeError('Provided value cannot be bound to SQLite parameter ' + index + '.');
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+  }
+
   StatementSync.prototype._prime = function (args) {
     this._assertReady();
     // Reset clears any prior row cursor and bindings so the statement can be
@@ -132,11 +161,22 @@
         // An unmatched named parameter binds as NULL, matching node:sqlite (an
         // unbound parameter defaults to NULL rather than raising).
         var value = named && Object.prototype.hasOwnProperty.call(named, key) ? named[key] : null;
-        native.bind(this._stmtId, i + 1, value);
+        bindOne(this._stmtId, i + 1, value);
+      } else if (pos < args.length) {
+        // Anonymous "?" parameter — take the next positional argument. An
+        // explicitly-passed undefined is rejected by bindOne (Node throws).
+        bindOne(this._stmtId, i + 1, args[pos++]);
       } else {
-        // Anonymous "?" parameter — take the next positional argument.
-        native.bind(this._stmtId, i + 1, args[pos++]);
+        // Fewer positional args than placeholders: the trailing ones bind NULL,
+        // matching node:sqlite (which leaves unbound parameters as NULL).
+        native.bind(this._stmtId, i + 1, null);
       }
+    }
+    // Extra positional args beyond the placeholder count: bind one past the end
+    // so SQLite reports "column index out of range" (ERR_SQLITE_ERROR) — the same
+    // way node:sqlite surfaces too many parameters.
+    if (pos < args.length) {
+      bindOne(this._stmtId, count + 1, args[pos]);
     }
   };
 
@@ -175,7 +215,18 @@
     if (!(this instanceof DatabaseSync)) {
       throw new TypeError("Class constructor DatabaseSync cannot be invoked without 'new'");
     }
-    this._id = native.open(String(path));
+    // node:sqlite requires an explicit path (string, Uint8Array, or URL); it does
+    // not default. Reject anything else rather than opening a file literally named
+    // "undefined" (what String(undefined) would produce). A NUL in the path is also
+    // rejected, since it would silently truncate the filename.
+    if (typeof path !== 'string' || path.indexOf('\0') !== -1) {
+      var e = new TypeError(
+        'The "path" argument must be a string, Uint8Array, or URL without null bytes.',
+      );
+      e.code = 'ERR_INVALID_ARG_TYPE';
+      throw e;
+    }
+    this._id = native.open(path);
     this._open = true;
     // Map of live statement id -> true for statements prepared on this connection.
     // Null-proto so a statement id can never collide with an Object.prototype key.

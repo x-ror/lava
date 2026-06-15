@@ -3,6 +3,7 @@ package lava_runtime
 import "base:runtime"
 import "core:c"
 import "core:fmt"
+import "core:strconv"
 import jsc "lava:pkg/jsc"
 import sqlite "lava:pkg/std/sqlite"
 
@@ -23,6 +24,7 @@ make_sqlite_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "finalize", sqlite_finalize_cb)
 	inject_native_function(ctx, bindings, "reset", sqlite_reset_cb)
 	inject_native_function(ctx, bindings, "bind", sqlite_bind_cb)
+	inject_native_function(ctx, bindings, "bindBigInt", sqlite_bind_bigint_cb)
 	inject_native_function(ctx, bindings, "bindParameterCount", sqlite_bind_parameter_count_cb)
 	inject_native_function(ctx, bindings, "bindParameterName", sqlite_bind_parameter_name_cb)
 	inject_native_function(ctx, bindings, "step", sqlite_step_cb)
@@ -291,39 +293,99 @@ sqlite_bind_cb :: proc "c" (
 	index := int(jsc.JSValueToNumber(ctx, args[1], nil))
 	value := args[2]
 
-	// Classify the value up front. (The JSValueType is read once via JSValueGetType
-	// rather than via a chain of JSValueIs* calls.)
+	// js/internal/sqlite.js validates the value type before calling here, so the
+	// bridge only ever sees the bindable types (null/number/string/TypedArray) and
+	// routes BigInt through sqlite_bind_bigint_cb. The default branch stays as a
+	// defensive backstop: undefined, booleans, plain objects, etc. throw rather
+	// than silently coercing (matching node:sqlite).
+	res: sqlite.Result
 	#partial switch jsc.JSValueGetType(ctx, value) {
-	case .Null, .Undefined:
-		sqlite.bind_null(stmt, index)
-	case .Boolean:
-		sqlite.bind_int(stmt, index, bool(jsc.JSValueToBoolean(ctx, value)) ? 1 : 0)
+	case .Null:
+		res = sqlite.bind_null(stmt, index)
 	case .Number:
 		n := jsc.JSValueToNumber(ctx, value, nil)
 		// Whole numbers within the safe-integer range bind as INTEGER, else REAL.
 		if n == f64(i64(n)) && n >= -9007199254740992.0 && n <= 9007199254740992.0 {
-			sqlite.bind_int(stmt, index, i64(n))
+			res = sqlite.bind_int(stmt, index, i64(n))
 		} else {
-			sqlite.bind_double(stmt, index, n)
+			res = sqlite.bind_double(stmt, index, n)
 		}
 	case .String:
 		s, alloc := jsc_value_to_string_or_default(ctx, value)
 		defer if alloc do delete(s, context.allocator)
-		sqlite.bind_text(stmt, index, s)
+		res = sqlite.bind_text(stmt, index, s)
 	case .Object:
 		if jsc.JSValueGetTypedArrayType(ctx, value, nil) != .None {
 			bytes: []byte = nil
 			if view, ok := typed_array_view(ctx, value); ok {
 				bytes = view
 			}
-			sqlite.bind_blob(stmt, index, bytes)
+			res = sqlite.bind_blob(stmt, index, bytes)
 		} else if exception != nil {
 			exception^ = make_js_error(ctx, "unsupported SQLite bind value type")
 		}
 	case:
 		if exception != nil do exception^ = make_js_error(ctx, "unsupported SQLite bind value type")
 	}
+	sqlite_throw_bind_error(ctx, res, exception)
 	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// sqlite_bind_bigint_cb(stmtId, index, decimalString): binds a JS BigInt as a
+// 64-bit INTEGER (matching node:sqlite). The JS wrapper has already range-checked
+// that the value fits in i64 and passes it as a decimal string, so the i64 parse
+// here cannot overflow; a failed parse is treated defensively as a bind error.
+sqlite_bind_bigint_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 3 {
+		if exception != nil do exception^ = make_js_error(ctx, "sqlite bindBigInt requires handle, index and value")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	state := get_state_from_ctx(ctx)
+	args := arguments[:int(argument_count)]
+	stmt := sqlite_get_stmt(state, sqlite_arg_id(ctx, args[0]))
+	if stmt == nil {
+		if exception != nil do exception^ = make_js_error(ctx, "statement is not prepared")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	index := int(jsc.JSValueToNumber(ctx, args[1], nil))
+	s, alloc := jsc_value_to_string_or_default(ctx, args[2])
+	defer if alloc do delete(s, context.allocator)
+	v, ok := strconv.parse_i64(s)
+	if !ok {
+		if exception != nil do exception^ = make_js_error(ctx, "invalid BigInt value")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	sqlite_throw_bind_error(ctx, sqlite.bind_int(stmt, index, v), exception)
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// sqlite_throw_bind_error surfaces a failed bind (e.g. SQLITE_RANGE from an
+// out-of-range index — how node:sqlite reports too many positional params) as a
+// JS Error carrying SQLite's text and the ERR_SQLITE_ERROR code, instead of
+// letting the statement execute with the slot silently unbound.
+sqlite_throw_bind_error :: proc(
+	ctx: jsc.JSContextRef,
+	res: sqlite.Result,
+	exception: ^jsc.JSValueRef,
+) {
+	if res.status == .Ok do return
+	if exception == nil do return
+	// Don't clobber a more specific exception already set by the caller.
+	if exception^ != nil do return
+	msg := len(res.message) > 0 ? res.message : "sqlite bind failed"
+	err := make_js_error(ctx, msg)
+	if jsc.JSValueIsObject(ctx, err) {
+		set_named(ctx, cast(jsc.JSObjectRef)err, "code", js_string_value(ctx, "ERR_SQLITE_ERROR"))
+	}
+	exception^ = err
 }
 
 // sqlite_step_cb(stmtId) -> 0 (row available) | 1 (done). Throws on error.
@@ -392,7 +454,11 @@ sqlite_row_cb :: proc "c" (
 		case .Float:
 			value = jsc.JSValueMakeNumber(ctx, sqlite.column_double(stmt, i))
 		case .Text:
-			value = js_string_value(ctx, sqlite.column_text(stmt, i))
+			// SQLite TEXT may legally contain embedded NULs; build the JS string
+			// from explicit bytes so it isn't truncated at the first NUL (which a
+			// NUL-terminated cstring would do). column_text already returns the
+			// full byte slice via sqlite3_column_bytes.
+			value = js_string_from_bytes(ctx, sqlite.column_text(stmt, i))
 		case .Blob:
 			value = sqlite_blob_to_value(ctx, sqlite.column_blob(stmt, i))
 		case .Null:
