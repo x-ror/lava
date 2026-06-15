@@ -1,15 +1,15 @@
 // Native SQLite for Lava's standard library. On Linux/macOS this links the system
-// libsqlite3 and exposes a small synchronous Odin API (open / exec / prepare /
-// step / column / bind / close) that the runtime's node:sqlite bridge sits on top
-// of. On platforms without a linkable libsqlite3 (Windows in CI, where the runtime
-// is type-checked/codegen-only) the same API compiles but reports
-// `Native_SQLite_Unavailable`.
+// libsqlite3; on Windows it links a statically-compiled sqlite3.lib built from a
+// downloaded amalgamation in .deps/sqlite (see scripts/build-sqlite-windows.sh).
+// All three expose a small synchronous Odin API (open / exec / prepare / step /
+// column / bind / close) that the runtime's node:sqlite bridge sits on top of. On
+// any other platform the same API compiles but reports `Native_SQLite_Unavailable`.
 package sqlite
 
 import "core:c"
 import "core:strings"
 
-SQLITE_AVAILABLE :: ODIN_OS == .Linux || ODIN_OS == .Darwin
+SQLITE_AVAILABLE :: ODIN_OS == .Linux || ODIN_OS == .Darwin || ODIN_OS == .Windows
 
 Status :: enum {
 	Ok,
@@ -60,7 +60,15 @@ unavailable :: proc() -> Result {
 }
 
 when SQLITE_AVAILABLE {
-	foreign import sqlite_lib "system:sqlite3"
+	// `system:` resolves via the linker's library search path. On Linux/Darwin that
+	// is the system libsqlite3 (-lsqlite3 / framework-style); on Windows it is the
+	// statically-built sqlite3.lib placed on LIB by the build (same convention as
+	// JSC's `system:JavaScriptCore.lib` and OpenSSL's `system:libssl.lib`).
+	when ODIN_OS == .Windows {
+		foreign import sqlite_lib "system:sqlite3.lib"
+	} else {
+		foreign import sqlite_lib "system:sqlite3"
+	}
 
 	SQLITE_OK :: 0
 	SQLITE_ROW :: 100

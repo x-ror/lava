@@ -22,14 +22,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 for case_file in "$ROOT_DIR"/tests/std/fs/cases/*.js; do
 	[ -f "$case_file" ] || continue
-	rel=${case_file#$ROOT_DIR/}
-	if [ "$RUN_LAVA" = "1" ]; then
-		printf 'compare %s\n' "$rel"
-		compare_case "$case_file"
-	else
-		printf 'node %s\n' "$rel"
-		"$NODE_BIN" "$case_file"
-	fi
+	run_case "$case_file"
 done
 
 printf '%s\n' 'fs oracle passed'

@@ -104,7 +104,7 @@ jobs:
         run: make test-fetch-smoke
 
   windows:
-    name: Windows (type-check + codegen + eventloop + fs tests)
+    name: Windows (type-check + codegen + eventloop + fs + sqlite tests)
     runs-on: windows-latest
     defaults:
       run:
@@ -149,20 +149,20 @@ jobs:
           mkdir -p build
           odin build cmd/lava -collection:lava=. -build-mode:obj -out:build/lava.obj
 
-      # --- Real link + JSC-backed runtime smoke ---
+      # --- Real link for JSC-backed runtime tests ---
       # JavaScriptCore is provisioned from the Bun project's WebKit fork (static
       # libs; see scripts/fetch-webkit-windows.sh), statically linked into lava.exe,
-      # which then runs a JS file through JavaScriptCore for real on Windows.
+      # which the oracle/fetch suites below run through JavaScriptCore for real.
       - name: Cache JavaScriptCore (bun-webkit)
         id: cache-webkit
         uses: actions/cache@v4
         with:
-          path: webkit
+          path: .deps/webkit
           key: bun-webkit-windows-amd64-${{ env.WEBKIT_TAG }}
 
       - name: Provision JavaScriptCore
         if: steps.cache-webkit.outputs.cache-hit != 'true'
-        run: WEBKIT_TAG="$WEBKIT_TAG" DEST=webkit scripts/fetch-webkit-windows.sh
+        run: WEBKIT_TAG="$WEBKIT_TAG" bash scripts/fetch-webkit-windows.sh
 
       # Set up the MSVC x64 developer environment (LIB/INCLUDE/PATH) so the linker
       # resolves system import libs via $LIB rather than absolute "C:\Program
@@ -172,14 +172,34 @@ jobs:
         with:
           arch: x64
 
-      - name: Windows link + JSC smoke
+      - name: Cache SQLite amalgamation
+        id: cache-sqlite
+        uses: actions/cache@v4
+        with:
+          path: .deps/sqlite
+          key: sqlite-amalgamation-3530200
+
+      - name: Provision SQLite amalgamation
+        if: steps.cache-sqlite.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-sqlite-windows.sh
+
+      # node:sqlite links a statically-built sqlite3.lib (there is no system
+      # libsqlite3 on Windows). Compile the cached amalgamation with the MSVC cl
+      # that msvc-dev-cmd just put on PATH; the link step below adds build/ to LIB so
+      # pkg/std/sqlite's `system:sqlite3.lib` resolves.
+      - name: Build SQLite (static)
+        run: bash scripts/build-sqlite-windows.sh
+
+      - name: Windows link
         run: |
           mkdir -p build
           # Resolve the JSC static libs via the linker's LIB search path rather than
           # a /LIBPATH on the command line, so no path-with-spaces reaches the link
           # line. msvc-dev-cmd already populated LIB with the CRT/SDK dirs.
-          WK_WIN="$(cygpath -w "$PWD/webkit/bun-webkit/lib")"
+          WK_WIN="$(cygpath -w "$PWD/.deps/webkit/bun-webkit/lib")"
           export LIB="$WK_WIN;$LIB"
+          # build/ holds sqlite3.lib (built above); on LIB so `system:sqlite3.lib` resolves.
+          export LIB="$(cygpath -w "$PWD/build");$LIB"
           # OpenSSL (tls.odin foreign-imports libssl.lib/libcrypto.lib). The runner
           # ships OpenSSL; add the dir that actually holds the import libs to LIB.
           OSSL_LIB="$(find '/c/Program Files/OpenSSL' '/c/Program Files/OpenSSL-Win64' -iname 'libssl.lib' 2>/dev/null | head -1 || true)"
@@ -220,27 +240,15 @@ jobs:
           # splits "C:\Program Files\..." → LNK1181).
           odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
             -extra-linker-flags:"$RT_OBJS WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
-          # JSC smoke: prove lava.exe links and JavaScriptCore evaluates JS, and
-          # that a clean script exits 0 — a regression guard against the JSC VM
-          # teardown making the process exit non-zero after an otherwise-correct run.
-          echo 'console.log("jsc-smoke:" + (40 + 2))' > smoke.js
-          set +e
-          ./build/lava.exe run smoke.js > smoke.out 2>&1
-          code=$?
-          set -e
-          echo "lava.exe exit code: $code"
-          echo "--- output ---"; cat smoke.out
-          grep -q "jsc-smoke:42" smoke.out || { echo "JSC SMOKE FAIL: bad output"; exit 1; }
-          [ "$code" = "0" ] || { echo "JSC SMOKE FAIL: expected exit 0, got $code"; exit 1; }
-          echo "JSC SMOKE PASS"
 
-      # Every oracle suite supported on Windows (event-loop + node:fs) against the
-      # JSC-linked lava.exe, via the same scripts/run-oracles.sh that `make
-      # test-lava` uses on Linux/macOS. node:sqlite is compiled out on Windows and
-      # the node-compat suite is POSIX-path-shaped, so run-oracles.sh skips both
-      # here; they run on the Linux/macOS jobs. The fs leg validates the Win32
-      # GetLastError -> errno mapping (fs_os_error_to_code) end to end.
-      - name: Oracle suites (event-loop + fs)
+      # Every oracle suite supported on Windows (event-loop + node:fs + node:sqlite)
+      # against the JSC-linked lava.exe, via the same scripts/run-oracles.sh that
+      # `make test-lava` uses on Linux/macOS. Only the node-compat suite is
+      # POSIX-path-shaped, so run-oracles.sh skips it here; it runs on Linux/macOS.
+      # The fs leg validates the Win32 GetLastError -> errno mapping
+      # (fs_os_error_to_code) end to end; the sqlite leg exercises the statically
+      # linked sqlite3.lib through the node:sqlite bridge.
+      - name: Oracle suites (event-loop + fs + sqlite)
         run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-oracles.sh
 
       # Fetch transport smoke over the real Winsock + select() backend, reusing the

@@ -3,12 +3,14 @@ LAVA ?= bin/lava
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-lava test-report test-report-html api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-all test-lava api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
 	@printf '%s\n' ''
 	@printf '%s\n' '  make build              Build the lava CLI'
+	@printf '%s\n' '  make bootstrap-windows-deps Fetch ignored Windows native deps into .deps/'
+	@printf '%s\n' '  make build-sqlite-windows Build build/sqlite3.lib via MSVC'
 	@printf '%s\n' '  make run FILE=app.js    Run a JavaScript file through lava'
 	@printf '%s\n' '  make eval SOURCE=...    Evaluate JavaScript source through lava'
 	@printf '%s\n' '  make check              Type-check Odin packages'
@@ -19,9 +21,8 @@ help:
 	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
 	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
 	@printf '%s\n' '  make test               Run Odin and Node compatibility tests'
+	@printf '%s\n' '  make test-all           Run unified test script (Odin + oracle suites)'
 	@printf '%s\n' '  make test-lava          Compare every supported oracle suite through Lava (run-oracles.sh)'
-	@printf '%s\n' '  make test-report        Run tests and write benchmark report'
-	@printf '%s\n' '  make test-report-html   Write Node.js vs Lava HTML compatibility report'
 	@printf '%s\n' '  make api-surface        Report Buffer/Crypto API surface differences vs Node'
 	@printf '%s\n' '  make vendor-bun-report  Summarize vendored Bun node compatibility corpus'
 	@printf '%s\n' '  make bun-buffer-report  List vendored Bun buffer tests and adapted ports'
@@ -44,6 +45,17 @@ help:
 	@printf '%s\n' '  RUN_LAVA=1              Compare each case Node-vs-Lava instead of Node-only'
 	@printf '%s\n' '  SKIP_KNOWN_LAVA_GAPS=1  Skip paths listed in the matching known-lava-gaps.txt'
 	@printf '%s\n' '  NODE_BIN=/path/to/node  Override the Node oracle binary'
+
+bootstrap-windows-deps:
+	bash ./scripts/bootstrap-windows-deps.sh
+
+ifeq ($(OS),Windows_NT)
+build-sqlite-windows:
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-sqlite-windows.ps1
+else
+build-sqlite-windows:
+	bash ./scripts/build-sqlite-windows.sh
+endif
 
 build:
 	./scripts/build.sh
@@ -78,13 +90,14 @@ check-jsc:
 check-native:
 	./scripts/check-native-deps.sh
 
-test: test-odin test-eventloop-odin test-sqlite-odin test-compat test-sqlite-node test-fs-node test-eventloop-node
+ifeq ($(OS),Windows_NT)
+test: test-odin test-eventloop-odin test-sqlite-odin
+else
+test: test-all
+endif
 
-test-report:
-	./scripts/report-tests.sh
-
-test-report-html: build
-	./scripts/report-node-vs-lava.sh
+test-all:
+	sh ./scripts/run-tests.sh
 
 api-surface: build
 	./scripts/report-api-surface.sh
@@ -93,7 +106,7 @@ vendor-bun-report:
 	./scripts/report-vendored-bun.sh
 
 bun-buffer-report:
-	./scripts/report-bun-buffer-tests.sh
+	./scripts/report-vendored-bun.sh buffer
 
 test-compat:
 	./scripts/run-node-compat-all.sh
@@ -110,8 +123,13 @@ test-odin:
 test-eventloop-odin:
 	$(ODIN) test pkg/runtime/eventloop
 
+ifeq ($(OS),Windows_NT)
+test-sqlite-odin:
+	powershell -NoProfile -ExecutionPolicy Bypass -Command "if (!(Test-Path 'build/sqlite3.lib')) { Write-Host 'skipping pkg/std/sqlite Odin link test (missing build/sqlite3.lib; run Windows bootstrap/MSVC build first)'; exit 0 }; $$env:LIB = (Resolve-Path 'build').Path + ';' + $$env:LIB; & '$(ODIN)' test pkg/std/sqlite; exit $$LASTEXITCODE"
+else
 test-sqlite-odin:
 	$(ODIN) test pkg/std/sqlite
+endif
 
 test-sqlite-node:
 	./scripts/run-sqlite-oracle.sh

@@ -12,7 +12,7 @@
 set -euo pipefail
 
 WEBKIT_TAG="${WEBKIT_TAG:?set WEBKIT_TAG to an oven-sh/WebKit release tag}"
-DEST="${DEST:-webkit}"
+DEST="${DEST:-.deps/webkit}"
 ASSET="bun-webkit-windows-amd64.tar.gz"
 URL="https://github.com/oven-sh/WebKit/releases/download/${WEBKIT_TAG}/${ASSET}"
 

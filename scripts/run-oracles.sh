@@ -7,8 +7,10 @@ set -eu
 #
 # Platform coverage:
 #   event-loop, node:fs : all platforms (pure-JS / cross-platform behavior).
-#   node:sqlite         : Linux/macOS only — libsqlite3 is compiled out on Windows
-#                         (see SQLITE_AVAILABLE in pkg/std/sqlite/sqlite.odin).
+#   node:sqlite         : all platforms — Linux/macOS link the system libsqlite3,
+#                         Windows links the statically-built sqlite3.lib from the
+#                         cached amalgamation (see SQLITE_AVAILABLE in
+#                         pkg/std/sqlite/sqlite.odin and scripts/build-sqlite-windows.sh).
 #   node-compat suite   : Linux/macOS only — it includes POSIX path cases
 #                         (tests/node-compat/cases/02-fs-path.js).
 #
@@ -24,12 +26,12 @@ esac
 
 SKIP_KNOWN_LAVA_GAPS=1 "$ROOT_DIR/scripts/run-eventloop-oracle.sh"
 "$ROOT_DIR/scripts/run-fs-oracle.sh"
+"$ROOT_DIR/scripts/run-sqlite-oracle.sh"
 
 if [ "$cross_platform_only" = 0 ]; then
-	"$ROOT_DIR/scripts/run-sqlite-oracle.sh"
 	SKIP_KNOWN_LAVA_GAPS=1 "$ROOT_DIR/scripts/run-node-compat-all.sh"
 else
-	printf '%s\n' 'skipping sqlite + node-compat suites (not supported on this platform)'
+	printf '%s\n' 'skipping node-compat suite (POSIX-path-shaped; not supported on this platform)'
 fi
 
 printf '%s\n' 'all supported oracle suites passed'

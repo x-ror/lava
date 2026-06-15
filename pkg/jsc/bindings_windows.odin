@@ -3,13 +3,12 @@ package jsc
 
 import "core:c"
 
-// Links against the WebKit Windows port's JavaScriptCore import library.
+// Links against the WebKit Windows port's JavaScriptCore library.
 //
-// The WebKit Windows build ships `JavaScriptCore.dll` plus the `JavaScriptCore.lib`
-// import library. Make that .lib visible to the linker (via the `LIB` environment
-// variable or `-extra-linker-flags:"/LIBPATH:<dir>"`) and keep `JavaScriptCore.dll`
-// next to `lava.exe` (or on `PATH`) at runtime. If your build uses a different
-// import-library name, edit the path below.
+// The Windows bootstrap keeps the prebuilt WebKit payload outside git under
+// .deps/webkit. Make its lib directory visible to the linker via the `LIB`
+// environment variable (or `-extra-linker-flags:"/LIBPATH:<dir>"`). If your build
+// uses a different library name, edit the path below.
 foreign import jsc_lib "system:JavaScriptCore.lib"
 
 @(default_calling_convention = "c")
