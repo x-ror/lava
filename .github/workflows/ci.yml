@@ -57,6 +57,12 @@ jobs:
       - name: Test (Lava behavior)
         run: make test-lava
 
+      # Real socket transport: start a Node origin and require lava's fetch output
+      # to match Node's, over http://, https:// (TLS), and IPv6 loopback. Excluded
+      # from `make test` because it binds a local port; runs here as its own gate.
+      - name: Fetch transport smoke
+        run: make test-fetch-smoke
+
   macos:
     name: macOS (full build + tests)
     runs-on: macos-latest
@@ -89,6 +95,13 @@ jobs:
 
       - name: Test (Lava behavior)
         run: make test-lava
+
+      # Same fetch smoke as Linux over the Darwin (kqueue + BSD-socket) transport.
+      # macOS's system openssl is LibreSSL, whose `req -addext` may not run, so the
+      # script falls back to HTTP-only cases there; the HTTP/IPv6 transport is the
+      # coverage this adds (Linux still gates the HTTPS/TLS path).
+      - name: Fetch transport smoke
+        run: make test-fetch-smoke
 
   windows:
     name: Windows (type-check + codegen + eventloop tests)
@@ -220,3 +233,11 @@ jobs:
           grep -q "jsc-smoke:42" smoke.out || { echo "JSC SMOKE FAIL: bad output"; exit 1; }
           [ "$code" = "0" ] || { echo "JSC SMOKE FAIL: expected exit 0, got $code"; exit 1; }
           echo "JSC SMOKE PASS"
+
+      # Fetch transport smoke over the real Winsock + select() backend, reusing the
+      # build/lava.exe linked above (not `make test-fetch-smoke`, whose `build`
+      # prerequisite runs the POSIX scripts/build.sh → bin/lava). Drives the same
+      # node-vs-lava cases over a loopback socket; HTTPS cases run only when the
+      # runner's openssl CLI can mint a cert, otherwise the HTTP path still gates.
+      - name: Fetch transport smoke
+        run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" ./scripts/run-fetch-smoke.sh
