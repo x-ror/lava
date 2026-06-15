@@ -4,6 +4,7 @@
 // object and resolves it via node:url. The test exercises whichever the runtime
 // provides and asserts the same observable result, diffed against Node as oracle.
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const { DatabaseSync } = require('node:sqlite');
 
 // sqlite is unavailable on Windows builds (the oracle compares Lava only where it
@@ -14,19 +15,26 @@ if (process.platform !== 'win32') {
     /[/\\]$/,
     '',
   );
-  const dbPath = tmp + '/lava-sqlite-url-test.db';
+  // mkdtempSync (#166) gives the Node oracle and the Lava run their own isolated
+  // directories, so they never collide on a shared db path — this case used to
+  // hard-code one and had to be written idempotently to tolerate a previous run's
+  // leftover file. With an isolated dir the schema setup can be a plain CREATE.
+  const dir = fs.mkdtempSync(tmp + '/lava-sqlite-url-');
+  const dbPath = dir + '/db.sqlite';
   const href = 'file://' + dbPath;
   // Real URL under Node; a WHATWG-shaped object under Lava (no global URL yet).
   const location = typeof URL === 'function' ? new URL(href) : { href: href, protocol: 'file:' };
 
   const db = new DatabaseSync(location);
-  // Idempotent: Lava's fs has no unlinkSync yet (#166), so a previous run's file
-  // may remain — make the case insensitive to that rather than depend on cleanup.
-  db.exec('CREATE TABLE IF NOT EXISTS t (x)');
-  db.exec('DELETE FROM t');
+  db.exec('CREATE TABLE t (x)');
   db.prepare('INSERT INTO t VALUES (7)').run();
   assert.equal(db.prepare('SELECT x FROM t').get().x, 7);
   db.close();
+
+  // Clean teardown now that fs has unlinkSync + rmdirSync (#166); a clean close in
+  // the default rollback-journal mode leaves only the db file behind.
+  fs.unlinkSync(dbPath);
+  fs.rmdirSync(dir);
 }
 
 console.log('ok');

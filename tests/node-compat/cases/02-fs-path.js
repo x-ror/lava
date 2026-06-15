@@ -168,6 +168,120 @@ assert.throws(
   (e) => typeof e.code === 'string' && e.code.length > 0 && typeof e.errno === 'number',
 );
 
+// --- unlinkSync / renameSync / rmdirSync / mkdtempSync (#166) ---
+
+// unlinkSync removes a file; a second unlink throws ENOENT; a non-directory path
+// component throws ENOTDIR (proving lstat errors keep their real code, not a flat
+// ENOENT). unlink on a directory does not fall through to rmdir — it throws, with
+// the platform's native code: EISDIR on Linux, EPERM on Darwin/BSD/Windows.
+const dirUnlinkCode = process.platform === 'linux' ? 'EISDIR' : 'EPERM';
+const unlinkTarget = path.join(scratch, 'to-unlink.txt');
+fs.writeFileSync(unlinkTarget, 'bye');
+fs.unlinkSync(unlinkTarget);
+assert.equal(fs.existsSync(unlinkTarget), false);
+assert.throws(
+  () => fs.unlinkSync(unlinkTarget),
+  (e) => e.code === 'ENOENT' && e.syscall === 'unlink',
+);
+assert.throws(
+  () => fs.unlinkSync(path.join(textFile, 'child')),
+  (e) => e.code === 'ENOTDIR' && e.syscall === 'unlink',
+);
+assert.throws(
+  () => fs.unlinkSync(path.join(scratch, 'nested')),
+  (e) => e.code === dirUnlinkCode && e.syscall === 'unlink',
+);
+
+// renameSync moves a file (round-trips through readFileSync); a missing source
+// throws ENOENT with syscall 'rename' and carries both `path` (old) and `dest`.
+const renameSrc = path.join(scratch, 'rename-src.txt');
+const renameDst = path.join(scratch, 'rename-dst.txt');
+fs.writeFileSync(renameSrc, 'moved');
+fs.renameSync(renameSrc, renameDst);
+assert.equal(fs.existsSync(renameSrc), false);
+assert.equal(fs.readFileSync(renameDst, 'utf8'), 'moved');
+fs.unlinkSync(renameDst);
+const renameMissSrc = path.join(scratch, 'nope-src');
+const renameMissDst = path.join(scratch, 'nope-dst');
+assert.throws(
+  () => fs.renameSync(renameMissSrc, renameMissDst),
+  (e) =>
+    e.code === 'ENOENT' &&
+    e.syscall === 'rename' &&
+    e.path === renameMissSrc &&
+    e.dest === renameMissDst,
+);
+
+// rmdirSync removes an empty directory; ENOTDIR on a file, ENOTEMPTY on a
+// non-empty dir, ENOENT on a missing path.
+const emptyDir = path.join(scratch, 'empty-dir');
+fs.mkdirSync(emptyDir);
+fs.rmdirSync(emptyDir);
+assert.equal(fs.existsSync(emptyDir), false);
+assert.throws(
+  () => fs.rmdirSync(path.join(scratch, 'gone')),
+  (e) => e.code === 'ENOENT' && e.syscall === 'rmdir',
+);
+assert.throws(
+  () => fs.rmdirSync(textFile),
+  (e) => e.code === 'ENOTDIR' && e.syscall === 'rmdir',
+);
+assert.throws(
+  () => fs.rmdirSync(path.join(textFile, 'child')),
+  (e) => e.code === 'ENOTDIR' && e.syscall === 'rmdir',
+);
+assert.throws(
+  () => fs.rmdirSync(scratch),
+  (e) => e.code === 'ENOTEMPTY' && e.syscall === 'rmdir',
+);
+
+// mkdtempSync creates a real, unique directory whose basename starts with the
+// prefix's basename; a non-existent parent throws ENOENT with syscall 'mkdtemp'.
+const tmpDir = fs.mkdtempSync(path.join(scratch, 'tmp-'));
+assert.equal(fs.statSync(tmpDir).isDirectory(), true);
+assert.equal(path.basename(tmpDir).startsWith('tmp-'), true);
+assert.equal(path.dirname(tmpDir), scratch);
+const tmpDir2 = fs.mkdtempSync(path.join(scratch, 'tmp-'));
+assert.notEqual(tmpDir, tmpDir2); // unique suffix per call
+fs.rmdirSync(tmpDir);
+fs.rmdirSync(tmpDir2);
+assert.throws(
+  () => fs.mkdtempSync(path.join(scratch, 'no-such-parent', 'tmp-')),
+  (e) => e.code === 'ENOENT' && e.syscall === 'mkdtemp',
+);
+
+// The prefix is taken literally — a '*' is part of the name, not a placeholder
+// (Node appends random chars to the whole prefix; STD's pattern '*' is NOT used).
+const starDir = fs.mkdtempSync(path.join(scratch, 'lit-*-'));
+assert.equal(path.basename(starDir).startsWith('lit-*-'), true);
+assert.equal(fs.statSync(starDir).isDirectory(), true);
+fs.rmdirSync(starDir);
+
+// { encoding: 'buffer' } (and the 'buffer' shorthand) return the path as bytes,
+// modeled as a Uint8Array (Node's Buffer is a Uint8Array subclass). Decode to a
+// string to verify the path and to clean up.
+const bufDir = fs.mkdtempSync(path.join(scratch, 'buf-'), 'buffer');
+assert.equal(bufDir instanceof Uint8Array, true);
+const bufDirPath = new TextDecoder().decode(bufDir);
+assert.equal(path.basename(bufDirPath).startsWith('buf-'), true);
+assert.equal(fs.statSync(bufDirPath).isDirectory(), true);
+fs.rmdirSync(bufDirPath);
+const objBufDir = fs.mkdtempSync(path.join(scratch, 'obj-'), { encoding: 'buffer' });
+assert.equal(objBufDir instanceof Uint8Array, true);
+fs.rmdirSync(new TextDecoder().decode(objBufDir));
+
+// Paths with spaces and Unicode round-trip through the new ops.
+const spaced = path.join(scratch, 'a dir with spaces');
+fs.mkdirSync(spaced);
+const unicodeFile = path.join(spaced, 'café-日本語.txt');
+fs.writeFileSync(unicodeFile, 'ünïcødé');
+assert.equal(fs.readFileSync(unicodeFile, 'utf8'), 'ünïcødé');
+const unicodeMoved = path.join(spaced, 'rénamed 文件.txt');
+fs.renameSync(unicodeFile, unicodeMoved);
+assert.equal(fs.readFileSync(unicodeMoved, 'utf8'), 'ünïcødé');
+fs.unlinkSync(unicodeMoved);
+fs.rmdirSync(spaced);
+
 // Async writeFile -> readFile round-trip, then recursive cleanup. The sentinel
 // console.log proves the async chain ran (so a silent skip can't pass).
 fs.writeFile(path.join(scratch, 'async.txt'), 'async fs', (writeErr) => {

@@ -104,7 +104,7 @@ jobs:
         run: make test-fetch-smoke
 
   windows:
-    name: Windows (type-check + codegen + eventloop tests)
+    name: Windows (type-check + codegen + eventloop + fs tests)
     runs-on: windows-latest
     defaults:
       run:
@@ -233,6 +233,13 @@ jobs:
           grep -q "jsc-smoke:42" smoke.out || { echo "JSC SMOKE FAIL: bad output"; exit 1; }
           [ "$code" = "0" ] || { echo "JSC SMOKE FAIL: expected exit 0, got $code"; exit 1; }
           echo "JSC SMOKE PASS"
+
+      # node:fs cross-platform oracle against the JSC-linked lava.exe. This is the
+      # only place fs behavior is gated on Windows: the node-compat suite is
+      # POSIX-path-shaped and does not run here. It validates the Win32
+      # GetLastError -> errno code mapping (fs_os_error_to_code) end to end.
+      - name: node:fs oracle
+        run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-fs-oracle.sh
 
       # Fetch transport smoke over the real Winsock + select() backend, reusing the
       # build/lava.exe linked above (not `make test-fetch-smoke`, whose `build`
