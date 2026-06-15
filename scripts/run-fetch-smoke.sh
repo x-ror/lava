@@ -14,6 +14,18 @@ SERVER="$ROOT_DIR/tests/runtime/fetch/server.js"
 CASE="$ROOT_DIR/tests/runtime/fetch/cases.js"
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lava-fetch-smoke.XXXXXX")
 
+# Native-path form for tools that don't understand MSYS/Cygwin paths. On the
+# Windows CI runner this script runs under Git Bash, but the programs it hands
+# cert paths to are native Win32 and reject "/tmp/..." paths: Node
+# (NODE_EXTRA_CA_CERTS and server.js fs.readFileSync) and lava's OpenSSL
+# (SSL_CERT_FILE). `cygpath -w -l` rewrites them to a long "C:\..." form; -l is
+# required because the bare -w form can emit an 8.3 short name (RUNNER~1) that
+# does not resolve when 8.3 generation is disabled on the volume. A no-op on
+# Linux/macOS, where cygpath does not exist and the path is already native.
+winpath() {
+	if command -v cygpath >/dev/null 2>&1; then cygpath -w -l "$1"; else printf '%s' "$1"; fi
+}
+
 cleanup() {
 	[ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null || true
 	rm -rf "$TMP_DIR"
@@ -41,7 +53,7 @@ if command -v openssl >/dev/null 2>&1; then
 		-days 2 -subj "/CN=127.0.0.1" \
 		-addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1; then
 		FETCH_BASE_HTTPS="https://127.0.0.1:$TLS_PORT"
-		export LAVA_TLS_CERT="$TLS_CERT" LAVA_TLS_KEY="$TLS_KEY" LAVA_TLS_PORT="$TLS_PORT"
+		export LAVA_TLS_CERT="$(winpath "$TLS_CERT")" LAVA_TLS_KEY="$(winpath "$TLS_KEY")" LAVA_TLS_PORT="$TLS_PORT"
 		cp "$TLS_CERT" "$TLS_CA"
 		# Mismatched cert: trusted via the same CA bundle, but its SAN is a
 		# different host — so connecting to 127.0.0.1 must fail hostname
@@ -51,7 +63,7 @@ if command -v openssl >/dev/null 2>&1; then
 			-addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; then
 			cat "$TLS_BADCERT" >>"$TLS_CA"
 			FETCH_BASE_HTTPS_BAD="https://127.0.0.1:$TLS_BADPORT"
-			export LAVA_TLS_BADCERT="$TLS_BADCERT" LAVA_TLS_BADKEY="$TLS_BADKEY" LAVA_TLS_BADPORT="$TLS_BADPORT"
+			export LAVA_TLS_BADCERT="$(winpath "$TLS_BADCERT")" LAVA_TLS_BADKEY="$(winpath "$TLS_BADKEY")" LAVA_TLS_BADPORT="$TLS_BADPORT"
 		fi
 	fi
 fi
@@ -82,18 +94,27 @@ fi
 # case to a hostname mismatch rather than an untrusted issuer.
 CA_FILE="$TLS_CA"
 [ -f "$CA_FILE" ] || CA_FILE="$TLS_CERT"
-NODE_EXTRA_CA_CERTS="$CA_FILE" \
+CA_FILE_NATIVE="$(winpath "$CA_FILE")"
+# Compare STDOUT only — the test's contract is the cases' console.log output.
+# stderr is diagnostic noise that diverges per runtime/platform (e.g. Node's
+# "Ignoring extra certs ..." CA-load warning on Windows) and must not fail the
+# comparison; capture it separately so a genuine failure can still be inspected.
+NODE_EXTRA_CA_CERTS="$CA_FILE_NATIVE" \
 	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" \
 	FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" FETCH_BASE_HTTPS_BAD="$FETCH_BASE_HTTPS_BAD" \
-	"$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>&1 || true
-SSL_CERT_FILE="$CA_FILE" \
+	"$NODE_BIN" "$CASE" >"$TMP_DIR/node.out" 2>"$TMP_DIR/node.err" || true
+SSL_CERT_FILE="$CA_FILE_NATIVE" \
 	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" \
 	FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" FETCH_BASE_HTTPS_BAD="$FETCH_BASE_HTTPS_BAD" \
-	"$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>&1 || true
+	"$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>"$TMP_DIR/lava.err" || true
 
 if diff -u "$TMP_DIR/node.out" "$TMP_DIR/lava.out"; then
 	printf '%s\n' 'fetch smoke passed (lava output matches node)'
 else
 	printf '%s\n' 'fetch smoke FAILED: lava output differs from node' >&2
+	printf '%s\n' '--- node stderr ---' >&2
+	cat "$TMP_DIR/node.err" >&2 || true
+	printf '%s\n' '--- lava stderr ---' >&2
+	cat "$TMP_DIR/lava.err" >&2 || true
 	exit 1
 fi
