@@ -3,9 +3,15 @@ package eventloop
 
 import "core:sys/linux"
 import "core:sys/linux/uring"
+import "core:time"
 
-URING_TIMEOUT_USER_DATA :: u64(0)
 URING_WAKEUP_USER_DATA :: u64(1)
+// Sentinel stored in the epoll event-data union for the wakeup-pipe registration.
+// The wakeup is told apart from a watcher by an exact value match, NOT by reading
+// the union's `fd` field and comparing it to the pipe fd: watchers store a `ptr`
+// in the same union, and a watcher pointer whose low 32 bits happen to equal the
+// pipe fd would be misclassified. All-ones is never a valid (canonical) pointer.
+EPOLL_WAKEUP_TOKEN :: ~u64(0)
 
 Platform_Loop :: struct {
 	use_uring:   bool,
@@ -53,7 +59,7 @@ platform_init :: proc(loop: ^Loop) -> bool {
 
 	ev: linux.EPoll_Event
 	ev.events = {.IN}
-	ev.data.fd = loop.platform.wakeup_pipe[0]
+	ev.data.u64 = EPOLL_WAKEUP_TOKEN
 	linux.epoll_ctl(loop.platform.epoll_fd, .ADD, loop.platform.wakeup_pipe[0], &ev)
 
 	return true
@@ -139,37 +145,49 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 
 	events: [32]linux.EPoll_Event
 	n: int
-	errno: linux.Errno
 
-	if timeout_ms < 0 {
-		n_res, err := linux.epoll_wait(
-			loop.platform.epoll_fd,
-			raw_data(events[:]),
-			i32(len(events)),
-			-1,
-		)
-		n, errno = int(n_res), err
-	} else {
-		ts := linux.Time_Spec {
-			time_sec  = uint(timeout_ms / 1000),
-			time_nsec = uint((timeout_ms % 1000) * 1_000_000),
+	// Re-enter on EINTR rather than returning a spurious idle wake: a signal that
+	// interrupts the wait must not be mistaken for "nothing to do". For a finite
+	// timeout the retry waits the REMAINING time (an absolute deadline), so a storm
+	// of signals can neither restart the full interval nor extend it unboundedly.
+	poll_start := time.tick_now()
+	for {
+		res: i32
+		errno: linux.Errno
+		if timeout_ms < 0 {
+			res, errno = linux.epoll_wait(
+				loop.platform.epoll_fd,
+				raw_data(events[:]),
+				i32(len(events)),
+				-1,
+			)
+		} else {
+			remaining := poll_remaining_ms(poll_start, timeout_ms)
+			ts := linux.Time_Spec {
+				time_sec  = uint(remaining / 1000),
+				time_nsec = uint((remaining % 1000) * 1_000_000),
+			}
+			res, errno = linux.epoll_pwait2(
+				loop.platform.epoll_fd,
+				raw_data(events[:]),
+				i32(len(events)),
+				&ts,
+				nil,
+			)
 		}
-		n_res, err := linux.epoll_pwait2(
-			loop.platform.epoll_fd,
-			raw_data(events[:]),
-			i32(len(events)),
-			&ts,
-			nil,
-		)
-		n, errno = int(n_res), err
-	}
 
-	// EINTR is benign — the next tick retries. Any other error is fatal (e.g.
-	// EBADF on a closed epoll fd): flag it so the run drivers stop instead of
-	// busy-spinning on a syscall that can never make progress.
-	if errno != nil && errno != .EINTR {
-		loop.backend_error = true
-		return
+		if errno == .EINTR {
+			continue
+		}
+		// Any other error is fatal (e.g. EBADF on a closed epoll fd): flag it so the
+		// run drivers stop instead of busy-spinning on a syscall that can never make
+		// progress.
+		if errno != nil {
+			loop.backend_error = true
+			return
+		}
+		n = int(res)
+		break
 	}
 
 	if n <= 0 do return
@@ -177,12 +195,12 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 	for i in 0 ..< n {
 		ev := events[i]
 
-		if ev.data.fd == loop.platform.wakeup_pipe[0] {
+		if ev.data.u64 == EPOLL_WAKEUP_TOKEN {
 			drain_wakeup(loop)
 			continue
 		}
 
-		// Обробка мережевого сокету / дескриптора файлу
+		// A registered socket / file-descriptor event.
 		watcher := cast(^IO_Watcher)ev.data.ptr
 		if watcher != nil && watcher.callback != nil {
 			loop.io_events += 1
@@ -197,20 +215,26 @@ platform_poll_uring :: proc(loop: ^Loop, timeout_ms: int) {
 		return
 	}
 
+	// Bound the wait with the timer deadline via io_uring_enter's EXT_ARG timeout
+	// (the same path submit already takes) rather than submitting a separate
+	// IORING_OP_TIMEOUT SQE. The kernel arms and tears the timeout down internally,
+	// so there is no standalone timeout op left pending after an early wake (a
+	// socket completing first) to fire spuriously on a later wait — previously one
+	// of the spurious-wake sources behind the premature-exit class (#72).
+	ts: linux.Time_Spec
+	ts_ptr: ^linux.Time_Spec = nil
 	if timeout_ms > 0 {
-		ts := linux.Time_Spec {
+		ts = linux.Time_Spec {
 			time_sec  = uint(timeout_ms / 1000),
 			time_nsec = uint((timeout_ms % 1000) * 1_000_000),
 		}
-		_, ok := uring.timeout(&loop.platform.ring, URING_TIMEOUT_USER_DATA, &ts, 0, {})
-		if !ok {
-			drain_uring_completions(loop)
-			return
-		}
+		ts_ptr = &ts
 	}
 
-	// Очікуємо на завершення хоча б однієї події в черзі ядра
-	uring.submit(&loop.platform.ring, 1, nil)
+	// Wait for at least one completion (timeout_ms < 0 → ts_ptr nil → block until
+	// one arrives). A timed-out wait returns -ETIME and an interrupted one -EINTR;
+	// both are benign — we just reap whatever completed and let the driver re-enter.
+	uring.submit(&loop.platform.ring, 1, ts_ptr)
 	drain_uring_completions(loop)
 }
 
@@ -222,18 +246,31 @@ drain_uring_completions :: proc(loop: ^Loop) {
 		for i in 0 ..< int(n) {
 			cqe := loop.platform.cqes[i]
 
-			if cqe.user_data == URING_TIMEOUT_USER_DATA {
-				continue
-			}
-
 			if cqe.user_data == URING_WAKEUP_USER_DATA {
 				drain_wakeup(loop)
-				// Re-arm the one-shot poll on the wakeup pipe for the next wakeup.
-				arm_uring_poll(loop, u64(loop.platform.wakeup_pipe[0]), URING_WAKEUP_USER_DATA, {.IN})
+				// Re-arm the one-shot poll on the wakeup pipe for the next wakeup. If
+				// the SQ ring is momentarily full, submit to free slots and retry once
+				// rather than silently dropping the re-arm — otherwise this loop could
+				// never be woken across threads again (post_async could not break a
+				// parked poll). Mirrors the watcher re-arm below.
+				if !arm_uring_poll(
+					loop,
+					u64(loop.platform.wakeup_pipe[0]),
+					URING_WAKEUP_USER_DATA,
+					{.IN},
+				) {
+					uring.submit(&loop.platform.ring, 0, nil)
+					arm_uring_poll(
+						loop,
+						u64(loop.platform.wakeup_pipe[0]),
+						URING_WAKEUP_USER_DATA,
+						{.IN},
+					)
+				}
 				continue
 			}
 
-			// Подія від зареєстрованого асинхронного вочера сокетів
+			// A completion from a registered async socket watcher.
 			watcher := cast(^IO_Watcher)uintptr(cqe.user_data)
 			if watcher != nil && watcher.callback != nil {
 				loop.io_events += 1
@@ -256,7 +293,12 @@ drain_uring_completions :: proc(loop: ^Loop) {
 	}
 }
 
-arm_uring_poll :: proc(loop: ^Loop, fd: u64, user_data: u64, events: linux.Fd_Poll_Events) -> bool {
+arm_uring_poll :: proc(
+	loop: ^Loop,
+	fd: u64,
+	user_data: u64,
+	events: linux.Fd_Poll_Events,
+) -> bool {
 	sqe, ok := uring.get_sqe(&loop.platform.ring)
 	if !ok do return false
 
@@ -264,7 +306,7 @@ arm_uring_poll :: proc(loop: ^Loop, fd: u64, user_data: u64, events: linux.Fd_Po
 	// ring entries and does not zero them.
 	sqe^ = {}
 	sqe.opcode = .POLL_ADD
-	sqe.fd = cast(linux.Fd)fd // явний cast до distinct типу linux.Fd
+	sqe.fd = cast(linux.Fd)fd // explicit cast to the distinct linux.Fd type
 	sqe.user_data = user_data
 	// POLL_ADD reads the interest mask from poll_events; writing it to addr (the
 	// previous behavior) left poll_events zero, so the poll never completed.

@@ -58,55 +58,55 @@ Timer :: struct {
 }
 
 Loop :: struct {
-	backend:         Backend,
-	now_ms:          u64,
-	next_timer_id:   Timer_ID,
-	next_sequence:   u64,
-	next_ticks:      [dynamic]Task,
-	microtasks:      [dynamic]Task,
+	backend:            Backend,
+	now_ms:             u64,
+	next_timer_id:      Timer_ID,
+	next_sequence:      u64,
+	next_ticks:         [dynamic]Task,
+	microtasks:         [dynamic]Task,
 	// Scratch buffers swapped with next_ticks/microtasks while draining, so a
 	// drain reuses capacity instead of allocating a fresh queue every checkpoint
 	// (same double-buffer trick as async_queue/async_scratch). Tasks appended by
 	// callbacks during a drain land in the now-empty live queue.
 	next_ticks_scratch: [dynamic]Task,
 	microtasks_scratch: [dynamic]Task,
-	immediates:      [dynamic]Task,
-	io_callbacks:    [dynamic]Task, // poll-phase completions (e.g. fs.readFile); run before check
-	close_callbacks: [dynamic]Task,
+	immediates:         [dynamic]Task,
+	io_callbacks:       [dynamic]Task, // poll-phase completions (e.g. fs.readFile); run before check
+	close_callbacks:    [dynamic]Task,
 	// timers is a binary min-heap keyed on (due_ms, seq): the root is the earliest
 	// deadline, seq breaking ties to preserve Node's FIFO order for equal due_ms.
 	// Push/pop are O(log n); cancelled entries are removed lazily (skipped/popped
 	// when they reach the root) rather than compacted each tick.
-	timers:          [dynamic]Timer,
+	timers:             [dynamic]Timer,
 	// reffed_timer_count mirrors the number of heap timers that are ref'd and not
 	// cancelled, so pending_count is O(1) instead of walking the heap every tick.
 	// Maintained at every site a timer enters/leaves the heap or flips ref state.
 	reffed_timer_count: int,
-	cancelled_ids:   map[Timer_ID]bool,
-	running_id:      Timer_ID,
-	active_io_count: int,
-	io_events:       u64, // bumped by platform_poll each time a watcher callback fires
+	cancelled_ids:      map[Timer_ID]bool,
+	running_id:         Timer_ID,
+	active_io_count:    int,
+	io_events:          u64, // bumped by platform_poll each time a watcher callback fires
 	// Set by platform_poll when the backend's blocking syscall fails fatally (any
 	// error other than EINTR — e.g. EBADF on a closed epoll/kqueue fd). The run
 	// drivers exit instead of busy-spinning on a syscall that can never make
 	// progress; the flag stays set so an embedder can inspect it after run returns.
-	backend_error:   bool,
-	allocator:       mem.Allocator,
-	platform:        Platform_Loop,
+	backend_error:      bool,
+	allocator:          mem.Allocator,
+	platform:           Platform_Loop,
 	// When set (the lava runtime), now_ms tracks the monotonic wall clock so
 	// timer deadlines elapse in real time. When unset (deterministic Odin tests),
 	// now_ms is a logical clock advanced explicitly via the run drivers.
-	real_time:       bool,
-	start_tick:      time.Tick, // monotonic origin for real_time mode
+	real_time:          bool,
+	start_tick:         time.Tick, // monotonic origin for real_time mode
 	// Cross-thread completion handoff (like libuv's uv_async). A background worker
 	// (e.g. async DNS) runs off the loop, then post_async enqueues a completion
 	// callback under async_mutex and wakes the loop; the loop drains async_queue on
 	// its own thread. active_async (loop-thread only) counts in-flight off-loop ops
 	// so the loop stays alive and blocks in poll until they complete.
-	async_queue:     [dynamic]Task,
-	async_scratch:   [dynamic]Task, // swapped with async_queue under the lock to drain
-	async_mutex:     sync.Mutex,
-	active_async:    int,
+	async_queue:        [dynamic]Task,
+	async_scratch:      [dynamic]Task, // swapped with async_queue under the lock to drain
+	async_mutex:        sync.Mutex,
+	active_async:       int,
 }
 
 Poll_Mode :: enum {
@@ -120,6 +120,13 @@ IO_Watcher :: struct {
 	mode:      Poll_Mode,
 	callback:  Callback,
 	user_data: rawptr,
+	// watched tracks whether this watcher is currently in the loop's registered set.
+	// It is the single source of truth for active_io_count accounting: the watch/
+	// unwatch wrappers count off this flag, not the platform syscall result, so no
+	// backend can desync the count (io_uring's logical-only unwatch, an EPOLL_CTL_DEL
+	// that fails because the fd is already closed, a duplicate watch). Owned by the
+	// wrappers; callers must zero-initialize the watcher (a fresh IO_Watcher literal).
+	watched:   bool,
 }
 
 // init creates a loop. Pass real_time=true (the lava runtime) to have timer
@@ -133,6 +140,22 @@ init :: proc(allocator := context.allocator, real_time := false) -> Loop {
 		cancelled_ids = make(map[Timer_ID]bool, 16, allocator),
 		real_time     = real_time,
 	}
+
+	// Bind every queue to loop.allocator up front. A [dynamic] otherwise adopts the
+	// allocator of whatever context first appends to it — for async_queue that is a
+	// worker thread calling post_async, which would bind the worker's context
+	// allocator (a contract break, and a race against a custom loop allocator)
+	// instead of the loop's. destroy deletes all of these.
+	loop.next_ticks = make([dynamic]Task, allocator)
+	loop.next_ticks_scratch = make([dynamic]Task, allocator)
+	loop.microtasks = make([dynamic]Task, allocator)
+	loop.microtasks_scratch = make([dynamic]Task, allocator)
+	loop.immediates = make([dynamic]Task, allocator)
+	loop.io_callbacks = make([dynamic]Task, allocator)
+	loop.close_callbacks = make([dynamic]Task, allocator)
+	loop.timers = make([dynamic]Timer, allocator)
+	loop.async_queue = make([dynamic]Task, allocator)
+	loop.async_scratch = make([dynamic]Task, allocator)
 
 	if real_time {
 		loop.start_tick = time.tick_now()
@@ -167,6 +190,12 @@ sync_real_clock :: proc(loop: ^Loop) {
 // per live handle: cancelled handles already had theirs run and nulled by
 // clear_timeout, and a fired one-shot freed its own binding, so neither is
 // double-released here.
+//
+// PRECONDITION: every off-loop producer that may call post_async (e.g. fetch's DNS
+// workers) must already be joined. destroy touches async_queue WITHOUT the mutex on
+// the assumption it is the sole surviving accessor; a still-running worker would
+// race the read here and could post into freed memory. The lava runtime enforces
+// this by calling fetch_shutdown_active (which joins the workers) before destroy.
 destroy :: proc(loop: ^Loop) {
 	dispose_pending_tasks(&loop.next_ticks)
 	dispose_pending_tasks(&loop.next_ticks_scratch)
@@ -610,8 +639,12 @@ run_once :: proc(loop: ^Loop) -> bool {
 		did_work = true
 		loop.running_id = timer.id
 		timer.callback(loop, timer.user_data)
-		loop.running_id = 0
+		// Drain microtasks while running_id still names this timer: a task the
+		// callback queued (next_tick/microtask) that clears this very timer must
+		// reach clear_timeout's running-handle branch and record the cancel, or the
+		// re-arm check below misses it and re-arms a cancelled repeating timer.
 		drain_microtasks(loop)
+		loop.running_id = 0
 
 		if timer.repeating && !is_cancel_requested(loop, timer.id) {
 			// Re-armed: stays active, so reffed_timer_count is unchanged.
@@ -652,8 +685,8 @@ run_once :: proc(loop: ^Loop) -> bool {
 		did_work = true
 		loop.running_id = task.id
 		task.callback(loop, task.user_data)
-		loop.running_id = 0
 		drain_microtasks(loop)
+		loop.running_id = 0
 	}
 
 	// Phase 4b: poll — block for I/O only when there is nothing else to do
@@ -664,6 +697,20 @@ run_once :: proc(loop: ^Loop) -> bool {
 		active_close_count(loop) == 0 &&
 		len(loop.next_ticks) == 0 &&
 		len(loop.microtasks) == 0
+
+	if !has_nothing_to_do && (loop.active_io_count > 0 || loop.active_async > 0) {
+		// Other phases still have work this iteration (e.g. a self-rescheduling
+		// setImmediate chain that keeps an immediate perpetually pending), but I/O is
+		// in flight. Block-free poll (timeout 0) so ready socket completions are
+		// drained every iteration and cannot be starved until the chain ends —
+		// matching Node, which runs the poll phase with timeout 0 when other work is
+		// queued. The blocking wait below is only for when there is nothing else to do.
+		io_before := loop.io_events
+		platform_poll(loop, 0)
+		if loop.io_events != io_before {
+			did_work = true
+		}
+	}
 
 	if has_nothing_to_do {
 		timeout_ms := get_next_timer_timeout(loop)
@@ -715,8 +762,8 @@ run_once :: proc(loop: ^Loop) -> bool {
 		did_work = true
 		loop.running_id = immediate.id
 		immediate.callback(loop, immediate.user_data)
-		loop.running_id = 0
 		drain_microtasks(loop)
+		loop.running_id = 0
 	}
 
 	// Phase 6: close callbacks
@@ -1016,11 +1063,37 @@ discard_cancelled_immediates :: proc(loop: ^Loop) {
 	}
 }
 
+// poll_remaining_ms returns the time left until an absolute poll deadline, so a
+// platform_poll re-entering after EINTR waits the REMAINING interval rather than
+// restarting it: a storm of signals can neither restart the full timeout nor
+// extend it unboundedly. A non-positive timeout (0 = non-blocking, <0 = block
+// forever) has no deadline to track and is returned unchanged; a finite timeout
+// returns max(0, timeout_ms - elapsed). Shared by the epoll and kqueue backends.
+poll_remaining_ms :: proc(start: time.Tick, timeout_ms: int) -> int {
+	if timeout_ms <= 0 do return timeout_ms
+	elapsed := int(time.duration_milliseconds(time.tick_since(start)))
+	return max(0, timeout_ms - elapsed)
+}
+
 // --- I/O watcher API ---
 
+// watch_fd registers watcher with the backend and returns whether it is now the
+// caller's freshly-registered watch. RETURN CONTRACT: true means this call moved
+// the watcher into the registered set (and bumped active_io_count). false means
+// "not newly registered" and covers THREE distinct cases the caller cannot tell
+// apart: a nil/callback-less watcher, an already-watched watcher (a benign re-arm,
+// not an error), or a real backend failure. A caller that must react to a genuine
+// registration failure should therefore drive watch_fd off a freshly zeroed
+// watcher (watched == false), so a false return can only mean the backend failed.
+// fetch_set_watch_mode relies on this: it unwatch_fd's first, clearing the flag.
 watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	if watcher == nil || watcher.callback == nil do return false
+	// Already in the registered set: a re-arm, not a new watcher. Do not call the
+	// backend again (io_uring would over-count by arming a duplicate poll) or bump
+	// active_io_count a second time.
+	if watcher.watched do return false
 	if platform_watch_fd(loop, watcher) {
+		watcher.watched = true
 		loop.active_io_count += 1
 		return true
 	}
@@ -1029,11 +1102,18 @@ watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 
 unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	if watcher == nil do return false
-	if platform_unwatch_fd(loop, watcher) {
-		loop.active_io_count = max(0, loop.active_io_count - 1)
-		return true
-	}
-	return false
+	// Only a watcher that is actually registered may decrement the count. A no-op
+	// unwatch (never watched, or already unwatched) must not drift active_io_count
+	// down — a spurious decrement can let the loop exit with I/O still pending.
+	if !watcher.watched do return false
+	// The platform op is best-effort: a failed EPOLL_CTL_DEL (fd already closed →
+	// the kernel auto-removed it) or io_uring's logical-only unwatch must still drop
+	// the count, or has_pending_work stays true forever and the loop parks. The
+	// logical `watched` flag — not the syscall result — drives the accounting.
+	platform_unwatch_fd(loop, watcher)
+	watcher.watched = false
+	loop.active_io_count = max(0, loop.active_io_count - 1)
+	return true
 }
 
 // wakeup allows background worker threads to instantly kick the loop out of sleep.

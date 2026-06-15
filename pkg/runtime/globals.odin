@@ -12,10 +12,10 @@ import eventloop "lava:pkg/runtime/eventloop"
 // object's private data slot (see make_global_class) instead of being exposed
 // to JavaScript, so user code can neither read nor corrupt the loop pointer.
 Runtime_State :: struct {
-	loop:            ^eventloop.Loop,
-	module_cache:    map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
-	builtin_require: jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
-	esm_transform:   jsc.JSValueRef, // js/internal/esm.js transform(source,url,filename,dirname); GC-protected
+	loop:              ^eventloop.Loop,
+	module_cache:      map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
+	builtin_require:   jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
+	esm_transform:     jsc.JSValueRef, // js/internal/esm.js transform(source,url,filename,dirname); GC-protected
 	// Set when an uncaught exception escapes an async callback or a promise
 	// rejects with no handler. The process then exits non-zero even though the
 	// initial JSEvaluateScript returned cleanly (see resolve_exit_code).
@@ -33,6 +33,9 @@ Runtime_State :: struct {
 	// because the io_uring watcher may reference a request once more after it is
 	// stopped; freeing only at destroy keeps that memory valid (see fetch.odin).
 	pending_free:      [dynamic]^Fetch_Request,
+	// Fetches currently owned by this runtime context. Used during abnormal eval
+	// teardown to stop requests and join any DNS worker before the loop/context die.
+	active_fetches:    [dynamic]^Fetch_Request,
 	// node:sqlite handle registries: opaque id -> ^sqlite.Database / ^sqlite.Statement
 	// (kept as rawptr so this struct need not import pkg/std/sqlite). See sqlite.odin.
 	sqlite_dbs:        map[u64]rawptr,
@@ -83,6 +86,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state := new(Runtime_State)
 	state.loop = loop
 	state.module_cache = make(map[string]jsc.JSValueRef)
+	state.active_fetches = make([dynamic]^Fetch_Request)
 	state.sqlite_dbs = make(map[u64]rawptr)
 	state.sqlite_stmts = make(map[u64]rawptr)
 	state.next_sqlite_id = 1
@@ -91,6 +95,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 
 destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	if state == nil do return
+	fetch_shutdown_active(state)
 	fetch_destroy_pending(state)
 	sqlite_destroy_state(state)
 	for key, value in state.module_cache {
@@ -375,6 +380,24 @@ make_js_named_error :: proc(ctx: jsc.JSContextRef, name, message: string) -> jsc
 
 // --- Timer / scheduling callbacks ---
 
+// TIMER_MAX_MS is Node's TIMEOUT_MAX (2^31 - 1): the largest setTimeout/setInterval
+// delay. A delay outside [1, TIMER_MAX_MS] (including NaN/Infinity) clamps to 1ms.
+TIMER_MAX_MS :: 2147483647.0
+// MAX_SAFE_HANDLE_ID bounds a numeric timer/immediate id for the u64() conversion in
+// clear*: ids grow unbounded but stay exactly representable as f64 below 2^53.
+MAX_SAFE_HANDLE_ID :: 9007199254740992.0
+
+// clamp_timer_delay applies Node's [1, 2^31-1] ms clamp to a raw setTimeout/
+// setInterval delay and returns the u64 the event loop expects. Anything < 1
+// (including NaN) or > TIMER_MAX_MS becomes 1 — which also covers two guards:
+// flooring at 1 stops a 0ms timer from busy-spinning the loop and starving pending
+// I/O (and freezing the virtual clock), and the bounded value makes the u64()
+// conversion safe (float→int on NaN/Infinity/out-of-range is undefined in Odin).
+clamp_timer_delay :: proc(delay: f64) -> u64 {
+	if !(delay >= 1 && delay <= TIMER_MAX_MS) do return 1
+	return u64(delay)
+}
+
 set_timeout_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -392,14 +415,16 @@ set_timeout_cb :: proc "c" (
 
 	delay := 0.0
 	if argument_count >= 2 do delay = jsc.JSValueToNumber(ctx, arguments[1], nil)
-	// Node floors timer delays at 1ms (delays < 1 become 1). Besides matching Node,
-	// this prevents a 0ms timer from busy-spinning the loop and starving pending
-	// I/O (and freezing the virtual clock) while a request is in flight.
-	if !(delay >= 1) do delay = 1
 
 	// Trailing args (setTimeout(fn, delay, ...args)) are forwarded on fire.
 	cb := make_js_callback(ctx, fn, false, capture_timer_args(ctx, argument_count, arguments, 2))
-	id := eventloop.set_timeout(loop, js_callback_trampoline, u64(delay), cb, js_callback_dispose)
+	id := eventloop.set_timeout(
+		loop,
+		js_callback_trampoline,
+		clamp_timer_delay(delay),
+		cb,
+		js_callback_dispose,
+	)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
 
@@ -420,12 +445,16 @@ set_interval_cb :: proc "c" (
 
 	interval := 0.0
 	if argument_count >= 2 do interval = jsc.JSValueToNumber(ctx, arguments[1], nil)
-	// Match Node's 1ms floor (and avoid a 0ms interval starving pending I/O).
-	if !(interval >= 1) do interval = 1
 
 	// Trailing args (setInterval(fn, delay, ...args)) are forwarded on every fire.
 	cb := make_js_callback(ctx, fn, true, capture_timer_args(ctx, argument_count, arguments, 2))
-	id := eventloop.set_interval(loop, js_callback_trampoline, u64(interval), cb, js_callback_dispose)
+	id := eventloop.set_interval(
+		loop,
+		js_callback_trampoline,
+		clamp_timer_delay(interval),
+		cb,
+		js_callback_dispose,
+	)
 	return jsc.JSValueMakeNumber(ctx, f64(id))
 }
 
@@ -462,8 +491,14 @@ clear_timer_cb :: proc "c" (
 	loop := get_loop_from_ctx(ctx)
 	if loop == nil || argument_count < 1 do return jsc.JSValueMakeUndefined(ctx)
 
-	id := u64(jsc.JSValueToNumber(ctx, arguments[0], nil))
-	eventloop.clear_timeout(loop, id)
+	// clearTimeout/clearInterval(NaN) (and any non-finite/negative id) is a no-op in
+	// Node — no handle can carry that id. Guard before u64(): float→int on NaN or an
+	// out-of-range value is undefined in Odin and could match an unrelated live id.
+	// Handle ids start at 1 and grow unbounded, but stay f64-exact below 2^53, so the
+	// upper bound is the exact-integer limit, not the timer-delay clamp.
+	n := jsc.JSValueToNumber(ctx, arguments[0], nil)
+	if !(n >= 1 && n <= MAX_SAFE_HANDLE_ID) do return jsc.JSValueMakeUndefined(ctx)
+	eventloop.clear_timeout(loop, u64(n))
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
@@ -663,7 +698,14 @@ install_microtasks :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
 
 	args := [3]jsc.JSValueRef{cast(jsc.JSValueRef)global, process, cast(jsc.JSValueRef)report}
 	exception: jsc.JSValueRef
-	exports := jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)factory, nil, 3, raw_data(args[:]), &exception)
+	exports := jsc.JSObjectCallAsFunction(
+		ctx,
+		cast(jsc.JSObjectRef)factory,
+		nil,
+		3,
+		raw_data(args[:]),
+		&exception,
+	)
 	if exception != nil {
 		report_internal_exception(ctx, "lava:microtasks", exception)
 		return
@@ -900,7 +942,14 @@ install_console :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)out_fn, cast(jsc.JSValueRef)err_fn}
 	exception: jsc.JSValueRef
-	jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)factory, nil, 2, raw_data(args[:]), &exception)
+	jsc.JSObjectCallAsFunction(
+		ctx,
+		cast(jsc.JSObjectRef)factory,
+		nil,
+		2,
+		raw_data(args[:]),
+		&exception,
+	)
 	if exception != nil do report_internal_exception(ctx, "lava:console", exception)
 }
 
@@ -922,11 +971,7 @@ make_native_function :: proc(
 // eval_internal runs a trusted, lava-provided JS snippet (a prelude) and returns
 // its value. Any exception is reported to stderr rather than surfaced to user
 // code; nil is returned in that case.
-eval_internal :: proc(
-	ctx: jsc.JSContextRef,
-	name: string,
-	source: string,
-) -> jsc.JSValueRef {
+eval_internal :: proc(ctx: jsc.JSContextRef, name: string, source: string) -> jsc.JSValueRef {
 	c_source, source_err := strings.clone_to_cstring(source, context.temp_allocator)
 	if source_err != nil do return nil
 	js_source := jsc.JSStringCreateWithUTF8CString(c_source)
@@ -946,11 +991,7 @@ eval_internal :: proc(
 	return value
 }
 
-report_internal_exception :: proc(
-	ctx: jsc.JSContextRef,
-	name: string,
-	exception: jsc.JSValueRef,
-) {
+report_internal_exception :: proc(ctx: jsc.JSContextRef, name: string, exception: jsc.JSValueRef) {
 	msg, allocated := jsc_value_to_string_or_default(ctx, exception)
 	os.write_string(os.stderr, "lava: failed to initialize ")
 	os.write_string(os.stderr, name)

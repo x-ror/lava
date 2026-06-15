@@ -53,6 +53,9 @@ eval_command :: proc(args: []string) {
 	}
 
 	loop := eventloop.init(real_time = true)
+	// eval tears the loop down before its JS context is released (it owns both); see
+	// the destroy call there. Calling destroy here instead would run the handles'
+	// dispose hooks against an already-freed context.
 	result := lava_runtime.eval(args[0], "<eval>", &loop, true)
 	print_result(result)
 	exit_code := result.exit_code
@@ -69,6 +72,8 @@ run_command :: proc(args: []string) {
 	loop := eventloop.init(real_time = true)
 	// args is [scriptPath, ...userArgs]; everything after the script is forwarded to
 	// process.argv.slice(2) (Node parity).
+	// run_file forwards to eval, which tears the loop down before releasing its JS
+	// context (see eval_command).
 	result := lava_runtime.run_file(args[0], &loop, args[1:])
 	print_result(result)
 	exit_code := result.exit_code

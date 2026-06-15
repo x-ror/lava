@@ -61,6 +61,12 @@ release_global_context_after_eval :: proc(ctx: jsc.JSGlobalContextRef) {
 // script's completion value is returned for printing. `lava run` passes false so
 // running a file never echoes a trailing expression value, matching `node file`
 // (and avoiding JSC-version-dependent completion values like `[object Promise]`).
+//
+// OWNERSHIP: a non-nil `loop` is CONSUMED — eval destroys it before returning on
+// EVERY path (a pre-flight input rejection, a thrown top-level exception, or a
+// clean run), and for any path that created handles it does so while the context
+// they are GC-protected against is still alive. Callers must not destroy the loop
+// themselves (a double destroy closes fd 0); they only init it and pass it in.
 eval :: proc(
 	source: string,
 	source_name := "<eval>",
@@ -68,11 +74,17 @@ eval :: proc(
 	echo_result := false,
 	script_args: []string = nil,
 ) -> Result {
+	// eval consumes the loop on EVERY path (see the OWNERSHIP note above). These two
+	// pre-flight rejections return before the JS context (and the deferred teardown
+	// below) exists, so they destroy the loop explicitly. It holds no handles yet, so
+	// this single destroy needs no live context.
 	if len(source) == 0 {
+		if loop != nil do eventloop.destroy(loop)
 		return Result{status = .Invalid_Input, exit_code = 2, message = "empty JavaScript source"}
 	}
 
 	if strings.has_prefix(source_name, "node:") {
+		if loop != nil do eventloop.destroy(loop)
 		return Result {
 			status = .Invalid_Input,
 			exit_code = 2,
@@ -99,6 +111,8 @@ eval :: proc(
 	ctx := jsc.JSGlobalContextCreate(global_class)
 	if ctx == nil {
 		jsc.JSClassRelease(global_class)
+		// Still consume the loop (no context was created, so no handles exist).
+		if loop != nil do eventloop.destroy(loop)
 		return native_runtime_unavailable()
 	}
 	defer jsc.JSClassRelease(global_class)
@@ -117,6 +131,21 @@ eval :: proc(
 	// Runs before the context is released (defers execute in reverse order), so
 	// JSValueUnprotect on cached modules still has a live context.
 	defer destroy_runtime_state(cast(jsc.JSContextRef)ctx, state)
+
+	// eval owns the loop's teardown (see the OWNERSHIP note above). A deferred
+	// destroy — not a tail call after eventloop.run — so that EVERY return once the
+	// context exists tears the loop down: a thrown top-level exception (which may
+	// already have created timers/sockets), an .mjs wrap error, or a source-string
+	// allocation failure would otherwise return the loop alive with GC-protected
+	// callbacks stranded. Declared after destroy_runtime_state so it fires first
+	// (LIFO), and before the context release, so dispose hooks still see a live
+	// context. On abnormal returns it first stops active fetches and joins DNS
+	// workers, so no background thread can post into a destroyed loop/context. On
+	// the success path it runs after eventloop.run returns.
+	defer if loop != nil {
+		fetch_shutdown_active(state)
+		eventloop.destroy(loop)
+	}
 
 	setup_module_environment(cast(jsc.JSContextRef)ctx, source_name, loop)
 
@@ -239,6 +268,8 @@ eval :: proc(
 
 	if loop != nil {
 		eventloop.run(loop)
+		// Loop teardown is the deferred eventloop.destroy declared above — it covers
+		// this success path and every early return once the context exists.
 	}
 
 	exit_code := resolve_exit_code(cast(jsc.JSContextRef)ctx, state)
@@ -284,6 +315,7 @@ run_file :: proc(
 	script_args: []string = nil,
 ) -> Result {
 	if len(path) == 0 {
+		if loop != nil do eventloop.destroy(loop)
 		return Result {
 			status = .Invalid_Input,
 			exit_code = 2,
@@ -293,6 +325,7 @@ run_file :: proc(
 
 	data, err := os.read_entire_file(path, context.allocator)
 	if err != os.ERROR_NONE {
+		if loop != nil do eventloop.destroy(loop)
 		return Result {
 			status = .Read_Error,
 			exit_code = 1,

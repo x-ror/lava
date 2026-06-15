@@ -63,11 +63,12 @@ fetch_transport_start :: proc(
 	// spawn failure we undo it — otherwise the loop would block forever on an
 	// in-flight count that never clears, and the fetch would never settle.
 	eventloop.async_begin(req.loop)
-	worker := thread.create_and_start_with_data(req, fetch_dns_worker, nil, .Normal, true)
+	worker := thread.create_and_start_with_data(req, fetch_dns_worker, nil, .Normal, false)
 	if worker == nil {
 		eventloop.async_cancel(req.loop)
 		return false, "fetch: could not start DNS resolver thread"
 	}
+	req.dns_worker = worker
 	return true, ""
 }
 
@@ -91,6 +92,7 @@ fetch_dns_worker :: proc(data: rawptr) {
 // post_async published the worker's writes.
 fetch_dns_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	req := cast(^Fetch_Request)user_data
+	fetch_release_dns_worker(req)
 	if req == nil || req.settled do return
 	if !req.dns_ok {
 		fetch_settle_error(req, "fetch: could not resolve host")
