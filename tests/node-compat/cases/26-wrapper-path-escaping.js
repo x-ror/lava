@@ -9,7 +9,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const weird = 'we"ird\nname';
+// POSIX allows a quote and newline in a filename — both would break the spliced
+// literal if unescaped. On Windows those are illegal in names, but every path
+// there contains backslashes (the separator), which is the same escaping hazard;
+// an apostrophe adds a quote character that is legal on Windows.
+const weird = process.platform === 'win32' ? "weird'name" : 'we"ird\nname';
 const base = path.join(__dirname, '..', 'fixtures', 'wrapper-escape-tmp');
 const dir = path.join(base, weird);
 fs.mkdirSync(dir, { recursive: true });
