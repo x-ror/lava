@@ -10,63 +10,72 @@ assert.equal(path.extname(fixturePath), '.txt');
 assert.equal(path.isAbsolute(fixturePath), true);
 assert.equal(fs.existsSync(fixturePath), true);
 
-// --- expanded node:path surface (POSIX default on this platform) ---
+// --- expanded node:path surface ---
+// The default path module delegates to the platform flavor: POSIX on
+// Linux/macOS and win32 on Windows (whose behavior is covered by the
+// path.win32.* assertions below). Assert the platform separators here; the
+// concrete POSIX path vectors run on POSIX.
+const isWin = process.platform === 'win32';
+if (isWin) {
+  assert.equal(path.sep, '\\');
+  assert.equal(path.delimiter, ';');
+} else {
+  assert.equal(path.sep, '/');
+  assert.equal(path.delimiter, ':');
 
-assert.equal(path.sep, '/');
-assert.equal(path.delimiter, ':');
+  // dirname / basename / extname
+  assert.equal(path.dirname('/a/b/c.js'), '/a/b');
+  assert.equal(path.dirname('/a/b/'), '/a');
+  assert.equal(path.dirname('foo'), '.');
+  assert.equal(path.dirname('/'), '/');
+  assert.equal(path.basename('/a/b/c.js'), 'c.js');
+  assert.equal(path.basename('/a/b/c.js', '.js'), 'c');
+  assert.equal(path.basename('/a/b/'), 'b');
+  assert.equal(path.extname('index.html'), '.html');
+  assert.equal(path.extname('a.b.c'), '.c');
+  assert.equal(path.extname('.gitignore'), '');
+  assert.equal(path.extname('noext'), '');
 
-// dirname / basename / extname
-assert.equal(path.dirname('/a/b/c.js'), '/a/b');
-assert.equal(path.dirname('/a/b/'), '/a');
-assert.equal(path.dirname('foo'), '.');
-assert.equal(path.dirname('/'), '/');
-assert.equal(path.basename('/a/b/c.js'), 'c.js');
-assert.equal(path.basename('/a/b/c.js', '.js'), 'c');
-assert.equal(path.basename('/a/b/'), 'b');
-assert.equal(path.extname('index.html'), '.html');
-assert.equal(path.extname('a.b.c'), '.c');
-assert.equal(path.extname('.gitignore'), '');
-assert.equal(path.extname('noext'), '');
+  // normalize
+  assert.equal(path.normalize('/foo/bar//baz/asdf/quux/..'), '/foo/bar/baz/asdf');
+  assert.equal(path.normalize('a/b/../c'), 'a/c');
+  assert.equal(path.normalize('a/../../b'), '../b');
+  assert.equal(path.normalize('foo/bar/'), 'foo/bar/');
+  assert.equal(path.normalize(''), '.');
 
-// normalize
-assert.equal(path.normalize('/foo/bar//baz/asdf/quux/..'), '/foo/bar/baz/asdf');
-assert.equal(path.normalize('a/b/../c'), 'a/c');
-assert.equal(path.normalize('a/../../b'), '../b');
-assert.equal(path.normalize('foo/bar/'), 'foo/bar/');
-assert.equal(path.normalize(''), '.');
+  // join
+  assert.equal(path.join('a', 'b', 'c'), 'a/b/c');
+  assert.equal(path.join('/a', 'b', '..', 'c'), '/a/c');
+  assert.equal(path.join('a', '', 'b'), 'a/b');
+  assert.equal(path.join(), '.');
 
-// join
-assert.equal(path.join('a', 'b', 'c'), 'a/b/c');
-assert.equal(path.join('/a', 'b', '..', 'c'), '/a/c');
-assert.equal(path.join('a', '', 'b'), 'a/b');
-assert.equal(path.join(), '.');
+  // resolve (anchored to an absolute first arg so it is cwd-independent)
+  assert.equal(path.resolve('/foo/bar', './baz'), '/foo/bar/baz');
+  assert.equal(path.resolve('/foo/bar', '../baz'), '/foo/baz');
+  assert.equal(path.resolve('/a', '/b', 'c'), '/b/c');
+  // a relative resolve is rooted at cwd; assert its shape, not the absolute prefix
+  const rel = path.resolve('x', 'y');
+  assert.equal(path.isAbsolute(rel), true);
+  assert.equal(rel.endsWith('/x/y'), true);
 
-// resolve (anchored to an absolute first arg so it is cwd-independent)
-assert.equal(path.resolve('/foo/bar', './baz'), '/foo/bar/baz');
-assert.equal(path.resolve('/foo/bar', '../baz'), '/foo/baz');
-assert.equal(path.resolve('/a', '/b', 'c'), '/b/c');
-// a relative resolve is rooted at cwd; assert its shape, not the absolute prefix
-const rel = path.resolve('x', 'y');
-assert.equal(path.isAbsolute(rel), true);
-assert.equal(rel.endsWith('/x/y'), true);
+  // relative
+  assert.equal(path.relative('/a/b/c', '/a/b/d'), '../d');
+  assert.equal(path.relative('/a/b', '/a/b/c/d'), 'c/d');
+  assert.equal(path.relative('/a/b/c/d', '/a/b'), '../..');
+  assert.equal(path.relative('/a/b', '/a/b'), '');
 
-// relative
-assert.equal(path.relative('/a/b/c', '/a/b/d'), '../d');
-assert.equal(path.relative('/a/b', '/a/b/c/d'), 'c/d');
-assert.equal(path.relative('/a/b/c/d', '/a/b'), '../..');
-assert.equal(path.relative('/a/b', '/a/b'), '');
-
-// parse / format round-trip
-const parsed = path.parse('/home/user/file.txt');
-assert.deepEqual(parsed, {
-  root: '/',
-  dir: '/home/user',
-  base: 'file.txt',
-  ext: '.txt',
-  name: 'file',
-});
-assert.equal(path.format(parsed), '/home/user/file.txt');
-assert.equal(path.format({ dir: '/a', base: 'b.js' }), '/a/b.js');
+  // parse / format round-trip
+  const parsed = path.parse('/home/user/file.txt');
+  assert.deepEqual(parsed, {
+    root: '/',
+    dir: '/home/user',
+    base: 'file.txt',
+    ext: '.txt',
+    name: 'file',
+  });
+  assert.equal(path.format(parsed), '/home/user/file.txt');
+  assert.equal(path.format({ dir: '/a', base: 'b.js' }), '/a/b.js');
+}
 
 // posix and win32 are always reachable as sub-namespaces
 assert.equal(path.posix.join('a', 'b'), 'a/b');
@@ -108,7 +117,8 @@ assert.equal(fs.readdirSync(fixturesDir).includes('hello.txt'), true);
 
 // Writes go to a pid-namespaced scratch dir so the node and lava runs never
 // collide; each run creates it fresh and removes it at the end.
-const scratch = path.join(process.env.TMPDIR || '/tmp', 'lava-fs-compat-' + process.pid);
+const tmpBase = process.env.TMPDIR || process.env.TEMP || process.env.TMP || '/tmp';
+const scratch = path.join(tmpBase, 'lava-fs-compat-' + process.pid);
 fs.rmSync(scratch, { recursive: true, force: true });
 
 // mkdirSync (recursive) then a non-recursive mkdir on an existing dir throws.
@@ -137,7 +147,7 @@ assert.throws(
 );
 assert.throws(
   () => fs.readFileSync(path.join(scratch, 'nope')),
-  (e) => e.code === 'ENOENT' && e.syscall === 'open' && e.path.endsWith('/nope'),
+  (e) => e.code === 'ENOENT' && e.syscall === 'open' && e.path.endsWith(path.sep + 'nope'),
 );
 
 // readFileSync with {encoding} object form returns a string.
@@ -171,10 +181,12 @@ assert.throws(
 // --- unlinkSync / renameSync / rmdirSync / mkdtempSync (#166) ---
 
 // unlinkSync removes a file; a second unlink throws ENOENT; a non-directory path
-// component throws ENOTDIR (proving lstat errors keep their real code, not a flat
-// ENOENT). unlink on a directory does not fall through to rmdir — it throws, with
-// the platform's native code: EISDIR on Linux, EPERM on Darwin/BSD/Windows.
+// component throws ENOTDIR on POSIX (proving lstat errors keep their real code,
+// not a flat ENOENT); Windows reports ENOENT for a file used as a path component.
+// unlink on a directory does not fall through to rmdir — it throws, with the
+// platform's native code: EISDIR on Linux, EPERM on Darwin/BSD/Windows.
 const dirUnlinkCode = process.platform === 'linux' ? 'EISDIR' : 'EPERM';
+const notDirCode = isWin ? 'ENOENT' : 'ENOTDIR';
 const unlinkTarget = path.join(scratch, 'to-unlink.txt');
 fs.writeFileSync(unlinkTarget, 'bye');
 fs.unlinkSync(unlinkTarget);
@@ -185,7 +197,7 @@ assert.throws(
 );
 assert.throws(
   () => fs.unlinkSync(path.join(textFile, 'child')),
-  (e) => e.code === 'ENOTDIR' && e.syscall === 'unlink',
+  (e) => e.code === notDirCode && e.syscall === 'unlink',
 );
 assert.throws(
   () => fs.unlinkSync(path.join(scratch, 'nested')),
@@ -224,11 +236,11 @@ assert.throws(
 );
 assert.throws(
   () => fs.rmdirSync(textFile),
-  (e) => e.code === 'ENOTDIR' && e.syscall === 'rmdir',
+  (e) => e.code === notDirCode && e.syscall === 'rmdir',
 );
 assert.throws(
   () => fs.rmdirSync(path.join(textFile, 'child')),
-  (e) => e.code === 'ENOTDIR' && e.syscall === 'rmdir',
+  (e) => e.code === notDirCode && e.syscall === 'rmdir',
 );
 assert.throws(
   () => fs.rmdirSync(scratch),
@@ -252,10 +264,14 @@ assert.throws(
 
 // The prefix is taken literally — a '*' is part of the name, not a placeholder
 // (Node appends random chars to the whole prefix; STD's pattern '*' is NOT used).
-const starDir = fs.mkdtempSync(path.join(scratch, 'lit-*-'));
-assert.equal(path.basename(starDir).startsWith('lit-*-'), true);
-assert.equal(fs.statSync(starDir).isDirectory(), true);
-fs.rmdirSync(starDir);
+// POSIX-only: '*' is an illegal filename character on Windows, so such a name
+// cannot be created there at all.
+if (!isWin) {
+  const starDir = fs.mkdtempSync(path.join(scratch, 'lit-*-'));
+  assert.equal(path.basename(starDir).startsWith('lit-*-'), true);
+  assert.equal(fs.statSync(starDir).isDirectory(), true);
+  fs.rmdirSync(starDir);
+}
 
 // { encoding: 'buffer' } (and the 'buffer' shorthand) return the path as bytes,
 // modeled as a Uint8Array (Node's Buffer is a Uint8Array subclass). Decode to a

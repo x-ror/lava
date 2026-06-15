@@ -39,17 +39,24 @@ async function main() {
     );
   }
 
-  // --- fileURLToPath: non-localhost host rejected ---
-  {
+  // --- fileURLToPath: host + absolute-path semantics are platform-specific ---
+  // POSIX: a non-localhost host is invalid; a drive-less "/foo/bar" is the path.
+  // Windows: a host is a UNC share (\\server\share); a path needs a drive letter
+  // (file:///C:/x -> C:\x), so a drive-less "/foo/bar" is not absolute.
+  if (process.platform === 'win32') {
+    assert.equal(url.fileURLToPath('file://server/share/x'), '\\\\server\\share\\x');
+    assert.equal(url.fileURLToPath('file:///C:/foo/bar'), 'C:\\foo\\bar');
+    assert.throws(
+      () => url.fileURLToPath('file:///foo/bar'),
+      (e) => e.code === 'ERR_INVALID_FILE_URL_PATH',
+      'drive-less path must throw ERR_INVALID_FILE_URL_PATH on Windows',
+    );
+  } else {
     assert.throws(
       () => url.fileURLToPath('file://evil.com/x'),
       (e) => e.code === 'ERR_INVALID_FILE_URL_HOST',
       'non-localhost host must throw ERR_INVALID_FILE_URL_HOST',
     );
-  }
-
-  // --- fileURLToPath: localhost and empty host accepted ---
-  {
     assert.equal(url.fileURLToPath('file:///foo/bar'), '/foo/bar');
     assert.equal(url.fileURLToPath('file://localhost/foo/bar'), '/foo/bar');
   }
