@@ -53,6 +53,9 @@
     // as BigInt (node:sqlite setReadBigInts). Default false: out-of-range column
     // reads throw ERR_OUT_OF_RANGE rather than silently losing precision.
     this._readBigInts = false;
+    // When false (default), a key on a named-parameter object that matches no
+    // placeholder throws (node:sqlite setAllowUnknownNamedParameters).
+    this._allowUnknownNamedParameters = false;
     // Track the live statement on its database so db.close() can finalize it.
     db._stmts[stmtId] = true;
     if (stmtFinalizers) {
@@ -96,6 +99,12 @@
   StatementSync.prototype.setReadBigInts = function (enabled) {
     this._readBigInts = !!enabled;
   };
+
+  // setAllowUnknownNamedParameters(enabled): when enabled, extra keys on a named-
+  // parameter object are ignored instead of throwing. Matches node:sqlite.
+  StatementSync.prototype.setAllowUnknownNamedParameters = function (enabled) {
+    this._allowUnknownNamedParameters = !!enabled;
+  };
   if (disposeSymbol) {
     StatementSync.prototype[disposeSymbol] = StatementSync.prototype._finalize;
   }
@@ -130,7 +139,15 @@
       }
       native.bindBigInt(stmtId, index, value.toString());
     } else if (ArrayBuffer.isView(value)) {
-      native.bind(stmtId, index, value);
+      // TypedArray/DataView bind as a BLOB. A DataView isn't a JSC "typed array",
+      // so view it as a Uint8Array over the same bytes for the native blob path.
+      // A bare ArrayBuffer is intentionally NOT accepted here — node:sqlite rejects
+      // it too (only views are bindable).
+      var view =
+        value instanceof DataView
+          ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+          : value;
+      native.bind(stmtId, index, view);
     } else {
       var err = new TypeError('Provided value cannot be bound to SQLite parameter ' + index + '.');
       err.code = 'ERR_INVALID_ARG_TYPE';
@@ -153,11 +170,15 @@
 
     var count = native.bindParameterCount(this._stmtId);
     var pos = posStart;
+    // Names the statement actually declares (sigil stripped), so we can reject any
+    // extra key on the named-parameter object below.
+    var known = named ? Object.create(null) : null;
     for (var i = 0; i < count; i++) {
       var name = native.bindParameterName(this._stmtId, i + 1);
       if (name) {
         // Strip the leading sigil (":" / "@" / "$") to get the object key.
         var key = name.slice(1);
+        if (known) known[key] = true;
         // An unmatched named parameter binds as NULL, matching node:sqlite (an
         // unbound parameter defaults to NULL rather than raising).
         var value = named && Object.prototype.hasOwnProperty.call(named, key) ? named[key] : null;
@@ -170,6 +191,20 @@
         // Fewer positional args than placeholders: the trailing ones bind NULL,
         // matching node:sqlite (which leaves unbound parameters as NULL).
         native.bind(this._stmtId, i + 1, null);
+      }
+    }
+    // A key on the named-parameter object that maps to no placeholder is almost
+    // always a typo that would otherwise run with a value silently dropped, so
+    // node:sqlite throws ERR_INVALID_STATE unless setAllowUnknownNamedParameters
+    // was enabled. (Missing keys are fine — they bind NULL above.)
+    if (named && !this._allowUnknownNamedParameters) {
+      var keys = Object.keys(named);
+      for (var k = 0; k < keys.length; k++) {
+        if (!known[keys[k]]) {
+          var unknown = new Error("Unknown named parameter '" + keys[k] + "'");
+          unknown.code = 'ERR_INVALID_STATE';
+          throw unknown;
+        }
       }
     }
     // Extra positional args beyond the placeholder count: bind one past the end
@@ -211,22 +246,48 @@
     };
   };
 
-  function DatabaseSync(path) {
-    if (!(this instanceof DatabaseSync)) {
-      throw new TypeError("Class constructor DatabaseSync cannot be invoked without 'new'");
-    }
-    // node:sqlite requires an explicit path (string, Uint8Array, or URL); it does
-    // not default. Reject anything else rather than opening a file literally named
-    // "undefined" (what String(undefined) would produce). A NUL in the path is also
-    // rejected, since it would silently truncate the filename.
-    if (typeof path !== 'string' || path.indexOf('\0') !== -1) {
+  // normalizePath resolves the accepted node:sqlite location types to a filesystem
+  // path string: a string as-is, a Uint8Array/Buffer decoded as UTF-8 path bytes,
+  // and a WHATWG file: URL via node:url. Anything else (including a bare object or
+  // undefined) throws ERR_INVALID_ARG_TYPE rather than opening a file named
+  // "undefined" (what String(undefined) would produce). The path may not contain a
+  // NUL, which would silently truncate the filename.
+  function normalizePath(path) {
+    var resolved;
+    if (typeof path === 'string') {
+      resolved = path;
+    } else if (path instanceof Uint8Array) {
+      resolved = new TextDecoder().decode(path);
+    } else if (
+      path !== null &&
+      typeof path === 'object' &&
+      typeof path.href === 'string' &&
+      typeof path.protocol === 'string'
+    ) {
+      // A URL object — only a file: URL names a path (fileURLToPath rejects others).
+      resolved = require('node:url').fileURLToPath(path.href);
+    } else {
       var e = new TypeError(
         'The "path" argument must be a string, Uint8Array, or URL without null bytes.',
       );
       e.code = 'ERR_INVALID_ARG_TYPE';
       throw e;
     }
-    this._id = native.open(path);
+    if (resolved.indexOf('\0') !== -1) {
+      var nul = new TypeError(
+        'The "path" argument must be a string, Uint8Array, or URL without null bytes.',
+      );
+      nul.code = 'ERR_INVALID_ARG_TYPE';
+      throw nul;
+    }
+    return resolved;
+  }
+
+  function DatabaseSync(path) {
+    if (!(this instanceof DatabaseSync)) {
+      throw new TypeError("Class constructor DatabaseSync cannot be invoked without 'new'");
+    }
+    this._id = native.open(normalizePath(path));
     this._open = true;
     // Map of live statement id -> true for statements prepared on this connection.
     // Null-proto so a statement id can never collide with an Object.prototype key.
