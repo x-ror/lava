@@ -49,7 +49,11 @@ mkdir -p build
 # nor the exported Windows PATH. CI runs this script directly under its bash shell.
 "$BASH" scripts/build-sqlite-windows.sh
 
-# JSC static libs (bun-webkit) + build/ (sqlite3.lib), Windows paths, prepended to LIB.
+# Compile the JSC init shim to build/jsc_init.lib (pkg/jsc/jsc_init_windows.cpp).
+# It needs the bun-webkit headers; build/ is on LIB below so the link resolves it.
+"$BASH" scripts/build-jsc-init-windows.sh
+
+# JSC static libs (bun-webkit) + build/ (sqlite3.lib, jsc_init.lib), Windows paths, prepended to LIB.
 WK_DIR="${WEBKIT_DIR:-.deps/webkit/bun-webkit}"
 [ -d "$WK_DIR/lib" ] || { echo "missing $WK_DIR/lib (run WEBKIT_TAG=<tag> scripts/fetch-webkit-windows.sh)"; exit 1; }
 WK_WIN="$(cygpath -w "$PWD/$WK_DIR/lib")"

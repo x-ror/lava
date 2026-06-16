@@ -190,6 +190,13 @@ jobs:
       - name: Build SQLite (static)
         run: bash scripts/build-sqlite-windows.sh
 
+      # JSC init shim (pkg/jsc/jsc_init_windows.cpp -> build/jsc_init.lib). Calls
+      # JSC's one-time process bring-up (WTF main thread + JSC::initialize) that a
+      # statically-linked JSC never performs; without it the JIT/GC threads corrupt
+      # memory mid-execution on Windows (0xC0000409). build/ is on LIB at link.
+      - name: Build JSC init shim (static)
+        run: bash scripts/build-jsc-init-windows.sh
+
       - name: Windows link
         run: |
           mkdir -p build

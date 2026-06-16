@@ -105,13 +105,12 @@ eval :: proc(
 	// context.allocator, so nothing returned escapes through the temp arena.
 	defer free_all(context.temp_allocator)
 
-	// Pin JSC engine options before the first JSGlobalContextCreate (JSC reads its
-	// JSC_* options when it initializes at first VM creation). On Windows concurrent
-	// JIT — compiling on a background thread while the main thread runs — crashes the
-	// process mid-execution under a heavy JS workload (0xC0000409, surfaced as exit
-	// 127); compiling JIT synchronously (JIT stays on) removes the race. No-op
-	// elsewhere, where concurrent JIT is stable and faster.
-	configure_jsc_options()
+	// Configure JSC before the first JSGlobalContextCreate. On Windows this disables
+	// the (buggy on this bun-webkit build) baseline JIT tier and runs JSC's proper
+	// process bring-up — without it, heavy JS corrupts memory mid-execution
+	// (0xC0000409, surfaced as exit 127). See pkg/jsc/jsc_init_windows.cpp for the
+	// full rationale. Idempotent; a no-op on Linux/macOS.
+	jsc.lava_jsc_init()
 
 	// A custom global class gives the global object a private-data slot, where we
 	// stash Runtime_State (loop + module cache) out of reach of user JavaScript.
