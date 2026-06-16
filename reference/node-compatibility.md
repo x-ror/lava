@@ -13,8 +13,8 @@ Coverage of the Node.js public API surface in **lava**.
 | Status | Count | Modules / surfaces |
 |--------|------:|--------------------|
 | ✅ Full | 7 | assert, buffer, events, intl*, path, sqlite, url |
-| 🟡 Partial | 14 | console, crypto, esm, fs, globals, module/modules, packages, perf_hooks, process, timers, util, webcrypto, environment_variables |
-| 🟥 Missing | 39 | net, http(s), http2, stream, dns, dgram, tls, os, zlib, child_process, worker_threads, querystring, string_decoder, async_hooks, readline, repl, vm, v8, test, webstreams, … |
+| 🟡 Partial | 15 | console, crypto, esm, fs, globals, module/modules, packages, perf_hooks, process, timers, util, webcrypto, webstreams, environment_variables |
+| 🟥 Missing | 38 | net, http(s), http2, stream, dns, dgram, tls, os, zlib, child_process, worker_threads, querystring, string_decoder, async_hooks, readline, repl, vm, v8, test, … |
 | ⚪ N/A | 10 | addons, cli, debugger, deprecations, documentation, embedding, errors, index, n-api, synopsis |
 
 \* `intl` is provided by the JavaScriptCore engine, not by lava code.
@@ -42,7 +42,7 @@ Coverage of the Node.js public API surface in **lava**.
 | **http** | ❌ | 🟥 | — | `request`, `createServer`, `Agent` (fetch covers the client side — GET/POST, streaming response bodies, buffered streaming request bodies) | — |
 | **https** | ❌ | 🟥 | — | same as http over TLS | — |
 | **http2** | ❌ | 🟥 | — | entire module | — |
-| **stream** | ❌ | 🟥 | — | Readable/Writable/Duplex/Transform, `pipeline`, `finished` (a fetch-internal `ReadableStream` backs `response.body`, but `node:stream` and the web-stream globals are still unexposed) | — |
+| **stream** | ❌ | 🟥 | — | Node `Readable`/`Writable`/`Duplex`/`Transform`, `pipeline`, `finished` (the **Web** Streams live in `node:stream/web` — see `webstreams` — but the classic `node:stream` object-mode API and `node:stream` ↔ Web Stream bridging are not wired yet) | — |
 | **dns** | ❌ | 🟥 | internal IPv4-only resolver inside fetch; **no public module** | `lookup`, `resolve*`, `Resolver`, `reverse` (implementation in progress) | [fetch_transport.odin](../pkg/runtime/fetch_transport.odin) |
 | **dgram** | ❌ | 🟥 | — | UDP `Socket` | — |
 | **os** | ❌ | 🟥 | — | platform/arch/cpus/hostname/networkInterfaces/homedir/tmpdir/… | — |
@@ -59,7 +59,7 @@ Coverage of the Node.js public API surface in **lava**.
 | **v8** | ❌ | 🟥 | — | serialize/deserialize, heap stats | — |
 | **test** | ❌ | 🟥 | — | `node:test`, `describe`/`it`, mocks | — |
 | **tty** | ❌ | 🟥 | — | `isatty`, `ReadStream`/`WriteStream` | — |
-| **webstreams** | ❌ | 🟡 | a fetch-internal `ReadableStream` backs `response.body` (`getReader`/`read`/async iteration/`cancel`/`tee`/`locked`) and is accepted as a request body | not exposed as `node:stream/web` or as the `ReadableStream`/`WritableStream`/`TransformStream` globals; no BYOB reader, `pipeTo`/`pipeThrough`, or `WritableStream` | [js/internal/fetch.js](../pkg/runtime/js/internal/fetch.js) |
+| **webstreams** | 🟡 | 🟡 | `ReadableStream`/`WritableStream`/`TransformStream` (+ default readers/writers/controllers and `ByteLengthQueuingStrategy`/`CountQueuingStrategy`) as globals and via `require('node:stream/web')`; `getReader`/`read`/async iteration/`cancel`/`tee`/`locked`/`pipeTo`/`pipeThrough`, desiredSize backpressure; backs `response.body` and is accepted as a request body | byte streams / BYOB (`type:'bytes'`, `mode:'byob'`) deferred and reported explicitly; no `TextEncoderStream`/`TextDecoderStream`/`CompressionStream` | [js/internal/streams.js](../pkg/runtime/js/internal/streams.js) |
 | **webcrypto** | ❌ | 🟡 | global `crypto.getRandomValues`, `crypto.randomUUID` | `crypto.subtle` (all SubtleCrypto) | [globals.odin](../pkg/runtime/globals.odin) |
 | **diagnostics_channel** | ❌ | 🟥 | — | channels/subscribe | — |
 | **inspector** | ❌ | 🟥 | — | inspector session/console | — |
@@ -73,11 +73,37 @@ Coverage of the Node.js public API surface in **lava**.
 
 Probed directly against `bin/lava`.
 
-**Present (30):** `global`, `globalThis`, `Buffer`, `fetch`, `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `structuredClone`, `queueMicrotask`, `setTimeout`, `setInterval`, `setImmediate`, `clearTimeout`, `clearInterval`, `clearImmediate`, `console`, `process`, `performance`, `Blob`, `File`, `crypto` (getRandomValues/randomUUID), `URL` (full WHATWG constructor + `createObjectURL`/`revokeObjectURL`), `URLSearchParams`, plus engine-provided `WebAssembly` and `Intl`.
+**Present (37):** `global`, `globalThis`, `Buffer`, `fetch`, `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `structuredClone`, `queueMicrotask`, `setTimeout`, `setInterval`, `setImmediate`, `clearTimeout`, `clearInterval`, `clearImmediate`, `console`, `process`, `performance`, `Blob`, `File`, `crypto` (getRandomValues/randomUUID), `URL` (full WHATWG constructor + `createObjectURL`/`revokeObjectURL`), `URLSearchParams`, the Web Streams family — `ReadableStream`, `WritableStream`, `TransformStream`, `ReadableStreamDefaultReader`, `ReadableStreamBYOBReader` (deferred; see below), `ReadableStreamDefaultController`, `WritableStreamDefaultWriter`, `WritableStreamDefaultController`, `TransformStreamDefaultController`, `ByteLengthQueuingStrategy`, `CountQueuingStrategy` — plus engine-provided `WebAssembly` and `Intl`.
 
-`fetch` streams bodies: `response.body` is a `ReadableStream` (incrementally fed by the transport — `getReader().read()`, `for await…of`, `cancel()`, `tee()`, `locked`), and the buffered accessors `text()`/`json()`/`arrayBuffer()`/`bytes()` drain that same stream (single-consumption enforced). Request bodies may be a `ReadableStream`, async iterable, or `Blob`, but are **buffered before send** in v1 (Content-Length framing; `duplex: 'half'` is required for stream bodies, matching Node) — true chunked upload is a follow-up. The standalone `ReadableStream`/`WritableStream` globals are still not exposed.
+`fetch` streams bodies on the public Web Streams type: `response.body` is a real `ReadableStream` (incrementally fed by the transport — `getReader().read()`, `for await…of`, `cancel()`, `tee()`, `locked`, `pipeTo`, `pipeThrough`), and the buffered accessors `text()`/`json()`/`arrayBuffer()`/`bytes()` drain that same stream (single-consumption enforced). Request bodies may be a user-created `ReadableStream`, async iterable, or `Blob`, but are **buffered before send** in v1 (Content-Length framing; `duplex: 'half'` is required for stream bodies, matching Node) — true chunked upload is a follow-up. fetch and `node:stream/web` share one stream implementation ([js/internal/streams.js](../pkg/runtime/js/internal/streams.js)), so there is no fetch-only fork.
 
-**Missing:** `atob`, `btoa` (global form), `Event`, `EventTarget`, `CustomEvent`, `ReadableStream`/`WritableStream`/`TransformStream` (globals; an internal one backs `response.body`), `TextEncoderStream`/`TextDecoderStream`, `CompressionStream`, `MessageChannel`/`MessagePort`, `Worker`, `BroadcastChannel`, `navigator`, `reportError`, `crypto.subtle`.
+**Missing:** `atob`, `btoa` (global form), `Event`, `EventTarget`, `CustomEvent`, `ReadableStreamBYOBRequest`/`ReadableByteStreamController` (byte streams deferred), `TextEncoderStream`/`TextDecoderStream`, `CompressionStream`/`DecompressionStream`, `MessageChannel`/`MessagePort`, `Worker`, `BroadcastChannel`, `navigator`, `reportError`, `crypto.subtle`.
+
+## Web Streams surface
+
+WHATWG Web Streams ([js/internal/streams.js](../pkg/runtime/js/internal/streams.js)) are exposed both as globals and through `require('node:stream/web')` (the global and the module export the same class objects, as in Node). `fetch` builds `response.body` and consumes user-provided request bodies through this same `ReadableStream`, so there is a single stream implementation rather than a fetch-only fork. Verified by `tests/node-compat/cases/25-web-streams.js` (`make test-compat-lava`) and the streaming/`pipeTo`/`pipeThrough` cases in `make test-fetch-smoke`.
+
+**Supported (Node-parity):**
+
+- **`ReadableStream`** (default/chunk source): `new ReadableStream(underlyingSource, strategy)` with `start`/`pull`/`cancel`; `getReader()`, `read()`, `releaseLock()`, `reader.closed`/`cancel()`; `[Symbol.asyncIterator]` / `values()` (with early-break cancellation); `cancel()`, `tee()`, `locked`; `pipeTo()` and `pipeThrough()` (incl. `preventClose`/`preventAbort`/`preventCancel` and an `AbortSignal`); `ReadableStreamDefaultController` with `enqueue`/`close`/`error`/`desiredSize` and `pull`-driven, high-water-mark backpressure.
+- **`WritableStream`**: `new WritableStream(underlyingSink, strategy)` with `start`/`write`/`close`/`abort`; `getWriter()`, `write()`, `close()`, `abort()`, `releaseLock()`, `writer.ready`/`closed`/`desiredSize`; `WritableStreamDefaultController.error`. Implemented to the level `pipeTo` needs and generally usable directly.
+- **`TransformStream`**: `new TransformStream(transformer, writableStrategy, readableStrategy)` with `start`/`transform`/`flush`; `readable`/`writable`; `TransformStreamDefaultController` `enqueue`/`error`/`terminate`/`desiredSize`; readable↔writable backpressure coupling. The default (no-`transform`) transformer is an identity pass-through, matching Node.
+- **Queuing strategies:** `ByteLengthQueuingStrategy` and `CountQueuingStrategy` (`highWaterMark`, `size`).
+- **Error/cancellation propagation:** controller `error()`, a throwing `transform`, a failing sink `write`, reader/writer lock violations, and abort-during-`pipeTo` all settle the right side and reject the right promise, matching Node (compared by error constructor; see "intentional differences").
+
+**Deferred (reported explicitly, not silently wrong):**
+
+- **Byte streams / BYOB.** `new ReadableStream({ type: 'bytes' })` throws a clear `TypeError` rather than degrading to a default stream; `stream.getReader({ mode: 'byob' })` throws a `TypeError` (this matches Node for a non-byte stream). `ReadableStreamBYOBReader` exists as a global constructor (so `typeof` matches Node) but constructing one reports the deferral. `ReadableStreamBYOBRequest`/`ReadableByteStreamController` are not exposed. Tracked as a follow-up.
+
+**Intentionally unsupported here:**
+
+- `TextEncoderStream` / `TextDecoderStream`, `CompressionStream` / `DecompressionStream`. (Node provides them via `node:stream/web`; Lava omits them for now — use the buffered `TextEncoder`/`TextDecoder` globals.)
+
+**Intentional differences from Node:**
+
+- Error **messages** carry Lava wording, not Node/undici wording; error **types** (`TypeError`/`RangeError`) and names match. Tests compare by constructor name.
+- Web Streams use Promise-based microtask scheduling; fine-grained interleaving of stream microtasks with unrelated work may differ from Node, but per-stream ordering and delivered values do not.
+- `node:stream` (the classic object-mode `Readable`/`Writable`) and `node:stream` ↔ Web Stream bridging are not implemented; only `node:stream/web` is.
 
 ## `Buffer` surface
 
@@ -111,7 +137,7 @@ Probed directly against `bin/lava`.
 ## Biggest gaps by impact
 
 1. **Networking stack** — `net`/`tls`/`http`/`https`/`http2`/`dgram`. fetch covers outbound HTTP(S) client only; there is no server or raw-socket capability.
-2. **Streams** — `stream` + `webstreams`. Blocks a huge swath of the ecosystem (fs streams, http bodies, zlib piping).
+2. **Streams** — Web Streams (`node:stream/web`) now ship (see above); the classic object-mode `node:stream` (`Readable`/`Writable`/`Duplex`/`Transform`, `pipeline`/`finished`) and `node:stream` ↔ Web Stream bridging remain, blocking fs streams, classic http bodies, and zlib piping.
 3. **`util` helpers** — `promisify`/`callbackify`/`types`/`inherits` are load-bearing for many packages.
 4. **`os`**, **`zlib`**, **`querystring`**, **`string_decoder`** — small, high-frequency modules that are cheap wins.
 5. **`crypto` asymmetric/cipher** — hashing/HMAC/KDFs (incl. scrypt) and digest aliases are real; the asymmetric/cipher surface (keys, sign/verify, ciphers, ECDH/DH, X.509, argon2, subtle) is still stubbed and needs OpenSSL wiring (TLS already links it).

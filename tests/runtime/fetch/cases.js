@@ -127,6 +127,47 @@ async function main() {
     console.log('request blob echo:', JSON.stringify((await rb2.json()).echo));
   }
 
+  // --- Public Web Streams over a real response/request body (issue #184) ---
+  // A user-created ReadableStream (the standard global) is accepted as a request
+  // body, the same as the internal stream that backs response.body.
+  {
+    const body = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('rs-'));
+        c.enqueue(new TextEncoder().encode('global-body'));
+        c.close();
+      },
+    });
+    const echoed = await fetch(base + '/echo', { method: 'POST', body, duplex: 'half' }).then((r) =>
+      r.json(),
+    );
+    console.log('readablestream request body:', JSON.stringify(echoed.echo), echoed.len);
+  }
+
+  // response.body.pipeTo(WritableStream): the sink reassembles the full body and
+  // the body ends up consumed (locked → used). Chunk sizes are transport-defined,
+  // so only the reassembled length is compared, never chunk counts.
+  {
+    const r = await fetch(base + '/big');
+    let total = 0;
+    const sink = new WritableStream({
+      write(chunk) {
+        total += chunk.length;
+      },
+    });
+    await r.body.pipeTo(sink);
+    console.log('response pipeTo:', total === BIG.length, r.bodyUsed);
+  }
+
+  // response.body.pipeThrough(TransformStream): an identity transform passes the
+  // streamed bytes through; the drained total matches the body length.
+  {
+    const r = await fetch(base + '/big-cl');
+    let total = 0;
+    for await (const chunk of r.body.pipeThrough(new TransformStream())) total += chunk.length;
+    console.log('response pipeThrough:', total === BIG_CL.length);
+  }
+
   // A body can be consumed only once; a second attempt rejects with a TypeError.
   {
     const r = await fetch(base + '/a');

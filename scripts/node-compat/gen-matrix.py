@@ -70,7 +70,7 @@ MODULES = {
     "vfs": ("missing", "", ""),
     "vm": ("missing", "", ""),
     "wasi": ("missing", "", "WebAssembly present, WASI glue absent"),
-    "webstreams": ("missing", "", "ReadableStream/WritableStream/TransformStream"),
+    "webstreams": ("partial", "ReadableStream/WritableStream/TransformStream globals + node:stream/web; readers/writers/controllers; pipeTo/pipeThrough; backs response.body", "byte streams/BYOB (deferred), TextEncoderStream/TextDecoderStream, CompressionStream"),
     "worker_threads": ("missing", "", ""),
     "zlib": ("missing", "", ""),
     "addons": ("na", "", "C++ addon docs"),
@@ -85,8 +85,8 @@ MODULES = {
     "synopsis": ("na", "", "intro"),
 }
 
-GLOBALS_PRESENT = ["global", "globalThis", "Buffer", "fetch", "Headers", "Request", "Response", "TextEncoder", "TextDecoder", "AbortController", "AbortSignal", "structuredClone", "queueMicrotask", "setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval", "clearImmediate", "console", "process", "performance", "Blob", "File", "crypto", "URL", "URLSearchParams", "WebAssembly", "Intl"]
-GLOBALS_MISSING = ["atob", "btoa", "Event", "EventTarget", "CustomEvent", "ReadableStream", "WritableStream", "TransformStream", "TextEncoderStream", "TextDecoderStream", "CompressionStream", "MessageChannel", "MessagePort", "Worker", "BroadcastChannel", "navigator", "reportError", "crypto.subtle"]
+GLOBALS_PRESENT = ["global", "globalThis", "Buffer", "fetch", "Headers", "Request", "Response", "TextEncoder", "TextDecoder", "AbortController", "AbortSignal", "structuredClone", "queueMicrotask", "setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval", "clearImmediate", "console", "process", "performance", "Blob", "File", "crypto", "URL", "URLSearchParams", "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "ReadableStreamBYOBReader", "ReadableStreamDefaultController", "WritableStreamDefaultWriter", "WritableStreamDefaultController", "TransformStreamDefaultController", "ByteLengthQueuingStrategy", "CountQueuingStrategy", "WebAssembly", "Intl"]
+GLOBALS_MISSING = ["atob", "btoa", "Event", "EventTarget", "CustomEvent", "ReadableStreamBYOBRequest", "ReadableByteStreamController", "TextEncoderStream", "TextDecoderStream", "CompressionStream", "MessageChannel", "MessagePort", "Worker", "BroadcastChannel", "navigator", "reportError", "crypto.subtle"]
 PROCESS_PRESENT = ["argv", "env", "cwd", "exit", "nextTick", "pid", "platform", "arch", "version", "versions"]
 PROCESS_MISSING = ["hrtime", "chdir", "kill", "memoryUsage", "resourceUsage", "uptime", "stdout", "stderr", "stdin", "execPath", "argv0", "execArgv", "umask", "on", "once", "exitCode", "title", "report"]
 
