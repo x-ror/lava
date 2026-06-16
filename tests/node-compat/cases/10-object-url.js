@@ -67,6 +67,10 @@ assert.equal(buffer.resolveObjectURL(123), undefined);
 assert.equal(buffer.resolveObjectURL(), undefined);
 assert.equal(buffer.resolveObjectURL(null), undefined);
 
+// A Symbol is not string-coercible: like Node's `${id}`, it throws a TypeError
+// rather than silently stringifying (which is what String(id) would have done).
+assert.throws(() => buffer.resolveObjectURL(Symbol('blob')), TypeError);
+
 // createObjectURL rejects non-Blob values with ERR_INVALID_ARG_TYPE.
 for (const bad of [{}, 'str', 123, undefined, null]) {
   assert.throws(

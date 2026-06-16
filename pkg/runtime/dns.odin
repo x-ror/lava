@@ -49,8 +49,9 @@ Dns_Lookup_Request :: struct {
 	all:      bool,
 	worker:   ^thread.Thread,
 	results:  [dynamic]Dns_Lookup_Result, // heap (default allocator); full address list
+	last_err: net.DNS_Error, // worst resolver error seen, to distinguish NXDOMAIN from transient
 	ok:       bool,
-	err_code: string, // static literal, e.g. "ENOTFOUND"
+	err_code: string, // static literal, e.g. "ENOTFOUND" / "EAI_AGAIN"
 }
 
 // make_dns_bindings builds the `native` object handed to js/internal/dns.js.
@@ -130,14 +131,18 @@ dns_lookup_cb :: proc "c" (
 // lookup(all:true) returns every address the resolver knows about. Worker thread.
 dns_query_family :: proc(req: ^Dns_Lookup_Request, type: net.DNS_Record_Type, family: int, first_only: bool) {
 	recs: []net.DNS_Record
+	err: net.DNS_Error
 	is_mdns := ODIN_OS != .Windows && strings.has_suffix(req.hostname, ".local")
 	if is_mdns && type == .IP4 {
-		recs, _ = net.get_dns_records_from_nameservers(req.hostname, .IP4, {net.IP4_mDNS_Broadcast}, nil, context.temp_allocator)
+		recs, err = net.get_dns_records_from_nameservers(req.hostname, .IP4, {net.IP4_mDNS_Broadcast}, nil, context.temp_allocator)
 	} else if is_mdns {
-		recs, _ = net.get_dns_records_from_nameservers(req.hostname, .IP6, {net.IP6_mDNS_Broadcast}, nil, context.temp_allocator)
+		recs, err = net.get_dns_records_from_nameservers(req.hostname, .IP6, {net.IP6_mDNS_Broadcast}, nil, context.temp_allocator)
 	} else {
-		recs, _ = net.get_dns_records_from_os(req.hostname, type, context.temp_allocator)
+		recs, err = net.get_dns_records_from_os(req.hostname, type, context.temp_allocator)
 	}
+	// Keep any reported resolver failure so the worker can tell a real "no such
+	// host" (empty + .None) from a transient/system error (see dns_error_to_code).
+	if err != .None do req.last_err = err
 	for rec in recs {
 		addr: net.Address
 		#partial switch r in rec {
@@ -196,10 +201,30 @@ dns_lookup_worker :: proc(data: rawptr) {
 	}
 
 	req.ok = len(req.results) > 0
-	if !req.ok do req.err_code = "ENOTFOUND"
+	if !req.ok do req.err_code = dns_error_to_code(req.last_err)
 
 	free_all(context.temp_allocator) // release this worker's resolver scratch
 	eventloop.post_async(req.loop, dns_lookup_complete_cb, req)
+}
+
+// dns_error_to_code maps a failed lookup to a Node getaddrinfo error code. A real
+// "no such host" surfaces from core:net as empty records with .None, which we
+// report as ENOTFOUND. The errors core:net DOES report (no/unsendable nameserver,
+// malformed response, missing resolv.conf/hosts) are transient/system failures —
+// Node's EAI_AGAIN — so they are no longer flattened into ENOTFOUND. Caveat:
+// core:net swallows a per-nameserver recv timeout (it just tries the next server
+// and ends with .None), so a pure timeout still reads as ENOTFOUND here; matching
+// Node's EAI_AGAIN for that case needs a resolver that surfaces the timeout.
+dns_error_to_code :: proc(e: net.DNS_Error) -> string {
+	#partial switch e {
+	case .Connection_Error,
+	     .Server_Error,
+	     .System_Error,
+	     .Invalid_Resolv_Config_Error,
+	     .Invalid_Hosts_Config_Error:
+		return "EAI_AGAIN"
+	}
+	return "ENOTFOUND"
 }
 
 // dns_lookup_complete_cb runs on the loop thread once resolution finishes: it
