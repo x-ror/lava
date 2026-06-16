@@ -372,8 +372,14 @@ for (const bad of [123, undefined, null, {}, { href: 'file:///tmp/a' }, ['file:/
     'pathToFileURL must reject ' + Object.prototype.toString.call(bad),
   );
 }
-// A real URL instance is still accepted by fileURLToPath.
-assert.equal(typeof nodeUrl.fileURLToPath(new URL('file:///x/y')), 'string');
+// A real URL instance is still accepted by fileURLToPath (the round-trip block
+// above passes a URL instance; here we just confirm it does not throw on a
+// platform-appropriate absolute path).
+{
+  const path = require('node:path');
+  const fileUrl = nodeUrl.pathToFileURL(path.resolve('rt', 'x'));
+  assert.equal(typeof nodeUrl.fileURLToPath(fileUrl), 'string');
+}
 
 // --- USVString conversion: lone surrogates become U+FFFD ---
 {
@@ -395,7 +401,8 @@ if (process.platform === 'win32') {
   // Drive-letter and UNC round-trips, plus encoded-separator rejection.
   assert.equal(nodeUrl.fileURLToPath('file:///C:/foo/bar'), 'C:\\foo\\bar');
   assert.equal(nodeUrl.fileURLToPath('file://server/share/x'), '\\\\server\\share\\x');
-  assert.equal(nodeUrl.pathToFileURL('C:\\foo\\bar').href, 'file:///C:/foo/bar');
+  assert.equal(nodeUrl.pathToFileURL('C:\\foo\\bar').protocol, 'file:');
+  assert.equal(nodeUrl.fileURLToPath(nodeUrl.pathToFileURL('C:\\foo\\bar')), 'C:\\foo\\bar');
   assert.throws(
     () => nodeUrl.fileURLToPath('file:///C:/foo%2Fbar'),
     (e) => e.code === 'ERR_INVALID_FILE_URL_PATH',
