@@ -254,6 +254,7 @@ jobs:
         # from the in-process _putenv_s delivery. Remove once the root cause is fixed.
         env:
           JSC_useConcurrentJIT: "false"
+          JSC_useConcurrentGC: "false"
         run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-oracles.sh
 
       # Fetch transport smoke over the real Winsock + select() backend, reusing the

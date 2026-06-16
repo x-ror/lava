@@ -64,7 +64,7 @@
   // arrive via _append and are not re-normalized — the transport already trims
   // OWS around values — matching undici, which fills response headers verbatim.
   function normalizeHeaderValue(value) {
-    return value.replace(/^[\r\n\t ]+|[\r\n\t ]+$/g, '');
+    return value.replaceAll(/^[\r\n\t ]+|[\r\n\t ]+$/g, '');
   }
 
   // Shared by Headers.append and Headers.set, which performed the identical
@@ -291,7 +291,7 @@
           return self._readInternal();
         },
         cancel: function (reason) {
-          if (released) return Promise.resolve(undefined);
+          if (released) return Promise.resolve();
           return self.cancel(reason);
         },
         releaseLock: function () {
@@ -314,7 +314,7 @@
           cancel(reason);
         } catch (e) {}
       }
-      return Promise.resolve(undefined);
+      return Promise.resolve();
     }
     tee() {
       if (this.locked) throw new TypeError('ReadableStream is already locked to a reader');
@@ -788,10 +788,10 @@
     });
   }
 
-  if (typeof globalThis.Headers === 'undefined') globalThis.Headers = Headers;
-  if (typeof globalThis.Request === 'undefined') globalThis.Request = Request;
-  if (typeof globalThis.Response === 'undefined') globalThis.Response = Response;
-  if (typeof globalThis.fetch === 'undefined') globalThis.fetch = fetch;
+  if (globalThis.Headers === undefined) globalThis.Headers = Headers;
+  if (globalThis.Request === undefined) globalThis.Request = Request;
+  if (globalThis.Response === undefined) globalThis.Response = Response;
+  if (globalThis.fetch === undefined) globalThis.fetch = fetch;
 
   module.exports = { fetch: fetch, Headers: Headers, Request: Request, Response: Response };
 });

@@ -71,7 +71,7 @@
               lastSlash = i;
               dots = 0;
               continue;
-            } else if (res.length !== 0) {
+            } else if (res.length > 0) {
               res = '';
               lastSegmentLength = 0;
               lastSlash = i;

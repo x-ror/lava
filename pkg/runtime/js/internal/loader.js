@@ -25,7 +25,7 @@
     // so a bracket lookup of 'constructor'/'toString' would otherwise return an
     // inherited function and mis-resolve those specifiers instead of yielding the
     // "not a builtin" (undefined) that lets native_require_cb fall through.
-    if (!hasOwn.call(factories, key)) return undefined;
+    if (!hasOwn.call(factories, key)) return;
     var factory = factories[key];
     var module = { exports: {} };
     // Seed the cache before running the factory so a require cycle resolves

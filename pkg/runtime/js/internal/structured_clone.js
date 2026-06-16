@@ -157,7 +157,7 @@
     return clone(value, new Map());
   }
 
-  if (typeof globalThis.structuredClone === 'undefined') {
+  if (globalThis.structuredClone === undefined) {
     globalThis.structuredClone = structuredClone;
   }
 

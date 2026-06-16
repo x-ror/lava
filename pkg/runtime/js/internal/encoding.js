@@ -174,8 +174,8 @@
     return result;
   };
 
-  if (typeof globalThis.TextEncoder === 'undefined') globalThis.TextEncoder = TextEncoder;
-  if (typeof globalThis.TextDecoder === 'undefined') globalThis.TextDecoder = TextDecoder;
+  if (globalThis.TextEncoder === undefined) globalThis.TextEncoder = TextEncoder;
+  if (globalThis.TextDecoder === undefined) globalThis.TextDecoder = TextDecoder;
 
   module.exports = { TextEncoder: TextEncoder, TextDecoder: TextDecoder };
 });
