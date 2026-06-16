@@ -268,6 +268,10 @@ jobs:
           set -e
 
       - name: Oracle suites (event-loop + fs + sqlite)
+        # DIAGNOSTIC (temporary): does full-suite green require useJIT=false (the only
+        # lever that fixed 07-crypto's baseline-JIT crash)? Delivered via inherited env.
+        env:
+          JSC_useJIT: "false"
         run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-oracles.sh
 
       # Fetch transport smoke over the real Winsock + select() backend, reusing the
