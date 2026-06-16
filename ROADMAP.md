@@ -120,9 +120,26 @@ implementations — no `primordials`, no `internalBinding` coupling.
       machine certificate store is loaded into OpenSSL's trust store. DNS resolves
       off the loop on a worker thread. All three platforms build and run for real in
       CI — the Windows job links a JavaScriptCore-backed `lava.exe` and runs it.
-      Follow-ups: native Security.framework TLS on macOS (#143), streaming bodies
-      (#31), a resolved-address list for IPv6 hostnames + Happy Eyeballs (#145), and
-      HTTP correctness (#99).
+      Follow-ups: native Security.framework TLS on macOS (#143), a resolved-address
+      list for IPv6 hostnames + Happy Eyeballs (#145), and HTTP correctness (#99).
+- [x] **Streaming fetch bodies (#31)** — `response.body` is a real, incrementally
+      fed `ReadableStream` (`getReader().read()`, async iteration, `cancel()`,
+      `tee()`, `locked`). The transport delivers status + headers as soon as they
+      parse, then pushes decoded body chunks (incremental chunked de-framing and
+      Content-Length / read-until-EOF identity framing) until the body completes or
+      errors — no full-body buffer is kept. The buffered accessors (`text()`,
+      `json()`, `arrayBuffer()`, `bytes()`) drain the same stream, so streaming and
+      buffering share one consumption path and a body is consumed at most once.
+      Backpressure pauses the socket read when the consumer saturates the
+      high-water mark and resumes on drain; an abandoned body no longer pins the
+      loop (Node parity). Cross-platform via the shared transport
+      (`pkg/runtime/fetch_transport.odin`). Request bodies accept `ReadableStream`,
+      async iterables, and `Blob` but are **buffered before send** in v1 (no chunked
+      upload); true streaming upload is the remaining follow-up. Verified by
+      `make test-fetch-smoke`. Lifetime note: io_uring has no `POLL_REMOVE`, so a
+      paused-then-resumed read can leave an uncancellable poll outstanding; settled
+      requests are reclaimed only after two loop iterations so a stale completion
+      cannot land on freed memory (a real `POLL_REMOVE` path is still tracked).
 - [x] **Event-loop I/O driving** — fetch was the first real `watch_fd` consumer
       and exposed several gaps, now fixed (`pkg/runtime/eventloop/`):
       - io_uring `POLL_ADD` mask is written to `poll_events` (was `addr`, so no
