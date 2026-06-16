@@ -59,8 +59,11 @@
     }
   }
   function assertValidHeaderValue(name, value) {
-    if (/[\r\n\0]/.test(value)) {
-      throw new TypeError('Invalid header value for "' + name + '": "' + value + '"');
+    for (var i = 0; i < value.length; i++) {
+      var code = value.charCodeAt(i);
+      if (code === 0 || code === 10 || code === 13) {
+        throw new TypeError('Invalid header value for "' + name + '": "' + value + '"');
+      }
     }
   }
 
@@ -74,7 +77,7 @@
   // arrive via _append and are not re-normalized — the transport already trims
   // OWS around values — matching undici, which fills response headers verbatim.
   function normalizeHeaderValue(value) {
-    return value.replace(/^[\r\n\t ]+|[\r\n\t ]+$/g, '');
+    return value.replaceAll(/^[\r\n\t ]+|[\r\n\t ]+$/g, '');
   }
 
   // Shared by Headers.append and Headers.set, which performed the identical
@@ -241,7 +244,7 @@
       enqueue: function (bytes) {
         try {
           controller.enqueue(bytes);
-        } catch (e) {
+        } catch {
           return false;
         }
         return controller.desiredSize > 0;
@@ -249,7 +252,7 @@
       close: function () {
         try {
           controller.close();
-        } catch (e) {}
+        } catch {}
       },
       error: function (err) {
         controller.error(err);
@@ -484,17 +487,38 @@
     var chunks = [];
     if (typeof src.getReader === 'function') {
       var reader = src.getReader();
-      for (;;) {
-        if (signal && signal.aborted) {
+      // An abort can land while reader.read() is pending — for a slow or stalled
+      // producer that next chunk may never arrive, so a between-reads
+      // signal.aborted check can never wake it and fetch() would hang before the
+      // transport even starts. Register a listener that cancels the reader:
+      // cancel() both settles the in-flight read (as done, waking the loop) and
+      // tears the underlying source down. The reader is always released on the
+      // way out so a user-created stream is never left locked.
+      var aborted = false;
+      var onAbort = null;
+      if (signal) {
+        onAbort = function () {
+          aborted = true;
           try {
-            reader.cancel(signal.reason);
-          } catch (e) {}
-          throw signal.reason;
-        }
-        var r = await reader.read();
-        if (r.done) break;
-        chunks.push(chunkToBytes(r.value));
+            var canceled = reader.cancel(signal.reason);
+            if (canceled && typeof canceled.catch === 'function') canceled.catch(function () {});
+          } catch {}
+        };
+        signal.addEventListener('abort', onAbort);
       }
+      try {
+        for (;;) {
+          var r = await reader.read();
+          if (r.done) break;
+          chunks.push(chunkToBytes(r.value));
+        }
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+        reader.releaseLock();
+      }
+      // cancel() settles the pending read as done, so the loop exits normally on
+      // abort; surface the abort reason rather than a truncated body.
+      if (aborted) throw signal.reason;
     } else {
       for await (var chunk of src) {
         if (signal && signal.aborted) throw signal.reason;
@@ -673,10 +697,10 @@
     });
   }
 
-  if (typeof globalThis.Headers === 'undefined') globalThis.Headers = Headers;
-  if (typeof globalThis.Request === 'undefined') globalThis.Request = Request;
-  if (typeof globalThis.Response === 'undefined') globalThis.Response = Response;
-  if (typeof globalThis.fetch === 'undefined') globalThis.fetch = fetch;
+  if (globalThis.Headers === undefined) globalThis.Headers = Headers;
+  if (globalThis.Request === undefined) globalThis.Request = Request;
+  if (globalThis.Response === undefined) globalThis.Response = Response;
+  if (globalThis.fetch === undefined) globalThis.fetch = fetch;
 
   module.exports = { fetch: fetch, Headers: Headers, Request: Request, Response: Response };
 });

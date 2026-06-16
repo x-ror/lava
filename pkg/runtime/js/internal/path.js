@@ -3,7 +3,7 @@
 // layer previously provided only basename/join/extname/isAbsolute; this supersedes
 // it with the full common surface and both `posix` and `win32` variants. The
 // exported `path` is the variant matching process.platform.
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   var SLASH = 47; // '/'
@@ -71,7 +71,7 @@
               lastSlash = i;
               dots = 0;
               continue;
-            } else if (res.length !== 0) {
+            } else if (res.length > 0) {
               res = '';
               lastSegmentLength = 0;
               lastSlash = i;

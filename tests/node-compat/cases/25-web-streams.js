@@ -288,6 +288,30 @@ async function main() {
     }
     console.log('iter break:', first, canceled);
   }
+
+  // --- many-chunk drain: the internal chunk queue must stay efficient (no
+  // O(n^2) Array.prototype.shift) and preserve FIFO order across a large number
+  // of small chunks — the shape a byte-sized fetch body or a pipe under
+  // fine-grained network chunking produces. ---
+  {
+    const N = 2000;
+    const rs = new ReadableStream({
+      start(c) {
+        for (let i = 0; i < N; i++) c.enqueue(i);
+        c.close();
+      },
+    });
+    const reader = rs.getReader();
+    let count = 0;
+    let ordered = true;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value !== count) ordered = false;
+      count += 1;
+    }
+    console.log('many-chunk drain:', count === N, ordered);
+  }
 }
 
 main()

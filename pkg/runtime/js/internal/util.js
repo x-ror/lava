@@ -9,7 +9,7 @@
     typeof Symbol !== 'undefined' && Symbol.for ? Symbol.for('nodejs.util.inspect.custom') : null;
 
   function quote(s) {
-    return "'" + s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n') + "'";
+    return "'" + s.replaceAll('\\', '\\\\').replaceAll("'", "\\'").replaceAll('\n', '\\n') + "'";
   }
 
   function inspect(v, opts, seen, depth) {
@@ -63,14 +63,14 @@
       v.forEach(function (val, key) {
         mp.push(inspect(key, opts, seen, depth + 1) + ' => ' + inspect(val, opts, seen, depth + 1));
       });
-      return 'Map(' + v.size + ') {' + (mp.length ? ' ' + mp.join(', ') + ' ' : '') + '}';
+      return 'Map(' + v.size + ') {' + (mp.length > 0 ? ' ' + mp.join(', ') + ' ' : '') + '}';
     }
     if (typeof Set !== 'undefined' && v instanceof Set) {
       var st = [];
       v.forEach(function (val) {
         st.push(inspect(val, opts, seen, depth + 1));
       });
-      return 'Set(' + v.size + ') {' + (st.length ? ' ' + st.join(', ') + ' ' : '') + '}';
+      return 'Set(' + v.size + ') {' + (st.length > 0 ? ' ' + st.join(', ') + ' ' : '') + '}';
     }
 
     var keys = Object.keys(v);
@@ -90,7 +90,7 @@
     return typeof v === 'string' ? v : inspect(v, {}, [], 1);
   }
 
-  function formatWithOptions(opts, f) {
+  function formatWithOptions(opts, _f) {
     var args = Array.prototype.slice.call(arguments, 1);
     if (args.length === 0) return '';
     var first = args[0];
@@ -127,7 +127,7 @@
             else if (spec === 'j') {
               try {
                 result += JSON.stringify(a);
-              } catch (e) {
+              } catch {
                 result += '[Circular]';
               }
             } else if (spec === 'o' || spec === 'O') result += inspect(a, opts, [], 1);
@@ -144,7 +144,7 @@
     return result;
   }
 
-  function format(f) {
+  function format(_f) {
     return formatWithOptions.apply(null, [{}].concat(Array.prototype.slice.call(arguments)));
   }
 

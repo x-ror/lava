@@ -105,6 +105,13 @@ eval :: proc(
 	// context.allocator, so nothing returned escapes through the temp arena.
 	defer free_all(context.temp_allocator)
 
+	// Configure JSC before the first JSGlobalContextCreate. On Windows this disables
+	// the (buggy on this bun-webkit build) baseline JIT tier and runs JSC's proper
+	// process bring-up — without it, heavy JS corrupts memory mid-execution
+	// (0xC0000409, surfaced as exit 127). See pkg/jsc/jsc_init_windows.cpp for the
+	// full rationale. Idempotent; a no-op on Linux/macOS.
+	jsc.lava_jsc_init()
+
 	// A custom global class gives the global object a private-data slot, where we
 	// stash Runtime_State (loop + module cache) out of reach of user JavaScript.
 	global_class := make_global_class()

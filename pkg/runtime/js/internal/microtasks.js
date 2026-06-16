@@ -52,7 +52,7 @@
 //
 // The factory returns { drainNextTicks, dispatch } so install_microtasks can hand
 // them to native (see globals.odin install_microtasks / invoke_user_callback).
-(function (globalThis, process, reportUncaught) {
+(function (globalObject, process, reportUncaught) {
   'use strict';
 
   var PromiseCtor = Promise;
@@ -116,7 +116,7 @@
     try {
       // `this` is globalThis to preserve the prior call sites' semantics, where
       // native passed NULL as thisObject (JSC binds the global object for NULL).
-      return functionApply(fn, globalThis, args);
+      return functionApply(fn, globalObject, args);
     } finally {
       drainNextTicks();
     }
@@ -145,13 +145,13 @@
   }
 
   process.nextTick = nextTick;
-  globalThis.queueMicrotask = queueMicrotask;
+  globalObject.queueMicrotask = queueMicrotask;
 
   // Internal, non-enumerable global so the native top-level drain shim (a trailing
   // statement appended to the entry source) can reach checkpoint 1 before
   // JSEvaluateScript returns. Native also receives drainNextTicks directly via the
   // factory return below; this hook exists only for the JS-source-level drain.
-  objectDefineProperty(globalThis, '__lavaDrainNextTicks', {
+  objectDefineProperty(globalObject, '__lavaDrainNextTicks', {
     value: drainNextTicks,
     writable: false,
     enumerable: false,
@@ -164,7 +164,7 @@
   // *enumerable*, non-configurable global; redeclaring an existing own property
   // instead writes through without changing this descriptor, so the internal name
   // stays out of `Object.keys(globalThis)` / `for...in`.
-  objectDefineProperty(globalThis, '__lava_tl_drain', {
+  objectDefineProperty(globalObject, '__lava_tl_drain', {
     value: undefined,
     writable: true,
     enumerable: false,

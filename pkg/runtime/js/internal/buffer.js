@@ -148,16 +148,16 @@
 
   function normalizeBase64(str) {
     str = String(str)
-      .replace(/-/g, '+')
-      .replace(/_/g, '/')
-      .replace(/[^A-Za-z0-9+/]/g, '');
+      .replaceAll('-', '+')
+      .replaceAll('_', '/')
+      .replaceAll(/[^A-Za-z0-9+/]/g, '');
     if (str.length % 4 === 1) str = str.slice(0, str.length - 1);
     while (str.length % 4 !== 0) str += '=';
     return str;
   }
 
   function toBase64Url(str) {
-    return str.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    return str.replaceAll('+', '-').replaceAll('/', '_').replaceAll(/=+$/g, '');
   }
 
   function utf16leEncode(str) {
@@ -475,7 +475,7 @@
       if (typeof value === 'number') {
         bytes = new Uint8Array([value & 0xff]);
       } else if (value instanceof Uint8Array) {
-        bytes = value.length ? value : new Uint8Array([0]);
+        bytes = value.length > 0 ? value : new Uint8Array([0]);
       } else {
         bytes = strToBytes(String(value), encoding || 'utf8');
         if (bytes.length === 0) bytes = new Uint8Array([0]);
@@ -546,12 +546,16 @@
     var shown = buf.length > max ? max : buf.length;
     var hex = Buffer.prototype.toString
       .call(buf, 'hex', 0, shown)
-      .replace(/(.{2})/g, '$1 ')
+      .replaceAll(/(.{2})/g, '$1 ')
       .trim();
     var remaining = buf.length - max;
     if (remaining > 0)
       hex +=
-        (hex.length ? ' ' : '') + '... ' + remaining + ' more byte' + (remaining > 1 ? 's' : '');
+        (hex.length > 0 ? ' ' : '') +
+        '... ' +
+        remaining +
+        ' more byte' +
+        (remaining > 1 ? 's' : '');
     return '<Buffer ' + hex + '>';
   }
 
@@ -1158,13 +1162,13 @@
     // template form matches Node's ToString exactly — including throwing a
     // TypeError on a Symbol, which String(id) would silently stringify instead.
     var blob = objectUrlRegistry.get(`${id}`);
-    if (blob === undefined) return undefined;
+    if (blob === undefined) return;
     // Node returns a fresh Blob over the same bytes rather than the registered
     // instance, and a registered File resolves back as a plain Blob.
     return new Blob([blob], { type: blob.type });
   }
 
-  if (typeof globalThis.URL === 'undefined') {
+  if (globalThis.URL === undefined) {
     globalThis.URL = { createObjectURL: createObjectURL, revokeObjectURL: revokeObjectURL };
   } else {
     if (typeof globalThis.URL.createObjectURL !== 'function')
@@ -1173,13 +1177,13 @@
       globalThis.URL.revokeObjectURL = revokeObjectURL;
   }
 
-  if (typeof globalThis.Buffer === 'undefined') {
+  if (globalThis.Buffer === undefined) {
     globalThis.Buffer = Buffer;
   }
-  if (typeof globalThis.Blob === 'undefined') {
+  if (globalThis.Blob === undefined) {
     globalThis.Blob = Blob;
   }
-  if (typeof globalThis.File === 'undefined') {
+  if (globalThis.File === undefined) {
     globalThis.File = File;
   }
 

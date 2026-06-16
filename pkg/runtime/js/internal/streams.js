@@ -15,7 +15,7 @@
 // ReadableStreamBYOBReader exists as a constructor that reports the same. Text
 // encoder/decoder streams and (de)compression streams are intentionally not
 // provided here.
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   // ---- microtask + promise helpers -------------------------------------------
@@ -77,8 +77,41 @@
 
   // ---- generic queue (spec "queue-with-sizes") -------------------------------
 
+  // A FIFO queue with amortized O(1) push/shift. A plain array's shift() is O(n)
+  // — it reindexes every remaining element — so draining N queued chunks costs
+  // O(n^2). That bites a byte-sized response body or a pipe that arrives as many
+  // small chunks: the queue can hold thousands of them before a reader drains
+  // (the high-water mark bounds queued *bytes*, not chunk count). Keeping a head
+  // cursor and only compacting once the consumed prefix dominates the backing
+  // array keeps push/shift/peek/length O(1) amortized while bounding wasted space
+  // to ~2x the live length.
+  class SimpleQueue {
+    constructor() {
+      this._items = [];
+      this._head = 0;
+    }
+    get length() {
+      return this._items.length - this._head;
+    }
+    push(item) {
+      this._items.push(item);
+    }
+    shift() {
+      var item = this._items[this._head];
+      this._head++;
+      if (this._head > 64 && this._head * 2 >= this._items.length) {
+        this._items = this._items.slice(this._head);
+        this._head = 0;
+      }
+      return item;
+    }
+    peek() {
+      return this._items[this._head];
+    }
+  }
+
   function resetQueue(container) {
-    container._queue = [];
+    container._queue = new SimpleQueue();
     container._queueTotalSize = 0;
   }
   function dequeueValue(container) {
@@ -95,7 +128,7 @@
     container._queueTotalSize += size;
   }
   function peekQueueValue(container) {
-    return container._queue[0].value;
+    return container._queue.peek().value;
   }
 
   // ---- queuing strategies ----------------------------------------------------

@@ -9,7 +9,7 @@
     typeof Symbol !== 'undefined' && Symbol.for ? Symbol.for('nodejs.util.inspect.custom') : null;
 
   function quote(s) {
-    return "'" + s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n') + "'";
+    return "'" + s.replaceAll('\\', '\\\\').replaceAll("'", "\\'").replaceAll('\n', '\\n') + "'";
   }
 
   function inspect(v, seen, depth) {
@@ -55,14 +55,14 @@
       v.forEach(function (val, key) {
         mp.push(inspect(key, seen, depth + 1) + ' => ' + inspect(val, seen, depth + 1));
       });
-      return 'Map(' + v.size + ') {' + (mp.length ? ' ' + mp.join(', ') + ' ' : '') + '}';
+      return 'Map(' + v.size + ') {' + (mp.length > 0 ? ' ' + mp.join(', ') + ' ' : '') + '}';
     }
     if (typeof Set !== 'undefined' && v instanceof Set) {
       var st = [];
       v.forEach(function (val) {
         st.push(inspect(val, seen, depth + 1));
       });
-      return 'Set(' + v.size + ') {' + (st.length ? ' ' + st.join(', ') + ' ' : '') + '}';
+      return 'Set(' + v.size + ') {' + (st.length > 0 ? ' ' + st.join(', ') + ' ' : '') + '}';
     }
     var keys = Object.keys(v);
     var ctor = v.constructor && v.constructor.name;
@@ -117,7 +117,7 @@
             else if (spec === 'j') {
               try {
                 result += JSON.stringify(a);
-              } catch (e) {
+              } catch {
                 result += '[Circular]';
               }
             } else if (spec === 'o' || spec === 'O') result += inspect(a, [], 0);
@@ -310,11 +310,11 @@
       delete counts[key];
     },
     group: function () {
-      if (arguments.length) line(out, args(arguments));
+      if (arguments.length > 0) line(out, args(arguments));
       groupIndent += '  ';
     },
     groupCollapsed: function () {
-      if (arguments.length) line(out, args(arguments));
+      if (arguments.length > 0) line(out, args(arguments));
       groupIndent += '  ';
     },
     groupEnd: function () {
@@ -346,7 +346,7 @@
       }
       var d = Date.now() - timers[key];
       var extra = Array.prototype.slice.call(arguments, 1);
-      emit(out, key + ': ' + duration(d) + (extra.length ? ' ' + formatArgs(extra) : ''));
+      emit(out, key + ': ' + duration(d) + (extra.length > 0 ? ' ' + formatArgs(extra) : ''));
     },
     clear: function () {
       out('[2J[3J[H');

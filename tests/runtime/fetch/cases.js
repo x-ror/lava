@@ -144,6 +144,29 @@ async function main() {
     console.log('readablestream request body:', JSON.stringify(echoed.echo), echoed.len);
   }
 
+  // Aborting while a streaming request body is still being collected — a stalled
+  // producer whose read() never resolves — must reject promptly with the signal's
+  // AbortError rather than hang waiting for a chunk that never comes. (Regression:
+  // collectStreamBody only checked signal.aborted between reads, so an abort
+  // landing during a pending read could not wake it and fetch hung before the
+  // transport even started.)
+  {
+    const ac = new AbortController();
+    const body = new ReadableStream({
+      pull() {
+        return new Promise(() => {}); // never produces a chunk
+      },
+    });
+    setTimeout(() => ac.abort(), 10);
+    let name = '';
+    try {
+      await fetch(base + '/echo', { method: 'POST', body, duplex: 'half', signal: ac.signal });
+    } catch (error) {
+      name = error && error.name;
+    }
+    console.log('abort streaming upload:', name);
+  }
+
   // response.body.pipeTo(WritableStream): the sink reassembles the full body and
   // the body ends up consumed (locked → used). Chunk sizes are transport-defined,
   // so only the reassembled length is compared, never chunk counts.
@@ -324,7 +347,7 @@ async function main() {
     let tlsRejected = false;
     try {
       await fetch(baseHttpsBad + '/hello.txt');
-    } catch (error) {
+    } catch {
       tlsRejected = true;
     }
     console.log('https hostname-mismatch rejected:', tlsRejected);
@@ -334,7 +357,7 @@ async function main() {
   let refused = false;
   try {
     await fetch('http://127.0.0.1:9/x');
-  } catch (error) {
+  } catch {
     refused = true;
   }
   console.log('refused rejected:', refused);
@@ -344,7 +367,7 @@ async function main() {
   let dnsFailed = false;
   try {
     await fetch('http://does-not-exist.invalid/');
-  } catch (error) {
+  } catch {
     dnsFailed = true;
   }
   console.log('dns failure rejected:', dnsFailed);
