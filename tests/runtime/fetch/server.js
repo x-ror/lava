@@ -73,6 +73,25 @@ const handler = (req, res) => {
       res.writeHead(204);
       res.end();
       return;
+    case '/slowbody':
+      // Send the head and one body chunk, then hold the connection open forever.
+      // Lets a client read part of the body and then abort — deterministically
+      // exercising abort-after-headers (the body never completes on its own).
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.write('partial');
+      return;
+    case '/badchunk': {
+      // Hijack the socket to emit a chunked body whose chunk data is followed by
+      // a non-CRLF terminator — a framing violation a client must reject. Written
+      // raw because the http module always frames chunks correctly.
+      const sock = res.socket;
+      if (sock) {
+        sock.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n');
+        sock.write('5\r\nhelloXX'); // "XX" where the chunk-terminating CRLF must be
+        setTimeout(() => sock.destroy(), 15);
+      }
+      return;
+    }
     case '/truncate':
       // Declare a Content-Length far longer than the bytes actually sent, then
       // drop the connection — a truncated body the client must surface as an

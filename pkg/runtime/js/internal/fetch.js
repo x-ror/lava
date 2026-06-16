@@ -342,14 +342,20 @@
           },
         );
       }
-      var src = {
-        pull: pump,
-        cancel: function (reason) {
-          reader.cancel(reason);
-        },
-      };
-      b1 = new BodyStream(src);
-      b2 = new BodyStream(src);
+      // WHATWG tee: cancelling one branch must not abort the source while the
+      // other is still consuming. Cancel the underlying reader only once both
+      // branches have been cancelled.
+      var c1 = false;
+      var c2 = false;
+      function makeCancel(isFirst) {
+        return function (reason) {
+          if (isFirst) c1 = true;
+          else c2 = true;
+          if (c1 && c2) reader.cancel(reason);
+        };
+      }
+      b1 = new BodyStream({ pull: pump, cancel: makeCancel(true) });
+      b2 = new BodyStream({ pull: pump, cancel: makeCancel(false) });
       return [b1, b2];
     }
     [Symbol.asyncIterator]() {
@@ -530,13 +536,19 @@
       // the string path.
       var src = input && typeof input === 'object' && typeof input.url === 'string' ? input : null;
       // Per spec, init.body overrides only when present and non-null; a null
-      // or absent init.body keeps the source Request's body.
-      var bodyInit =
-        init.body !== undefined && init.body !== null
-          ? init.body
-          : src
-            ? src._bodyBytes
-            : init.body;
+      // or absent init.body keeps the source Request's body. A source's body may
+      // be a streaming body (held in _streamBody, with _bodyBytes null), so
+      // inherit that too — otherwise fetch(new Request(req)) would silently send
+      // an empty body. (v1 caveat: the stream reference is shared, not teed, so
+      // fetching both the source and the derived request is not supported.)
+      var initBodyGiven = init.body !== undefined && init.body !== null;
+      var bodyInit = initBodyGiven
+        ? init.body
+        : src
+          ? src._streamBody != null
+            ? src._streamBody
+            : src._bodyBytes
+          : init.body;
 
       // A streaming body (Blob / ReadableStream / async iterable) is held as-is
       // and materialized to bytes in fetch(); only buffered bodies go to Body.
@@ -545,8 +557,13 @@
         super(null);
         this._streamBody = streamBody;
         // Node requires duplex:'half' for a ReadableStream / async-iterable body;
-        // a Blob is a known-length body and is exempt.
+        // a Blob is a known-length body and is exempt. The check is at construction
+        // (where the duplex option lives) — only for a NEW init.body stream; a body
+        // inherited from a source Request was already validated when it was built.
         this._streamNeedsDuplex = !(typeof Blob !== 'undefined' && streamBody instanceof Blob);
+        if (this._streamNeedsDuplex && initBodyGiven && init.duplex !== 'half') {
+          throw new TypeError('fetch: a streaming request body requires init.duplex to be "half"');
+        }
       } else {
         super(bodyInit);
         this._streamBody = null;
@@ -571,21 +588,34 @@
 
   // collectStreamBody materializes a streaming request body to a single Uint8Array.
   // v1 buffers the whole body before sending (Content-Length framing); true
-  // chunked upload is a tracked follow-up.
-  async function collectStreamBody(src) {
+  // chunked upload is a tracked follow-up. An abort signal is honored mid-read so
+  // an infinite/slow producer does not keep allocating after the caller cancels.
+  async function collectStreamBody(src, signal) {
+    if (signal && signal.aborted) throw signal.reason;
     if (typeof Blob !== 'undefined' && src instanceof Blob) {
-      return new Uint8Array(await src.arrayBuffer());
+      var ab = await src.arrayBuffer();
+      if (signal && signal.aborted) throw signal.reason;
+      return new Uint8Array(ab);
     }
     var chunks = [];
     if (typeof src.getReader === 'function') {
       var reader = src.getReader();
       for (;;) {
+        if (signal && signal.aborted) {
+          try {
+            reader.cancel(signal.reason);
+          } catch (e) {}
+          throw signal.reason;
+        }
         var r = await reader.read();
         if (r.done) break;
         chunks.push(chunkToBytes(r.value));
       }
     } else {
-      for await (var chunk of src) chunks.push(chunkToBytes(chunk));
+      for await (var chunk of src) {
+        if (signal && signal.aborted) throw signal.reason;
+        chunks.push(chunkToBytes(chunk));
+      }
     }
     var bytes = concatChunks(chunks);
     return bytes === null ? new Uint8Array(0) : bytes;
@@ -640,15 +670,10 @@
     });
 
     // A streaming request body (Blob / ReadableStream / async iterable) is
-    // buffered to bytes before the request is sent (v1 limitation). Node requires
-    // duplex:'half' for stream bodies; enforce it for parity.
+    // buffered to bytes before the request is sent (v1 limitation); the
+    // duplex:'half' requirement was already enforced at Request construction.
     if (req._streamBody) {
-      if (req._streamNeedsDuplex && (!init || init.duplex !== 'half')) {
-        return Promise.reject(
-          new TypeError('fetch: a streaming request body requires init.duplex to be "half"'),
-        );
-      }
-      return collectStreamBody(req._streamBody).then(function (bytes) {
+      return collectStreamBody(req._streamBody, signal).then(function (bytes) {
         return startFetch(req, headerLines, bytes, signal);
       });
     }
@@ -674,7 +699,10 @@
       }
 
       function onResponse(raw) {
-        cleanup();
+        // NB: do NOT remove the abort listener here. The promise resolves at the
+        // head, but the body is still streaming — an abort after headers must
+        // still tear the transport down and error the body stream. cleanup runs
+        // when the body settles (onEnd), fails (onError), or is cancelled.
         var headers = new Headers();
         var pairs = raw.headers || [];
         for (var i = 0; i + 1 < pairs.length; i += 2) headers._append(pairs[i], pairs[i + 1]);
@@ -686,6 +714,7 @@
               if (handles && typeof handles.resume === 'function') handles.resume();
             },
             cancel: function () {
+              cleanup();
               if (handles && typeof handles.cancel === 'function') handles.cancel();
             },
           });
@@ -724,6 +753,7 @@
 
       // Body complete: err == null closes the stream cleanly; a string errors it.
       function onEnd(err) {
+        cleanup(); // body settled — abort can no longer affect it
         sink.ended = true;
         sink.endErr = err;
         if (sink.stream) {

@@ -183,6 +183,60 @@ async function main() {
     console.log('truncated stream:', r.status, streamErr);
   }
 
+  // Malformed chunked framing (chunk data not followed by CRLF) must reject the
+  // body read, not be accepted as valid bytes.
+  {
+    const r = await fetch(base + '/badchunk');
+    let err = '';
+    try {
+      await r.text();
+    } catch (error) {
+      err = error && error.constructor.name;
+    }
+    console.log('malformed chunk:', r.status, err);
+  }
+
+  // Abort AFTER the response head has resolved must still tear the body down: the
+  // in-flight body read rejects with the signal's AbortError. /slowbody sends one
+  // chunk then stalls, so the abort — not EOF — ends the read.
+  {
+    const ac = new AbortController();
+    const r = await fetch(base + '/slowbody', { signal: ac.signal });
+    const reader = r.body.getReader();
+    await reader.read(); // first chunk ('partial')
+    ac.abort();
+    let name = '';
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch (error) {
+      name = error && error.name;
+    }
+    console.log('abort after headers:', name);
+  }
+
+  // fetch(new Request(url, { body: <stream>, duplex: 'half' })) — the streaming
+  // body must survive Request construction and reach the server (not be dropped).
+  {
+    async function* gen() {
+      yield new TextEncoder().encode('req-');
+      yield new TextEncoder().encode('obj-body');
+    }
+    const rq = new Request(base + '/echo', { method: 'POST', body: gen(), duplex: 'half' });
+    const echoed = await fetch(rq).then((r) => r.json());
+    console.log('request-object stream body:', JSON.stringify(echoed.echo));
+  }
+
+  // clone() tees a streaming body: both responses read the full content.
+  {
+    const r = await fetch(base + '/big');
+    const r2 = r.clone();
+    const [t1, t2] = await Promise.all([r.text(), r2.text()]);
+    console.log('clone tee:', t1.length === BIG.length, t1 === t2);
+  }
+
   // IPv6 literal host: parse [::1], connect over AF_INET6, and re-bracket the
   // Host header. Only runs when the runner confirmed IPv6 loopback is up (it
   // sets FETCH_BASE6), so Node and Lava take this branch identically.

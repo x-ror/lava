@@ -697,10 +697,17 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 		req.on_end = nil
 	}
 	if req.cancel_fn != nil {
+		// The JS body stream retains these handles (via Response.body) long after
+		// the request settles, so clear the back-pointer before the request is
+		// freed: a later cancel()/pull() then reads a nil private and no-ops rather
+		// than dereferencing freed memory. Unprotect drops our GC root; JS keeps the
+		// object alive as long as it is reachable.
+		jsc.JSObjectSetPrivate(req.cancel_fn, nil)
 		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.cancel_fn)
 		req.cancel_fn = nil
 	}
 	if req.resume_fn != nil {
+		jsc.JSObjectSetPrivate(req.resume_fn, nil)
 		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.resume_fn)
 		req.resume_fn = nil
 	}
@@ -965,6 +972,12 @@ fetch_feed_chunked :: proc(req: ^Fetch_Request, data: []byte) {
 
 		case .Data_CRLF:
 			if len(buf) - pos < 2 do break loop // CRLF not fully arrived
+			// RFC 7230: chunk data is always followed by CRLF. A different byte pair
+			// means the framing is corrupt — fail rather than resync on garbage.
+			if buf[pos] != '\r' || buf[pos + 1] != '\n' {
+				fetch_finish_body(req, "fetch: terminated")
+				return
+			}
 			pos += 2 // skip the chunk-terminating CRLF
 			req.chunk_state = .Size
 
