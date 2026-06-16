@@ -133,7 +133,7 @@
       // dense undefined: structuredClone preserves holes, and copyOwnEnumerable
       // below only copies indices actually present in the source. A dense array
       // here would turn every hole into an own `undefined` (breaking `i in clone`).
-      // oxlint-disable-next-line no-array-constructor
+      // oxlint-disable-next-line unicorn/no-new-array
       var arr = new Array(value.length);
       seen.set(value, arr);
       copyOwnEnumerable(value, arr, seen);
