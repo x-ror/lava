@@ -3,4 +3,4 @@
 (function (require, module, exports) {
   'use strict';
   module.exports = require('node:dns').promises;
-})
+});

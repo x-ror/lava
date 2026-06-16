@@ -31,7 +31,9 @@
     // Node accepts a falsy hostname (resolves to null); only a non-string truthy
     // value is a type error.
     if (name && typeof name !== 'string') {
-      var e = new TypeError('The "hostname" argument must be of type string. Received ' + typeof name);
+      var e = new TypeError(
+        'The "hostname" argument must be of type string. Received ' + typeof name,
+      );
       e.code = 'ERR_INVALID_ARG_TYPE';
       throw e;
     }
@@ -85,7 +87,9 @@
   function setDefaultResultOrder(order) {
     if (order !== 'ipv4first' && order !== 'ipv6first' && order !== 'verbatim') {
       var e = new TypeError(
-        "The argument 'order' must be one of 'verbatim', 'ipv4first', 'ipv6first'. Received '" + order + "'"
+        "The argument 'order' must be one of 'verbatim', 'ipv4first', 'ipv6first'. Received '" +
+          order +
+          "'",
       );
       e.code = 'ERR_INVALID_ARG_VALUE';
       throw e;
@@ -98,9 +102,23 @@
 
   // ---- Tier 2 (c-ares) — surface present, not yet implemented ----
   var TIER2 = [
-    'resolve', 'resolve4', 'resolve6', 'resolveAny', 'resolveCname', 'resolveCaa',
-    'resolveMx', 'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa', 'resolveSrv',
-    'resolveTxt', 'reverse', 'lookupService', 'getServers', 'setServers',
+    'resolve',
+    'resolve4',
+    'resolve6',
+    'resolveAny',
+    'resolveCname',
+    'resolveCaa',
+    'resolveMx',
+    'resolveNaptr',
+    'resolveNs',
+    'resolvePtr',
+    'resolveSoa',
+    'resolveSrv',
+    'resolveTxt',
+    'reverse',
+    'lookupService',
+    'getServers',
+    'setServers',
   ];
 
   function notImplemented(name) {
@@ -154,12 +172,30 @@
 
   // ---- error codes & getaddrinfo hint flags (Node parity) ----
   var CODES = {
-    NODATA: 'ENODATA', FORMERR: 'EFORMERR', SERVFAIL: 'ESERVFAIL', NOTFOUND: 'ENOTFOUND',
-    NOTIMP: 'ENOTIMP', REFUSED: 'EREFUSED', BADQUERY: 'EBADQUERY', BADNAME: 'EBADNAME',
-    BADFAMILY: 'EBADFAMILY', BADRESP: 'EBADRESP', CONNREFUSED: 'ECONNREFUSED', TIMEOUT: 'ETIMEOUT',
-    EOF: 'EOF', FILE: 'EFILE', NOMEM: 'ENOMEM', DESTRUCTION: 'EDESTRUCTION', BADSTR: 'EBADSTR',
-    BADFLAGS: 'EBADFLAGS', NONAME: 'ENONAME', BADHINTS: 'EBADHINTS', NOTINITIALIZED: 'ENOTINITIALIZED',
-    LOADIPHLPAPI: 'ELOADIPHLPAPI', ADDRGETNETWORKPARAMS: 'EADDRGETNETWORKPARAMS', CANCELLED: 'ECANCELLED',
+    NODATA: 'ENODATA',
+    FORMERR: 'EFORMERR',
+    SERVFAIL: 'ESERVFAIL',
+    NOTFOUND: 'ENOTFOUND',
+    NOTIMP: 'ENOTIMP',
+    REFUSED: 'EREFUSED',
+    BADQUERY: 'EBADQUERY',
+    BADNAME: 'EBADNAME',
+    BADFAMILY: 'EBADFAMILY',
+    BADRESP: 'EBADRESP',
+    CONNREFUSED: 'ECONNREFUSED',
+    TIMEOUT: 'ETIMEOUT',
+    EOF: 'EOF',
+    FILE: 'EFILE',
+    NOMEM: 'ENOMEM',
+    DESTRUCTION: 'EDESTRUCTION',
+    BADSTR: 'EBADSTR',
+    BADFLAGS: 'EBADFLAGS',
+    NONAME: 'ENONAME',
+    BADHINTS: 'EBADHINTS',
+    NOTINITIALIZED: 'ENOTINITIALIZED',
+    LOADIPHLPAPI: 'ELOADIPHLPAPI',
+    ADDRGETNETWORKPARAMS: 'EADDRGETNETWORKPARAMS',
+    CANCELLED: 'ECANCELLED',
   };
 
   exports.lookup = lookup;
@@ -176,4 +212,4 @@
     exports[m] = notImplemented(m);
   });
   exports.promises = promises;
-})
+});

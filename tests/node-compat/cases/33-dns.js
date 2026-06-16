@@ -60,15 +60,12 @@ async function main() {
   assert.equal(p.family, 4);
 
   // Failed resolution rejects with a getaddrinfo ENOTFOUND error.
-  await assert.rejects(
-    lookup('lava-nonexistent.invalid'),
-    (err) => {
-      assert.equal(err.code, 'ENOTFOUND');
-      assert.equal(err.syscall, 'getaddrinfo');
-      assert.equal(err.hostname, 'lava-nonexistent.invalid');
-      return true;
-    }
-  );
+  await assert.rejects(lookup('lava-nonexistent.invalid'), (err) => {
+    assert.equal(err.code, 'ENOTFOUND');
+    assert.equal(err.syscall, 'getaddrinfo');
+    assert.equal(err.hostname, 'lava-nonexistent.invalid');
+    return true;
+  });
 }
 
 main().catch((error) => {
