@@ -11,12 +11,90 @@
     throw new Error('node:dns is unavailable: native bindings missing');
   }
 
-  function familyToNumber(f) {
-    if (f === 4 || f === 6 || f === 0) return f;
+  // getaddrinfo hint flags. These mirror Node's numeric values (which come from
+  // the platform getaddrinfo headers); user code does bitwise math with them, so
+  // the numbers must match. Lava's resolver is the core:net DNS client rather than
+  // a real getaddrinfo, so ADDRCONFIG/V4MAPPED have no behavioral effect yet — but
+  // they are still validated like Node so invalid hint masks throw rather than
+  // silently passing.
+  var ADDRCONFIG = 32;
+  var V4MAPPED = 8;
+  var ALL = 16;
+
+  // ---- Node-parity argument validation -------------------------------------
+  // dns.lookup is strict about option types/values: Node throws synchronously on
+  // bad input (ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE, both TypeError) so
+  // mistakes surface instead of resolving as "any family". We mirror the codes and
+  // shapes; message text is close but the contract callers rely on is code + type.
+  function typeErr(code, message) {
+    var e = new TypeError(message);
+    e.code = code;
+    return e;
+  }
+  function show(value) {
+    return typeof value === 'string' ? "'" + value + "'" : String(value);
+  }
+  function propWord(name) {
+    return name.indexOf('.') !== -1 ? 'property' : 'argument';
+  }
+  function invalidArgType(name, expected, value) {
+    var kind = value === null ? 'null' : typeof value;
+    return typeErr(
+      'ERR_INVALID_ARG_TYPE',
+      'The "' +
+        name +
+        '" ' +
+        propWord(name) +
+        ' must be ' +
+        expected +
+        '. Received type ' +
+        kind +
+        ' (' +
+        show(value) +
+        ')',
+    );
+  }
+  function invalidArgValue(name, value, reason) {
+    return typeErr(
+      'ERR_INVALID_ARG_VALUE',
+      'The ' +
+        propWord(name) +
+        " '" +
+        name +
+        "' " +
+        (reason || 'is invalid') +
+        '. Received ' +
+        show(value),
+    );
+  }
+  function validateBoolean(value, name) {
+    if (typeof value !== 'boolean') throw invalidArgType(name, 'of type boolean', value);
+  }
+  function validateNumber(value, name) {
+    if (typeof value !== 'number') throw invalidArgType(name, 'of type number', value);
+  }
+  function validateOneOf(value, name, list) {
+    if (list.indexOf(value) === -1) {
+      var allowed = list.map(show).join(', ');
+      throw invalidArgValue(name, value, 'must be one of: ' + allowed);
+    }
+  }
+  // Node accepts the 'IPv4'/'IPv6' aliases, then requires the family to be 0/4/6;
+  // anything else (including the string '4') is ERR_INVALID_ARG_VALUE.
+  function parseFamily(f, name) {
     if (f === 'IPv4') return 4;
     if (f === 'IPv6') return 6;
-    return 0;
+    validateOneOf(f, name, [0, 4, 6]);
+    return f;
   }
+  // A hint mask is valid iff it only sets known flags (matches Node's validateHints).
+  function validateHints(hints) {
+    if ((hints & ~(ADDRCONFIG | V4MAPPED | ALL)) !== 0) {
+      throw invalidArgValue('hints', hints);
+    }
+  }
+  // Result-order names map to the small integer codes the native bridge understands.
+  var ORDER_CODES = { verbatim: 0, ipv4first: 1, ipv6first: 2 };
 
   function makeDnsError(code, syscall, hostname) {
     var err = new Error(syscall + ' ' + code + (hostname ? ' ' + hostname : ''));
@@ -46,22 +124,42 @@
       options = undefined;
     }
     if (typeof callback !== 'function') {
-      var e = new TypeError('The "callback" argument must be of type function.');
-      e.code = 'ERR_INVALID_ARG_TYPE';
-      throw e;
+      throw invalidArgType('callback', 'of type function', callback);
     }
     validateHostname(hostname);
 
     var family = 0;
     var all = false;
+    var order = defaultResultOrder;
     if (typeof options === 'number') {
-      family = familyToNumber(options);
-    } else if (options && typeof options === 'object') {
-      family = familyToNumber(options.family);
-      all = !!options.all;
+      // Numeric options is the family shorthand: dns.lookup(host, 4, cb).
+      validateOneOf(options, 'family', [0, 4, 6]);
+      family = options;
+    } else if (options !== undefined && options !== null && typeof options !== 'object') {
+      throw invalidArgType('options', 'of type object or integer', options);
+    } else if (options) {
+      if (options.hints !== undefined && options.hints !== null) {
+        validateNumber(options.hints, 'options.hints');
+        validateHints(options.hints >>> 0);
+      }
+      if (options.family !== undefined && options.family !== null) {
+        family = parseFamily(options.family, 'options.family');
+      }
+      if (options.all !== undefined && options.all !== null) {
+        validateBoolean(options.all, 'options.all');
+        all = options.all;
+      }
+      if (options.verbatim !== undefined && options.verbatim !== null) {
+        validateBoolean(options.verbatim, 'options.verbatim');
+        order = options.verbatim ? 'verbatim' : 'ipv4first';
+      }
+      if (options.order !== undefined && options.order !== null) {
+        validateOneOf(options.order, 'options.order', ['verbatim', 'ipv4first', 'ipv6first']);
+        order = options.order;
+      }
     }
 
-    // Node returns null/[] for an empty hostname rather than erroring.
+    // Node returns null/[] for a falsy hostname rather than erroring.
     if (!hostname) {
       queueMicrotask(function () {
         if (all) callback(null, []);
@@ -70,7 +168,7 @@
       return;
     }
 
-    native.lookup(String(hostname), family, all, function (code, addresses) {
+    native.lookup(String(hostname), family, ORDER_CODES[order], all, function (code, addresses) {
       if (code) {
         callback(makeDnsError(code, 'getaddrinfo', hostname));
         return;
@@ -202,9 +300,9 @@
   exports.setDefaultResultOrder = setDefaultResultOrder;
   exports.getDefaultResultOrder = getDefaultResultOrder;
   exports.Resolver = Resolver;
-  exports.ADDRCONFIG = 1024;
-  exports.V4MAPPED = 2048;
-  exports.ALL = 256;
+  exports.ADDRCONFIG = ADDRCONFIG;
+  exports.V4MAPPED = V4MAPPED;
+  exports.ALL = ALL;
   Object.keys(CODES).forEach(function (k) {
     exports[k] = CODES[k];
   });

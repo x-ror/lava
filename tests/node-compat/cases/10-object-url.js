@@ -35,6 +35,24 @@ assert.equal(fileResolved.size, 3);
 assert.equal(fileResolved.type, 'text/plain');
 assert.equal(fileResolved.name, undefined);
 
+// resolveObjectURL string-coerces its argument (Node does `${id}`), so any value
+// whose string form is the registered id resolves to a fresh Blob — e.g. a URL
+// object, or anything with a matching toString(). A miss still returns undefined.
+const viaToString = buffer.resolveObjectURL({ toString: () => url });
+assert.equal(viaToString.constructor.name, 'Blob');
+assert.equal(viaToString.size, 11);
+assert.equal(viaToString.type, 'text/plain');
+assert.equal(buffer.resolveObjectURL({ toString: () => 'blob:nodedata:nope' }), undefined);
+
+// The canonical case is a WHATWG URL object (its href is the id). Lava has no URL
+// constructor yet, so guard on it — Node still exercises the exact path, and the
+// silent assertions keep stdout identical across runtimes.
+if (typeof URL === 'function') {
+  const viaUrl = buffer.resolveObjectURL(new URL(url));
+  assert.equal(viaUrl.constructor.name, 'Blob');
+  assert.equal(viaUrl.size, 11);
+}
+
 // revoke removes the registration; resolving afterwards yields undefined.
 assert.equal(URL.revokeObjectURL(url), undefined);
 assert.equal(buffer.resolveObjectURL(url), undefined);
