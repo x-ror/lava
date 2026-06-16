@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keep the SHA-pinned actions in .github/workflows/ current. Because the
+  # workflows pin by commit SHA (supply-chain integrity), these bumps won't
+  # happen on their own — Dependabot opens the PRs that advance the pins.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      # One PR per week for all action bumps instead of one per action.
+      github-actions:
+        patterns:
+          - "*"
