@@ -86,7 +86,9 @@ const handler = (req, res) => {
       // raw because the http module always frames chunks correctly.
       const sock = res.socket;
       if (sock) {
-        sock.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n');
+        sock.write(
+          'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n',
+        );
         sock.write('5\r\nhelloXX'); // "XX" where the chunk-terminating CRLF must be
         setTimeout(() => sock.destroy(), 15);
       }
