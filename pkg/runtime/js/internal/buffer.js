@@ -921,8 +921,12 @@
   }
 
   function resolveObjectURL(id) {
-    if (typeof id !== 'string') return undefined;
-    var blob = objectUrlRegistry.get(id);
+    // Node coerces the argument with `${id}`, so a URL object or anything with a
+    // toString() resolves the same as its string form; a non-registered or junk
+    // id then misses the registry and returns undefined (never throws). The
+    // template form matches Node's ToString exactly — including throwing a
+    // TypeError on a Symbol, which String(id) would silently stringify instead.
+    var blob = objectUrlRegistry.get(`${id}`);
     if (blob === undefined) return undefined;
     // Node returns a fresh Blob over the same bytes rather than the registered
     // instance, and a registered File resolves back as a plain Blob.
