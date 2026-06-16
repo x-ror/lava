@@ -18,8 +18,25 @@
 (function (require, module, exports) {
   'use strict';
 
-  var encoder = new TextEncoder();
-  var decoder = new TextDecoder('utf-8');
+  // TextEncoder/TextDecoder are installed by internal/encoding.js. This module is
+  // eagerly instantiated to install the URL/URLSearchParams globals, so the codecs
+  // are created lazily (on first parse/serialize) rather than at module-eval time —
+  // that keeps url.js robust to the loader's eager-instantiation order, since no
+  // URL operation runs until user code, by which point every builtin has loaded.
+  var encoderInstance = null;
+  var decoderInstance = null;
+  var fatalDecoderInstance = null;
+  function encoder() {
+    return encoderInstance || (encoderInstance = new TextEncoder());
+  }
+  function decoder() {
+    return decoderInstance || (decoderInstance = new TextDecoder('utf-8'));
+  }
+  function fatalDecoder() {
+    return (
+      fatalDecoderInstance || (fatalDecoderInstance = new TextDecoder('utf-8', { fatal: true }))
+    );
+  }
 
   // A unique sentinel distinct from any valid parser result; using a symbol means
   // it can never collide with a legitimately-produced host string or number.
@@ -84,7 +101,7 @@
       var cp = str.codePointAt(i);
       if (cp > 0xffff) i++; // consumed a surrogate pair
       if (inSet(cp)) {
-        var bytes = encoder.encode(String.fromCodePoint(cp));
+        var bytes = encoder().encode(String.fromCodePoint(cp));
         for (var b = 0; b < bytes.length; b++) out += percentEncodeByte(bytes[b]);
       } else {
         out += String.fromCodePoint(cp);
@@ -92,8 +109,6 @@
     }
     return out;
   }
-
-  var fatalDecoder = new TextDecoder('utf-8', { fatal: true });
 
   // Percent-decode a string to its raw byte sequence. Non-%XX characters
   // contribute their own UTF-8 bytes so raw multibyte input survives.
@@ -112,7 +127,7 @@
       } else {
         var cp = str.codePointAt(i);
         if (cp > 0xffff) i++;
-        var enc = encoder.encode(String.fromCodePoint(cp));
+        var enc = encoder().encode(String.fromCodePoint(cp));
         for (var k = 0; k < enc.length; k++) bytes.push(enc[k]);
       }
     }
@@ -121,14 +136,14 @@
 
   // Lenient percent-decode (invalid UTF-8 → U+FFFD), used for query/form parsing.
   function percentDecode(str) {
-    return decoder.decode(percentDecodeBytes(str));
+    return decoder().decode(percentDecodeBytes(str));
   }
 
   // Strict percent-decode for host parsing: invalid UTF-8 is a parse failure, as
   // the URL Standard's domain-to-ASCII step rejects it (Node throws to match).
   function percentDecodeHostStrict(str) {
     try {
-      return fatalDecoder.decode(percentDecodeBytes(str));
+      return fatalDecoder().decode(percentDecodeBytes(str));
     } catch (e) {
       return FAILURE;
     }
@@ -1217,7 +1232,7 @@
   }
 
   function formUrlencodedByteSerialize(str) {
-    var bytes = encoder.encode(str);
+    var bytes = encoder().encode(str);
     var out = '';
     for (var i = 0; i < bytes.length; i++) {
       var b = bytes[i];
