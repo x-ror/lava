@@ -249,6 +249,11 @@ jobs:
       # (fs_os_error_to_code) end to end; the sqlite leg exercises the statically
       # linked sqlite3.lib through the node:sqlite bridge.
       - name: Oracle suites (event-loop + fs + sqlite)
+        # DIAGNOSTIC (temporary): deliver the JSC option via the inherited env so it
+        # is guaranteed visible to JSC's getenv at startup, isolating option-choice
+        # from the in-process _putenv_s delivery. Remove once the root cause is fixed.
+        env:
+          JSC_useConcurrentJIT: "false"
         run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-oracles.sh
 
       # Fetch transport smoke over the real Winsock + select() backend, reusing the
