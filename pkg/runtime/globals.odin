@@ -844,6 +844,8 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"structured_clone", INTERNAL_STRUCTURED_CLONE},
 		{"path", INTERNAL_PATH},
 		{"sqlite", INTERNAL_SQLITE},
+		{"dns", INTERNAL_DNS},
+		{"dns/promises", INTERNAL_DNS_PROMISES},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -864,6 +866,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "buffer", cast(jsc.JSValueRef)make_buffer_bindings(ctx))
 	set_named(ctx, natives, "fetch", cast(jsc.JSValueRef)make_fetch_bindings(ctx))
 	set_named(ctx, natives, "sqlite", cast(jsc.JSValueRef)make_sqlite_bindings(ctx))
+	set_named(ctx, natives, "dns", cast(jsc.JSValueRef)make_dns_bindings(ctx))
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef
@@ -1106,6 +1109,8 @@ INTERNAL_URL :: #load("js/internal/url.js", string)
 INTERNAL_STRUCTURED_CLONE :: #load("js/internal/structured_clone.js", string)
 INTERNAL_PATH :: #load("js/internal/path.js", string)
 INTERNAL_SQLITE :: #load("js/internal/sqlite.js", string)
+INTERNAL_DNS :: #load("js/internal/dns.js", string)
+INTERNAL_DNS_PROMISES :: #load("js/internal/dns_promises.js", string)
 
 // ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
 // the module resolver (see install_internal_modules); evaluates to a function.
