@@ -20,7 +20,7 @@ MODULES = {
     "path": ("full", "posix+win32 full surface", ""),
     "sqlite": ("full", "DatabaseSync/StatementSync", "session/backup"),
     "console": ("partial", "global console (rich)", "no node:console module / Console class"),
-    "crypto": ("partial", "hash/hmac/hkdf/pbkdf2/random*/uuid/timingSafeEqual", "~50 stubbed: ciphers/keys/sign/verify/scrypt/x509/ecdh/dh/argon2/subtle"),
+    "crypto": ("partial", "hash/hmac (+OpenSSL aliases)/hkdf/pbkdf2/scrypt/random*/uuid/timingSafeEqual/getFips", "~45 stubbed: ciphers/keys/sign/verify/x509/ecdh/dh/argon2/subtle"),
     "esm": ("partial", ".mjs transform, import works", "loader hooks/register"),
     "fs": ("partial", "13 fns: readFile/writeFile(Sync)/stat/readdir/mkdir/rm/...", "no promises/streams/watch/copyFile/access/chmod/open"),
     "globals": ("partial", "29 globals present (incl. URL/URLSearchParams)", "Event/streams/atob/navigator/reportError"),

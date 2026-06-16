@@ -20,8 +20,12 @@ import jsc "lava:pkg/jsc"
 // getrandom on Linux, BCryptGenRandom on Windows), replacing the Math.random
 // placeholder the pure-JS module shipped with.
 
-// crypto_algorithm maps a Node digest name (already lowercased by the JS layer)
-// to an Odin hash.Algorithm. The bool is false for names we do not implement.
+// crypto_algorithm maps a canonical Node digest name to an Odin hash.Algorithm.
+// The JS layer (js/internal/crypto.js) lowercases the name and resolves every
+// OpenSSL/Node alias (RSA-SHA256, sha256WithRSAEncryption, ssl3-md5, …) to one
+// of the canonical names below before crossing the boundary, and rejects any
+// digest Lava does not support — so this switch only handles the canonical set
+// and returns (.Invalid, false) defensively for anything unexpected.
 crypto_algorithm :: proc(name: string) -> (hash.Algorithm, bool) {
 	switch name {
 	case "md5":
@@ -57,44 +61,6 @@ crypto_algorithm :: proc(name: string) -> (hash.Algorithm, bool) {
 		return .BLAKE2S, true
 	case "sm3":
 		return .SM3, true
-
-	// TODO(hash-aliases): Node/OpenSSL exposes these digest aliases. Normalize
-	// them to the canonical algorithms above once alias coverage is tested.
-	case "rsa-md5", "md5withrsaencryption", "ssl3-md5":
-		return .Invalid, false
-	case "rsa-sha1", "rsa-sha1-2", "sha1withrsaencryption", "ssl3-sha1":
-		return .Invalid, false
-	case "rsa-sha224", "sha224withrsaencryption":
-		return .Invalid, false
-	case "rsa-sha256", "sha256withrsaencryption":
-		return .Invalid, false
-	case "rsa-sha384", "sha384withrsaencryption":
-		return .Invalid, false
-	case "rsa-sha512", "sha512withrsaencryption":
-		return .Invalid, false
-	case "rsa-sha512/256", "sha512-256withrsaencryption":
-		return .Invalid, false
-	case "rsa-sha3-224", "id-rsassa-pkcs1-v1_5-with-sha3-224":
-		return .Invalid, false
-	case "rsa-sha3-256", "id-rsassa-pkcs1-v1_5-with-sha3-256":
-		return .Invalid, false
-	case "rsa-sha3-384", "id-rsassa-pkcs1-v1_5-with-sha3-384":
-		return .Invalid, false
-	case "rsa-sha3-512", "id-rsassa-pkcs1-v1_5-with-sha3-512":
-		return .Invalid, false
-	case "rsa-sm3", "sm3withrsaencryption":
-		return .Invalid, false
-
-	// TODO(hash-unsupported): Node exposes these names, but Odin's current
-	// hash.Algorithm enum does not have matching primitives.
-	case "ripemd", "ripemd160", "rmd160", "ripemd160withrsa":
-		return .Invalid, false
-	case "sha512-224", "rsa-sha512/224", "sha512-224withrsaencryption":
-		return .Invalid, false
-	case "md5-sha1":
-		return .Invalid, false
-	case "shake128", "shake256":
-		return .Invalid, false
 	}
 	return .Invalid, false
 }
@@ -388,10 +354,11 @@ crypto_timing_safe_equal_cb :: proc "c" (
 //     diffieHellman, encapsulate, decapsulate
 //   - key generation/prime APIs: generateKey*, generateKeyPair*, generatePrime*,
 //     checkPrime*
-//   - password hashing/KDF APIs: scrypt*, argon2*
+//   - password hashing/KDF APIs: argon2* (scrypt is implemented in JS on top of
+//     the PBKDF2 primitive; core:crypto/argon2id could back argon2* in a follow-up)
 //   - metadata/webcrypto APIs: getCiphers, getCipherInfo, getCurves,
-//     getDiffieHellman, fips/getFips/setFips/setEngine, secureHeapUsed,
-//     webcrypto/subtle
+//     getDiffieHellman, setFips/setEngine, secureHeapUsed, webcrypto/subtle
+//     (getFips is a constant 0 in JS — Lava has no FIPS provider)
 //   - randomness aliases/features: getRandomValues and randomUUIDv7
 
 // make_crypto_bindings builds the `native` object handed to js/internal/crypto.js.

@@ -74,8 +74,8 @@
     {
       "page": "crypto",
       "status": "partial",
-      "implemented": "hash/hmac/hkdf/pbkdf2/random*/uuid/timingSafeEqual",
-      "gaps": "~50 stubbed: ciphers/keys/sign/verify/scrypt/x509/ecdh/dh/argon2/subtle"
+      "implemented": "hash/hmac (+OpenSSL aliases)/hkdf/pbkdf2/scrypt/random*/uuid/timingSafeEqual/getFips",
+      "gaps": "~45 stubbed: ciphers/keys/sign/verify/x509/ecdh/dh/argon2/subtle"
     },
     {
       "page": "debugger",
