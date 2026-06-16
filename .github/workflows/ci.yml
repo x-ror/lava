@@ -248,13 +248,26 @@ jobs:
       # The fs leg validates the Win32 GetLastError -> errno mapping
       # (fs_os_error_to_code) end to end; the sqlite leg exercises the statically
       # linked sqlite3.lib through the node:sqlite bridge.
+      # DIAGNOSTIC (temporary): bisect the 07-crypto exit-127 crash. Run it directly
+      # plus minimal probes with markers so we can see how far each gets and whether
+      # the sync or async scrypt (or the heavy default-cost compute) is the trigger.
+      - name: Debug 07-crypto crash
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== 07-crypto direct ==="
+          ./build/lava.exe run tests/node-compat/cases/07-crypto.js; echo "07-crypto exit=$?"
+          printf "const c=require('node:crypto');console.error('A');const k=c.scryptSync('password','salt',32);console.error('B '+k.length);\n" > p1.js
+          echo "=== scryptSync default ==="; ./build/lava.exe run p1.js; echo "p1 exit=$?"
+          printf "const c=require('node:crypto');console.error('A');const k=c.scryptSync('password','salt',32,{N:16384,r:8,p:1});console.error('B '+k.length);\n" > p2.js
+          echo "=== scryptSync N=16384 ==="; ./build/lava.exe run p2.js; echo "p2 exit=$?"
+          printf "const c=require('node:crypto');console.error('A');c.scrypt('password','salt',32,(e,k)=>console.error('B '+(k&&k.length)));console.error('C');\n" > p3.js
+          echo "=== async scrypt ==="; ./build/lava.exe run p3.js; echo "p3 exit=$?"
+          printf "console.error('hi');\n" > p4.js
+          echo "=== trivial ==="; ./build/lava.exe run p4.js; echo "p4 exit=$?"
+          set -e
+
       - name: Oracle suites (event-loop + fs + sqlite)
-        # DIAGNOSTIC (temporary): deliver the JSC option via the inherited env so it
-        # is guaranteed visible to JSC's getenv at startup, isolating option-choice
-        # from the in-process _putenv_s delivery. Remove once the root cause is fixed.
-        env:
-          JSC_useConcurrentJIT: "false"
-          JSC_useConcurrentGC: "false"
         run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-oracles.sh
 
       # Fetch transport smoke over the real Winsock + select() backend, reusing the
