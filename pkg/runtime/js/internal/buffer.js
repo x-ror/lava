@@ -1052,6 +1052,23 @@
   Blob.prototype.bytes = function () {
     return Promise.resolve(new Uint8Array(this._bytes));
   };
+  // stream() returns a WHATWG ReadableStream that emits the Blob's bytes. Node
+  // delivers an in-memory Blob as a single Uint8Array chunk, then closes; we do
+  // the same. The chunk is a fresh copy (new Uint8Array(...)), so a consumer that
+  // mutates a read chunk cannot write back into the Blob's immutable bytes —
+  // matching Node, whose chunk is also a copy. node:stream/web is required
+  // lazily here because it loads after node:buffer (see internal/loader.js), so
+  // it is not available at this module's evaluation time.
+  Blob.prototype.stream = function () {
+    var bytes = this._bytes;
+    var ReadableStream = require('node:stream/web').ReadableStream;
+    return new ReadableStream({
+      start: function (controller) {
+        if (bytes.length > 0) controller.enqueue(new Uint8Array(bytes));
+        controller.close();
+      },
+    });
+  };
   Blob.prototype.text = function () {
     return Promise.resolve(Buffer.from(this._bytes).toString('utf8'));
   };
