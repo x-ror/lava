@@ -10,5 +10,10 @@ export default defineConfig({
 	},
 	lint: {
 		ignorePatterns: ignoredGenerated,
+		rules: {
+			'no-unused-expressions': 'off',
+			'no-sparse-arrays': 'off',
+			'unicorn/no-thenable': 'off',
+		},
 	},
 });
