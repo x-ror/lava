@@ -421,9 +421,9 @@
     },
     {
       "page": "webstreams",
-      "status": "missing",
-      "implemented": "",
-      "gaps": "ReadableStream/WritableStream/TransformStream"
+      "status": "partial",
+      "implemented": "ReadableStream/WritableStream/TransformStream globals + node:stream/web; readers/writers/controllers; pipeTo/pipeThrough; backs response.body",
+      "gaps": "byte streams/BYOB (deferred), TextEncoderStream/TextDecoderStream, CompressionStream"
     },
     {
       "page": "worker_threads",
@@ -467,6 +467,17 @@
       "crypto",
       "URL",
       "URLSearchParams",
+      "ReadableStream",
+      "WritableStream",
+      "TransformStream",
+      "ReadableStreamDefaultReader",
+      "ReadableStreamBYOBReader",
+      "ReadableStreamDefaultController",
+      "WritableStreamDefaultWriter",
+      "WritableStreamDefaultController",
+      "TransformStreamDefaultController",
+      "ByteLengthQueuingStrategy",
+      "CountQueuingStrategy",
       "WebAssembly",
       "Intl"
     ],
@@ -476,9 +487,8 @@
       "Event",
       "EventTarget",
       "CustomEvent",
-      "ReadableStream",
-      "WritableStream",
-      "TransformStream",
+      "ReadableStreamBYOBRequest",
+      "ReadableByteStreamController",
       "TextEncoderStream",
       "TextDecoderStream",
       "CompressionStream",

@@ -7,6 +7,16 @@
 (function (require, module, exports, native) {
   'use strict';
 
+  // The public Web Streams implementation (js/internal/streams.js). fetch builds
+  // response bodies and consumes request bodies through this same ReadableStream
+  // type, so `response.body` is a real, standard ReadableStream — not a fetch-only
+  // fork. The `_internal` helpers let the transport drive a stream's controller
+  // (enqueue/close/error + desiredSize backpressure) without re-implementing the
+  // controller plumbing here.
+  var webStreams = require('node:stream/web');
+  var ReadableStream = webStreams.ReadableStream;
+  var streamInternal = webStreams._internal;
+
   // Shared, lazily-created codecs. TextEncoder.encode / TextDecoder.decode
   // (non-streaming) are stateless across calls, so a single instance each is
   // reused across every body conversion instead of allocating one per call —
@@ -199,194 +209,68 @@
   }
 
   // BODY_HWM is the response-body high-water mark in bytes. When more than this
-  // many undelivered bytes are queued in a BodyStream, its _desiredSize goes
-  // non-positive and the native transport pauses the socket read until the
-  // consumer drains below it (backpressure).
+  // many undelivered bytes are queued in the response ReadableStream, its
+  // controller.desiredSize goes non-positive and the native transport pauses the
+  // socket read until the consumer drains below it (backpressure).
   var BODY_HWM = 64 * 1024;
 
-  // BodyStream is a minimal, WHATWG-ReadableStream-shaped queue tailored to fetch
-  // bodies. It is fed either by the native transport (push: _enqueue/_close/_error,
-  // driven by the request's sink) or, for an in-memory body, by a single enqueued
-  // chunk. It supports getReader().read(), async iteration, cancel(), tee(),
-  // locked, and drives transport backpressure through its source.pull hook.
-  class BodyStream {
-    constructor(source) {
-      this._source = source || {};
-      this._queue = []; // Uint8Array chunks awaiting a reader
-      this._queuedBytes = 0;
-      this._state = 'readable'; // 'readable' | 'closed' | 'errored'
-      this._storedError = undefined;
-      this._reader = null; // active reader holds the lock
-      this._disturbed = false; // a read or cancel has occurred (drives bodyUsed)
-      this._pending = []; // [{resolve, reject}] reads waiting on a chunk
-    }
-    get locked() {
-      return this._reader !== null;
-    }
-    // _desiredSize <= 0 tells the transport to pause; > 0 to keep reading.
-    get _desiredSize() {
-      if (this._state !== 'readable') return 0;
-      return BODY_HWM - this._queuedBytes;
-    }
-    _enqueue(chunk) {
-      if (this._state !== 'readable') return;
-      if (this._pending.length > 0) {
-        this._pending.shift().resolve({ value: chunk, done: false });
-        return;
-      }
-      this._queue.push(chunk);
-      this._queuedBytes += chunk.length;
-    }
-    _close() {
-      if (this._state !== 'readable') return;
-      this._state = 'closed';
-      while (this._pending.length > 0) {
-        this._pending.shift().resolve({ value: undefined, done: true });
-      }
-    }
-    _error(err) {
-      if (this._state !== 'readable') return;
-      this._state = 'errored';
-      this._storedError = err;
-      this._queue = [];
-      this._queuedBytes = 0;
-      while (this._pending.length > 0) this._pending.shift().reject(err);
-    }
-    _readInternal() {
-      this._disturbed = true;
-      if (this._queue.length > 0) {
-        var chunk = this._queue.shift();
-        this._queuedBytes -= chunk.length;
-        this._pull();
-        return Promise.resolve({ value: chunk, done: false });
-      }
-      if (this._state === 'closed') return Promise.resolve({ value: undefined, done: true });
-      if (this._state === 'errored') return Promise.reject(this._storedError);
-      var self = this;
-      var p = new Promise(function (resolve, reject) {
-        self._pending.push({ resolve: resolve, reject: reject });
-      });
-      this._pull();
-      return p;
-    }
-    // _pull asks the source for more once the buffer has room. The native source's
-    // pull resumes a paused socket read; it is a cheap no-op when not paused, so it
-    // is safe to call on every read.
-    _pull() {
-      if (this._state !== 'readable') return;
-      if (this._queuedBytes >= BODY_HWM) return;
-      var pull = this._source.pull;
-      if (typeof pull === 'function') {
-        try {
-          pull();
-        } catch {}
-      }
-    }
-    getReader(options) {
-      if (options && options.mode !== undefined) throw new TypeError('Unsupported reader mode');
-      if (this._reader) throw new TypeError('ReadableStream is already locked to a reader');
-      var self = this;
-      var released = false;
-      var reader = {
-        read: function () {
-          if (released || self._reader !== reader)
-            return Promise.reject(new TypeError('Reader has no associated stream'));
-          return self._readInternal();
-        },
-        cancel: function (reason) {
-          if (released) return Promise.resolve();
-          return self.cancel(reason);
-        },
-        releaseLock: function () {
-          if (released) return;
-          released = true;
-          if (self._reader === reader) self._reader = null;
-        },
-      };
-      this._reader = reader;
-      return reader;
-    }
-    cancel(reason) {
-      this._disturbed = true;
-      this._queue = [];
-      this._queuedBytes = 0;
-      if (this._state === 'readable') this._close();
-      var cancel = this._source.cancel;
-      if (typeof cancel === 'function') {
-        try {
-          cancel(reason);
-        } catch {}
-      }
-      return Promise.resolve();
-    }
-    tee() {
-      if (this.locked) throw new TypeError('ReadableStream is already locked to a reader');
-      var reader = this.getReader();
-      var b1, b2;
-      var reading = false;
-      function pump() {
-        if (reading) return;
-        reading = true;
-        reader.read().then(
-          function (r) {
-            reading = false;
-            if (r.done) {
-              b1._close();
-              b2._close();
-              return;
-            }
-            b1._enqueue(r.value);
-            b2._enqueue(r.value);
-            if (b1._desiredSize > 0 || b2._desiredSize > 0) pump();
-          },
-          function (e) {
-            b1._error(e);
-            b2._error(e);
-          },
-        );
-      }
-      // WHATWG tee: cancelling one branch must not abort the source while the
-      // other is still consuming. Cancel the underlying reader only once both
-      // branches have been cancelled.
-      var c1 = false;
-      var c2 = false;
-      function makeCancel(isFirst) {
-        return function (reason) {
-          if (isFirst) c1 = true;
-          else c2 = true;
-          if (c1 && c2) reader.cancel(reason);
-        };
-      }
-      b1 = new BodyStream({ pull: pump, cancel: makeCancel(true) });
-      b2 = new BodyStream({ pull: pump, cancel: makeCancel(false) });
-      return [b1, b2];
-    }
-    [Symbol.asyncIterator]() {
-      var reader = this.getReader();
-      return {
-        next: function () {
-          return reader.read();
-        },
-        return: function (value) {
-          reader.cancel();
-          reader.releaseLock();
-          return Promise.resolve({ value: value, done: true });
-        },
-        [Symbol.asyncIterator]: function () {
-          return this;
-        },
-      };
-    }
+  // byteSizeAlgorithm sizes a queued response chunk by its byte length, so the
+  // response-body high-water mark (BODY_HWM) is measured in bytes — the unit the
+  // native transport pauses/resumes on.
+  function byteSizeAlgorithm(chunk) {
+    return chunk && chunk.byteLength ? chunk.byteLength : 0;
   }
 
-  // streamFromBytes wraps an in-memory body in a one-shot BodyStream so .body is a
-  // ReadableStream (Node parity). Enqueuing does not mark the stream disturbed, so
-  // merely reading `.body` does not flip bodyUsed.
+  // makeTransportStream builds a response-body ReadableStream fed by the native
+  // transport. It returns the public stream plus push handles the transport's
+  // sink uses: enqueue(bytes) returns whether to keep reading (desiredSize > 0),
+  // close() / error(err) settle the stream. enqueue/close are guarded because a
+  // late chunk can arrive after the consumer cancelled (stream no longer
+  // readable); the guard turns that into a harmless no-op rather than a throw.
+  function makeTransportStream(hooks) {
+    var captured = streamInternal.createReadableStreamWithController(
+      {
+        // pull resumes a paused socket read; a no-op when not paused, so it is
+        // safe for the controller to call it on every drained read.
+        pull: hooks.pull,
+        cancel: hooks.cancel,
+      },
+      BODY_HWM,
+      byteSizeAlgorithm,
+    );
+    var controller = captured.controller;
+    return {
+      stream: captured.stream,
+      enqueue: function (bytes) {
+        try {
+          controller.enqueue(bytes);
+        } catch {
+          return false;
+        }
+        return controller.desiredSize > 0;
+      },
+      close: function () {
+        try {
+          controller.close();
+        } catch {}
+      },
+      error: function (err) {
+        controller.error(err);
+      },
+    };
+  }
+
+  // streamFromBytes wraps an in-memory body in a one-shot ReadableStream so .body
+  // is a real ReadableStream (Node parity). Enqueuing happens inside start(),
+  // which does not mark the stream disturbed, so merely reading `.body` does not
+  // flip bodyUsed.
   function streamFromBytes(bytes) {
-    var s = new BodyStream({});
-    if (bytes !== null && bytes !== undefined && bytes.length > 0) s._enqueue(bytes);
-    s._close();
-    return s;
+    return new ReadableStream({
+      start: function (controller) {
+        if (bytes !== null && bytes !== undefined && bytes.length > 0) controller.enqueue(bytes);
+        controller.close();
+      },
+    });
   }
 
   // Body backs Request and Response. It holds EITHER an in-memory byte body
@@ -397,7 +281,7 @@
   // most once.
   class Body {
     constructor(bodyInit) {
-      if (bodyInit instanceof BodyStream) {
+      if (streamInternal.isReadableStream(bodyInit)) {
         this._bodyStream = bodyInit;
         this._bodyBytes = undefined;
       } else {
@@ -603,17 +487,38 @@
     var chunks = [];
     if (typeof src.getReader === 'function') {
       var reader = src.getReader();
-      for (;;) {
-        if (signal && signal.aborted) {
+      // An abort can land while reader.read() is pending — for a slow or stalled
+      // producer that next chunk may never arrive, so a between-reads
+      // signal.aborted check can never wake it and fetch() would hang before the
+      // transport even starts. Register a listener that cancels the reader:
+      // cancel() both settles the in-flight read (as done, waking the loop) and
+      // tears the underlying source down. The reader is always released on the
+      // way out so a user-created stream is never left locked.
+      var aborted = false;
+      var onAbort = null;
+      if (signal) {
+        onAbort = function () {
+          aborted = true;
           try {
-            reader.cancel(signal.reason);
+            var canceled = reader.cancel(signal.reason);
+            if (canceled && typeof canceled.catch === 'function') canceled.catch(function () {});
           } catch {}
-          throw signal.reason;
-        }
-        var r = await reader.read();
-        if (r.done) break;
-        chunks.push(chunkToBytes(r.value));
+        };
+        signal.addEventListener('abort', onAbort);
       }
+      try {
+        for (;;) {
+          var r = await reader.read();
+          if (r.done) break;
+          chunks.push(chunkToBytes(r.value));
+        }
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+        reader.releaseLock();
+      }
+      // cancel() settles the pending read as done, so the loop exits normally on
+      // abort; surface the abort reason rather than a truncated body.
+      if (aborted) throw signal.reason;
     } else {
       for await (var chunk of src) {
         if (signal && signal.aborted) throw signal.reason;
@@ -684,14 +589,16 @@
   }
 
   // startFetch hands the materialized request to the Odin transport and wires its
-  // streaming callbacks (see native.request in pkg/runtime/fetch.odin) to a
-  // BodyStream. onResponse resolves the promise with a Response whose body streams
-  // incrementally; onChunk/onEnd feed and finish that stream; onError rejects a
-  // pre-headers failure.
+  // streaming callbacks (see native.request in pkg/runtime/fetch.odin) to a public
+  // ReadableStream. onResponse resolves the promise with a Response whose body
+  // streams incrementally; onChunk/onEnd feed and finish that stream; onError
+  // rejects a pre-headers failure.
   function startFetch(req, headerLines, body, signal) {
     return new Promise(function (resolve, reject) {
       var abortListener = null;
-      var sink = { stream: null, ended: false, endErr: null };
+      // sink.body is the makeTransportStream handle (enqueue/close/error +
+      // .stream) once the response head has arrived; null while still pending.
+      var sink = { body: null, ended: false, endErr: null };
       var handles = null;
 
       function cleanup() {
@@ -712,7 +619,7 @@
 
         var bodyArg = null;
         if (raw.hasBody) {
-          var stream = new BodyStream({
+          var bodyHandle = makeTransportStream({
             pull: function () {
               if (handles && typeof handles.resume === 'function') handles.resume();
             },
@@ -721,14 +628,14 @@
               if (handles && typeof handles.cancel === 'function') handles.cancel();
             },
           });
-          sink.stream = stream;
+          sink.body = bodyHandle;
           // A terminal signal that arrived before the stream existed (a fully
           // buffered, same-tick body) is replayed here.
           if (sink.ended) {
-            if (sink.endErr != null) stream._error(new TypeError(String(sink.endErr)));
-            else stream._close();
+            if (sink.endErr != null) bodyHandle.error(new TypeError(String(sink.endErr)));
+            else bodyHandle.close();
           }
-          bodyArg = stream;
+          bodyArg = bodyHandle.stream;
         }
         resolve(
           new Response(bodyArg, {
@@ -746,11 +653,10 @@
       }
 
       // Per body chunk: enqueue and report whether to keep reading (backpressure).
+      // enqueue() already maps a non-positive desiredSize (or a closed/cancelled
+      // stream) to false, so the transport pauses or stops as appropriate.
       function onChunk(bytes) {
-        if (sink.stream) {
-          sink.stream._enqueue(bytes);
-          return sink.stream._desiredSize > 0;
-        }
+        if (sink.body) return sink.body.enqueue(bytes);
         return true;
       }
 
@@ -759,9 +665,9 @@
         cleanup(); // body settled — abort can no longer affect it
         sink.ended = true;
         sink.endErr = err;
-        if (sink.stream) {
-          if (err != null) sink.stream._error(new TypeError(String(err)));
-          else sink.stream._close();
+        if (sink.body) {
+          if (err != null) sink.body.error(new TypeError(String(err)));
+          else sink.body.close();
         }
       }
 
@@ -783,7 +689,7 @@
           if (handles && typeof handles.cancel === 'function') handles.cancel();
           // Pre-headers: reject the fetch promise. Post-headers (promise already
           // resolved): error the in-flight body stream with the abort reason.
-          if (sink.stream) sink.stream._error(signal.reason);
+          if (sink.body) sink.body.error(signal.reason);
           reject(signal.reason);
         };
         signal.addEventListener('abort', abortListener);
