@@ -103,15 +103,13 @@ make_uint8_array :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef 
 		ptr = raw_data(pad)
 		n = 0
 	}
-	array := jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
-		ctx,
-		.Uint8Array,
-		ptr,
-		c.size_t(n),
-		fs_buffer_deallocator,
-		nil,
-		nil,
-	)
+	// Enter the VM (JSLockHolder) around the creation: the C-API typed-array
+	// creators do not self-lock, so when this runs from native code that is not
+	// already inside a JSC callback (e.g. fetch's streaming body, driven from the
+	// event loop), a GC triggered by the allocation would abort on Windows. The
+	// helper is a recursive no-op for callers already holding the lock, and a plain
+	// C-API call on Linux/macOS. See pkg/jsc/jsc_init.odin.
+	array := jsc.make_uint8_nocopy_locked(ctx, ptr, c.size_t(n), fs_buffer_deallocator)
 	return cast(jsc.JSValueRef)array
 }
 

@@ -62,3 +62,55 @@ extern "C" void lava_jsc_init(void) {
 		JSC::initialize();
 	});
 }
+
+// --- VM-entering Uint8Array creator ---
+//
+// JSC's typed-array C-API creators (JSObjectMakeTypedArray*) do NOT enter the VM
+// (no JSLockHolder / APIEntryShim) — unlike JSObjectCallAsFunction et al., they
+// assume the caller already holds the API lock. Native code that creates a
+// Uint8Array from the bare event loop (fetch's streaming body is the first such
+// caller) therefore runs with the wrong thread atom-string table; when the
+// allocation triggers a GC, JSC::Heap::requestCollection aborts on
+// RELEASE_ASSERT(vm().atomStringTable() == Thread::current().atomStringTable())
+// — surfaced as 0xC0000409. Wrapping the creation in a JSLockHolder enters the VM
+// (swapping in its atom-string table). JSLock is recursive, so callers already
+// inside a JSC callback (fs/sqlite/crypto/buffer) re-enter harmlessly. This is the
+// general guard for ALL native Uint8Array creation, so other modules cannot
+// reintroduce the same crash.
+//
+// Forward-declared, like the init entry points above: JSLockHolder is exactly one
+// pointer (RefPtr<VM> m_vm) with JS_EXPORT_PRIVATE ctor/dtor (plain symbols under
+// BUN_JSC_ADDITIONS), and toJS(JSContextRef) is a reinterpret_cast to
+// JSGlobalObject* (see JSC's APICast.h). kJSTypedArrayTypeUint8Array == 3.
+
+extern "C" {
+struct OpaqueJSContext;
+struct OpaqueJSValue;
+typedef const struct OpaqueJSContext *JSContextRef;
+typedef const struct OpaqueJSValue *JSValueRef;
+typedef struct OpaqueJSValue *JSObjectRef;
+typedef void (*JSTypedArrayBytesDeallocator)(void *bytes, void *deallocatorContext);
+JSObjectRef JSObjectMakeTypedArrayWithBytesNoCopy(
+	JSContextRef ctx, int arrayType, void *bytes, size_t byteLength,
+	JSTypedArrayBytesDeallocator bytesDeallocator, void *deallocatorContext,
+	JSValueRef *exception);
+}
+
+namespace JSC {
+class JSGlobalObject;
+class JSLockHolder {
+public:
+	JSLockHolder(JSGlobalObject *);
+	~JSLockHolder();
+private:
+	void *m_vm; // RefPtr<VM> — single pointer
+};
+} // namespace JSC
+
+extern "C" JSObjectRef lava_make_uint8_nocopy(
+	JSContextRef ctx, void *bytes, size_t length, JSTypedArrayBytesDeallocator dealloc) {
+	JSC::JSLockHolder lock(
+		reinterpret_cast<JSC::JSGlobalObject *>(const_cast<OpaqueJSContext *>(ctx)));
+	return JSObjectMakeTypedArrayWithBytesNoCopy(
+		ctx, 3 /* kJSTypedArrayTypeUint8Array */, bytes, length, dealloc, nullptr, nullptr);
+}
