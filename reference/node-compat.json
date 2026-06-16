@@ -44,7 +44,7 @@
     {
       "page": "buffer",
       "status": "full",
-      "implemented": "Buffer/Blob/File/SlowBuffer/atob/btoa/isAscii/isUtf8/transcode",
+      "implemented": "Buffer/Blob/File/SlowBuffer/atob/btoa/isAscii/isUtf8/transcode/resolveObjectURL (+ global URL.createObjectURL/revokeObjectURL)",
       "gaps": ""
     },
     {
@@ -380,8 +380,8 @@
     {
       "page": "url",
       "status": "partial",
-      "implemented": "fileURLToPath",
-      "gaps": "URL/URLSearchParams/pathToFileURL/format"
+      "implemented": "fileURLToPath; global URL.createObjectURL/revokeObjectURL",
+      "gaps": "URL constructor/URLSearchParams/pathToFileURL/format"
     },
     {
       "page": "util",
@@ -465,11 +465,11 @@
       "Blob",
       "File",
       "crypto",
+      "URL",
       "WebAssembly",
       "Intl"
     ],
     "missing": [
-      "URL",
       "URLSearchParams",
       "atob",
       "btoa",
