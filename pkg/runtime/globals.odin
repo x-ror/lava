@@ -105,16 +105,37 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	dns_destroy_state(state)
 	sqlite_destroy_state(state)
 	for key, value in state.module_cache {
-		jsc.JSValueUnprotect(ctx, value)
+		unprotect_before_eval_exit(ctx, value)
 		delete(key)
 	}
 	delete(state.module_cache)
-	if state.builtin_require != nil do jsc.JSValueUnprotect(ctx, state.builtin_require)
-	if state.esm_transform != nil do jsc.JSValueUnprotect(ctx, state.esm_transform)
-	if state.rejection_handler != nil do jsc.JSValueUnprotect(ctx, state.rejection_handler)
-	if state.dispatch_fn != nil do jsc.JSValueUnprotect(ctx, state.dispatch_fn)
-	if state.next_tick_drain != nil do jsc.JSValueUnprotect(ctx, state.next_tick_drain)
+	unprotect_before_eval_exit(ctx, state.builtin_require)
+	unprotect_before_eval_exit(ctx, state.esm_transform)
+	unprotect_before_eval_exit(ctx, state.rejection_handler)
+	unprotect_before_eval_exit(ctx, state.dispatch_fn)
+	unprotect_before_eval_exit(ctx, state.next_tick_drain)
 	free(state)
+}
+
+// unprotect_before_eval_exit drops a GC root held by Runtime_State — except on
+// Windows, where it is a no-op (a nil value is also skipped everywhere).
+//
+// This mirrors release_global_context_after_eval's Windows carve-out and exists
+// for the same reason: these unprotects run from eval's deferred teardown right
+// before the one-shot CLI's os.exit. On Windows, touching JSC's GC during that
+// final teardown races the VM's concurrent GC/JIT worker threads — which a heavy
+// JS workload (e.g. node:crypto scrypt's ROMix) leaves running at exit — and
+// poisons the ensuing ExitProcess DLL-detach, so the process exits 127
+// (ERROR_PROC_NOT_FOUND) despite the script having run correctly. The VM is
+// already intentionally leaked on Windows (the context is never released), so
+// dropping these roots is a semantic no-op anyway; the OS reclaims everything,
+// exactly as the process.exit() fast path already does. Other platforms tear
+// down cleanly and keep unprotecting.
+unprotect_before_eval_exit :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) {
+	if value == nil do return
+	when ODIN_OS != .Windows {
+		jsc.JSValueUnprotect(ctx, value)
+	}
 }
 
 get_state_from_ctx :: proc(ctx: jsc.JSContextRef) -> ^Runtime_State {
