@@ -1,10 +1,10 @@
 const assert = require('node:assert/strict');
 
-const twoByteString = new Array(16)
+const twoByteString = Array.from({ length: 16 })
   .fill(0)
   .map((_, i) =>
     Buffer.from(
-      new Array(16)
+      Array.from({ length: 16 })
         .fill(0)
         .map((_, j) => String.fromCharCode(i * 16 + j))
         .join(''),

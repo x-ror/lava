@@ -15,7 +15,7 @@
 //     exotic mapping/validation edge cases may differ.
 //   * The legacy `url.parse`/`url.resolve`/`url.Url` API is not provided; only the
 //     WHATWG surface is.
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   // TextEncoder/TextDecoder are installed by internal/encoding.js. This module is
@@ -54,6 +54,13 @@
   // is a superset of the C0-control set (control chars and everything past 0x7E).
   function inC0ControlSet(cp) {
     return cp <= 0x1f || cp > 0x7e;
+  }
+  function trimC0ControlOrSpace(str) {
+    var start = 0;
+    var end = str.length;
+    while (start < end && str.charCodeAt(start) <= 0x20) start++;
+    while (end > start && str.charCodeAt(end - 1) <= 0x20) end--;
+    return start === 0 && end === str.length ? str : str.slice(start, end);
   }
   function inFragmentSet(cp) {
     return (
@@ -144,7 +151,7 @@
   function percentDecodeHostStrict(str) {
     try {
       return fatalDecoder().decode(percentDecodeBytes(str));
-    } catch (e) {
+    } catch {
       return FAILURE;
     }
   }
@@ -287,7 +294,7 @@
   function domainToASCII(domain) {
     if (domain === '') return '';
     // IDEOGRAPHIC FULL STOP, FULLWIDTH FULL STOP, HALFWIDTH IDEOGRAPHIC FULL STOP.
-    domain = domain.replace(/[。．｡]/g, '.');
+    domain = domain.replaceAll(/[。．｡]/g, '.');
     var labels = domain.split('.');
     var out = [];
     for (var i = 0; i < labels.length; i++) {
@@ -301,7 +308,7 @@
         }
         try {
           out.push('xn--' + punycodeEncode(mapped));
-        } catch (e) {
+        } catch {
           return FAILURE;
         }
       } else {
@@ -320,7 +327,7 @@
       if (label.slice(0, 4).toLowerCase() === 'xn--') {
         try {
           out.push(punycodeDecode(label.slice(4)));
-        } catch (e) {
+        } catch {
           out.push(label);
         }
       } else {
@@ -381,11 +388,11 @@
 
   function endsInANumber(input) {
     var parts = input.split('.');
-    if (parts[parts.length - 1] === '') {
+    if (parts.at(-1) === '') {
       if (parts.length === 1) return false;
       parts.pop();
     }
-    var last = parts[parts.length - 1];
+    var last = parts.at(-1);
     if (last !== '' && /^[0-9]+$/.test(last)) return true;
     return parseIPv4Number(last) !== FAILURE;
   }
@@ -402,7 +409,7 @@
 
   function parseIPv4(input) {
     var parts = input.split('.');
-    if (parts[parts.length - 1] === '') {
+    if (parts.at(-1) === '') {
       if (parts.length > 1) parts.pop();
     }
     if (parts.length > 4) return FAILURE;
@@ -415,7 +422,7 @@
     for (var j = 0; j < numbers.length; j++) {
       if (numbers[j] > 255 && j !== numbers.length - 1) return FAILURE;
     }
-    if (numbers[numbers.length - 1] >= Math.pow(256, 5 - numbers.length)) return FAILURE;
+    if (numbers.at(-1) >= Math.pow(256, 5 - numbers.length)) return FAILURE;
     var ipv4 = numbers.pop();
     var counter = 0;
     for (var m = 0; m < numbers.length; m++) {
@@ -557,7 +564,7 @@
 
   function parseHost(input, isSpecial) {
     if (input[0] === '[') {
-      if (input[input.length - 1] !== ']') return FAILURE;
+      if (input.at(-1) !== ']') return FAILURE;
       return parseIPv6(input.slice(1, -1));
     }
     if (!isSpecial) return parseOpaqueHost(input);
@@ -660,9 +667,9 @@
       case 'blob': {
         var pathStr = url.opaque ? url.path : serializePath(url);
         try {
-          var inner = parseURLOrThrow(pathStr, undefined);
+          var inner = parseURLOrThrow(pathStr);
           return serializeOrigin(inner);
-        } catch (e) {
+        } catch {
           return 'null';
         }
       }
@@ -744,10 +751,10 @@
     if (url === undefined) {
       url = newRecord();
       // Remove leading/trailing C0 control or space (only when not a setter).
-      input = input.replace(/^[\u0000-\u0020]+/, '').replace(/[\u0000-\u0020]+$/, '');
+      input = trimC0ControlOrSpace(input);
     }
     // Remove all ASCII tab or newline.
-    input = input.replace(/[\t\n\r]/g, '');
+    input = input.replaceAll(/[\t\n\r]/g, '');
 
     var cps = Array.from(input);
     var pointer = 0;
@@ -1200,7 +1207,7 @@
   function parseURLOrThrow(input, base) {
     var baseRecord;
     if (base !== undefined && base !== null) {
-      baseRecord = basicURLParse(String(base), undefined);
+      baseRecord = basicURLParse(String(base));
       if (baseRecord === FAILURE) throw invalidURL(base);
     }
     var record = basicURLParse(String(input), baseRecord);
@@ -1272,8 +1279,8 @@
         name = bytes.slice(0, eq);
         value = bytes.slice(eq + 1);
       }
-      name = percentDecode(name.replace(/\+/g, ' '));
-      value = percentDecode(value.replace(/\+/g, ' '));
+      name = percentDecode(name.replaceAll('+', ' '));
+      value = percentDecode(value.replaceAll('+', ' '));
       output.push([name, value]);
     }
     return output;
@@ -1620,7 +1627,7 @@
       return serializeURL(this[kRecord]);
     },
     set: function (value) {
-      var record = basicURLParse(toUSVString(value), undefined);
+      var record = basicURLParse(toUSVString(value));
       if (record === FAILURE) throw invalidURL(value);
       this[kRecord] = record;
       refreshSearchParams(this);
@@ -1815,7 +1822,7 @@
       try {
         parseURLOrThrow(input, base);
         return true;
-      } catch (e) {
+      } catch {
         return false;
       }
     },
@@ -1830,7 +1837,7 @@
       }
       try {
         return new URL(input, base);
-      } catch (e) {
+      } catch {
         return null;
       }
     },
@@ -1880,7 +1887,7 @@
     }
 
     if (isWindows) {
-      var winPath = decodeURIComponent(rest.replace(/\//g, '\\'));
+      var winPath = decodeURIComponent(rest.replaceAll('/', '\\'));
       if (host !== '' && !isLocalhost) {
         return '\\\\' + host + winPath;
       }
@@ -1915,20 +1922,20 @@
     // re-append a '/' when the original path ended in one and resolve removed it.
     var lastChar = input.charCodeAt(input.length - 1);
     var endedWithSep = lastChar === 0x2f || (isWindows && lastChar === 0x5c);
-    if (endedWithSep && resolved[resolved.length - 1] !== path.sep) resolved += '/';
+    if (endedWithSep && resolved.at(-1) !== path.sep) resolved += '/';
     var url = new URL('file://');
     // Percent-encode the path's special characters, then assign as pathname so the
     // URL machinery normalizes it. We encode %, #, ? and (on POSIX) backslash so
     // they are not reinterpreted; control chars and others are handled by the setter.
     var encoded = resolved
-      .replace(/%/g, '%25')
-      .replace(/\\/g, isWindows ? '\\' : '%5C')
-      .replace(/\n/g, '%0A')
-      .replace(/\r/g, '%0D')
-      .replace(/\t/g, '%09');
+      .replaceAll('%', '%25')
+      .replaceAll('\\', isWindows ? '\\' : '%5C')
+      .replaceAll('\n', '%0A')
+      .replaceAll('\r', '%0D')
+      .replaceAll('	', '%09');
     if (isWindows) {
       // Normalize separators for the file URL; UNC paths keep the host.
-      encoded = encoded.replace(/\\/g, '/');
+      encoded = encoded.replaceAll('\\', '/');
       if (encoded.slice(0, 2) === '//') {
         // UNC \\server\share -> file://server/share
         var withoutLead = encoded.slice(2);
@@ -2003,7 +2010,7 @@
   // everything up to the first authority terminator (/ \ ? #). Returns the parsed
   // host string, or FAILURE for an invalid domain.
   function hostFromDomainArg(domain) {
-    var input = String(domain).replace(/[\t\n\r]/g, '');
+    var input = String(domain).replaceAll(/[\t\n\r]/g, '');
     for (var i = 0; i < input.length; i++) {
       var c = input.charCodeAt(i);
       if (c === 0x2f || c === 0x5c || c === 0x3f || c === 0x23) {
@@ -2034,7 +2041,7 @@
   if (typeof globalThis.URL !== 'function') {
     globalThis.URL = URL;
   }
-  if (typeof globalThis.URLSearchParams === 'undefined') {
+  if (globalThis.URLSearchParams === undefined) {
     globalThis.URLSearchParams = URLSearchParams;
   }
 

@@ -127,6 +127,70 @@ async function main() {
     console.log('request blob echo:', JSON.stringify((await rb2.json()).echo));
   }
 
+  // --- Public Web Streams over a real response/request body (issue #184) ---
+  // A user-created ReadableStream (the standard global) is accepted as a request
+  // body, the same as the internal stream that backs response.body.
+  {
+    const body = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('rs-'));
+        c.enqueue(new TextEncoder().encode('global-body'));
+        c.close();
+      },
+    });
+    const echoed = await fetch(base + '/echo', { method: 'POST', body, duplex: 'half' }).then((r) =>
+      r.json(),
+    );
+    console.log('readablestream request body:', JSON.stringify(echoed.echo), echoed.len);
+  }
+
+  // Aborting while a streaming request body is still being collected — a stalled
+  // producer whose read() never resolves — must reject promptly with the signal's
+  // AbortError rather than hang waiting for a chunk that never comes. (Regression:
+  // collectStreamBody only checked signal.aborted between reads, so an abort
+  // landing during a pending read could not wake it and fetch hung before the
+  // transport even started.)
+  {
+    const ac = new AbortController();
+    const body = new ReadableStream({
+      pull() {
+        return new Promise(() => {}); // never produces a chunk
+      },
+    });
+    setTimeout(() => ac.abort(), 10);
+    let name = '';
+    try {
+      await fetch(base + '/echo', { method: 'POST', body, duplex: 'half', signal: ac.signal });
+    } catch (error) {
+      name = error && error.name;
+    }
+    console.log('abort streaming upload:', name);
+  }
+
+  // response.body.pipeTo(WritableStream): the sink reassembles the full body and
+  // the body ends up consumed (locked → used). Chunk sizes are transport-defined,
+  // so only the reassembled length is compared, never chunk counts.
+  {
+    const r = await fetch(base + '/big');
+    let total = 0;
+    const sink = new WritableStream({
+      write(chunk) {
+        total += chunk.length;
+      },
+    });
+    await r.body.pipeTo(sink);
+    console.log('response pipeTo:', total === BIG.length, r.bodyUsed);
+  }
+
+  // response.body.pipeThrough(TransformStream): an identity transform passes the
+  // streamed bytes through; the drained total matches the body length.
+  {
+    const r = await fetch(base + '/big-cl');
+    let total = 0;
+    for await (const chunk of r.body.pipeThrough(new TransformStream())) total += chunk.length;
+    console.log('response pipeThrough:', total === BIG_CL.length);
+  }
+
   // A body can be consumed only once; a second attempt rejects with a TypeError.
   {
     const r = await fetch(base + '/a');
@@ -341,7 +405,7 @@ async function main() {
     let tlsRejected = false;
     try {
       await fetch(baseHttpsBad + '/hello.txt');
-    } catch (error) {
+    } catch {
       tlsRejected = true;
     }
     console.log('https hostname-mismatch rejected:', tlsRejected);
@@ -351,7 +415,7 @@ async function main() {
   let refused = false;
   try {
     await fetch('http://127.0.0.1:9/x');
-  } catch (error) {
+  } catch {
     refused = true;
   }
   console.log('refused rejected:', refused);
@@ -361,7 +425,7 @@ async function main() {
   let dnsFailed = false;
   try {
     await fetch('http://does-not-exist.invalid/');
-  } catch (error) {
+  } catch {
     dnsFailed = true;
   }
   console.log('dns failure rejected:', dnsFailed);

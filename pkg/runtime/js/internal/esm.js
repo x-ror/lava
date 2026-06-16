@@ -43,7 +43,7 @@
     // 'block', 'sq' (single-quote), 'dq' (double-quote), 'tpl' (template).
     var stack = [{ mode: 'code', brace: 0 }];
     function top() {
-      return stack[stack.length - 1];
+      return stack.at(-1);
     }
     var i = 0;
     while (i < src.length) {
@@ -89,7 +89,7 @@
           continue;
         }
         if (c === '}') {
-          if (top().brace === 0 && stack.length > 1 && stack[stack.length - 2].mode === 'tpl') {
+          if (top().brace === 0 && stack.length > 1 && stack.at(-2).mode === 'tpl') {
             // Closes a `${ ... }` template expression; the brace belongs to the
             // template, so blank it (it is not a statement brace).
             stack.pop();

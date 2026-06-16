@@ -248,7 +248,7 @@
       setImmediate(function () {
         callback(null, buf);
       });
-      return undefined;
+      return;
     }
     return buf;
   }
@@ -372,7 +372,7 @@
         }
         callback(null, value);
       });
-      return undefined;
+      return;
     }
     return sample();
   }
@@ -784,7 +784,7 @@
   // WHATWG Web Crypto global. Only the random surface is provided here;
   // crypto.subtle is a follow-up. Eager-required by loader.js so it is present
   // without an explicit require.
-  if (typeof globalThis.crypto === 'undefined') {
+  if (globalThis.crypto === undefined) {
     globalThis.crypto = {
       randomUUID: randomUUID,
       getRandomValues: getRandomValues,

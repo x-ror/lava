@@ -25,7 +25,7 @@
     // so a bracket lookup of 'constructor'/'toString' would otherwise return an
     // inherited function and mis-resolve those specifiers instead of yielding the
     // "not a builtin" (undefined) that lets native_require_cb fall through.
-    if (!hasOwn.call(factories, key)) return undefined;
+    if (!hasOwn.call(factories, key)) return;
     var factory = factories[key];
     var module = { exports: {} };
     // Seed the cache before running the factory so a require cycle resolves
@@ -38,14 +38,17 @@
     return cache[key];
   }
 
-  // Eagerly instantiate modules that install globals (Buffer; fetch/Response/
-  // Headers/Request; crypto's WHATWG global; URL/URLSearchParams), so they are
-  // present even when user code never requires them explicitly. `url` runs after
-  // `buffer` (so it preserves the URL.createObjectURL/revokeObjectURL statics
-  // buffer attaches) and after `encoding` (which installs the TextEncoder/
-  // TextDecoder globals url uses); url also lazily creates its codecs, so the
-  // order is belt-and-suspenders rather than load-bearing.
+  // Eagerly instantiate modules that install globals (Buffer; the Web Streams
+  // ReadableStream/WritableStream/TransformStream family; fetch/Response/Headers/
+  // Request; crypto's WHATWG global; URL/URLSearchParams), so they are present
+  // even when user code never requires them explicitly. `stream/web` runs before
+  // `fetch` because fetch builds response bodies from the public ReadableStream.
+  // `url` runs after `buffer` (so it preserves the URL.createObjectURL/
+  // revokeObjectURL statics buffer attaches) and after `encoding` (which installs
+  // the TextEncoder/TextDecoder globals url uses); url also lazily creates its
+  // codecs, so the order is belt-and-suspenders rather than load-bearing.
   req('buffer');
+  req('stream/web');
   req('fetch');
   req('abort');
   req('encoding');

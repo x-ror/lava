@@ -6,7 +6,7 @@
 // shared references are preserved via a memory map. Non-cloneable inputs
 // (functions, symbols, Promise/WeakMap/WeakSet, and the `transfer` option) throw
 // a DataCloneError rather than being silently mishandled.
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   function dataCloneError(message) {
@@ -69,7 +69,7 @@
     }
     // lastIndex is intentionally not carried (Node resets it to 0).
     if (tag === '[object RegExp]') {
-      var re = new RegExp(value.source, value.flags);
+      var re = new RegExp(value);
       seen.set(value, re);
       return re;
     }
@@ -129,6 +129,11 @@
     }
 
     if (Array.isArray(value)) {
+      // Must be a SPARSE array (real holes), not Array.from({length}) which fills
+      // dense undefined: structuredClone preserves holes, and copyOwnEnumerable
+      // below only copies indices actually present in the source. A dense array
+      // here would turn every hole into an own `undefined` (breaking `i in clone`).
+      // oxlint-disable-next-line unicorn/no-new-array
       var arr = new Array(value.length);
       seen.set(value, arr);
       copyOwnEnumerable(value, arr, seen);
@@ -157,7 +162,7 @@
     return clone(value, new Map());
   }
 
-  if (typeof globalThis.structuredClone === 'undefined') {
+  if (globalThis.structuredClone === undefined) {
     globalThis.structuredClone = structuredClone;
   }
 

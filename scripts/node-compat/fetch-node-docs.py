@@ -8,12 +8,18 @@ from the pinned SHA); only SOURCE.txt is tracked. Run from anywhere:
     python3 scripts/node-compat/fetch-node-docs.py
 """
 import json, os, urllib.request
+from urllib.parse import urlparse
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEST = os.path.join(REPO_ROOT, "reference", "node-doc-api")
 
+ALLOWED_HOSTS = {"api.github.com", "raw.githubusercontent.com"}
+
 
 def get(url, accept="application/vnd.github+json"):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
+        raise ValueError(f"URL not allowed: {url}")
     req = urllib.request.Request(
         url, headers={"Accept": accept, "User-Agent": "lava-node-compat"}
     )

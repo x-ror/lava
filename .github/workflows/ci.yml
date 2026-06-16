@@ -23,7 +23,7 @@ jobs:
     name: Linux (full build + tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install JavaScriptCoreGTK (6.0), SQLite and OpenSSL
         run: |
@@ -67,9 +67,9 @@ jobs:
     name: macOS (full build + tests)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
 
@@ -114,9 +114,9 @@ jobs:
       # (see scripts/fetch-webkit-windows.sh). Bump to re-provision a newer JSC.
       WEBKIT_TAG: autobuild-9cb85a0716065c461bea14a0de9fe7139e5323aa
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
 
@@ -155,7 +155,7 @@ jobs:
       # which the oracle/fetch suites below run through JavaScriptCore for real.
       - name: Cache JavaScriptCore (bun-webkit)
         id: cache-webkit
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .deps/webkit
           key: bun-webkit-windows-amd64-${{ env.WEBKIT_TAG }}
@@ -174,7 +174,7 @@ jobs:
 
       - name: Cache SQLite amalgamation
         id: cache-sqlite
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .deps/sqlite
           key: sqlite-amalgamation-3530200
@@ -189,6 +189,13 @@ jobs:
       # pkg/std/sqlite's `system:sqlite3.lib` resolves.
       - name: Build SQLite (static)
         run: bash scripts/build-sqlite-windows.sh
+
+      # JSC init shim (pkg/jsc/jsc_init_windows.cpp -> build/jsc_init.lib). Calls
+      # JSC's one-time process bring-up (WTF main thread + JSC::initialize) that a
+      # statically-linked JSC never performs; without it the JIT/GC threads corrupt
+      # memory mid-execution on Windows (0xC0000409). build/ is on LIB at link.
+      - name: Build JSC init shim (static)
+        run: bash scripts/build-jsc-init-windows.sh
 
       - name: Windows link
         run: |

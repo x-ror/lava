@@ -18,7 +18,7 @@
   if (typeof Symbol === 'function' && !Symbol.dispose) {
     try {
       Symbol.dispose = Symbol('Symbol.dispose');
-    } catch (e) {
+    } catch {
       // Symbol is non-extensible here; dispose-by-symbol is simply unavailable.
     }
   }
@@ -221,7 +221,7 @@
     if (native.step(this._stmtId, this._dbId) === 0) {
       return native.row(this._stmtId, this._readBigInts);
     }
-    return undefined;
+    return;
   };
 
   // all(...params) -> array of row objects.

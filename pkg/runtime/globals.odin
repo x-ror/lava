@@ -105,16 +105,37 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	dns_destroy_state(state)
 	sqlite_destroy_state(state)
 	for key, value in state.module_cache {
-		jsc.JSValueUnprotect(ctx, value)
+		unprotect_before_eval_exit(ctx, value)
 		delete(key)
 	}
 	delete(state.module_cache)
-	if state.builtin_require != nil do jsc.JSValueUnprotect(ctx, state.builtin_require)
-	if state.esm_transform != nil do jsc.JSValueUnprotect(ctx, state.esm_transform)
-	if state.rejection_handler != nil do jsc.JSValueUnprotect(ctx, state.rejection_handler)
-	if state.dispatch_fn != nil do jsc.JSValueUnprotect(ctx, state.dispatch_fn)
-	if state.next_tick_drain != nil do jsc.JSValueUnprotect(ctx, state.next_tick_drain)
+	unprotect_before_eval_exit(ctx, state.builtin_require)
+	unprotect_before_eval_exit(ctx, state.esm_transform)
+	unprotect_before_eval_exit(ctx, state.rejection_handler)
+	unprotect_before_eval_exit(ctx, state.dispatch_fn)
+	unprotect_before_eval_exit(ctx, state.next_tick_drain)
 	free(state)
+}
+
+// unprotect_before_eval_exit drops a GC root held by Runtime_State — except on
+// Windows, where it is a no-op (a nil value is also skipped everywhere).
+//
+// This mirrors release_global_context_after_eval's Windows carve-out and exists
+// for the same reason: these unprotects run from eval's deferred teardown right
+// before the one-shot CLI's os.exit. On Windows, touching JSC's GC during that
+// final teardown races the VM's concurrent GC/JIT worker threads — which a heavy
+// JS workload (e.g. node:crypto scrypt's ROMix) leaves running at exit — and
+// poisons the ensuing ExitProcess DLL-detach, so the process exits 127
+// (ERROR_PROC_NOT_FOUND) despite the script having run correctly. The VM is
+// already intentionally leaked on Windows (the context is never released), so
+// dropping these roots is a semantic no-op anyway; the OS reclaims everything,
+// exactly as the process.exit() fast path already does. Other platforms tear
+// down cleanly and keep unprotecting.
+unprotect_before_eval_exit :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) {
+	if value == nil do return
+	when ODIN_OS != .Windows {
+		jsc.JSValueUnprotect(ctx, value)
+	}
 }
 
 get_state_from_ctx :: proc(ctx: jsc.JSContextRef) -> ^Runtime_State {
@@ -246,17 +267,43 @@ capture_timer_args :: proc(
 	return args
 }
 
-// free_js_callback releases a binding: it unprotects the function and every
-// forwarded argument, frees the args slice, and frees the binding itself. Called
-// once per binding — by js_callback_trampoline on a one-shot's only fire, or by
-// js_callback_dispose when the loop drops the binding without (re-)firing.
-free_js_callback :: proc(cb: ^JS_Callback) {
-	jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
-	for arg in cb.args {
-		jsc.JSValueUnprotect(cb.ctx, arg)
+// free_js_callback releases a binding. When release_roots is true it also
+// unprotects the function and every forwarded argument; when false, only the
+// native binding memory is released and the roots stay with the process-lifetime
+// VM. Called once per binding - by js_callback_trampoline on a one-shot's only
+// fire, or by js_callback_dispose when the loop drops the binding without
+// (re-)firing.
+free_js_callback :: proc(cb: ^JS_Callback, release_roots := true) {
+	if release_roots {
+		jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
+		for arg in cb.args {
+			jsc.JSValueUnprotect(cb.ctx, arg)
+		}
 	}
 	delete(cb.args)
 	free(cb)
+}
+
+// should_release_fired_callback_roots keeps normal callback GC-root cleanup on
+// every platform except the Windows one-shot CLI exit edge. A heavy final JS
+// callback (crypto.scrypt's setImmediate-backed ROMix is the current canary, but
+// the same holds for any timer/immediate/I-O callback) can leave JSC worker
+// threads alive; unprotecting the just-fired callback root as the last loop work
+// then poisons Windows process teardown and ExitProcess reports 127. If more loop
+// work exists, keep releasing roots so long-running scripts do not leak every
+// one-shot timer/immediate callback. The VM is already intentionally leaked on
+// Windows at eval exit, so the final callback root is reclaimed by the OS with the
+// rest of the process.
+//
+// "Last loop work" is has_pending_work() read from inside the trampoline: run_once
+// uncounts the firing task (immediates/I-O/close removed before the call, one-shot
+// timers ref-dropped at pop) before invoking it, so the check sees only the work
+// queued *behind* this callback — true for any final callback, not just setImmediate.
+should_release_fired_callback_roots :: proc(loop: ^eventloop.Loop) -> bool {
+	when ODIN_OS == .Windows {
+		return eventloop.has_pending_work(loop)
+	}
+	return true
 }
 
 js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
@@ -276,7 +323,7 @@ js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	// (the loop's dispose hook) when the interval is cleared, since the
 	// trampoline never runs for a cancelled timer.
 	if !cb.repeating {
-		free_js_callback(cb)
+		free_js_callback(cb, should_release_fired_callback_roots(loop))
 	}
 }
 
@@ -842,6 +889,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"assert", INTERNAL_ASSERT},
 		{"buffer", INTERNAL_BUFFER},
 		{"crypto", INTERNAL_CRYPTO},
+		{"stream/web", INTERNAL_STREAMS},
 		{"fetch", INTERNAL_FETCH},
 		{"abort", INTERNAL_ABORT},
 		{"timers/promises", INTERNAL_TIMERS_PROMISES},
@@ -1107,6 +1155,7 @@ INTERNAL_EVENTS :: #load("js/internal/events.js", string)
 INTERNAL_ASSERT :: #load("js/internal/assert.js", string)
 INTERNAL_BUFFER :: #load("js/internal/buffer.js", string)
 INTERNAL_CRYPTO :: #load("js/internal/crypto.js", string)
+INTERNAL_STREAMS :: #load("js/internal/streams.js", string)
 INTERNAL_FETCH :: #load("js/internal/fetch.js", string)
 INTERNAL_ABORT :: #load("js/internal/abort.js", string)
 INTERNAL_TIMERS_PROMISES :: #load("js/internal/timers_promises.js", string)

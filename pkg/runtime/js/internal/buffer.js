@@ -148,16 +148,16 @@
 
   function normalizeBase64(str) {
     str = String(str)
-      .replace(/-/g, '+')
-      .replace(/_/g, '/')
-      .replace(/[^A-Za-z0-9+/]/g, '');
+      .replaceAll('-', '+')
+      .replaceAll('_', '/')
+      .replaceAll(/[^A-Za-z0-9+/]/g, '');
     if (str.length % 4 === 1) str = str.slice(0, str.length - 1);
     while (str.length % 4 !== 0) str += '=';
     return str;
   }
 
   function toBase64Url(str) {
-    return str.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    return str.replaceAll('+', '-').replaceAll('/', '_').replaceAll(/=+$/g, '');
   }
 
   function utf16leEncode(str) {
@@ -475,7 +475,7 @@
       if (typeof value === 'number') {
         bytes = new Uint8Array([value & 0xff]);
       } else if (value instanceof Uint8Array) {
-        bytes = value.length ? value : new Uint8Array([0]);
+        bytes = value.length > 0 ? value : new Uint8Array([0]);
       } else {
         bytes = strToBytes(String(value), encoding || 'utf8');
         if (bytes.length === 0) bytes = new Uint8Array([0]);
@@ -546,12 +546,16 @@
     var shown = buf.length > max ? max : buf.length;
     var hex = Buffer.prototype.toString
       .call(buf, 'hex', 0, shown)
-      .replace(/(.{2})/g, '$1 ')
+      .replaceAll(/(.{2})/g, '$1 ')
       .trim();
     var remaining = buf.length - max;
     if (remaining > 0)
       hex +=
-        (hex.length ? ' ' : '') + '... ' + remaining + ' more byte' + (remaining > 1 ? 's' : '');
+        (hex.length > 0 ? ' ' : '') +
+        '... ' +
+        remaining +
+        ' more byte' +
+        (remaining > 1 ? 's' : '');
     return '<Buffer ' + hex + '>';
   }
 
@@ -789,16 +793,62 @@
     },
   });
 
-  // fromArrayLike copies element values (each coerced to a byte) into a fresh
-  // Buffer — used for Arrays, generic TypedArrays, and array-like objects. The
-  // length goes through a ToLength-style conversion (NaN/negative -> 0, finite
-  // fractional floored) so a hostile `{ length: -1 }` cannot wrap to a 4 GiB
-  // allocation; Node likewise returns an empty Buffer for those.
+  // --- Allocation pool (Node parity) --------------------------------------
+  // Node carves small *unsafe* allocations out of a shared poolSize-byte
+  // ArrayBuffer, so several small Buffers share one backing store at different
+  // byteOffsets (observable via buf.buffer / buf.byteOffset / buf.buffer
+  // .byteLength). This state is plain module scope: node:buffer is instantiated
+  // once per runtime/context, so the pool is per-runtime and never leaks across
+  // isolated runtimes. Pooled bytes are uninitialized — only allocUnsafe and the
+  // Buffer.from(...) copy paths (where Node pools) draw from it; Buffer.alloc,
+  // allocUnsafeSlow, and SlowBuffer stay on their own zero-able backing store.
+  var poolBufferSize; // Buffer.poolSize snapshot taken when the pool was built
+  var poolOffset; // next free byte in allocPool
+  var allocPool; // shared backing ArrayBuffer
+
+  function createPool() {
+    poolBufferSize = Buffer.poolSize >>> 0;
+    allocPool = new ArrayBuffer(poolBufferSize);
+    poolOffset = 0;
+  }
+
+  // Round the next offset up to an 8-byte boundary, matching Node's alignPool();
+  // keeps every pooled buffer's byteOffset 8-aligned.
+  function alignPool() {
+    if (poolOffset & 0x7) poolOffset = (poolOffset | 0x7) + 1;
+  }
+
+  // allocate(size) mirrors Node's internal allocate(): sizes strictly below
+  // poolSize/2 are served from the shared pool (uninitialized); anything larger
+  // (or exactly poolSize/2 — Node's threshold is `< (poolSize >>> 1)`) gets its
+  // own backing ArrayBuffer. The pool is recreated when the request no longer
+  // fits in what remains. Callers that expose the bytes (Buffer.from) overwrite
+  // the whole view; allocUnsafe deliberately leaves stale pool bytes visible.
+  function allocate(size) {
+    if (!(size > 0)) return new Buffer(0); // 0, negative, or NaN
+    if (size < Buffer.poolSize >>> 1) {
+      size = Math.floor(size);
+      if (size === 0) return new Buffer(0);
+      if (size > poolBufferSize - poolOffset) createPool();
+      var b = new Buffer(allocPool, poolOffset, size);
+      poolOffset += size;
+      alignPool();
+      return b;
+    }
+    return new Buffer(size); // Infinity stays Infinity -> ctor throws, like Node
+  }
+
+  // fromArrayLike copies element values (each coerced to a byte) into a small
+  // pooled (or own, for large) Buffer — used for Arrays, generic TypedArrays,
+  // and array-like objects. The length goes through a ToLength-style conversion
+  // (NaN/negative -> 0, finite fractional floored) so a hostile `{ length: -1 }`
+  // cannot wrap to a 4 GiB allocation; Node likewise returns an empty Buffer for
+  // those. The loop overwrites every byte, so no stale pool data leaks through.
   function fromArrayLike(obj) {
     var len = Number(obj.length);
     if (!(len > 0)) return new Buffer(0); // 0, negative, or NaN
     len = Math.floor(len); // Infinity stays Infinity -> Buffer ctor throws, like Node
-    var b = new Buffer(len);
+    var b = allocate(len);
     for (var i = 0; i < len; i++) b[i] = obj[i]; // Uint8Array store coerces & masks
     return b;
   }
@@ -806,8 +856,8 @@
   Buffer.from = function (value, encodingOrOffset, length) {
     if (typeof value === 'string') {
       var bytes = strToBytes(value, encodingOrOffset);
-      var b = new Buffer(bytes.length);
-      b.set(bytes);
+      var b = allocate(bytes.length); // pooled for small strings, like Node
+      b.set(bytes); // overwrites the whole view -> no stale pool bytes
       return b;
     }
     if (value !== null && typeof value === 'object') {
@@ -831,8 +881,9 @@
         }
       }
       if (ArrayBuffer.isView(value)) {
-        // Copy element values (Uint8Array.set masks each to a byte).
-        var copy = new Buffer(value.length);
+        // Copy element values (Uint8Array.set masks each to a byte). Pooled for
+        // small inputs like Node; set() overwrites the whole view.
+        var copy = allocate(value.length);
         copy.set(value);
         return copy;
       }
@@ -860,11 +911,12 @@
 
   Buffer.allocUnsafe = function (size) {
     assertSize(size);
-    return new Buffer(size);
+    return allocate(size); // small sizes share the per-runtime pool
   };
 
   Buffer.allocUnsafeSlow = function (size) {
-    return Buffer.allocUnsafe(size);
+    assertSize(size);
+    return new Buffer(size); // never pooled — its own backing store, like Node
   };
 
   Buffer.isBuffer = function (b) {
@@ -923,18 +975,25 @@
       if (totalLength < 0 || totalLength > MAX_SAFE)
         throw errOutOfRange('length', '>= 0 && <= ' + MAX_SAFE, totalLength);
     }
-    var result = new Buffer(totalLength);
+    // Pooled like Node: small concat results share the per-runtime pool. The
+    // copies below write [0, offset); any tail left when an explicit totalLength
+    // exceeds the input data is zero-filled, because pooled memory is otherwise
+    // uninitialized (Node fills the gap the same way). Every byte is thus either
+    // copied or zeroed, so no stale pool bytes leak through.
+    var result = allocate(totalLength);
     var offset = 0;
     for (var j = 0; j < list.length; j++) {
       var item = list[j];
       assertConcatElement(item, j);
       if (offset + item.length > totalLength) {
         result.set(item.subarray(0, totalLength - offset), offset);
+        offset = totalLength; // buffer is now full; suppress the tail fill below
         break;
       }
       result.set(item, offset);
       offset += item.length;
     }
+    if (offset < totalLength) result.fill(0, offset);
     return result;
   };
 
@@ -953,8 +1012,14 @@
 
   Buffer.poolSize = 8192;
 
+  // Build the initial pool now that Buffer.poolSize is set. Nothing in this
+  // module allocates Buffers during evaluation, so a single eager call is enough
+  // (allocate() re-pools on demand thereafter).
+  createPool();
+
   function SlowBuffer(size) {
-    return Buffer.allocUnsafe(size);
+    assertSize(size);
+    return new Buffer(size); // SlowBuffer is unpooled by definition
   }
 
   function atob(data) {
@@ -1047,6 +1112,23 @@
   };
   Blob.prototype.bytes = function () {
     return Promise.resolve(new Uint8Array(this._bytes));
+  };
+  // stream() returns a WHATWG ReadableStream that emits the Blob's bytes. Node
+  // delivers an in-memory Blob as a single Uint8Array chunk, then closes; we do
+  // the same. The chunk is a fresh copy (new Uint8Array(...)), so a consumer that
+  // mutates a read chunk cannot write back into the Blob's immutable bytes —
+  // matching Node, whose chunk is also a copy. node:stream/web is required
+  // lazily here because it loads after node:buffer (see internal/loader.js), so
+  // it is not available at this module's evaluation time.
+  Blob.prototype.stream = function () {
+    var bytes = this._bytes;
+    var ReadableStream = require('node:stream/web').ReadableStream;
+    return new ReadableStream({
+      start: function (controller) {
+        if (bytes.length > 0) controller.enqueue(new Uint8Array(bytes));
+        controller.close();
+      },
+    });
   };
   Blob.prototype.text = function () {
     return Promise.resolve(Buffer.from(this._bytes).toString('utf8'));
@@ -1158,13 +1240,13 @@
     // template form matches Node's ToString exactly — including throwing a
     // TypeError on a Symbol, which String(id) would silently stringify instead.
     var blob = objectUrlRegistry.get(`${id}`);
-    if (blob === undefined) return undefined;
+    if (blob === undefined) return;
     // Node returns a fresh Blob over the same bytes rather than the registered
     // instance, and a registered File resolves back as a plain Blob.
     return new Blob([blob], { type: blob.type });
   }
 
-  if (typeof globalThis.URL === 'undefined') {
+  if (globalThis.URL === undefined) {
     globalThis.URL = { createObjectURL: createObjectURL, revokeObjectURL: revokeObjectURL };
   } else {
     if (typeof globalThis.URL.createObjectURL !== 'function')
@@ -1173,13 +1255,13 @@
       globalThis.URL.revokeObjectURL = revokeObjectURL;
   }
 
-  if (typeof globalThis.Buffer === 'undefined') {
+  if (globalThis.Buffer === undefined) {
     globalThis.Buffer = Buffer;
   }
-  if (typeof globalThis.Blob === 'undefined') {
+  if (globalThis.Blob === undefined) {
     globalThis.Blob = Blob;
   }
-  if (typeof globalThis.File === 'undefined') {
+  if (globalThis.File === undefined) {
     globalThis.File = File;
   }
 

@@ -4,7 +4,7 @@
 // AbortError ("The operation was aborted") and carries the signal's reason as
 // the error's `cause` (so e.g. AbortSignal.timeout surfaces as cause.name
 // === "TimeoutError").
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   function abortError(signal) {

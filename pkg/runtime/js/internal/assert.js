@@ -250,7 +250,7 @@
   function doesNotThrow(fn, message) {
     try {
       fn();
-    } catch (e) {
+    } catch {
       throw AssertionError({
         message: (message ? message + ': ' : '') + 'Got unwanted exception.',
         operator: 'doesNotThrow',

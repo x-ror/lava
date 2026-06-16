@@ -54,23 +54,9 @@ fs_read_file_sync_cb :: proc "c" (
 		return js_string_value(ctx, string(data))
 	}
 
-	// Hand ownership of `data` to JavaScriptCore; fs_buffer_deallocator frees it
-	// when the typed array is collected.
-	array := jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
-		ctx,
-		.Uint8Array,
-		raw_data(data),
-		c.size_t(len(data)),
-		fs_buffer_deallocator,
-		nil,
-		nil,
-	)
-	return cast(jsc.JSValueRef)array
-}
-
-fs_buffer_deallocator :: proc "c" (bytes: rawptr, deallocator_context: rawptr) {
-	context = runtime.default_context()
-	if bytes != nil do free(bytes)
+	// Hand ownership of `data` to JavaScriptCore as a Uint8Array (make_uint8_array
+	// owns it and frees it on collection).
+	return make_uint8_array(ctx, data)
 }
 
 // FS_Read_Request carries an async fs.readFile result from the (synchronous) read
@@ -180,17 +166,11 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			call_args[1] = js_string_value(ctx, string(req.data))
 			delete(req.data, context.allocator)
 		} else {
-			// Hand the bytes to JSC; fs_buffer_deallocator frees them on collection.
-			array := jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
-				ctx,
-				.Uint8Array,
-				raw_data(req.data),
-				c.size_t(len(req.data)),
-				fs_buffer_deallocator,
-				nil,
-				nil,
-			)
-			call_args[1] = cast(jsc.JSValueRef)array
+			// Async completion runs from the event loop (not a JSC callback), so this
+			// must go through make_uint8_array, which enters the VM around the creation
+			// (see typed_array.odin) — a bare C-API typed-array call here would abort on
+			// a GC. make_uint8_array owns req.data and frees it on collection.
+			call_args[1] = make_uint8_array(ctx, req.data)
 		}
 	} else {
 		err := make_js_error(ctx, req.err_msg)
@@ -812,19 +792,10 @@ fs_mkdtemp_sync_cb :: proc "c" (
 
 	if as_buffer {
 		// Hand a private copy of the path bytes to JSC as a Uint8Array; the original
-		// `created` is freed by the defer above, the copy by fs_buffer_deallocator.
+		// `created` is freed by the defer above, the copy by make_uint8_array.
 		bytes := make([]byte, len(created), context.allocator)
 		copy(bytes, created)
-		array := jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
-			ctx,
-			.Uint8Array,
-			raw_data(bytes),
-			c.size_t(len(bytes)),
-			fs_buffer_deallocator,
-			nil,
-			nil,
-		)
-		return cast(jsc.JSValueRef)array
+		return make_uint8_array(ctx, bytes)
 	}
 	return js_string_value(ctx, created)
 }
