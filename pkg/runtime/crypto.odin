@@ -65,53 +65,8 @@ crypto_algorithm :: proc(name: string) -> (hash.Algorithm, bool) {
 	return .Invalid, false
 }
 
-// typed_array_view borrows the backing store of a TypedArray or DataView as an
-// Odin byte slice. The slice aliases JavaScriptCore-owned memory: valid only
-// for the duration of the native call, never stored or freed. A zero-length
-// array yields an empty slice (ok=true).
-//
-// The data start is computed as the ArrayBuffer's base pointer plus the view's
-// byteOffset rather than JSObjectGetTypedArrayBytesPtr, which on javascriptcoregtk
-// returns the buffer base and ignores the offset (so an offset view — e.g.
-// `buffer.subarray(8)` — was read/written at the wrong position; see issue #68).
-// base + byteOffset is correct regardless of whether a given JSC applies the
-// offset to BytesPtr, so this stays right across backends.
-typed_array_view :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> ([]byte, bool) {
-	if jsc.JSValueGetTypedArrayType(ctx, value, nil) == .None do return nil, false
-	obj := cast(jsc.JSObjectRef)value
-	n := int(jsc.JSObjectGetTypedArrayByteLength(ctx, obj, nil))
-	if n == 0 do return nil, true
-	buffer := jsc.JSObjectGetTypedArrayBuffer(ctx, obj, nil)
-	if buffer == nil do return nil, false
-	base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, buffer, nil)
-	if base == nil do return nil, false
-	offset := int(jsc.JSObjectGetTypedArrayByteOffset(ctx, obj, nil))
-	return (cast([^]byte)base)[offset:][:n], true
-}
-
-// make_uint8_array hands a heap-allocated (context.allocator) byte slice to
-// JavaScriptCore as a Uint8Array without copying; fs_buffer_deallocator frees it
-// when the array is collected. A nil backing pointer (an empty `make`) is
-// substituted with a 1-byte allocation reported as length 0, since JSC rejects a
-// null pointer — decoders can legitimately yield zero bytes (e.g. hex of an
-// invalid first pair).
-make_uint8_array :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef {
-	ptr := raw_data(data)
-	n := len(data)
-	if ptr == nil {
-		pad := make([]byte, 1, context.allocator)
-		ptr = raw_data(pad)
-		n = 0
-	}
-	// Enter the VM (JSLockHolder) around the creation: the C-API typed-array
-	// creators do not self-lock, so when this runs from native code that is not
-	// already inside a JSC callback (e.g. fetch's streaming body, driven from the
-	// event loop), a GC triggered by the allocation would abort on Windows. The
-	// helper is a recursive no-op for callers already holding the lock, and a plain
-	// C-API call on Linux/macOS. See pkg/jsc/jsc_init.odin.
-	array := jsc.make_uint8_nocopy_locked(ctx, ptr, c.size_t(n), fs_buffer_deallocator)
-	return cast(jsc.JSValueRef)array
-}
+// typed_array_view and make_uint8_array — the shared JSC TypedArray marshalling
+// helpers crypto uses — now live in typed_array.odin (same package).
 
 // randomFill(typedArray) — fill the array in place with CSPRNG bytes and return
 // it. Used by randomBytes/randomFillSync/randomUUID. Writing through the
