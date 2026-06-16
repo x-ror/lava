@@ -12,8 +12,8 @@ Coverage of the Node.js public API surface in **lava**.
 
 | Status | Count | Modules / surfaces |
 |--------|------:|--------------------|
-| ✅ Full | 6 | assert, buffer, events, intl*, path, sqlite |
-| 🟡 Partial | 15 | console, crypto, esm, fs, globals, module/modules, packages, perf_hooks, process, timers, url, util, webcrypto, environment_variables |
+| ✅ Full | 7 | assert, buffer, events, intl*, path, sqlite, url |
+| 🟡 Partial | 14 | console, crypto, esm, fs, globals, module/modules, packages, perf_hooks, process, timers, util, webcrypto, environment_variables |
 | 🟥 Missing | 39 | net, http(s), http2, stream, dns, dgram, tls, os, zlib, child_process, worker_threads, querystring, string_decoder, async_hooks, readline, repl, vm, v8, test, webstreams, … |
 | ⚪ N/A | 10 | addons, cli, debugger, deprecations, documentation, embedding, errors, index, n-api, synopsis |
 
@@ -31,7 +31,7 @@ Coverage of the Node.js public API surface in **lava**.
 | **crypto** | ✅ | 🟡 | **real:** createHash/Hash, createHmac/Hmac, `hash`, randomBytes, randomFill(Sync), randomInt, randomUUID, pbkdf2(Sync), hkdf(Sync), timingSafeEqual, getHashes. Full Node surface is exported but **~50 fns throw "not implemented"** | ciphers (`createCipheriv`), keys (`generateKeyPair*`, `createPrivateKey`), sign/verify, `scrypt`, `X509Certificate`, `ECDH`, `DiffieHellman`, primes, `argon2`, `webcrypto`/`subtle` | [crypto.odin](../pkg/runtime/crypto.odin), [js/internal/crypto.js](../pkg/runtime/js/internal/crypto.js) |
 | **fs** | ✅ | 🟡 | readFile(Sync)/writeFile(Sync), existsSync, mkdirSync, mkdtempSync, rmSync/rmdirSync, unlinkSync, renameSync, statSync (rich `Stats`), readdirSync (13 exports) | no `fs.promises`, no streams/watch, no copyFile/access/chmod/chown/open/read/appendFile/realpath/symlink, callbacks only on read/write | [fs.odin](../pkg/runtime/fs.odin), [require.odin](../pkg/runtime/require.odin) |
 | **util** | ✅ | 🟡 | `inspect`, `format`, `formatWithOptions` (3 exports) | `promisify`, `callbackify`, `types.*`, `inherits`, `deprecate`, `isDeepStrictEqual`, `parseArgs`, `styleText`, `TextEncoder` re-export, `MIMEType` | [js/internal/util.js](../pkg/runtime/js/internal/util.js) |
-| **url** | ✅ | 🟡 | `fileURLToPath` only | `URL` constructor/`URLSearchParams` (global `URL` exposes only `createObjectURL`/`revokeObjectURL`), `pathToFileURL`, `urlToHttpOptions`, `format`, `domainToASCII/Unicode` | [js/internal/url.js](../pkg/runtime/js/internal/url.js) |
+| **url** | ✅ | ✅ | WHATWG `URL` (constructor, all getters/setters, `origin`, `searchParams`, `toString`/`toJSON`, static `canParse`/`parse`) + `URLSearchParams` (get/getAll/set/append/delete/has/sort/forEach/iteration/`size`), both also installed as globals; `fileURLToPath`, `pathToFileURL`, `urlToHttpOptions`, `format`, `domainToASCII`/`domainToUnicode` | legacy `url.parse`/`url.resolve`/`url.Url` (deprecated upstream); IDNA host mapping is approximated (NFKC+Punycode, not full ICU UTS-46); Node-specific port-setter and non-special-scheme host-setter quirks for malformed values | [js/internal/url.js](../pkg/runtime/js/internal/url.js) |
 | **timers** | ❌ | 🟡 | globals setTimeout/Interval/Immediate + clear*; **`node:timers/promises` ✅** (setTimeout/setImmediate/setInterval/scheduler) | `require('node:timers')` is `MODULE_NOT_FOUND`; no `.ref()`/`.unref()`/`.refresh()` on handles | [globals.odin](../pkg/runtime/globals.odin), [js/internal/timers_promises.js](../pkg/runtime/js/internal/timers_promises.js) |
 | **console** | ❌ | 🟡 | global `console` is rich (log/info/warn/error/dir/trace/assert/time*/count*/group*/table/clear) | `require('node:console')` / `Console` class constructor not exported | [js/console.js](../pkg/runtime/js/console.js) |
 | **process** | ❌ | 🟡 | global `process`: argv, env, cwd(), exit(), nextTick(), pid, platform, arch, version, versions | hrtime, chdir, kill, memoryUsage, uptime, stdout/stderr/stdin, execPath, argv0, event-emitter (`on`/signals), `require('node:process')` | [globals.odin](../pkg/runtime/globals.odin) |
@@ -73,9 +73,9 @@ Coverage of the Node.js public API surface in **lava**.
 
 Probed directly against `bin/lava`.
 
-**Present (28):** `global`, `globalThis`, `Buffer`, `fetch`, `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `structuredClone`, `queueMicrotask`, `setTimeout`, `setInterval`, `setImmediate`, `clearTimeout`, `clearInterval`, `clearImmediate`, `console`, `process`, `performance`, `Blob`, `File`, `crypto` (getRandomValues/randomUUID), `URL` (only `createObjectURL`/`revokeObjectURL` — no constructor), plus engine-provided `WebAssembly` and `Intl`.
+**Present (30):** `global`, `globalThis`, `Buffer`, `fetch`, `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `structuredClone`, `queueMicrotask`, `setTimeout`, `setInterval`, `setImmediate`, `clearTimeout`, `clearInterval`, `clearImmediate`, `console`, `process`, `performance`, `Blob`, `File`, `crypto` (getRandomValues/randomUUID), `URL` (full WHATWG constructor + `createObjectURL`/`revokeObjectURL`), `URLSearchParams`, plus engine-provided `WebAssembly` and `Intl`.
 
-**Missing:** `new URL()`/`URLSearchParams`, `atob`, `btoa` (global form), `Event`, `EventTarget`, `CustomEvent`, `ReadableStream`/`WritableStream`/`TransformStream`, `TextEncoderStream`/`TextDecoderStream`, `CompressionStream`, `MessageChannel`/`MessagePort`, `Worker`, `BroadcastChannel`, `navigator`, `reportError`, `crypto.subtle`.
+**Missing:** `atob`, `btoa` (global form), `Event`, `EventTarget`, `CustomEvent`, `ReadableStream`/`WritableStream`/`TransformStream`, `TextEncoderStream`/`TextDecoderStream`, `CompressionStream`, `MessageChannel`/`MessagePort`, `Worker`, `BroadcastChannel`, `navigator`, `reportError`, `crypto.subtle`.
 
 ## `process` surface
 
@@ -91,9 +91,8 @@ Probed directly against `bin/lava`.
 
 1. **Networking stack** — `net`/`tls`/`http`/`https`/`http2`/`dgram`. fetch covers outbound HTTP(S) client only; there is no server or raw-socket capability.
 2. **Streams** — `stream` + `webstreams`. Blocks a huge swath of the ecosystem (fs streams, http bodies, zlib piping).
-3. **`url` globals** — the `URL` constructor and `URLSearchParams` are absent as both module and global (the global `URL` carries only `createObjectURL`/`revokeObjectURL`); very commonly assumed present.
-4. **`util` helpers** — `promisify`/`callbackify`/`types`/`inherits` are load-bearing for many packages.
-5. **`os`**, **`zlib`**, **`querystring`**, **`string_decoder`** — small, high-frequency modules that are cheap wins.
-6. **`crypto` asymmetric/cipher** — the surface is stubbed; real impl needs OpenSSL wiring (TLS already links it).
-7. **`dns`** — public module (in progress; c-ares planned).
-8. **Concurrency** — `worker_threads`/`child_process` entirely absent.
+3. **`util` helpers** — `promisify`/`callbackify`/`types`/`inherits` are load-bearing for many packages.
+4. **`os`**, **`zlib`**, **`querystring`**, **`string_decoder`** — small, high-frequency modules that are cheap wins.
+5. **`crypto` asymmetric/cipher** — the surface is stubbed; real impl needs OpenSSL wiring (TLS already links it).
+6. **`dns`** — public module (in progress; c-ares planned).
+7. **Concurrency** — `worker_threads`/`child_process` entirely absent.

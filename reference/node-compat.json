@@ -11,8 +11,8 @@
     "na": "not a JS-API surface"
   },
   "counts": {
-    "full": 6,
-    "partial": 15,
+    "full": 7,
+    "partial": 14,
     "missing": 39,
     "na": 10
   },
@@ -170,8 +170,8 @@
     {
       "page": "globals",
       "status": "partial",
-      "implemented": "27 globals present",
-      "gaps": "URL/Event/streams/atob/navigator/reportError"
+      "implemented": "29 globals present (incl. URL/URLSearchParams)",
+      "gaps": "Event/streams/atob/navigator/reportError"
     },
     {
       "page": "http",
@@ -379,9 +379,9 @@
     },
     {
       "page": "url",
-      "status": "partial",
-      "implemented": "fileURLToPath; global URL.createObjectURL/revokeObjectURL",
-      "gaps": "URL constructor/URLSearchParams/pathToFileURL/format"
+      "status": "full",
+      "implemented": "WHATWG URL + URLSearchParams (global and module); fileURLToPath/pathToFileURL/urlToHttpOptions/format/domainToASCII/domainToUnicode",
+      "gaps": "legacy url.parse/resolve/Url; IDNA approximated (NFKC+Punycode, not full ICU UTS-46)"
     },
     {
       "page": "util",
@@ -466,11 +466,11 @@
       "File",
       "crypto",
       "URL",
+      "URLSearchParams",
       "WebAssembly",
       "Intl"
     ],
     "missing": [
-      "URLSearchParams",
       "atob",
       "btoa",
       "Event",

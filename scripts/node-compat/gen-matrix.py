@@ -23,14 +23,14 @@ MODULES = {
     "crypto": ("partial", "hash/hmac/hkdf/pbkdf2/random*/uuid/timingSafeEqual", "~50 stubbed: ciphers/keys/sign/verify/scrypt/x509/ecdh/dh/argon2/subtle"),
     "esm": ("partial", ".mjs transform, import works", "loader hooks/register"),
     "fs": ("partial", "13 fns: readFile/writeFile(Sync)/stat/readdir/mkdir/rm/...", "no promises/streams/watch/copyFile/access/chmod/open"),
-    "globals": ("partial", "27 globals present", "URL/Event/streams/atob/navigator/reportError"),
+    "globals": ("partial", "29 globals present (incl. URL/URLSearchParams)", "Event/streams/atob/navigator/reportError"),
     "module": ("partial", "CommonJS require + node: resolution", "createRequire/register/isBuiltin/SourceMap"),
     "modules": ("partial", "CommonJS require", "same as module"),
     "packages": ("partial", "package.json resolution (partial)", "exports/imports map edge cases"),
     "perf_hooks": ("partial", "performance.now/timeOrigin", "PerformanceObserver/marks/entries"),
     "process": ("partial", "argv/env/cwd/exit/nextTick/pid/platform/arch/version(s)", "hrtime/stdio/on/kill/memoryUsage/execPath"),
     "timers": ("partial", "global timers + node:timers/promises", "no node:timers module; no ref/unref"),
-    "url": ("partial", "fileURLToPath", "URL/URLSearchParams/pathToFileURL/format"),
+    "url": ("full", "WHATWG URL + URLSearchParams (global and module); fileURLToPath/pathToFileURL/urlToHttpOptions/format/domainToASCII/domainToUnicode", "legacy url.parse/resolve/Url; IDNA approximated (NFKC+Punycode, not full ICU UTS-46)"),
     "util": ("partial", "inspect/format/formatWithOptions", "promisify/callbackify/types/inherits/parseArgs"),
     "webcrypto": ("partial", "crypto.getRandomValues/randomUUID", "crypto.subtle (all SubtleCrypto)"),
     "environment_variables": ("partial", "some env honored", ""),
@@ -85,8 +85,8 @@ MODULES = {
     "synopsis": ("na", "", "intro"),
 }
 
-GLOBALS_PRESENT = ["global", "globalThis", "Buffer", "fetch", "Headers", "Request", "Response", "TextEncoder", "TextDecoder", "AbortController", "AbortSignal", "structuredClone", "queueMicrotask", "setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval", "clearImmediate", "console", "process", "performance", "Blob", "File", "crypto", "WebAssembly", "Intl"]
-GLOBALS_MISSING = ["URL", "URLSearchParams", "atob", "btoa", "Event", "EventTarget", "CustomEvent", "ReadableStream", "WritableStream", "TransformStream", "TextEncoderStream", "TextDecoderStream", "CompressionStream", "MessageChannel", "MessagePort", "Worker", "BroadcastChannel", "navigator", "reportError", "crypto.subtle"]
+GLOBALS_PRESENT = ["global", "globalThis", "Buffer", "fetch", "Headers", "Request", "Response", "TextEncoder", "TextDecoder", "AbortController", "AbortSignal", "structuredClone", "queueMicrotask", "setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval", "clearImmediate", "console", "process", "performance", "Blob", "File", "crypto", "URL", "URLSearchParams", "WebAssembly", "Intl"]
+GLOBALS_MISSING = ["atob", "btoa", "Event", "EventTarget", "CustomEvent", "ReadableStream", "WritableStream", "TransformStream", "TextEncoderStream", "TextDecoderStream", "CompressionStream", "MessageChannel", "MessagePort", "Worker", "BroadcastChannel", "navigator", "reportError", "crypto.subtle"]
 PROCESS_PRESENT = ["argv", "env", "cwd", "exit", "nextTick", "pid", "platform", "arch", "version", "versions"]
 PROCESS_MISSING = ["hrtime", "chdir", "kill", "memoryUsage", "resourceUsage", "uptime", "stdout", "stderr", "stdin", "execPath", "argv0", "execArgv", "umask", "on", "once", "exitCode", "title", "report"]
 
