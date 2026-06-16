@@ -871,6 +871,73 @@
     });
   }
 
+  // --- blob: URL registry (URL.createObjectURL / buffer.resolveObjectURL) ----
+  //
+  // Node keeps Blobs created with URL.createObjectURL() in a process-wide
+  // registry keyed by a `blob:nodedata:<uuid>` URL; buffer.resolveObjectURL()
+  // looks one up and URL.revokeObjectURL() drops it. The registry lives here
+  // because node:buffer owns Blob and exports resolveObjectURL. Lava has no
+  // WHATWG URL class (see internal/url.js, where it is intentionally absent), so
+  // we add just the two object-URL statics this feature needs — the same place
+  // Node exposes them — without approximating the rest of URL.
+  var objectUrlRegistry = new Map();
+
+  function objectUrlId() {
+    var c = globalThis.crypto;
+    if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+    // Defensive fallback: a v4 UUID from whatever randomness is available.
+    var bytes = new Uint8Array(16);
+    if (c && typeof c.getRandomValues === 'function') c.getRandomValues(bytes);
+    else for (var i = 0; i < 16; i++) bytes[i] = (Math.random() * 256) & 0xff;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    var s = '';
+    for (var j = 0; j < 16; j++) {
+      s += (bytes[j] + 0x100).toString(16).slice(1);
+      if (j === 3 || j === 5 || j === 7 || j === 9) s += '-';
+    }
+    return s;
+  }
+
+  function createObjectURL(obj) {
+    if (!(obj instanceof Blob)) {
+      var typeErr = new TypeError('The "obj" argument must be an instance of Blob.');
+      typeErr.code = 'ERR_INVALID_ARG_TYPE';
+      throw typeErr;
+    }
+    var id = 'blob:nodedata:' + objectUrlId();
+    objectUrlRegistry.set(id, obj);
+    return id;
+  }
+
+  function revokeObjectURL(url) {
+    if (url === undefined) {
+      var missingErr = new TypeError('The "url" argument must be specified');
+      missingErr.code = 'ERR_MISSING_ARGS';
+      throw missingErr;
+    }
+    // Coerce like Node; an unregistered or malformed id is a silent no-op.
+    objectUrlRegistry.delete(String(url));
+  }
+
+  function resolveObjectURL(id) {
+    if (typeof id !== 'string') return undefined;
+    var blob = objectUrlRegistry.get(id);
+    if (blob === undefined) return undefined;
+    // Node returns a fresh Blob over the same bytes rather than the registered
+    // instance, and a registered File resolves back as a plain Blob.
+    return new Blob([blob], { type: blob.type });
+  }
+
+  if (typeof globalThis.URL === 'undefined') {
+    globalThis.URL = { createObjectURL: createObjectURL, revokeObjectURL: revokeObjectURL };
+  } else {
+    if (typeof globalThis.URL.createObjectURL !== 'function')
+      globalThis.URL.createObjectURL = createObjectURL;
+    if (typeof globalThis.URL.revokeObjectURL !== 'function')
+      globalThis.URL.revokeObjectURL = revokeObjectURL;
+  }
+
   if (typeof globalThis.Buffer === 'undefined') {
     globalThis.Buffer = Buffer;
   }
@@ -894,6 +961,7 @@
     isAscii: isAscii,
     isUtf8: isUtf8,
     transcode: transcode,
+    resolveObjectURL: resolveObjectURL,
   };
   Object.defineProperty(exported, 'INSPECT_MAX_BYTES', {
     get: function () {
