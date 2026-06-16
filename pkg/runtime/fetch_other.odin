@@ -15,3 +15,10 @@ fetch_close_fd :: proc(fd: uintptr) {}
 fetch_transport_start :: proc(req: ^Fetch_Request, host: string, port: int) -> (ok: bool, err: string) {
 	return false, "fetch: HTTP transport is not implemented on this platform"
 }
+
+// Streaming request-body entry points (called from the all-platform fetch.odin).
+// No transport exists here — a streamed request never gets past
+// fetch_transport_start — so these remain defensive no-ops.
+fetch_push_body :: proc(req: ^Fetch_Request, data: []byte) {}
+
+fetch_end_body :: proc(req: ^Fetch_Request) {}

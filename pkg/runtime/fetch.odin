@@ -28,7 +28,8 @@ import eventloop "lava:pkg/runtime/eventloop"
 Fetch_Phase :: enum {
 	Connecting,
 	TLS_Handshake, // https only: drive SSL_connect between Connecting and Writing
-	Writing,
+	Writing, // sending the request head (and, for buffered bodies, the body)
+	Body_Write, // streaming an upload body incrementally as chunked frames
 	Reading,
 }
 
@@ -62,6 +63,21 @@ Fetch_Request :: struct {
 	cancel_fn:     jsc.JSObjectRef, // GC-protected cancel handle (private data == this req)
 	resume_fn:     jsc.JSObjectRef, // GC-protected resume handle (private data == this req)
 	settled:       bool,
+
+	// Streaming request-body (true chunked upload) state. When body_streaming,
+	// request_bytes holds ONLY the head (Transfer-Encoding: chunked, no
+	// Content-Length); body chunks are pulled one at a time from the JS producer
+	// (on_body_drain → push_body_fn) and framed incrementally into body_out. See
+	// the body-write state machine in fetch_transport.odin.
+	body_streaming:    bool,
+	on_body_drain:     jsc.JSObjectRef, // GC-protected: "ready for the next body chunk"
+	push_body_fn:      jsc.JSObjectRef, // GC-protected callable(Uint8Array) (private == this req)
+	end_body_fn:       jsc.JSObjectRef, // GC-protected callable(errorOrNull) (private == this req)
+	body_out:          [dynamic]byte, // the current framed chunk awaiting the socket
+	body_out_off:      int, // bytes of body_out already written
+	body_end_seen:     bool, // producer signalled end-of-body; terminator pending
+	body_term_written: bool, // the zero-size terminating chunk was appended to body_out
+	body_idle:         bool, // awaiting the next chunk from the producer (fd unwatched)
 
 	// Owned copies (the JSC-derived strings they came from do not outlive the call).
 	url:           string,
@@ -98,7 +114,7 @@ Fetch_Request :: struct {
 	carry:         [dynamic]byte, // undecoded chunked framing bytes spanning reads
 	read_paused:   bool, // socket reads suspended for backpressure (consumer saturated)
 	want_pause:    bool, // a delivered chunk reported the consumer is full this turn
-	drive_pending: int, // queued fetch_drive_read_cb completions referencing this req
+	drive_pending: int, // queued drive completions (read resume / body drain) referencing this req
 	settle_tick:   u64, // loop iteration at settle; reclaim holds the req two ticks past it
 
 	// TLS state for https:// requests. is_https gates the TLS path in the
@@ -183,6 +199,89 @@ fetch_resume_fn_cb :: proc "c" (
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
+// fetch_get_push_class / fetch_get_end_class mirror the cancel/resume classes for
+// the streaming request-body channel: callable JSObjects whose private data is the
+// ^Fetch_Request. The JS producer pump calls pushBody(chunk) to hand a body chunk
+// to the transport and endBody(errorOrNull) to signal end-of-body (null) or a
+// producer error (a string, which aborts the request).
+@(private = "file")
+g_fetch_push_class: jsc.JSClassRef
+@(private = "file")
+g_fetch_end_class: jsc.JSClassRef
+
+fetch_get_push_class :: proc() -> jsc.JSClassRef {
+	if g_fetch_push_class == nil {
+		def := jsc.JSClassDefinition {
+			class_name       = "FetchPushBody",
+			call_as_function = fetch_push_fn_cb,
+		}
+		g_fetch_push_class = jsc.JSClassCreate(&def)
+	}
+	return g_fetch_push_class
+}
+
+fetch_get_end_class :: proc() -> jsc.JSClassRef {
+	if g_fetch_end_class == nil {
+		def := jsc.JSClassDefinition {
+			class_name       = "FetchEndBody",
+			call_as_function = fetch_end_fn_cb,
+		}
+		g_fetch_end_class = jsc.JSClassCreate(&def)
+	}
+	return g_fetch_end_class
+}
+
+// fetch_push_fn_cb hands one producer chunk (a Uint8Array) to the transport, which
+// frames it as a chunked request-body frame and writes it (with backpressure). A
+// nil private (request already settled/freed) or a non-typed-array argument is a
+// safe no-op.
+fetch_push_fn_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	req := cast(^Fetch_Request)jsc.JSObjectGetPrivate(function)
+	if req != nil && !req.settled && argument_count >= 1 {
+		if view, ok := typed_array_view(ctx, arguments[0]); ok {
+			fetch_push_body(req, view)
+		}
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// fetch_end_fn_cb signals the end of the request body: a null/undefined argument is
+// a clean end (write the terminating zero-size chunk), a string is a producer error
+// that aborts the request (the fetch promise rejects).
+fetch_end_fn_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	req := cast(^Fetch_Request)jsc.JSObjectGetPrivate(function)
+	if req != nil && !req.settled {
+		is_error :=
+			argument_count >= 1 &&
+			!jsc.JSValueIsNull(ctx, arguments[0]) &&
+			!jsc.JSValueIsUndefined(ctx, arguments[0])
+		if is_error {
+			msg, alloc := jsc_value_to_string_or_default(ctx, arguments[0])
+			defer if alloc do delete(msg, context.allocator)
+			fetch_settle_error(req, msg)
+		} else {
+			fetch_end_body(req)
+		}
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
 // make_fetch_bindings builds the `native` object handed to js/internal/fetch.js.
 make_fetch_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
@@ -203,9 +302,16 @@ make_fetch_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 //     (string) — closing or erroring the response body stream.
 //   - onError(message) fires for a pre-headers failure (the promise rejects).
 //
-// Returns { cancel, resume } native callables: cancel tears the request down
-// (abort / reader.cancel); resume re-arms a paused read. Returns undefined on a
-// synchronous reject (bad URL, no loop).
+// Streaming upload (args 8/9): when streamBody is true the body is sent as
+// Transfer-Encoding: chunked rather than buffered — arguments[3] carries no bytes;
+// instead onBodyDrain (arg 9) fires when the transport is ready for the next chunk,
+// the JS pump hands chunks back through the returned pushBody callable, and signals
+// completion / a producer error through endBody.
+//
+// Returns { cancel, resume[, pushBody, endBody] } native callables: cancel tears
+// the request down (abort / reader.cancel); resume re-arms a paused read; pushBody /
+// endBody drive the streaming request body. Returns undefined on a synchronous
+// reject (bad URL, no loop).
 fetch_request_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -222,6 +328,16 @@ fetch_request_cb :: proc "c" (
 	on_chunk := callback_arg(ctx, arguments[6])
 	on_end := callback_arg(ctx, arguments[7])
 	if on_response == nil || on_error == nil || on_chunk == nil || on_end == nil {
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	// Streaming upload args (8: bool, 9: onBodyDrain). When the body is streamed,
+	// arguments[3] carries no bytes — chunks arrive later via push_body_fn.
+	stream_body := argument_count >= 9 && jsc.JSValueToBoolean(ctx, arguments[8])
+	on_body_drain: jsc.JSObjectRef = nil
+	if argument_count >= 10 do on_body_drain = callback_arg(ctx, arguments[9])
+	if stream_body && on_body_drain == nil {
+		fetch_reject_now(ctx, on_error, "fetch: streaming body requires a drain callback")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
@@ -253,7 +369,9 @@ fetch_request_cb :: proc "c" (
 	if state := get_state_from_ctx(ctx); state != nil do fetch_reclaim_pending(state)
 
 	body: []byte
-	if view, has_body := typed_array_view(ctx, arguments[3]); has_body do body = view
+	if !stream_body {
+		if view, has_body := typed_array_view(ctx, arguments[3]); has_body do body = view
+	}
 
 	req := new(Fetch_Request)
 	req.ctx = ctx
@@ -262,6 +380,8 @@ fetch_request_cb :: proc "c" (
 	req.on_error = on_error
 	req.on_chunk = on_chunk
 	req.on_end = on_end
+	req.body_streaming = stream_body
+	req.on_body_drain = on_body_drain
 	req.body_len = -1
 	req.method = strings.clone(method)
 	req.url = strings.clone(url)
@@ -279,12 +399,14 @@ fetch_request_cb :: proc "c" (
 		header_lines,
 		body,
 		req.is_https,
+		stream_body,
 	)
 
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_response)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_error)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_chunk)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_end)
+	if on_body_drain != nil do jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_body_drain)
 
 	// Build and GC-protect the cancel / resume handles before starting the
 	// transport so the JS caller can cancel or resume even if the request settles
@@ -295,6 +417,20 @@ fetch_request_cb :: proc "c" (
 	resume_fn := jsc.JSObjectMake(ctx, fetch_get_resume_class(), req)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)resume_fn)
 	req.resume_fn = resume_fn
+	// The streaming request-body channel: push/end callables backed by this req.
+	// Keep local handles (like cancel/resume): a synchronous settle below clears
+	// req.push_body_fn/end_body_fn, but the JSObjects stay valid (and become inert
+	// no-ops once their private back-pointer is nulled), so the controls object can
+	// still expose them.
+	push_fn, end_fn: jsc.JSObjectRef
+	if stream_body {
+		push_fn = jsc.JSObjectMake(ctx, fetch_get_push_class(), req)
+		jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)push_fn)
+		req.push_body_fn = push_fn
+		end_fn = jsc.JSObjectMake(ctx, fetch_get_end_class(), req)
+		jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)end_fn)
+		req.end_body_fn = end_fn
+	}
 	if state := get_state_from_ctx(ctx); state != nil do fetch_track_active(state, req)
 
 	started, err := fetch_transport_start(req, host, port)
@@ -302,12 +438,17 @@ fetch_request_cb :: proc "c" (
 		fetch_settle_error(req, err)
 	}
 
-	// The controls object wraps both handles; the JS side reads .cancel / .resume.
-	// It is referenced by the JS fetch closure until the request settles, so it
-	// needs no independent GC protection (its handle properties are protected).
+	// The controls object wraps the handles; the JS side reads .cancel / .resume
+	// (and .pushBody / .endBody for a streamed body). It is referenced by the JS
+	// fetch closure until the request settles, so it needs no independent GC
+	// protection (its handle properties are protected).
 	controls := jsc.JSObjectMake(ctx, nil, nil)
 	set_named(ctx, controls, "cancel", cast(jsc.JSValueRef)cancel_fn)
 	set_named(ctx, controls, "resume", cast(jsc.JSValueRef)resume_fn)
+	if stream_body {
+		set_named(ctx, controls, "pushBody", cast(jsc.JSValueRef)push_fn)
+		set_named(ctx, controls, "endBody", cast(jsc.JSValueRef)end_fn)
+	}
 	return cast(jsc.JSValueRef)controls
 }
 
@@ -388,14 +529,19 @@ parse_http_url :: proc(
 
 // build_http_request serializes the request line, a Host header, the caller's
 // header block, Connection: close (so the server frames the body by closing —
-// we then read to EOF), an optional Content-Length, and the body. The returned
-// buffer is allocated on context.allocator and owned by the request.
+// we then read to EOF), the body framing, and (for a buffered body) the body
+// bytes. With chunked=true it emits Transfer-Encoding: chunked and NO body /
+// Content-Length — the body is streamed afterward as chunked frames (see the
+// body-write state machine in fetch_transport.odin); otherwise it emits a
+// Content-Length for a non-empty buffered body. The returned buffer is allocated
+// on context.allocator and owned by the request.
 build_http_request :: proc(
 	method, host: string,
 	port: int,
 	path, header_lines: string,
 	body: []byte,
 	is_https: bool,
+	chunked: bool,
 ) -> []byte {
 	b := strings.builder_make(context.allocator)
 	strings.write_string(&b, method)
@@ -424,6 +570,14 @@ build_http_request :: proc(
 
 	strings.write_string(&b, header_lines) // each line already ends with \r\n
 	strings.write_string(&b, "Connection: close\r\n")
+
+	if chunked {
+		// A streamed upload: frame the body with Transfer-Encoding: chunked and emit
+		// no Content-Length / body here — chunks follow as chunked frames.
+		strings.write_string(&b, "Transfer-Encoding: chunked\r\n")
+		strings.write_string(&b, "\r\n")
+		return b.buf[:]
+	}
 
 	if len(body) > 0 {
 		strings.write_string(&b, "Content-Length: ")
@@ -723,6 +877,23 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.resume_fn)
 		req.resume_fn = nil
 	}
+	// Drop the streaming request-body channel's GC roots. As with cancel/resume, the
+	// JS pump may still hold pushBody/endBody after the request settles, so clear the
+	// back-pointer first: a later call then reads a nil private and no-ops.
+	if req.on_body_drain != nil {
+		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.on_body_drain)
+		req.on_body_drain = nil
+	}
+	if req.push_body_fn != nil {
+		jsc.JSObjectSetPrivate(req.push_body_fn, nil)
+		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.push_body_fn)
+		req.push_body_fn = nil
+	}
+	if req.end_body_fn != nil {
+		jsc.JSObjectSetPrivate(req.end_body_fn, nil)
+		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.end_body_fn)
+		req.end_body_fn = nil
+	}
 
 	if state := get_state_from_ctx(req.ctx); state != nil {
 		append(&state.pending_free, req)
@@ -794,6 +965,7 @@ fetch_free_request :: proc(req: ^Fetch_Request) {
 	if req.request_bytes != nil do delete(req.request_bytes)
 	delete(req.response)
 	delete(req.carry)
+	delete(req.body_out)
 	free(req)
 }
 

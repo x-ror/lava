@@ -111,8 +111,13 @@ async function main() {
     console.log('buffered arrayBuffer:', ab.byteLength, ab instanceof ArrayBuffer);
   }
 
-  // Request body streaming: an async generator body (buffered before send in v1).
-  // Node requires duplex:'half' for stream bodies; Lava matches.
+  // --- Streaming request bodies (issue #182): true chunked upload ---
+  // A ReadableStream / async-iterable body is streamed incrementally as
+  // Transfer-Encoding: chunked (never materialized); a string/Buffer/Blob body
+  // keeps the buffered Content-Length fast path. Node and Lava frame these
+  // identically, so the server's echoed `te`/`cl` must match across both.
+
+  // An async-generator body streams chunked: byte-exact echo, te=chunked, no cl.
   {
     async function* gen() {
       yield new TextEncoder().encode('strm-');
@@ -121,10 +126,131 @@ async function main() {
     const rq = await fetch(base + '/echo', { method: 'POST', body: gen(), duplex: 'half' });
     const j = await rq.json();
     console.log('request stream echo:', JSON.stringify(j.echo), j.len);
+    console.log('request stream framing:', j.te, j.cl);
+  }
 
-    // A Blob request body (no duplex required) round-trips byte-exact.
-    const rb2 = await fetch(base + '/echo', { method: 'POST', body: new Blob(['blob ', 'data']) });
-    console.log('request blob echo:', JSON.stringify((await rb2.json()).echo));
+  // A ReadableStream body streams the same way. The source is another response's
+  // body (a real ReadableStream in both Node and Lava — the standalone
+  // ReadableStream global is not exposed in Lava), piped straight into the upload.
+  {
+    const src = (await fetch(base + '/a')).body;
+    const j = await fetch(base + '/echo', { method: 'POST', body: src, duplex: 'half' }).then((r) =>
+      r.json(),
+    );
+    console.log('request ReadableStream:', JSON.stringify(j.echo), j.te, j.cl);
+  }
+
+  // A buffered string body keeps the Content-Length fast path: cl set, no te.
+  {
+    const j = await fetch(base + '/echo', { method: 'POST', body: 'buffered-string' }).then((r) =>
+      r.json(),
+    );
+    console.log('buffered string framing:', JSON.stringify(j.echo), j.te, j.cl);
+  }
+
+  // A Blob body is a known-length body — buffered with Content-Length (no duplex
+  // required), not chunked.
+  {
+    const j = await fetch(base + '/echo', {
+      method: 'POST',
+      body: new Blob(['blob ', 'data']),
+    }).then((r) => r.json());
+    console.log('request blob echo:', JSON.stringify(j.echo), j.te, j.cl);
+  }
+
+  // A large streamed body crosses the socket write buffer many times, exercising
+  // the write-backpressure pause/resume path. Only the reassembled content is
+  // compared (chunk boundaries are transport-defined).
+  {
+    const PART = 'z'.repeat(8192);
+    async function* big() {
+      for (let i = 0; i < 30; i++) yield new TextEncoder().encode(PART);
+    }
+    const j = await fetch(base + '/echo', { method: 'POST', body: big(), duplex: 'half' }).then(
+      (r) => r.json(),
+    );
+    console.log('large stream upload:', j.len === 30 * PART.length, j.te);
+  }
+
+  // An empty streamed body delivers an empty request body. (Framing is NOT
+  // asserted: Node sends Content-Length: 0 for an immediately-empty producer,
+  // while Lava sends an empty chunked body — terminator only; the received body is
+  // identical either way. See reference/node-compatibility.md.)
+  {
+    async function* empty() {}
+    const j = await fetch(base + '/echo', { method: 'POST', body: empty(), duplex: 'half' }).then(
+      (r) => r.json(),
+    );
+    console.log('empty stream upload:', JSON.stringify(j.echo), j.len);
+  }
+
+  // A streaming body still requires duplex:'half' (matching Node) — omitting it
+  // throws a TypeError at fetch() time.
+  {
+    async function* gen() {
+      yield new TextEncoder().encode('x');
+    }
+    let dup = '';
+    try {
+      await fetch(base + '/echo', { method: 'POST', body: gen() });
+    } catch (error) {
+      dup = error && error.constructor.name;
+    }
+    console.log('stream needs duplex:', dup);
+  }
+
+  // A producer that throws mid-stream aborts the request: the fetch rejects.
+  {
+    async function* boom() {
+      yield new TextEncoder().encode('before-');
+      throw new Error('producer kaboom');
+    }
+    let failed = false;
+    try {
+      await fetch(base + '/echo', { method: 'POST', body: boom(), duplex: 'half' });
+    } catch (error) {
+      failed = true;
+    }
+    console.log('producer error aborts:', failed);
+  }
+
+  // Aborting an in-flight upload (a slow producer that stalls before finishing)
+  // rejects with an AbortError. The producer never completes on its own, so the
+  // abort — not EOF — ends the upload.
+  {
+    const ac = new AbortController();
+    async function* slow() {
+      yield new TextEncoder().encode('first-chunk');
+      // Stall long enough for the abort below to fire mid-upload.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      yield new TextEncoder().encode('never-sent');
+    }
+    setTimeout(() => ac.abort(), 20);
+    let name = '';
+    try {
+      await fetch(base + '/echo', {
+        method: 'POST',
+        body: slow(),
+        duplex: 'half',
+        signal: ac.signal,
+      });
+    } catch (error) {
+      name = error && error.name;
+    }
+    console.log('abort in-flight upload:', name);
+  }
+
+  // A streamed upload over Connection: close still completes (Lava always sends
+  // Connection: close; the chunked terminator delimits the body regardless).
+  {
+    async function* gen() {
+      yield new TextEncoder().encode('conn-');
+      yield new TextEncoder().encode('close');
+    }
+    const j = await fetch(base + '/echo', { method: 'POST', body: gen(), duplex: 'half' }).then(
+      (r) => r.json(),
+    );
+    console.log('stream over conn-close:', JSON.stringify(j.echo), j.te);
   }
 
   // --- Public Web Streams over a real response/request body (issue #184) ---

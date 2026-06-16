@@ -473,10 +473,13 @@
     }
   }
 
-  // collectStreamBody materializes a streaming request body to a single Uint8Array.
-  // v1 buffers the whole body before sending (Content-Length framing); true
-  // chunked upload is a tracked follow-up. An abort signal is honored mid-read so
-  // an infinite/slow producer does not keep allocating after the caller cancels.
+  // collectStreamBody materializes a known-length streaming body (a Blob) to a
+  // single Uint8Array so it can be sent with Content-Length framing — matching
+  // Node, which treats a Blob as a known-length body (no duplex required).
+  // ReadableStream / async-iterable bodies do NOT come here: they stream
+  // incrementally as Transfer-Encoding: chunked (see startFetch). An abort signal
+  // is honored mid-read so an infinite/slow producer does not keep allocating
+  // after the caller cancels.
   async function collectStreamBody(src, signal) {
     if (signal && signal.aborted) throw signal.reason;
     if (typeof Blob !== 'undefined' && src instanceof Blob) {
@@ -577,23 +580,39 @@
       headerLines += key + ': ' + String(value) + '\r\n';
     });
 
-    // A streaming request body (Blob / ReadableStream / async iterable) is
-    // buffered to bytes before the request is sent (v1 limitation); the
-    // duplex:'half' requirement was already enforced at Request construction.
+    // Request body framing:
+    //   - A Blob is a known-length body — Node frames it with Content-Length — so
+    //     it keeps the buffered fast path (collect to bytes, then send).
+    //   - A ReadableStream / async-iterable body (the ones that required
+    //     duplex:'half') is streamed incrementally as Transfer-Encoding: chunked,
+    //     never materialized in full (true upload streaming).
+    // The duplex:'half' requirement was already enforced at Request construction;
+    // _streamNeedsDuplex is false for a Blob and true for the stream-like bodies.
     if (req._streamBody) {
-      return collectStreamBody(req._streamBody, signal).then(function (bytes) {
-        return startFetch(req, headerLines, bytes, signal);
-      });
+      if (!req._streamNeedsDuplex) {
+        return collectStreamBody(req._streamBody, signal).then(function (bytes) {
+          return startFetch(req, headerLines, bytes, null, signal);
+        });
+      }
+      return startFetch(req, headerLines, null, req._streamBody, signal);
     }
-    return startFetch(req, headerLines, req._bodyBytes, signal);
+    return startFetch(req, headerLines, req._bodyBytes, null, signal);
   }
 
-  // startFetch hands the materialized request to the Odin transport and wires its
-  // streaming callbacks (see native.request in pkg/runtime/fetch.odin) to a public
+  // startFetch hands the request to the Odin transport and wires its streaming
+  // callbacks (see native.request in pkg/runtime/fetch.odin) to a public
   // ReadableStream. onResponse resolves the promise with a Response whose body
   // streams incrementally; onChunk/onEnd feed and finish that stream; onError
   // rejects a pre-headers failure.
-  function startFetch(req, headerLines, body, signal) {
+  //
+  // streamSource (optional) is a ReadableStream / async-iterable request body that
+  // is streamed incrementally (Transfer-Encoding: chunked) rather than buffered:
+  // the native side pulls one chunk at a time by invoking onBodyDrain, the pump
+  // reads the producer and hands each chunk back through handles.pushBody, and
+  // signals completion (or a producer error) through handles.endBody. The pull/push
+  // protocol holds at most one chunk in flight, so socket write backpressure (the
+  // native side defers onBodyDrain until the socket drains) pauses the producer.
+  function startFetch(req, headerLines, body, streamSource, signal) {
     return new Promise(function (resolve, reject) {
       var abortListener = null;
       // sink.body is the makeTransportStream handle (enqueue/close/error +
@@ -601,11 +620,98 @@
       var sink = { body: null, ended: false, endErr: null };
       var handles = null;
 
+      // --- request-body producer pump (streamSource only) ---
+      var bodyReader = null; // ReadableStream reader, if the source is one
+      var bodyIterator = null; // async iterator, otherwise
+      var producing = false; // a producer read is in flight
+      var producerDone = false; // producer finished, errored, or was torn down
+
+      function setupProducer() {
+        if (!streamSource) return;
+        if (typeof streamSource.getReader === 'function') {
+          bodyReader = streamSource.getReader();
+        } else {
+          bodyIterator = streamSource[Symbol.asyncIterator]();
+        }
+      }
+
+      function readNextChunk() {
+        return bodyReader ? bodyReader.read() : bodyIterator.next();
+      }
+
+      function cancelProducer(reason) {
+        producerDone = true;
+        try {
+          if (bodyReader && typeof bodyReader.cancel === 'function') bodyReader.cancel(reason);
+          else if (bodyIterator && typeof bodyIterator.return === 'function') bodyIterator.return();
+        } catch (e) {}
+      }
+
+      // failProducer aborts the request: cancel the source and tell the native side
+      // to tear the in-flight upload down (which rejects the fetch promise).
+      function failProducer(err) {
+        if (producerDone) return;
+        cancelProducer(err);
+        var msg =
+          err && err.message ? err.message : err === undefined ? 'request body error' : String(err);
+        if (handles && typeof handles.endBody === 'function') handles.endBody(msg);
+      }
+
+      // pumpBody pulls exactly one chunk from the producer and pushes it to the
+      // native transport. The native side calls onBodyDrain to request the next
+      // one once the current chunk has drained to the socket (backpressure).
+      function pumpBody() {
+        if (producing || producerDone) return;
+        producing = true;
+        var p;
+        try {
+          p = readNextChunk();
+        } catch (e) {
+          producing = false;
+          failProducer(e);
+          return;
+        }
+        Promise.resolve(p).then(
+          function (res) {
+            producing = false;
+            if (producerDone) return;
+            if (res.done) {
+              producerDone = true;
+              if (handles && typeof handles.endBody === 'function') handles.endBody(null);
+              return;
+            }
+            var bytes;
+            try {
+              bytes = chunkToBytes(res.value);
+            } catch (e) {
+              failProducer(e);
+              return;
+            }
+            // An empty chunk frames to nothing on the wire (and a zero-size chunk
+            // would be read as the terminator), so skip it and pull the next.
+            if (bytes.length === 0) {
+              pumpBody();
+              return;
+            }
+            if (handles && typeof handles.pushBody === 'function') handles.pushBody(bytes);
+          },
+          function (err) {
+            producing = false;
+            failProducer(err);
+          },
+        );
+      }
+
+      function onBodyDrain() {
+        pumpBody();
+      }
+
       function cleanup() {
         if (abortListener && signal) {
           signal.removeEventListener('abort', abortListener);
           abortListener = null;
         }
+        producerDone = true; // the request settled — stop pumping the producer
       }
 
       function onResponse(raw) {
@@ -671,6 +777,11 @@
         }
       }
 
+      // Acquire the producer reader before starting the transport so a locked /
+      // unusable stream rejects this promise synchronously (executor throw) rather
+      // than after the request is already in flight.
+      setupProducer();
+
       handles = native.request(
         req.method,
         req.url,
@@ -680,12 +791,16 @@
         onError,
         onChunk,
         onEnd,
+        streamSource ? true : false,
+        streamSource ? onBodyDrain : null,
       );
 
       if (signal) {
         abortListener = function () {
           cleanup();
-          // Tear down the native transport without invoking onResponse/onError.
+          // Stop the producer and tear down the native transport without invoking
+          // onResponse/onError.
+          cancelProducer(signal.reason);
           if (handles && typeof handles.cancel === 'function') handles.cancel();
           // Pre-headers: reject the fetch promise. Post-headers (promise already
           // resolved): error the in-flight body stream with the abort reason.
