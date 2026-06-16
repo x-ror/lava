@@ -237,6 +237,64 @@ async function main() {
     console.log('clone tee:', t1.length === BIG.length, t1 === t2);
   }
 
+  // --- Stale-poll cancellation regression (issue #183) ---
+  // Cancelling a streaming reader mid-body settles the request and frees its
+  // backing memory; the very next fetch reuses that memory. On the io_uring
+  // backend a stale poll completion landing on the reused request was a
+  // use-after-free. Looping cancel→refetch many times must stay clean — each body
+  // is marked used and the run completes without corruption.
+  {
+    let clean = true;
+    for (let i = 0; i < 12; i++) {
+      const r = await fetch(base + '/big');
+      const reader = r.body.getReader();
+      await reader.read(); // pull one chunk — a socket poll is outstanding here
+      await reader.cancel(); // settle + free mid-stream, with that poll still live
+      if (!r.bodyUsed) clean = false;
+    }
+    console.log('cancel churn clean:', clean);
+  }
+
+  // Backpressure resume racing body completion: yielding to a macrotask between
+  // reads invites the transport to pause and resume the socket read repeatedly, so
+  // the final chunk can arrive while a resume drive is still queued. The
+  // reassembled body must still be byte-exact and the stream must end cleanly.
+  {
+    const r = await fetch(base + '/big');
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let out = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += dec.decode(value, { stream: true });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    out += dec.decode();
+    console.log('slow-drain stream:', out.length === BIG.length, out === BIG);
+  }
+
+  // Abort mid-stream then immediately re-fetch and fully drain: the aborted
+  // request frees while its poll may still be outstanding, and the next request
+  // must read its body intact (not inherit a stale completion).
+  {
+    const ac = new AbortController();
+    const r = await fetch(base + '/big', { signal: ac.signal });
+    const reader = r.body.getReader();
+    await reader.read();
+    ac.abort();
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch {
+      // aborted read rejects — expected
+    }
+    const fresh = await (await fetch(base + '/big')).text();
+    console.log('abort then refetch:', fresh.length === BIG.length, fresh === BIG);
+  }
+
   // IPv6 literal host: parse [::1], connect over AF_INET6, and re-bracket the
   // Host header. Only runs when the runner confirmed IPv6 loopback is up (it
   // sets FETCH_BASE6), so Node and Lava take this branch identically.

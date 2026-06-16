@@ -44,9 +44,12 @@ Chunk_State :: enum {
 
 // Fetch_Request owns everything an in-flight request needs. It outlives the
 // native call that created it: the JS callbacks are GC-protected and the struct
-// is heap-allocated, settled later from an event-loop I/O callback. Freeing is
-// deferred to runtime teardown (see fetch_request_finish) because the io_uring
-// watcher may reference it once more after we stop it.
+// is heap-allocated, settled later from an event-loop I/O callback. A settled
+// request is queued onto pending_free and reclaimed on the next request (or at
+// teardown); the only thing it must outlive is an in-flight fetch_drive_read_cb
+// (tracked by drive_pending). Stale io_uring poll completions can no longer
+// reference it: unwatch_fd now truly cancels the poll and invalidates its token
+// (#183), so a completion that arrives after settle is dropped by the backend.
 Fetch_Request :: struct {
 	ctx:           jsc.JSContextRef,
 	loop:          ^eventloop.Loop,
@@ -94,7 +97,6 @@ Fetch_Request :: struct {
 	read_paused:   bool, // socket reads suspended for backpressure (consumer saturated)
 	want_pause:    bool, // a delivered chunk reported the consumer is full this turn
 	drive_pending: int, // queued fetch_drive_read_cb completions referencing this req
-	settle_tick:   u64, // loop iteration at settle; reclaim waits out stale io_uring polls
 
 	// TLS state for https:// requests. is_https gates the TLS path in the
 	// transport; tls is an opaque ^SSL (rawptr so this cross-platform struct
@@ -656,15 +658,16 @@ fetch_reject_now :: proc(ctx: jsc.JSContextRef, on_error: jsc.JSObjectRef, messa
 
 // fetch_request_finish tears down a settled request: stop the watcher, close the
 // socket, release the GC-protected callbacks. The struct is queued onto
-// pending_free rather than freed here — the io_uring drain reads this watcher
-// once more (to decide re-arm) right after the callback returns, so freeing now
-// would be a use-after-free. It is reclaimed on the next request or at teardown,
-// both safely past that read.
+// pending_free rather than freed here only because the drain loop may still read
+// this watcher once more (to decide re-arm) right after the callback returns, and
+// because an in-flight fetch_drive_read_cb may still hold a raw pointer to it
+// (drive_pending). It is reclaimed on the next request or at teardown. Clearing
+// req.watcher.callback below makes the request inert immediately; unwatch_fd then
+// truly cancels the io_uring poll (#183), so no stale completion can reach it.
 fetch_request_finish :: proc(req: ^Fetch_Request) {
 	if req.settled do return
 	fetch_release_dns_worker(req)
 	req.settled = true
-	req.settle_tick = eventloop.iteration_count(req.loop)
 	if state := get_state_from_ctx(req.ctx); state != nil {
 		fetch_untrack_active(state, req)
 	}
@@ -787,20 +790,22 @@ fetch_free_request :: proc(req: ^Fetch_Request) {
 
 // fetch_reclaim_pending frees every settled request awaiting cleanup. Safe to
 // call any time after the settling loop iteration: a settled request has its
-// watcher callback cleared and no poll in flight, so no later completion can
-// reference it. Called at the start of each new request so retention stays
-// bounded to roughly the in-flight set rather than growing until teardown.
+// watcher callback cleared and its io_uring poll truly cancelled (#183), so no
+// later completion can reference it. Called at the start of each new request so
+// retention stays bounded to roughly the in-flight set rather than growing until
+// teardown.
 //
-// A request is kept (reclaimed on a later pass) while anything may still reference
-// its memory: an outstanding fetch_drive_read_cb (drive_pending > 0), or — on the
-// io_uring backend — an already-submitted poll whose completion can surface for up
-// to one tick after the fd was closed. Waiting two loop iterations past settle
-// covers that uncancellable poll without a POLL_REMOVE (a tracked follow-up).
+// A request is kept (reclaimed on a later pass) only while an in-flight
+// fetch_drive_read_cb may still hold a raw pointer to it (drive_pending > 0); that
+// completion is queued on the loop's async queue and runs on a later tick. The
+// io_uring stale-poll concern that previously forced a two-iteration deferral is
+// gone: unwatch_fd cancels the poll and invalidates its generation token, so a
+// straggling completion is dropped by the backend, never dispatched onto freed
+// memory.
 fetch_reclaim_pending :: proc(state: ^Runtime_State) {
 	kept := 0
 	for req in state.pending_free {
-		stale_poll_possible := eventloop.iteration_count(req.loop) - req.settle_tick < 2
-		if req.drive_pending > 0 || stale_poll_possible {
+		if req.drive_pending > 0 {
 			state.pending_free[kept] = req
 			kept += 1
 			continue

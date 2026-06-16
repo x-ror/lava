@@ -309,10 +309,10 @@ now :: proc(loop: ^Loop) -> u64 {
 }
 
 // iteration_count returns the monotonic loop-tick counter (bumped once per
-// run_once). Used to age out resources that an io_uring backend may still
-// reference via an already-submitted, uncancellable poll: a completion for a
-// closed fd surfaces at most one tick later, so a resource settled `iteration`
-// ticks ago is safe to free once two ticks have elapsed.
+// run_once). A general-purpose tick clock for embedders that need to age out or
+// order resources across loop iterations. (The fetch transport once used it to
+// defer request reclaim past an uncancellable io_uring poll; that poll is now
+// truly cancelled — see #183 / loop_linux.odin — so the deferral is gone.)
 iteration_count :: proc(loop: ^Loop) -> u64 {
 	return loop.iteration
 }

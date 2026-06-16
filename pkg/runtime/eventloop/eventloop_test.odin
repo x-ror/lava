@@ -962,3 +962,169 @@ interval_cancelled_from_its_microtask_does_not_rearm :: proc(t: ^testing.T) {
 	testing.expect_value(t, sc.fire_count, 1) // fired once, then cancelled — never re-armed
 	testing.expect_value(t, pending_count(&loop), 0)
 }
+
+// --- Stale-poll cancellation (#183) ---
+//
+// These exercise the watch/unwatch race that the io_uring backend must make
+// memory-safe: a POLL_ADD that has (or may have) become ready before unwatch_fd
+// is called must never dispatch its callback afterwards. They run on every backend
+// — epoll removes the registration outright (EPOLL_CTL_DEL), io_uring cancels the
+// poll and invalidates its generation token — and assert the same observable
+// contract: no callback after unwatch. The assertions hold regardless of exact
+// completion timing, so the tests are deterministic, not timing-dependent.
+
+Watch_Counter :: struct {
+	fired: int,
+}
+
+watch_count_cb :: proc(loop: ^Loop, user_data: rawptr) {
+	c := cast(^Watch_Counter)user_data
+	c.fired += 1
+}
+
+// Stop_Watch is a watcher that records its fire and immediately stops itself, so a
+// loop driven to idle terminates even though the underlying fd stays readable.
+Stop_Watch :: struct {
+	loop:    ^Loop,
+	watcher: ^IO_Watcher,
+	fired:   int,
+}
+
+stop_watch_cb :: proc(loop: ^Loop, user_data: rawptr) {
+	s := cast(^Stop_Watch)user_data
+	s.fired += 1
+	s.watcher.callback = nil
+	unwatch_fd(loop, s.watcher)
+}
+
+// A completion that became ready before unwatch_fd was called must be dropped, not
+// dispatched. The callback is intentionally left set across unwatch, so ONLY the
+// backend cancellation (io_uring stale-token drop / epoll DEL) can suppress it —
+// this is the regression guard for the use-after-free that motivated #183.
+@(test)
+unwatch_fd_drops_stale_io_completion :: proc(t: ^testing.T) {
+	client, server, ok := connect_loopback_pair(t)
+	if !ok do return
+	defer net.close(client)
+	defer net.close(server)
+
+	loop := init(real_time = true)
+	defer destroy(&loop)
+
+	counter := Watch_Counter{}
+	w := IO_Watcher {
+		fd        = uintptr(server),
+		mode      = .Read,
+		callback  = watch_count_cb,
+		user_data = &counter,
+	}
+
+	if !testing.expect(t, watch_fd(&loop, &w)) do return
+	testing.expect_value(t, loop.active_io_count, 1)
+
+	// Make the watched fd readable, but do NOT drive the loop: the completion is now
+	// pending in the backend but unobserved.
+	_, serr := net.send_tcp(client, {1})
+	if !testing.expect_value(t, serr, nil) do return
+	time.sleep(20 * time.Millisecond)
+
+	// Unwatch before the completion is drained, leaving the callback set.
+	testing.expect(t, unwatch_fd(&loop, &w))
+	testing.expect_value(t, loop.active_io_count, 0)
+
+	// Reap whatever the backend produces (the cancelled poll and the cancel op on
+	// io_uring); none of it may reach the callback.
+	platform_poll(&loop, 20)
+	platform_poll(&loop, 0)
+
+	testing.expect_value(t, counter.fired, 0)
+}
+
+// After unwatch_fd, re-watching the SAME watcher struct (the backpressure
+// pause→resume pattern) must dispatch the fresh registration while any straggling
+// completion from the cancelled one is dropped. Verifies io_uring slot reuse and
+// the generation bump distinguish the two.
+@(test)
+rewatch_after_unwatch_dispatches_live_watcher :: proc(t: ^testing.T) {
+	client, server, ok := connect_loopback_pair(t)
+	if !ok do return
+	defer net.close(client)
+	defer net.close(server)
+
+	loop := init(real_time = true)
+	defer destroy(&loop)
+
+	stale := Watch_Counter{}
+	w := IO_Watcher {
+		fd        = uintptr(server),
+		mode      = .Read,
+		callback  = watch_count_cb,
+		user_data = &stale,
+	}
+
+	if !testing.expect(t, watch_fd(&loop, &w)) do return
+	_, serr := net.send_tcp(client, {1})
+	if !testing.expect_value(t, serr, nil) do return
+	time.sleep(20 * time.Millisecond)
+
+	// Pause: clear the callback (as the fetch transport does) and unwatch, then drain
+	// the now-stale completion.
+	w.callback = nil
+	testing.expect(t, unwatch_fd(&loop, &w))
+	platform_poll(&loop, 20)
+	platform_poll(&loop, 0)
+
+	// Resume: re-watch the same struct with a fresh, self-stopping callback. The fd
+	// is still readable (the byte was never read), so the live poll fires once.
+	live := Stop_Watch {
+		loop    = &loop,
+		watcher = &w,
+	}
+	w.callback = stop_watch_cb
+	w.user_data = &live
+	w.mode = .Read
+	if !testing.expect(t, watch_fd(&loop, &w)) do return
+
+	run_until_idle(&loop, 64)
+
+	testing.expect_value(t, stale.fired, 0) // the cancelled poll never dispatched
+	testing.expect_value(t, live.fired, 1) // the fresh registration did
+	testing.expect_value(t, loop.active_io_count, 0)
+}
+
+// Repeated arm→cancel cycles on a perpetually-readable fd: every armed poll has a
+// completion racing its cancel, and every one must be dropped by its stale token.
+// Models repeated backpressure pause/resume churn without ever dispatching stale.
+@(test)
+repeated_unwatch_never_dispatches_stale :: proc(t: ^testing.T) {
+	client, server, ok := connect_loopback_pair(t)
+	if !ok do return
+	defer net.close(client)
+	defer net.close(server)
+
+	loop := init(real_time = true)
+	defer destroy(&loop)
+
+	counter := Watch_Counter{}
+	w := IO_Watcher {
+		fd        = uintptr(server),
+		mode      = .Read,
+		callback  = watch_count_cb,
+		user_data = &counter,
+	}
+
+	_, serr := net.send_tcp(client, {1})
+	if !testing.expect_value(t, serr, nil) do return
+	time.sleep(20 * time.Millisecond)
+
+	for _ in 0 ..< 8 {
+		if !testing.expect(t, watch_fd(&loop, &w)) do return
+		testing.expect(t, unwatch_fd(&loop, &w))
+		platform_poll(&loop, 5)
+	}
+	platform_poll(&loop, 5)
+	platform_poll(&loop, 0)
+
+	testing.expect_value(t, counter.fired, 0)
+	testing.expect_value(t, loop.active_io_count, 0)
+}
