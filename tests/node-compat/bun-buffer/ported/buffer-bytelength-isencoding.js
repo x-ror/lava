@@ -16,6 +16,12 @@ assert.equal(Buffer.byteLength(new ArrayBuffer(9)), 9);
 assert.equal(Buffer.byteLength(new Uint16Array(4)), 8);
 assert.equal(Buffer.byteLength(new DataView(new ArrayBuffer(5))), 5);
 
+// An unknown or empty encoding falls back to UTF-8 for byteLength (it does NOT
+// throw the way Buffer.from / toString do).
+assert.equal(Buffer.byteLength('abc', 'bogus'), 3);
+assert.equal(Buffer.byteLength('abc', ''), 3);
+assert.equal(Buffer.byteLength('héllo', 'nonsense'), 6);
+
 // Non-string, non-binary -> TypeError.
 assert.throws(() => Buffer.byteLength(5), { code: 'ERR_INVALID_ARG_TYPE', name: 'TypeError' });
 

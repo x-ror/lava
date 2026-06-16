@@ -790,9 +790,14 @@
   });
 
   // fromArrayLike copies element values (each coerced to a byte) into a fresh
-  // Buffer — used for Arrays, generic TypedArrays, and array-like objects.
+  // Buffer — used for Arrays, generic TypedArrays, and array-like objects. The
+  // length goes through a ToLength-style conversion (NaN/negative -> 0, finite
+  // fractional floored) so a hostile `{ length: -1 }` cannot wrap to a 4 GiB
+  // allocation; Node likewise returns an empty Buffer for those.
   function fromArrayLike(obj) {
-    var len = obj.length >>> 0;
+    var len = Number(obj.length);
+    if (!(len > 0)) return new Buffer(0); // 0, negative, or NaN
+    len = Math.floor(len); // Infinity stays Infinity -> Buffer ctor throws, like Node
     var b = new Buffer(len);
     for (var i = 0; i < len; i++) b[i] = obj[i]; // Uint8Array store coerces & masks
     return b;
@@ -871,7 +876,12 @@
   };
 
   Buffer.byteLength = function (string, encoding) {
-    if (typeof string === 'string') return strToBytes(string, encoding || 'utf8').length;
+    if (typeof string === 'string') {
+      // Node treats an unknown/empty encoding here as UTF-8 (unlike from/toString,
+      // which throw) and returns the byte length rather than rejecting the label.
+      var enc = encoding === undefined || !isEncodingName(encoding) ? 'utf8' : encoding;
+      return strToBytes(string, enc).length;
+    }
     if (
       ArrayBuffer.isView(string) ||
       string instanceof ArrayBuffer ||

@@ -22,6 +22,15 @@ try {
   buffer.INSPECT_MAX_BYTES = original;
 }
 
+// A generic object's custom hook is honored too: a string is used verbatim, a
+// non-string result is inspected in its place, and the hook receives an inspect
+// function as its third argument.
+const customSym = Symbol.for('nodejs.util.inspect.custom');
+assert.equal(util.inspect({ [customSym]: () => 'CUSTOM' }), 'CUSTOM');
+assert.equal(util.inspect({ [customSym]: () => 123 }), '123');
+assert.equal(util.inspect({ [customSym]: () => ({ a: 1 }) }), '{ a: 1 }');
+assert.equal(util.inspect({ [customSym]: (_d, _o, insp) => typeof insp }), 'function');
+
 // console.log of a Buffer goes through the same renderer (stdout is compared).
 console.log(Buffer.from('hi'));
 console.log([Buffer.from([0]), Buffer.from([255])]);

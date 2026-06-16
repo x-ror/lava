@@ -30,10 +30,20 @@
       var fn = v.name;
       return fn ? '[Function: ' + fn + ']' : '[Function (anonymous)]';
     }
-    // Honor the util.inspect custom hook (Buffer renders as "<Buffer ..>").
+    // Honor the util.inspect custom hook (Buffer renders as "<Buffer ..>"). Node
+    // passes (depth, options, inspect) and formats whatever the hook returns:
+    // a string is used verbatim, anything else (number, object, …) is inspected
+    // in its place, and returning the object itself falls through to default
+    // formatting.
     if (customInspect && typeof v[customInspect] === 'function') {
-      var custom = v[customInspect](depth, opts);
-      if (typeof custom === 'string') return custom;
+      var nested = seen.concat([v]);
+      var recurse = function (val, o) {
+        return inspect(val, o || opts, nested, depth + 1);
+      };
+      var custom = v[customInspect](depth, opts, recurse);
+      if (custom !== v) {
+        return typeof custom === 'string' ? custom : inspect(custom, opts, nested, depth);
+      }
     }
     if (seen.indexOf(v) !== -1) return '[Circular *1]';
     if (v instanceof Error) return v.stack ? v.stack : v.name + ': ' + v.message;

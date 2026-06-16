@@ -12,6 +12,12 @@ assert.equal(Buffer.from('', 'utf8').length, 0);
 assert.deepEqual(Buffer.from([1, 2, 300, -1]), Buffer.from([1, 2, 44, 255]));
 assert.deepEqual(Buffer.from({ length: 3, 0: 65, 1: 66 }), Buffer.from([65, 66, 0]));
 assert.equal(Buffer.from({ length: 0 }).length, 0);
+// A hostile/odd length must not wrap to a huge allocation: negative and NaN
+// lengths yield an empty Buffer, fractional lengths floor (matching Node).
+assert.equal(Buffer.from({ length: -1 }).length, 0);
+assert.equal(Buffer.from({ length: -2 }).length, 0);
+assert.equal(Buffer.from({ length: NaN }).length, 0);
+assert.equal(Buffer.from({ length: 2.9, 0: 1, 1: 2 }).length, 2);
 
 // Typed arrays copy element values; Buffer copies bytes.
 assert.deepEqual(Buffer.from(new Uint8Array([1, 2, 3])), Buffer.from([1, 2, 3]));
