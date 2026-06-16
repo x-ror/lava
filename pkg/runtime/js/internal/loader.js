@@ -39,9 +39,12 @@
   }
 
   // Eagerly instantiate modules that install globals (Buffer; fetch/Response/
-  // Headers/Request; crypto's WHATWG global), so they are present even when user
-  // code never requires them explicitly.
+  // Headers/Request; crypto's WHATWG global; URL/URLSearchParams), so they are
+  // present even when user code never requires them explicitly. `url` runs after
+  // `buffer` so it preserves the URL.createObjectURL/revokeObjectURL statics
+  // buffer attaches (both sides guard defensively, so either order is safe).
   req('buffer');
+  req('url');
   req('fetch');
   req('abort');
   req('encoding');

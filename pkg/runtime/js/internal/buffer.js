@@ -876,10 +876,10 @@
   // Node keeps Blobs created with URL.createObjectURL() in a process-wide
   // registry keyed by a `blob:nodedata:<uuid>` URL; buffer.resolveObjectURL()
   // looks one up and URL.revokeObjectURL() drops it. The registry lives here
-  // because node:buffer owns Blob and exports resolveObjectURL. Lava has no
-  // WHATWG URL class (see internal/url.js, where it is intentionally absent), so
-  // we add just the two object-URL statics this feature needs — the same place
-  // Node exposes them — without approximating the rest of URL.
+  // because node:buffer owns Blob and exports resolveObjectURL, so the two
+  // object-URL statics are attached to globalThis.URL from here. internal/url.js
+  // provides the WHATWG URL class itself and copies these statics across when it
+  // installs the global; both modules guard defensively so load order is moot.
   var objectUrlRegistry = new Map();
 
   function objectUrlId() {
