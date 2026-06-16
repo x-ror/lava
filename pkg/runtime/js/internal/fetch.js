@@ -49,8 +49,11 @@
     }
   }
   function assertValidHeaderValue(name, value) {
-    if (/[\r\n\0]/.test(value)) {
-      throw new TypeError('Invalid header value for "' + name + '": "' + value + '"');
+    for (var i = 0; i < value.length; i++) {
+      var code = value.charCodeAt(i);
+      if (code === 0 || code === 10 || code === 13) {
+        throw new TypeError('Invalid header value for "' + name + '": "' + value + '"');
+      }
     }
   }
 
@@ -276,7 +279,7 @@
       if (typeof pull === 'function') {
         try {
           pull();
-        } catch (e) {}
+        } catch {}
       }
     }
     getReader(options) {
@@ -312,7 +315,7 @@
       if (typeof cancel === 'function') {
         try {
           cancel(reason);
-        } catch (e) {}
+        } catch {}
       }
       return Promise.resolve();
     }
@@ -604,7 +607,7 @@
         if (signal && signal.aborted) {
           try {
             reader.cancel(signal.reason);
-          } catch (e) {}
+          } catch {}
           throw signal.reason;
         }
         var r = await reader.read();

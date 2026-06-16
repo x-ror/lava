@@ -27,6 +27,7 @@ arr.foo = 'bar';
 const carr = structuredClone(arr);
 assert.deepEqual(carr, arr);
 assert.equal(carr.foo, 'bar');
+// oxlint-disable-next-line no-sparse-arrays
 const holed = [1, , 3];
 const choled = structuredClone(holed);
 assert.equal(1 in choled, false);

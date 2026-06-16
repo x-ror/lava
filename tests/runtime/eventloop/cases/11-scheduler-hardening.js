@@ -16,6 +16,7 @@
   Promise.resolve = function () {
     throw new Error('resolve poisoned');
   };
+  // oxlint-disable-next-line unicorn/no-thenable
   Promise.prototype.then = function () {
     throw new Error('then poisoned');
   };

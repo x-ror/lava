@@ -18,7 +18,7 @@
   if (typeof Symbol === 'function' && !Symbol.dispose) {
     try {
       Symbol.dispose = Symbol('Symbol.dispose');
-    } catch (e) {
+    } catch {
       // Symbol is non-extensible here; dispose-by-symbol is simply unavailable.
     }
   }

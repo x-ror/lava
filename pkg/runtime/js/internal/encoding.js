@@ -1,7 +1,7 @@
 // TextEncoder / TextDecoder (WHATWG Encoding standard), installed as globals.
 // Built on Buffer for utf-8 and utf-16le; windows-1252 (the WHATWG alias for
 // latin1/ascii) uses an explicit high-byte table so it is exact, not approximate.
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   var bufferModule = require('buffer');

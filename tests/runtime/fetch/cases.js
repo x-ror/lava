@@ -283,7 +283,7 @@ async function main() {
     let tlsRejected = false;
     try {
       await fetch(baseHttpsBad + '/hello.txt');
-    } catch (error) {
+    } catch {
       tlsRejected = true;
     }
     console.log('https hostname-mismatch rejected:', tlsRejected);
@@ -293,7 +293,7 @@ async function main() {
   let refused = false;
   try {
     await fetch('http://127.0.0.1:9/x');
-  } catch (error) {
+  } catch {
     refused = true;
   }
   console.log('refused rejected:', refused);
@@ -303,7 +303,7 @@ async function main() {
   let dnsFailed = false;
   try {
     await fetch('http://does-not-exist.invalid/');
-  } catch (error) {
+  } catch {
     dnsFailed = true;
   }
   console.log('dns failure rejected:', dnsFailed);

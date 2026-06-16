@@ -6,7 +6,7 @@
 // shared references are preserved via a memory map. Non-cloneable inputs
 // (functions, symbols, Promise/WeakMap/WeakSet, and the `transfer` option) throw
 // a DataCloneError rather than being silently mishandled.
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   function dataCloneError(message) {
@@ -129,7 +129,7 @@
     }
 
     if (Array.isArray(value)) {
-      var arr = new Array(value.length);
+      var arr = Array.from({ length: value.length });
       seen.set(value, arr);
       copyOwnEnumerable(value, arr, seen);
       return arr;

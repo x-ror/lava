@@ -15,7 +15,7 @@
 //     exotic mapping/validation edge cases may differ.
 //   * The legacy `url.parse`/`url.resolve`/`url.Url` API is not provided; only the
 //     WHATWG surface is.
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   // TextEncoder/TextDecoder are installed by internal/encoding.js. This module is
@@ -54,6 +54,13 @@
   // is a superset of the C0-control set (control chars and everything past 0x7E).
   function inC0ControlSet(cp) {
     return cp <= 0x1f || cp > 0x7e;
+  }
+  function trimC0ControlOrSpace(str) {
+    var start = 0;
+    var end = str.length;
+    while (start < end && str.charCodeAt(start) <= 0x20) start++;
+    while (end > start && str.charCodeAt(end - 1) <= 0x20) end--;
+    return start === 0 && end === str.length ? str : str.slice(start, end);
   }
   function inFragmentSet(cp) {
     return (
@@ -144,7 +151,7 @@
   function percentDecodeHostStrict(str) {
     try {
       return fatalDecoder().decode(percentDecodeBytes(str));
-    } catch (e) {
+    } catch {
       return FAILURE;
     }
   }
@@ -301,7 +308,7 @@
         }
         try {
           out.push('xn--' + punycodeEncode(mapped));
-        } catch (e) {
+        } catch {
           return FAILURE;
         }
       } else {
@@ -320,7 +327,7 @@
       if (label.slice(0, 4).toLowerCase() === 'xn--') {
         try {
           out.push(punycodeDecode(label.slice(4)));
-        } catch (e) {
+        } catch {
           out.push(label);
         }
       } else {
@@ -662,7 +669,7 @@
         try {
           var inner = parseURLOrThrow(pathStr);
           return serializeOrigin(inner);
-        } catch (e) {
+        } catch {
           return 'null';
         }
       }
@@ -744,7 +751,7 @@
     if (url === undefined) {
       url = newRecord();
       // Remove leading/trailing C0 control or space (only when not a setter).
-      input = input.replace(/^[\u0000-\u0020]+/, '').replace(/[\u0000-\u0020]+$/, '');
+      input = trimC0ControlOrSpace(input);
     }
     // Remove all ASCII tab or newline.
     input = input.replaceAll(/[\t\n\r]/g, '');
@@ -1815,7 +1822,7 @@
       try {
         parseURLOrThrow(input, base);
         return true;
-      } catch (e) {
+      } catch {
         return false;
       }
     },
@@ -1830,7 +1837,7 @@
       }
       try {
         return new URL(input, base);
-      } catch (e) {
+      } catch {
         return null;
       }
     },

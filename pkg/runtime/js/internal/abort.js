@@ -1,7 +1,7 @@
 // AbortController / AbortSignal (WHATWG DOM standard, also used across Node).
 // Installed as globals like Buffer. AbortSignal is a minimal EventTarget that
 // only carries the "abort" event, which is all the platform uses it for.
-(function (require, module, exports) {
+(function (require, module, _exports) {
   'use strict';
 
   var ABORT = 'abort';

@@ -117,7 +117,7 @@
             else if (spec === 'j') {
               try {
                 result += JSON.stringify(a);
-              } catch (e) {
+              } catch {
                 result += '[Circular]';
               }
             } else if (spec === 'o' || spec === 'O') result += inspect(a, [], 0);
