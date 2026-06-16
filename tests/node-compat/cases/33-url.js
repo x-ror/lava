@@ -296,6 +296,17 @@ assert.equal(new URLSearchParams('x=%C3%A9').get('x'), 'é');
 // --- helpers: domainToASCII/Unicode, urlToHttpOptions, format ---
 assert.equal(nodeUrl.domainToASCII('例え.テスト'), 'xn--r8jz45g.xn--zckzah');
 assert.equal(nodeUrl.domainToUnicode('xn--r8jz45g.xn--zckzah'), '例え.テスト');
+// domainToASCII handles IPs and IDN, and validates: invalid domains return ''.
+assert.equal(nodeUrl.domainToASCII('café.com'), 'xn--caf-dma.com');
+assert.equal(nodeUrl.domainToASCII('LOUD.com'), 'loud.com');
+assert.equal(nodeUrl.domainToASCII('0x7f.1'), '127.0.0.1');
+assert.equal(nodeUrl.domainToASCII('[::1]'), '[::1]');
+assert.equal(nodeUrl.domainToUnicode('xn--caf-dma.com'), 'café.com');
+for (const bad of ['exa mple.com', 'a b.com', 'http://x', 'a@b', '%C0%AF.com', '[bad']) {
+  assert.equal(nodeUrl.domainToASCII(bad), '', 'domainToASCII rejects ' + JSON.stringify(bad));
+  assert.equal(nodeUrl.domainToUnicode(bad), '', 'domainToUnicode rejects ' + JSON.stringify(bad));
+}
+
 {
   const opts = nodeUrl.urlToHttpOptions(new URL('http://u:p@a.com:81/x?y=1#z'));
   assert.equal(opts.protocol, 'http:');
@@ -303,6 +314,27 @@ assert.equal(nodeUrl.domainToUnicode('xn--r8jz45g.xn--zckzah'), '例え.テス�
   assert.equal(opts.port, 81);
   assert.equal(opts.path, '/x?y=1');
   assert.equal(opts.auth, 'u:p');
+}
+// urlToHttpOptions copies the URL's own enumerable properties (request options a
+// caller attached) ahead of the standard fields, matching Node.
+{
+  const u = new URL('http://h/p?q#f');
+  u.timeout = 5;
+  u.agent = 'x';
+  const opts = nodeUrl.urlToHttpOptions(u);
+  assert.equal(opts.timeout, 5);
+  assert.equal(opts.agent, 'x');
+  assert.deepEqual(Object.keys(opts), [
+    'timeout',
+    'agent',
+    'protocol',
+    'hostname',
+    'hash',
+    'search',
+    'pathname',
+    'path',
+    'href',
+  ]);
 }
 {
   const u = new URL('http://u:p@a.com/path?q=1#h');
@@ -326,5 +358,69 @@ assert.throws(
   () => nodeUrl.fileURLToPath('http://example.com/x'),
   (e) => e instanceof TypeError && e.code === 'ERR_INVALID_URL_SCHEME',
 );
+
+// --- argument-type validation parity (programmer errors must throw, not coerce) ---
+for (const bad of [123, undefined, null, {}, { href: 'file:///tmp/a' }, ['file:///x']]) {
+  assert.throws(
+    () => nodeUrl.fileURLToPath(bad),
+    (e) => e instanceof TypeError && e.code === 'ERR_INVALID_ARG_TYPE',
+    'fileURLToPath must reject ' + Object.prototype.toString.call(bad),
+  );
+  assert.throws(
+    () => nodeUrl.pathToFileURL(bad),
+    (e) => e instanceof TypeError && e.code === 'ERR_INVALID_ARG_TYPE',
+    'pathToFileURL must reject ' + Object.prototype.toString.call(bad),
+  );
+}
+// A real URL instance is still accepted by fileURLToPath.
+assert.equal(typeof nodeUrl.fileURLToPath(new URL('file:///x/y')), 'string');
+
+// --- USVString conversion: lone surrogates become U+FFFD ---
+{
+  const REPLACEMENT = '\uFFFD';
+  const sp = new URLSearchParams([['k\uD800', 'v\uDC00']]); // lone high in key, lone low in value
+  assert.equal(sp.get('k' + REPLACEMENT), 'v' + REPLACEMENT);
+  assert.equal(sp.toString(), 'k%EF%BF%BD=v%EF%BF%BD');
+  // A valid surrogate pair is preserved unchanged.
+  assert.equal(new URLSearchParams([['a', '😀']]).get('a'), '😀');
+  // URL setters convert too: the lone surrogate becomes U+FFFD, then the URL
+  // serializer percent-encodes it (UTF-8 of U+FFFD is EF BF BD).
+  const u = new URL('http://h/');
+  u.hash = 'x\uD834y'; // lone high surrogate
+  assert.equal(u.hash, '#x%EF%BF%BDy');
+}
+
+// --- platform-specific file: URL handling ---
+if (process.platform === 'win32') {
+  // Drive-letter and UNC round-trips, plus encoded-separator rejection.
+  assert.equal(nodeUrl.fileURLToPath('file:///C:/foo/bar'), 'C:\\foo\\bar');
+  assert.equal(nodeUrl.fileURLToPath('file://server/share/x'), '\\\\server\\share\\x');
+  assert.equal(nodeUrl.pathToFileURL('C:\\foo\\bar').href, 'file:///C:/foo/bar');
+  assert.throws(
+    () => nodeUrl.fileURLToPath('file:///C:/foo%2Fbar'),
+    (e) => e.code === 'ERR_INVALID_FILE_URL_PATH',
+  );
+  assert.throws(
+    () => nodeUrl.fileURLToPath('file:///C:/foo%5Cbar'),
+    (e) => e.code === 'ERR_INVALID_FILE_URL_PATH',
+  );
+  assert.throws(
+    () => nodeUrl.fileURLToPath('file:///foo/bar'),
+    (e) => e.code === 'ERR_INVALID_FILE_URL_PATH', // drive-less path is not absolute
+  );
+} else {
+  // POSIX: only an empty or "localhost" host is allowed; others are rejected.
+  assert.equal(nodeUrl.fileURLToPath('file:///foo/bar'), '/foo/bar');
+  assert.equal(nodeUrl.fileURLToPath('file://localhost/foo/bar'), '/foo/bar');
+  assert.equal(nodeUrl.fileURLToPath('file:///a%20b/c'), '/a b/c');
+  assert.throws(
+    () => nodeUrl.fileURLToPath('file://evil.com/x'),
+    (e) => e.code === 'ERR_INVALID_FILE_URL_HOST',
+  );
+  assert.throws(
+    () => nodeUrl.fileURLToPath('file:///foo%2Fbar'),
+    (e) => e.code === 'ERR_INVALID_FILE_URL_PATH',
+  );
+}
 
 console.log('url ok');

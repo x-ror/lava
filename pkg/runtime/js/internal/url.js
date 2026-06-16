@@ -1215,6 +1215,20 @@
     return err;
   }
 
+  // ERR_INVALID_ARG_TYPE, matching Node's message shape closely enough that the
+  // `.code` (what callers branch on) is identical.
+  function invalidArgType(name, expected, value) {
+    var received =
+      value === null
+        ? 'null'
+        : 'type ' + typeof value + ' (' + (typeof value === 'object' ? '' : value) + ')';
+    var err = new TypeError(
+      'The "' + name + '" argument must be ' + expected + '. Received ' + received,
+    );
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+  }
+
   // ------------------------------------------------------------------ //
   // application/x-www-form-urlencoded                                   //
   // ------------------------------------------------------------------ //
@@ -1321,9 +1335,26 @@
     this[kList] = formUrlencodedParse(str);
   }
 
+  // Convert to a USVString: stringify, then replace any unpaired surrogate with
+  // U+FFFD (per WHATWG). The fast path skips strings with no surrogate at all.
+  var SURROGATE_PAIR_OR_LONE = /([\uD800-\uDBFF])([\uDC00-\uDFFF])?|([\uDC00-\uDFFF])/g;
   function toUSVString(value) {
-    if (typeof value === 'string') return value;
-    return String(value);
+    var str = typeof value === 'string' ? value : String(value);
+    // Quick reject: no surrogate code unit means it is already a USVString.
+    var hasSurrogate = false;
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdfff) {
+        hasSurrogate = true;
+        break;
+      }
+    }
+    if (!hasSurrogate) return str;
+    return str.replace(SURROGATE_PAIR_OR_LONE, function (match, high, low, lone) {
+      if (lone !== undefined) return '\uFFFD'; // lone low surrogate
+      if (low === undefined) return '\uFFFD'; // lone high surrogate
+      return match; // valid pair, keep as-is
+    });
   }
 
   function spUpdate(sp) {
@@ -1810,11 +1841,13 @@
   // ------------------------------------------------------------------ //
 
   function fileURLToPath(input) {
+    // Node accepts only a string or a real URL instance — not an arbitrary
+    // {href}-shaped object — and rejects everything else with ERR_INVALID_ARG_TYPE
+    // so a programmer error can't silently become a filesystem path.
     var href;
     if (typeof input === 'string') href = new URL(input).href;
-    else if (input != null && typeof input === 'object' && typeof input.href === 'string')
-      href = input.href;
-    else href = new URL(String(input)).href;
+    else if (input instanceof URL) href = input.href;
+    else throw invalidArgType('path', 'of type string or an instance of URL', input);
     return fileURLToPathFromHref(href);
   }
 
@@ -1871,9 +1904,12 @@
   }
 
   function pathToFileURL(filepath) {
+    if (typeof filepath !== 'string') {
+      throw invalidArgType('path', 'of type string', filepath);
+    }
     var path = require('node:path');
     var isWindows = process.platform === 'win32';
-    var input = String(filepath);
+    var input = filepath;
     var resolved = path.resolve(input);
     // path.resolve drops a trailing separator; Node preserves it on the URL, so
     // re-append a '/' when the original path ended in one and resolve removed it.
@@ -1910,18 +1946,22 @@
   }
 
   function urlToHttpOptions(url) {
-    var options = {
-      protocol: url.protocol,
-      hostname:
-        typeof url.hostname === 'string' && url.hostname.startsWith('[')
-          ? url.hostname.slice(1, -1)
-          : url.hostname,
-      hash: url.hash,
-      search: url.search,
-      pathname: url.pathname,
-      path: '' + (url.pathname || '') + (url.search || ''),
-      href: url.href,
-    };
+    // Mirror Node's `{ __proto__: null, ...url, <standard fields> }`: own
+    // enumerable properties (e.g. request options a caller attached to the URL)
+    // are copied first, then the standard http.request fields are layered on top.
+    var options = Object.create(null);
+    var ownKeys = Object.keys(url);
+    for (var i = 0; i < ownKeys.length; i++) options[ownKeys[i]] = url[ownKeys[i]];
+    options.protocol = url.protocol;
+    options.hostname =
+      typeof url.hostname === 'string' && url.hostname.startsWith('[')
+        ? url.hostname.slice(1, -1)
+        : url.hostname;
+    options.hash = url.hash;
+    options.search = url.search;
+    options.pathname = url.pathname;
+    options.path = '' + (url.pathname || '') + (url.search || '');
+    options.href = url.href;
     if (url.port !== '') options.port = Number(url.port);
     if (url.username || url.password) {
       options.auth = decodeURIComponent(url.username) + ':' + decodeURIComponent(url.password);
@@ -1958,6 +1998,22 @@
     return output;
   }
 
+  // Extract and host-parse the domain argument to domainToASCII/Unicode, applying
+  // the same preprocessing the URL parser does: remove ASCII tab/newline, then take
+  // everything up to the first authority terminator (/ \ ? #). Returns the parsed
+  // host string, or FAILURE for an invalid domain.
+  function hostFromDomainArg(domain) {
+    var input = String(domain).replace(/[\t\n\r]/g, '');
+    for (var i = 0; i < input.length; i++) {
+      var c = input.charCodeAt(i);
+      if (c === 0x2f || c === 0x5c || c === 0x3f || c === 0x23) {
+        input = input.slice(0, i);
+        break;
+      }
+    }
+    return parseHost(input, true);
+  }
+
   // ------------------------------------------------------------------ //
   // Global installation + module exports                               //
   // ------------------------------------------------------------------ //
@@ -1989,12 +2045,20 @@
     pathToFileURL: pathToFileURL,
     urlToHttpOptions: urlToHttpOptions,
     format: format,
+    // Node's domainToASCII/domainToUnicode validate their input as a host (the
+    // same machinery URL parsing uses) and return '' for anything that is not a
+    // valid domain — so they can be used as a normalization/validation primitive.
+    // Route through hostFromDomainArg (which applies the URL parser's host
+    // preprocessing: strip tab/newline, cut at the first authority terminator,
+    // then host-parse) so forbidden characters, bad percent/UTF-8, NUL, and
+    // URL-shaped strings all collapse to '' exactly as Node does.
     domainToASCII: function (domain) {
-      var r = domainToASCII(String(domain === undefined ? 'undefined' : domain));
-      return r === FAILURE ? '' : r;
+      var host = hostFromDomainArg(domain);
+      return host === FAILURE ? '' : host;
     },
     domainToUnicode: function (domain) {
-      return domainToUnicode(String(domain === undefined ? 'undefined' : domain));
+      var host = hostFromDomainArg(domain);
+      return host === FAILURE ? '' : domainToUnicode(host);
     },
   };
 });
