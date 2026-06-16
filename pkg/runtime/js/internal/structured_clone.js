@@ -129,7 +129,12 @@
     }
 
     if (Array.isArray(value)) {
-      var arr = Array.from({ length: value.length });
+      // Must be a SPARSE array (real holes), not Array.from({length}) which fills
+      // dense undefined: structuredClone preserves holes, and copyOwnEnumerable
+      // below only copies indices actually present in the source. A dense array
+      // here would turn every hole into an own `undefined` (breaking `i in clone`).
+      // oxlint-disable-next-line no-array-constructor
+      var arr = new Array(value.length);
       seen.set(value, arr);
       copyOwnEnumerable(value, arr, seen);
       return arr;
