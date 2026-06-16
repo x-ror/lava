@@ -2009,7 +2009,7 @@
   };
 
   function installGlobal(name, value) {
-    if (typeof globalThis[name] === 'undefined') globalThis[name] = value;
+    if (globalThis[name] === undefined) globalThis[name] = value;
   }
   installGlobal('ReadableStream', ReadableStream);
   installGlobal('ReadableStreamDefaultReader', ReadableStreamDefaultReader);

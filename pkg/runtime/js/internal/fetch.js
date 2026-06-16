@@ -13,7 +13,7 @@
   // fork. The `_internal` helpers let the transport drive a stream's controller
   // (enqueue/close/error + desiredSize backpressure) without re-implementing the
   // controller plumbing here.
-  var webStreams = require('stream/web');
+  var webStreams = require('node:stream/web');
   var ReadableStream = webStreams.ReadableStream;
   var streamInternal = webStreams._internal;
 
