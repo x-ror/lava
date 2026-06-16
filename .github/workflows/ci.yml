@@ -255,16 +255,13 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          echo "=== 07-crypto direct ==="
-          ./build/lava.exe run tests/node-compat/cases/07-crypto.js; echo "07-crypto exit=$?"
-          printf "const c=require('node:crypto');console.error('A');const k=c.scryptSync('password','salt',32);console.error('B '+k.length);\n" > p1.js
-          echo "=== scryptSync default ==="; ./build/lava.exe run p1.js; echo "p1 exit=$?"
-          printf "const c=require('node:crypto');console.error('A');const k=c.scryptSync('password','salt',32,{N:16384,r:8,p:1});console.error('B '+k.length);\n" > p2.js
-          echo "=== scryptSync N=16384 ==="; ./build/lava.exe run p2.js; echo "p2 exit=$?"
-          printf "const c=require('node:crypto');console.error('A');c.scrypt('password','salt',32,(e,k)=>console.error('B '+(k&&k.length)));console.error('C');\n" > p3.js
-          echo "=== async scrypt ==="; ./build/lava.exe run p3.js; echo "p3 exit=$?"
-          printf "console.error('hi');\n" > p4.js
-          echo "=== trivial ==="; ./build/lava.exe run p4.js; echo "p4 exit=$?"
+          F=tests/node-compat/cases/07-crypto.js
+          wc -l $F
+          for n in 50 100 130 160 190 210 230 261; do
+            head -n $n $F > chunk.js
+            ./build/lava.exe run chunk.js >/dev/null 2>chunk.err
+            echo "head -$n exit=$? (stderr: $(head -c 120 chunk.err | tr '\n' '|'))"
+          done
           set -e
 
       - name: Oracle suites (event-loop + fs + sqlite)
