@@ -286,13 +286,19 @@ free_js_callback :: proc(cb: ^JS_Callback, release_roots := true) {
 
 // should_release_fired_callback_roots keeps normal callback GC-root cleanup on
 // every platform except the Windows one-shot CLI exit edge. A heavy final JS
-// callback (crypto.scrypt's setImmediate-backed ROMix is the current canary) can
-// leave JSC worker threads alive; unprotecting the just-fired callback root as the
-// last loop work then poisons Windows process teardown and ExitProcess reports
-// 127. If more loop work exists, keep releasing roots so long-running scripts do
-// not leak every one-shot timer/immediate callback. The VM is already intentionally
-// leaked on Windows at eval exit, so the final callback root is reclaimed by the
-// OS with the rest of the process.
+// callback (crypto.scrypt's setImmediate-backed ROMix is the current canary, but
+// the same holds for any timer/immediate/I-O callback) can leave JSC worker
+// threads alive; unprotecting the just-fired callback root as the last loop work
+// then poisons Windows process teardown and ExitProcess reports 127. If more loop
+// work exists, keep releasing roots so long-running scripts do not leak every
+// one-shot timer/immediate callback. The VM is already intentionally leaked on
+// Windows at eval exit, so the final callback root is reclaimed by the OS with the
+// rest of the process.
+//
+// "Last loop work" is has_pending_work() read from inside the trampoline: run_once
+// uncounts the firing task (immediates/I-O/close removed before the call, one-shot
+// timers ref-dropped at pop) before invoking it, so the check sees only the work
+// queued *behind* this callback — true for any final callback, not just setImmediate.
 should_release_fired_callback_roots :: proc(loop: ^eventloop.Loop) -> bool {
 	when ODIN_OS == .Windows {
 		return eventloop.has_pending_work(loop)
