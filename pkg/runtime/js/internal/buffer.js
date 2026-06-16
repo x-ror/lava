@@ -12,9 +12,109 @@
   var hexDecode = native.hexDecode; // (string) -> Uint8Array
   var base64Encode = native.base64Encode; // (Uint8Array) -> string
 
-  var K_MAX_LENGTH = 0x7fffffff;
-  var K_STRING_MAX_LENGTH = 0x1fffffff;
+  // Match Node's advertised limits (node:buffer constants): MAX_LENGTH is
+  // Number.MAX_SAFE_INTEGER on 64-bit builds, MAX_STRING_LENGTH is V8's string
+  // cap. Packages read these to size work; the real allocation ceiling is still
+  // bounded by available memory.
+  var MAX_SAFE = 9007199254740991; // Number.MAX_SAFE_INTEGER
+  var K_MAX_LENGTH = MAX_SAFE;
+  var K_STRING_MAX_LENGTH = 536870888;
   var inspectMaxBytes = 50;
+
+  // Node renders Buffers through util.inspect's custom hook; matching the
+  // well-known symbol lets console.log/util.inspect print "<Buffer ..>" instead
+  // of the generic object dump. internal/util.js and console.js look it up too.
+  var customInspectSymbol =
+    typeof Symbol !== 'undefined' && Symbol.for ? Symbol.for('nodejs.util.inspect.custom') : null;
+
+  // --- Node-style coded errors --------------------------------------------
+  // Real packages branch on err.code (and occasionally parse the message), so
+  // we reproduce Node's codes and message shapes rather than throwing generic
+  // Error objects.
+  function describeType(value) {
+    if (value === null) return 'null';
+    var t = typeof value;
+    if (t === 'undefined') return 'undefined';
+    if (t === 'string') {
+      var s = value.length > 28 ? value.slice(0, 25) + '...' : value;
+      return "type string ('" + s + "')";
+    }
+    if (t === 'number' || t === 'boolean') return 'type ' + t + ' (' + value + ')';
+    if (t === 'bigint') return 'type bigint (' + value + 'n)';
+    if (t === 'symbol') return 'type symbol (' + value.toString() + ')';
+    if (t === 'function') return 'function ' + (value.name || '(anonymous)');
+    var ctor = value.constructor && value.constructor.name;
+    return 'an instance of ' + (ctor || 'Object');
+  }
+
+  // Mirror Node's addNumericSeparator: group integer digits with underscores so
+  // large out-of-range values read the same ("9_007_199_254_740_991").
+  function numericSeparator(value) {
+    var str;
+    if (typeof value === 'bigint') str = value.toString();
+    else if (typeof value !== 'number') return String(value);
+    else if (!isFinite(value) || Math.floor(value) !== value) return String(value);
+    else str = String(value);
+    var neg = str.charAt(0) === '-';
+    if (neg) str = str.slice(1);
+    var out = '';
+    var i = str.length;
+    for (; i > 3; i -= 3) out = '_' + str.slice(i - 3, i) + out;
+    return (neg ? '-' : '') + str.slice(0, i) + out;
+  }
+
+  function errInvalidArgType(name, expected, actual) {
+    var e = new TypeError(
+      'The "' + name + '" argument must be ' + expected + '. Received ' + describeType(actual),
+    );
+    e.code = 'ERR_INVALID_ARG_TYPE';
+    return e;
+  }
+
+  function errInvalidFromArg(value) {
+    var e = new TypeError(
+      'The first argument must be of type string or an instance of Buffer, ArrayBuffer, ' +
+        'or Array or an Array-like Object. Received ' +
+        describeType(value),
+    );
+    e.code = 'ERR_INVALID_ARG_TYPE';
+    return e;
+  }
+
+  function errOutOfRange(name, range, received) {
+    var e = new RangeError(
+      'The value of "' +
+        name +
+        '" is out of range. It must be ' +
+        range +
+        '. Received ' +
+        numericSeparator(received),
+    );
+    e.code = 'ERR_OUT_OF_RANGE';
+    return e;
+  }
+
+  function errUnknownEncoding(encoding) {
+    var e = new TypeError('Unknown encoding: ' + encoding);
+    e.code = 'ERR_UNKNOWN_ENCODING';
+    return e;
+  }
+
+  function errBufferSize(bits) {
+    var e = new RangeError('Buffer size must be a multiple of ' + bits + '-bits');
+    e.code = 'ERR_INVALID_BUFFER_SIZE';
+    return e;
+  }
+
+  // assertSize guards Buffer.alloc/allocUnsafe. Negative or non-numeric sizes
+  // previously slipped through `size >>> 0` and asked for a multi-gigabyte
+  // allocation (OOM); Node throws here instead. Fractional sizes are allowed —
+  // the Uint8Array constructor truncates them, matching Node.
+  function assertSize(size) {
+    if (typeof size !== 'number') throw errInvalidArgType('size', 'number', size);
+    if (!(size >= 0 && size <= MAX_SAFE))
+      throw errOutOfRange('size', '>= 0 && <= ' + MAX_SAFE, size);
+  }
 
   function normalizeEncoding(encoding) {
     encoding = (encoding || 'utf8').toLowerCase();
@@ -25,10 +125,18 @@
   }
 
   function isEncodingName(encoding) {
-    switch (normalizeEncoding(encoding)) {
+    // Match against the raw (lowercased) name and its aliases directly. Going
+    // through normalizeEncoding would map the empty string to 'utf8' and wrongly
+    // report it as valid; Node rejects '' and unknown names.
+    switch (String(encoding).toLowerCase()) {
       case 'utf8':
+      case 'utf-8':
       case 'utf16le':
+      case 'utf-16le':
+      case 'ucs2':
+      case 'ucs-2':
       case 'latin1':
+      case 'binary':
       case 'ascii':
       case 'hex':
       case 'base64':
@@ -85,7 +193,7 @@
       for (var i = 0; i < str.length; i++) a[i] = str.charCodeAt(i) & 0xff;
       return a;
     }
-    throw new TypeError('Unknown encoding: ' + encoding);
+    throw errUnknownEncoding(encoding);
   }
 
   function bytesToString(bytes, encoding) {
@@ -101,7 +209,7 @@
         s += String.fromCharCode(encoding === 'ascii' ? bytes[i] & 0x7f : bytes[i]);
       return s;
     }
-    throw new TypeError('Unknown encoding: ' + encoding);
+    throw errUnknownEncoding(encoding);
   }
 
   function toInteger(value, fallback) {
@@ -119,10 +227,23 @@
     return value;
   }
 
+  function errBufferOutOfBounds() {
+    var e = new RangeError('Attempt to access memory outside buffer bounds');
+    e.code = 'ERR_BUFFER_OUT_OF_BOUNDS';
+    return e;
+  }
+
   function checkBounds(buf, offset, byteLength) {
-    offset = toInteger(offset, 0);
-    if (offset < 0 || offset + byteLength > buf.length)
-      throw new RangeError('Offset is outside the bounds of the Buffer');
+    if (offset === undefined) offset = 0;
+    // Node validates the offset (validateNumber + integer check) before testing
+    // the range, and distinguishes "type doesn't fit at all" (the max valid
+    // offset is negative -> ERR_BUFFER_OUT_OF_BOUNDS) from a plain out-of-range
+    // offset (ERR_OUT_OF_RANGE).
+    if (typeof offset !== 'number') throw errInvalidArgType('offset', 'number', offset);
+    if (Math.floor(offset) !== offset) throw errOutOfRange('offset', 'an integer', offset);
+    var max = buf.length - byteLength;
+    if (max < 0) throw errBufferOutOfBounds();
+    if (offset < 0 || offset > max) throw errOutOfRange('offset', '>= 0 and <= ' + max, offset);
     return offset;
   }
 
@@ -257,8 +378,15 @@
 
   class Buffer extends Uint8Array {
     toString(encoding, start, end) {
-      start = clampIndex(start, this.length, 0);
-      end = clampIndex(end, this.length, this.length);
+      // Node's slowToString clamps a negative start to 0 (it does NOT wrap like
+      // slice/subarray), and a start past the end yields ''. end clamps to the
+      // length. Use int32 truncation (|0) on in-range values, matching Node.
+      var len = this.length;
+      if (start <= 0) start = 0;
+      else if (start >= len) return '';
+      else start |= 0;
+      if (end === undefined || end > len) end = len;
+      else end |= 0;
       if (end <= start) return '';
       return bytesToString(this.subarray(start, end), encoding || 'utf8');
     }
@@ -369,7 +497,7 @@
     }
 
     swap16() {
-      if (this.length % 2 !== 0) throw new RangeError('Buffer size must be a multiple of 16-bits');
+      if (this.length % 2 !== 0) throw errBufferSize(16);
       for (var i = 0; i < this.length; i += 2) {
         var a = this[i];
         this[i] = this[i + 1];
@@ -379,7 +507,7 @@
     }
 
     swap32() {
-      if (this.length % 4 !== 0) throw new RangeError('Buffer size must be a multiple of 32-bits');
+      if (this.length % 4 !== 0) throw errBufferSize(32);
       for (var i = 0; i < this.length; i += 4) {
         var a = this[i],
           b = this[i + 1];
@@ -392,7 +520,7 @@
     }
 
     swap64() {
-      if (this.length % 8 !== 0) throw new RangeError('Buffer size must be a multiple of 64-bits');
+      if (this.length % 8 !== 0) throw errBufferSize(64);
       for (var i = 0; i < this.length; i += 8) {
         for (var j = 0; j < 4; j++) {
           var a = this[i + j];
@@ -409,9 +537,38 @@
   }
 
   var p = Buffer.prototype;
+
+  // Shared renderer for the legacy .inspect() method and the util.inspect custom
+  // hook. Caps the dump at INSPECT_MAX_BYTES, appending "... N more byte(s)" like
+  // Node when the buffer is longer.
+  function inspectBuffer(buf) {
+    var max = inspectMaxBytes;
+    var shown = buf.length > max ? max : buf.length;
+    var hex = Buffer.prototype.toString
+      .call(buf, 'hex', 0, shown)
+      .replace(/(.{2})/g, '$1 ')
+      .trim();
+    var remaining = buf.length - max;
+    if (remaining > 0)
+      hex +=
+        (hex.length ? ' ' : '') + '... ' + remaining + ' more byte' + (remaining > 1 ? 's' : '');
+    return '<Buffer ' + hex + '>';
+  }
+
   p.inspect = function () {
-    return '<Buffer ' + this.toString('hex').replace(/(..)/g, '$1 ').trim() + '>';
+    return inspectBuffer(this);
   };
+  if (customInspectSymbol) {
+    // Non-enumerable + symbol-keyed, so it stays off Object.getOwnPropertyNames
+    // (the API-surface probe) exactly as in Node.
+    Object.defineProperty(p, customInspectSymbol, {
+      value: function () {
+        return inspectBuffer(this);
+      },
+      writable: true,
+      configurable: true,
+    });
+  }
   p.toLocaleString = p.toString;
   p.utf8Slice = function (start, end) {
     return this.toString('utf8', start, end);
@@ -632,6 +789,20 @@
     },
   });
 
+  // fromArrayLike copies element values (each coerced to a byte) into a fresh
+  // Buffer — used for Arrays, generic TypedArrays, and array-like objects. The
+  // length goes through a ToLength-style conversion (NaN/negative -> 0, finite
+  // fractional floored) so a hostile `{ length: -1 }` cannot wrap to a 4 GiB
+  // allocation; Node likewise returns an empty Buffer for those.
+  function fromArrayLike(obj) {
+    var len = Number(obj.length);
+    if (!(len > 0)) return new Buffer(0); // 0, negative, or NaN
+    len = Math.floor(len); // Infinity stays Infinity -> Buffer ctor throws, like Node
+    var b = new Buffer(len);
+    for (var i = 0; i < len; i++) b[i] = obj[i]; // Uint8Array store coerces & masks
+    return b;
+  }
+
   Buffer.from = function (value, encodingOrOffset, length) {
     if (typeof value === 'string') {
       var bytes = strToBytes(value, encodingOrOffset);
@@ -639,30 +810,57 @@
       b.set(bytes);
       return b;
     }
-    if (value instanceof ArrayBuffer) {
-      return new Buffer(value, encodingOrOffset || 0, length);
+    if (value !== null && typeof value === 'object') {
+      if (
+        value instanceof ArrayBuffer ||
+        (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)
+      ) {
+        // Shares the backing store (a view), matching Node.
+        return new Buffer(value, encodingOrOffset === undefined ? 0 : encodingOrOffset, length);
+      }
+      // Node consults valueOf() before treating the object as array-like, so a
+      // boxed primitive (new String(...)) resolves to its primitive form first.
+      if (typeof value.valueOf === 'function') {
+        var valueOf = value.valueOf();
+        if (
+          valueOf != null &&
+          valueOf !== value &&
+          (typeof valueOf === 'string' || typeof valueOf === 'object')
+        ) {
+          return Buffer.from(valueOf, encodingOrOffset, length);
+        }
+      }
+      if (ArrayBuffer.isView(value)) {
+        // Copy element values (Uint8Array.set masks each to a byte).
+        var copy = new Buffer(value.length);
+        copy.set(value);
+        return copy;
+      }
+      if (Array.isArray(value) || typeof value.length === 'number') {
+        return fromArrayLike(value);
+      }
+      // Revive JSON.parse(JSON.stringify(buffer)) -> {type:'Buffer', data:[...]}.
+      if (value.type === 'Buffer' && Array.isArray(value.data)) {
+        return fromArrayLike(value.data);
+      }
+      if (typeof value[Symbol.toPrimitive] === 'function') {
+        var primitive = value[Symbol.toPrimitive]('string');
+        if (typeof primitive === 'string') return Buffer.from(primitive, encodingOrOffset);
+      }
     }
-    if (ArrayBuffer.isView(value) || Array.isArray(value)) {
-      var copy = new Buffer(value.length);
-      copy.set(value);
-      return copy;
-    }
-    if (value && typeof value.valueOf === 'function' && value.valueOf() !== value) {
-      return Buffer.from(value.valueOf(), encodingOrOffset, length);
-    }
-    throw new TypeError(
-      'The first argument must be a string, Buffer, ArrayBuffer, Array, or Array-like Object.',
-    );
+    throw errInvalidFromArg(value);
   };
 
   Buffer.alloc = function (size, fill, encoding) {
-    var b = new Buffer(size >>> 0);
+    assertSize(size);
+    var b = new Buffer(size);
     if (fill !== undefined && fill !== 0) b.fill(fill, 0, b.length, encoding);
     return b;
   };
 
   Buffer.allocUnsafe = function (size) {
-    return new Buffer(size >>> 0);
+    assertSize(size);
+    return new Buffer(size);
   };
 
   Buffer.allocUnsafeSlow = function (size) {
@@ -678,8 +876,24 @@
   };
 
   Buffer.byteLength = function (string, encoding) {
-    if (typeof string !== 'string') return string.length;
-    return strToBytes(string, encoding || 'utf8').length;
+    if (typeof string === 'string') {
+      // Node treats an unknown/empty encoding here as UTF-8 (unlike from/toString,
+      // which throw) and returns the byte length rather than rejecting the label.
+      var enc = encoding === undefined || !isEncodingName(encoding) ? 'utf8' : encoding;
+      return strToBytes(string, enc).length;
+    }
+    if (
+      ArrayBuffer.isView(string) ||
+      string instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && string instanceof SharedArrayBuffer)
+    ) {
+      return string.byteLength;
+    }
+    throw errInvalidArgType(
+      'string',
+      'of type string or an instance of Buffer or ArrayBuffer',
+      string,
+    );
   };
 
   Buffer.compare = function (a, b) {
@@ -688,15 +902,32 @@
     return compareBytes(a, b);
   };
 
+  function assertConcatElement(item, index) {
+    if (!(item instanceof Uint8Array))
+      throw errInvalidArgType('list[' + index + ']', 'an instance of Buffer or Uint8Array', item);
+  }
+
   Buffer.concat = function (list, totalLength) {
+    if (!Array.isArray(list)) throw errInvalidArgType('list', 'an instance of Array', list);
+    if (list.length === 0) return new Buffer(0);
     if (totalLength === undefined) {
       totalLength = 0;
-      for (var i = 0; i < list.length; i++) totalLength += list[i].length;
+      for (var i = 0; i < list.length; i++) {
+        assertConcatElement(list[i], i);
+        totalLength += list[i].length;
+      }
+    } else {
+      if (typeof totalLength !== 'number') throw errInvalidArgType('length', 'number', totalLength);
+      if (Math.floor(totalLength) !== totalLength)
+        throw errOutOfRange('length', 'an integer', totalLength);
+      if (totalLength < 0 || totalLength > MAX_SAFE)
+        throw errOutOfRange('length', '>= 0 && <= ' + MAX_SAFE, totalLength);
     }
     var result = new Buffer(totalLength);
     var offset = 0;
     for (var j = 0; j < list.length; j++) {
       var item = list[j];
+      assertConcatElement(item, j);
       if (offset + item.length > totalLength) {
         result.set(item.subarray(0, totalLength - offset), offset);
         break;

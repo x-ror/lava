@@ -5,6 +5,9 @@
   var counts = Object.create(null);
   var timers = Object.create(null);
 
+  var customInspect =
+    typeof Symbol !== 'undefined' && Symbol.for ? Symbol.for('nodejs.util.inspect.custom') : null;
+
   function quote(s) {
     return "'" + s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n') + "'";
   }
@@ -21,6 +24,19 @@
     if (t === 'function') {
       var fn = v.name;
       return fn ? '[Function: ' + fn + ']' : '[Function (anonymous)]';
+    }
+    // Honor the util.inspect custom hook (Buffer renders as "<Buffer ..>"). Node
+    // passes (depth, options, inspect) and inspects a non-string result in place
+    // (a string is used verbatim; returning the object itself falls through).
+    if (customInspect && typeof v[customInspect] === 'function') {
+      var nested = seen.concat([v]);
+      var recurse = function (val) {
+        return inspect(val, nested, depth + 1);
+      };
+      var custom = v[customInspect](depth, {}, recurse);
+      if (custom !== v) {
+        return typeof custom === 'string' ? custom : inspect(custom, nested, depth);
+      }
     }
     if (seen.indexOf(v) !== -1) return '[Circular *1]';
     if (v instanceof Error) return v.stack ? v.stack : v.name + ': ' + v.message;

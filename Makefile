@@ -7,7 +7,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-all test-lava api-surface vendor-bun-report bun-buffer-report test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -30,6 +30,7 @@ help:
 	@printf '%s\n' '  make api-surface        Report Buffer/Crypto API surface differences vs Node'
 	@printf '%s\n' '  make vendor-bun-report  Summarize vendored Bun node compatibility corpus'
 	@printf '%s\n' '  make bun-buffer-report  List vendored Bun buffer tests and adapted ports'
+	@printf '%s\n' '  make bun-buffer-tests   Run/compare the ported Bun buffer cases (node vs Lava)'
 	@printf '%s\n' '  make test-compat        Run all active Node compatibility tests with Node'
 	@printf '%s\n' '  make test-compat-lava   Build and compare active compatibility tests through Lava, skipping known gaps'
 	@printf '%s\n' '  make test-compat-lava-strict Build and compare active compatibility tests through Lava without skips'
@@ -116,6 +117,9 @@ vendor-bun-report:
 
 bun-buffer-report:
 	./scripts/report-vendored-bun.sh buffer
+
+bun-buffer-tests: build
+	LAVA_BIN="$(LAVA)" ./scripts/report-bun-buffer-tests.sh
 
 test-compat:
 	./scripts/run-node-compat-all.sh

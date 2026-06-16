@@ -24,7 +24,7 @@ Coverage of the Node.js public API surface in **lava**.
 | Module | `node:` | Status | Implemented | Key gaps | Source |
 |--------|:------:|:------:|-------------|----------|--------|
 | **assert** | ✅ | ✅ | ok/equal/strict*/deep*/match/throws/rejects/ifError + `assert/strict` (19 exports), `AssertionError` | snapshot/`partialDeepStrictEqual` niceties | [js/internal/assert.js](../pkg/runtime/js/internal/assert.js) |
-| **buffer** | ✅ | ✅ | `Buffer` (full read/write/encode), `Blob`, `File`, `SlowBuffer`, `atob`/`btoa` (module-scoped), `isAscii`/`isUtf8`, `transcode`, `resolveObjectURL` (+ global `URL.createObjectURL`/`revokeObjectURL`) | `Buffer.poolSize` semantics | [buffer.odin](../pkg/runtime/buffer.odin), [js/internal/buffer.js](../pkg/runtime/js/internal/buffer.js) |
+| **buffer** | ✅ | ✅ | `Buffer` (full read/write/encode/search, Node-coded errors, `util.inspect` `<Buffer ..>`), `Blob`, `File`, `SlowBuffer`, `atob`/`btoa` (module-scoped), `isAscii`/`isUtf8`, `transcode`, `resolveObjectURL` (+ global `URL.createObjectURL`/`revokeObjectURL`) | `Buffer.poolSize` semantics; huge (>~RAM) allocations may abort under JSC rather than throw — see notes | [buffer.odin](../pkg/runtime/buffer.odin), [js/internal/buffer.js](../pkg/runtime/js/internal/buffer.js) |
 | **events** | ✅ | ✅ | `EventEmitter` (on/once/off/emit/listeners/prepend/…), static `once`, `defaultMaxListeners` | `EventTarget`/`CustomEvent`, `events.on`/`getEventListeners`, captureRejections | [js/internal/events.js](../pkg/runtime/js/internal/events.js) |
 | **path** | ✅ | ✅ | all of posix + win32 (resolve/normalize/join/relative/dirname/basename/extname/parse/format/isAbsolute/toNamespacedPath) | — | [js/internal/path.js](../pkg/runtime/js/internal/path.js) |
 | **sqlite** | ✅ | ✅ | `DatabaseSync`, `StatementSync` (prepare/all/get/run/columns/bind/named params/BigInt) | session/backup, `Symbol.asyncDispose` | [sqlite.odin](../pkg/runtime/sqlite.odin), [js/internal/sqlite.js](../pkg/runtime/js/internal/sqlite.js), [pkg/std/sqlite](../pkg/std/sqlite/) |
@@ -76,6 +76,25 @@ Probed directly against `bin/lava`.
 **Present (30):** `global`, `globalThis`, `Buffer`, `fetch`, `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `structuredClone`, `queueMicrotask`, `setTimeout`, `setInterval`, `setImmediate`, `clearTimeout`, `clearInterval`, `clearImmediate`, `console`, `process`, `performance`, `Blob`, `File`, `crypto` (getRandomValues/randomUUID), `URL` (full WHATWG constructor + `createObjectURL`/`revokeObjectURL`), `URLSearchParams`, plus engine-provided `WebAssembly` and `Intl`.
 
 **Missing:** `atob`, `btoa` (global form), `Event`, `EventTarget`, `CustomEvent`, `ReadableStream`/`WritableStream`/`TransformStream`, `TextEncoderStream`/`TextDecoderStream`, `CompressionStream`, `MessageChannel`/`MessagePort`, `Worker`, `BroadcastChannel`, `navigator`, `reportError`, `crypto.subtle`.
+
+## `Buffer` surface
+
+`Buffer` is a clean-room `Uint8Array` subclass ([js/internal/buffer.js](../pkg/runtime/js/internal/buffer.js)) over Odin codec primitives for the hot paths ([buffer.odin](../pkg/runtime/buffer.odin)). Its own-property API surface matches Node exactly (verified by `make api-surface`). Ported Bun buffer cases live under [tests/node-compat/bun-buffer/ported](../tests/node-compat/bun-buffer/ported) and run via `scripts/report-bun-buffer-tests.sh` (or `make bun-buffer-tests`) and `make test-compat-lava`.
+
+**Supported (Node-parity):**
+
+- **Constructors / statics:** `Buffer.from` (string, `Array`, array-like objects, `ArrayBuffer`/`SharedArrayBuffer` views that *share* memory, `TypedArray`/`DataView` copies, boxed primitives via `valueOf`/`Symbol.toPrimitive`, and `{type:'Buffer',data:[…]}` JSON revival), `Buffer.alloc`/`allocUnsafe`/`allocUnsafeSlow` (with size validation), `Buffer.of`, `Buffer.concat` (with `list`/element validation), `Buffer.isBuffer`, `Buffer.isEncoding`, `Buffer.byteLength` (string + `ArrayBuffer`/`TypedArray`/`DataView`), `Buffer.compare`, `Buffer.copyBytesFrom`.
+- **Instance:** `toString`/slice writers (all encodings), `write`, `slice`/`subarray` (shared-memory views), `copy` (incl. overlapping), `equals`, `compare` (with ranges), `indexOf`/`lastIndexOf`/`includes` (string/number/Buffer needles, encodings, negative offsets), `fill` (number/string/Buffer, regions, encodings), `swap16`/`swap32`/`swap64`, all fixed-width and variable-width `read*`/`write*` integer/float accessors, `readBig*`/`writeBig*` 64-bit, `toJSON`.
+- **Encodings:** `utf8`/`utf-8`, `utf16le`/`ucs2`, `latin1`/`binary`, `ascii`, `hex`, `base64`, `base64url` (with Node's lenient base64 normalization and `ascii` high-bit masking).
+- **Errors:** Node `err.code`s and message shapes for `ERR_INVALID_ARG_TYPE`, `ERR_OUT_OF_RANGE`, `ERR_BUFFER_OUT_OF_BOUNDS`, `ERR_UNKNOWN_ENCODING`, `ERR_INVALID_BUFFER_SIZE`.
+- **Rendering:** `util.inspect`/`console.log` emit `<Buffer ..>` (honoring `INSPECT_MAX_BYTES`) via the `nodejs.util.inspect.custom` hook.
+- **Module extras:** `Blob`, `File`, `SlowBuffer`, `atob`/`btoa`, `isAscii`, `isUtf8`, `transcode`, `resolveObjectURL`, `kMaxLength`/`kStringMaxLength`/`constants`/`INSPECT_MAX_BYTES`.
+
+**Intentional differences / deferred:**
+
+- `Buffer.poolSize` exists but allocation pooling is not modeled (`allocUnsafe` simply allocates); observable only via shared-`ArrayBuffer` identity of small buffers, which real packages should not rely on.
+- The advertised `kMaxLength` matches Node (`Number.MAX_SAFE_INTEGER`); the *practical* ceiling is available memory. A huge but in-range allocation that exhausts memory aborts under JavaScriptCore rather than throwing a catchable `RangeError` as V8 does. Negative/`NaN`/non-number sizes are validated and throw before any allocation.
+- Property-access `TypeError` messages for engine-level faults (e.g. reading a property of `undefined`) carry JavaScriptCore wording, not V8's.
 
 ## `process` surface
 
