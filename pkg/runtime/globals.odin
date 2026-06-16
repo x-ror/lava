@@ -267,17 +267,37 @@ capture_timer_args :: proc(
 	return args
 }
 
-// free_js_callback releases a binding: it unprotects the function and every
-// forwarded argument, frees the args slice, and frees the binding itself. Called
-// once per binding — by js_callback_trampoline on a one-shot's only fire, or by
-// js_callback_dispose when the loop drops the binding without (re-)firing.
-free_js_callback :: proc(cb: ^JS_Callback) {
-	jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
-	for arg in cb.args {
-		jsc.JSValueUnprotect(cb.ctx, arg)
+// free_js_callback releases a binding. When release_roots is true it also
+// unprotects the function and every forwarded argument; when false, only the
+// native binding memory is released and the roots stay with the process-lifetime
+// VM. Called once per binding - by js_callback_trampoline on a one-shot's only
+// fire, or by js_callback_dispose when the loop drops the binding without
+// (re-)firing.
+free_js_callback :: proc(cb: ^JS_Callback, release_roots := true) {
+	if release_roots {
+		jsc.JSValueUnprotect(cb.ctx, cast(jsc.JSValueRef)cb.func)
+		for arg in cb.args {
+			jsc.JSValueUnprotect(cb.ctx, arg)
+		}
 	}
 	delete(cb.args)
 	free(cb)
+}
+
+// should_release_fired_callback_roots keeps normal callback GC-root cleanup on
+// every platform except the Windows one-shot CLI exit edge. A heavy final JS
+// callback (crypto.scrypt's setImmediate-backed ROMix is the current canary) can
+// leave JSC worker threads alive; unprotecting the just-fired callback root as the
+// last loop work then poisons Windows process teardown and ExitProcess reports
+// 127. If more loop work exists, keep releasing roots so long-running scripts do
+// not leak every one-shot timer/immediate callback. The VM is already intentionally
+// leaked on Windows at eval exit, so the final callback root is reclaimed by the
+// OS with the rest of the process.
+should_release_fired_callback_roots :: proc(loop: ^eventloop.Loop) -> bool {
+	when ODIN_OS == .Windows {
+		return eventloop.has_pending_work(loop)
+	}
+	return true
 }
 
 js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
@@ -297,7 +317,7 @@ js_callback_trampoline :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	// (the loop's dispose hook) when the interval is cleared, since the
 	// trampoline never runs for a cancelled timer.
 	if !cb.repeating {
-		free_js_callback(cb)
+		free_js_callback(cb, should_release_fired_callback_roots(loop))
 	}
 }
 
