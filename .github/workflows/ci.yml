@@ -256,12 +256,15 @@ jobs:
         run: |
           set +e
           F=tests/node-compat/cases/07-crypto.js
-          wc -l $F
-          for n in 50 100 130 160 190 210 230 261; do
-            head -n $n $F > chunk.js
-            ./build/lava.exe run chunk.js >/dev/null 2>chunk.err
-            echo "head -$n exit=$? (stderr: $(head -c 120 chunk.err | tr '\n' '|'))"
+          echo "--- 07-crypto under JSC levers ---"
+          for kv in "default=" "JSC_useJIT=false" "JSC_useDFGJIT=false" "JSC_useFTLJIT=false" "JSC_useGenerationalGC=false" "JSC_forceRAMSize=2147483648"; do
+            k="${kv%%=*}"; v="${kv#*=}"
+            if [ "$k" = "default" ]; then env -u JSC_useJIT ./build/lava.exe run $F >/dev/null 2>e.txt; else env "$k=$v" ./build/lava.exe run $F >/dev/null 2>e.txt; fi
+            echo "$kv -> exit=$? (err: $(head -c 100 e.txt | tr '\n' '|'))"
           done
+          echo "--- memory-pressure probe (no crypto) ---"
+          printf "let a=[];for(let i=0;i<400;i++){a.push(new Uint8Array(1<<20));}console.error('alloc ok '+a.length);\n" > mem.js
+          ./build/lava.exe run mem.js >/dev/null 2>e.txt; echo "mem -> exit=$? (err: $(head -c 100 e.txt | tr '\n' '|'))"
           set -e
 
       - name: Oracle suites (event-loop + fs + sqlite)
