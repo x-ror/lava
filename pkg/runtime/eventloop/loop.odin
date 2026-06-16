@@ -648,6 +648,18 @@ run_once :: proc(loop: ^Loop) -> bool {
 
 		timer := timer_heap_pop_min(loop)
 		did_work = true
+		// A one-shot cannot re-arm, so it leaves the active set the instant it is
+		// popped — drop its ref now, before the callback, not after. This keeps
+		// has_pending_work honest *while the callback runs* (a running task is not
+		// "pending"), matching how immediates/I-O/close are uncounted before firing.
+		// Without it the firing one-shot still counts itself, so an in-callback
+		// has_pending_work check (e.g. the Windows post-fire root-release decision)
+		// can't tell a final one-shot from one with real work queued behind it. A
+		// repeating timer's ref is left until the re-arm decision below, since it
+		// stays active across the fire.
+		if !timer.repeating && !timer.unreffed {
+			loop.reffed_timer_count -= 1
+		}
 		loop.running_id = timer.id
 		timer.callback(loop, timer.user_data)
 		// Drain microtasks while running_id still names this timer: a task the
@@ -662,14 +674,12 @@ run_once :: proc(loop: ^Loop) -> bool {
 			timer.due_ms = loop.now_ms + timer.repeat_ms
 			timer.seq = next_sequence(loop)
 			timer_heap_push(loop, timer)
-		} else {
-			// Leaving the heap for good. A repeating timer cancelled from within its
-			// own callback already fired (so its callback did NOT free the binding)
-			// and is not re-armed, so release it here; a one-shot freed its binding
-			// when it fired, so it is intentionally not disposed.
-			if timer.repeating {
-				run_dispose(timer.dispose, timer.user_data)
-			}
+		} else if timer.repeating {
+			// Repeating, not re-armed (cancelled from within its own callback): it
+			// already fired, so its callback did NOT free the binding — release it
+			// here — and drop the ref it kept across the fire. A one-shot freed its
+			// binding when it fired and dropped its ref above, so neither applies.
+			run_dispose(timer.dispose, timer.user_data)
 			if !timer.unreffed {
 				loop.reffed_timer_count -= 1
 			}

@@ -221,7 +221,7 @@
     if (native.step(this._stmtId, this._dbId) === 0) {
       return native.row(this._stmtId, this._readBigInts);
     }
-    return undefined;
+    return;
   };
 
   // all(...params) -> array of row objects.

@@ -164,9 +164,8 @@
     runAbort(this.signal, reason);
   };
 
-  if (typeof globalThis.AbortController === 'undefined')
-    globalThis.AbortController = AbortController;
-  if (typeof globalThis.AbortSignal === 'undefined') globalThis.AbortSignal = AbortSignal;
+  if (globalThis.AbortController === undefined) globalThis.AbortController = AbortController;
+  if (globalThis.AbortSignal === undefined) globalThis.AbortSignal = AbortSignal;
 
   module.exports = { AbortController: AbortController, AbortSignal: AbortSignal };
 });
