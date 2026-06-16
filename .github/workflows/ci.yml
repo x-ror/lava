@@ -248,30 +248,7 @@ jobs:
       # The fs leg validates the Win32 GetLastError -> errno mapping
       # (fs_os_error_to_code) end to end; the sqlite leg exercises the statically
       # linked sqlite3.lib through the node:sqlite bridge.
-      # DIAGNOSTIC (temporary): bisect the 07-crypto exit-127 crash. Run it directly
-      # plus minimal probes with markers so we can see how far each gets and whether
-      # the sync or async scrypt (or the heavy default-cost compute) is the trigger.
-      - name: Debug 07-crypto crash
-        continue-on-error: true
-        run: |
-          set +e
-          F=tests/node-compat/cases/07-crypto.js
-          echo "--- 07-crypto under JSC levers ---"
-          for kv in "default=" "JSC_useJIT=false" "JSC_useDFGJIT=false" "JSC_useFTLJIT=false" "JSC_useGenerationalGC=false" "JSC_forceRAMSize=2147483648"; do
-            k="${kv%%=*}"; v="${kv#*=}"
-            if [ "$k" = "default" ]; then env -u JSC_useJIT ./build/lava.exe run $F >/dev/null 2>e.txt; else env "$k=$v" ./build/lava.exe run $F >/dev/null 2>e.txt; fi
-            echo "$kv -> exit=$? (err: $(head -c 100 e.txt | tr '\n' '|'))"
-          done
-          echo "--- memory-pressure probe (no crypto) ---"
-          printf "let a=[];for(let i=0;i<400;i++){a.push(new Uint8Array(1<<20));}console.error('alloc ok '+a.length);\n" > mem.js
-          ./build/lava.exe run mem.js >/dev/null 2>e.txt; echo "mem -> exit=$? (err: $(head -c 100 e.txt | tr '\n' '|'))"
-          set -e
-
       - name: Oracle suites (event-loop + fs + sqlite)
-        # DIAGNOSTIC (temporary): does full-suite green require useJIT=false (the only
-        # lever that fixed 07-crypto's baseline-JIT crash)? Delivered via inherited env.
-        env:
-          JSC_useJIT: "false"
         run: NODE_BIN=node LAVA_BIN="$PWD/build/lava.exe" RUN_LAVA=1 ./scripts/run-oracles.sh
 
       # Fetch transport smoke over the real Winsock + select() backend, reusing the
