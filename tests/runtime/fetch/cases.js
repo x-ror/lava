@@ -68,6 +68,175 @@ async function main() {
   ]);
   console.log('concurrent:', a, b, c);
 
+  // --- Streaming response/request bodies (issue #31) ---
+  // The large bodies below cross the response-body backpressure high-water mark,
+  // so they exercise the pause/resume path. Chunk boundaries are transport
+  // defined, so the assertions only compare reassembled content, never chunk
+  // counts or sizes (which legitimately differ between Node and Lava).
+  const BIG = 'x'.repeat(200000);
+  const BIG_CL = 'y'.repeat(200000);
+
+  // response.body.getReader(): incremental reads reassemble to the full body.
+  {
+    const r = await fetch(base + '/big');
+    assert.equal(r.body.locked, false);
+    const reader = r.body.getReader();
+    assert.equal(r.body.locked, true);
+    const dec = new TextDecoder();
+    let out = '';
+    let first = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (first === null) first = value instanceof Uint8Array;
+      out += dec.decode(value, { stream: true });
+    }
+    out += dec.decode();
+    console.log('stream getReader:', first, out === BIG, r.bodyUsed);
+  }
+
+  // Content-Length-framed large body streams the same way.
+  {
+    let total = 0;
+    for await (const chunk of (await fetch(base + '/big-cl')).body) total += chunk.length;
+    console.log('stream asyncIterator:', total === BIG_CL.length);
+  }
+
+  // Buffered APIs still work over the streaming transport: text() drains the
+  // stream, json()/arrayBuffer() too.
+  {
+    const t = await (await fetch(base + '/big')).text();
+    console.log('buffered text after stream:', t.length === BIG.length, t === BIG);
+    const ab = await (await fetch(base + '/data.json')).arrayBuffer();
+    console.log('buffered arrayBuffer:', ab.byteLength, ab instanceof ArrayBuffer);
+  }
+
+  // Request body streaming: an async generator body (buffered before send in v1).
+  // Node requires duplex:'half' for stream bodies; Lava matches.
+  {
+    async function* gen() {
+      yield new TextEncoder().encode('strm-');
+      yield new TextEncoder().encode('body');
+    }
+    const rq = await fetch(base + '/echo', { method: 'POST', body: gen(), duplex: 'half' });
+    const j = await rq.json();
+    console.log('request stream echo:', JSON.stringify(j.echo), j.len);
+
+    // A Blob request body (no duplex required) round-trips byte-exact.
+    const rb2 = await fetch(base + '/echo', { method: 'POST', body: new Blob(['blob ', 'data']) });
+    console.log('request blob echo:', JSON.stringify((await rb2.json()).echo));
+  }
+
+  // A body can be consumed only once; a second attempt rejects with a TypeError.
+  {
+    const r = await fetch(base + '/a');
+    const t1 = await r.text();
+    let secondErr = '';
+    try {
+      await r.text();
+    } catch (error) {
+      secondErr = error && error.constructor.name;
+    }
+    console.log('double consume:', t1, secondErr);
+
+    // Once a reader is acquired the body is locked; buffered reads then reject.
+    const rl = await fetch(base + '/a');
+    const rd = rl.body.getReader();
+    let lockedErr = '';
+    try {
+      await rl.text();
+    } catch (error) {
+      lockedErr = error && error.constructor.name;
+    }
+    console.log('locked body:', rl.body.locked, lockedErr);
+    await rd.cancel();
+  }
+
+  // Empty body: a 204 response exposes a null body (no stream).
+  {
+    const r = await fetch(base + '/empty');
+    console.log('empty body:', r.body === null, r.status);
+  }
+
+  // Cancellation / early close: cancelling the reader mid-stream tears the
+  // transport down; the body is then marked used and further reads report done.
+  {
+    const r = await fetch(base + '/big');
+    const reader = r.body.getReader();
+    await reader.read();
+    await reader.cancel();
+    const after = await reader.read();
+    console.log('cancel mid-stream:', r.bodyUsed, after.done);
+  }
+
+  // Error propagation during streaming: a truncated body (declared length not
+  // met before the connection drops) rejects the body read with a TypeError,
+  // after the response head has already resolved.
+  {
+    const r = await fetch(base + '/truncate');
+    let streamErr = '';
+    try {
+      await r.text();
+    } catch (error) {
+      streamErr = error && error.constructor.name;
+    }
+    console.log('truncated stream:', r.status, streamErr);
+  }
+
+  // Malformed chunked framing (chunk data not followed by CRLF) must reject the
+  // body read, not be accepted as valid bytes.
+  {
+    const r = await fetch(base + '/badchunk');
+    let err = '';
+    try {
+      await r.text();
+    } catch (error) {
+      err = error && error.constructor.name;
+    }
+    console.log('malformed chunk:', r.status, err);
+  }
+
+  // Abort AFTER the response head has resolved must still tear the body down: the
+  // in-flight body read rejects with the signal's AbortError. /slowbody sends one
+  // chunk then stalls, so the abort — not EOF — ends the read.
+  {
+    const ac = new AbortController();
+    const r = await fetch(base + '/slowbody', { signal: ac.signal });
+    const reader = r.body.getReader();
+    await reader.read(); // first chunk ('partial')
+    ac.abort();
+    let name = '';
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch (error) {
+      name = error && error.name;
+    }
+    console.log('abort after headers:', name);
+  }
+
+  // fetch(new Request(url, { body: <stream>, duplex: 'half' })) — the streaming
+  // body must survive Request construction and reach the server (not be dropped).
+  {
+    async function* gen() {
+      yield new TextEncoder().encode('req-');
+      yield new TextEncoder().encode('obj-body');
+    }
+    const rq = new Request(base + '/echo', { method: 'POST', body: gen(), duplex: 'half' });
+    const echoed = await fetch(rq).then((r) => r.json());
+    console.log('request-object stream body:', JSON.stringify(echoed.echo));
+  }
+
+  // clone() tees a streaming body: both responses read the full content.
+  {
+    const r = await fetch(base + '/big');
+    const r2 = r.clone();
+    const [t1, t2] = await Promise.all([r.text(), r2.text()]);
+    console.log('clone tee:', t1.length === BIG.length, t1 === t2);
+  }
+
   // IPv6 literal host: parse [::1], connect over AF_INET6, and re-bracket the
   // Host header. Only runs when the runner confirmed IPv6 loopback is up (it
   // sets FETCH_BASE6), so Node and Lava take this branch identically.

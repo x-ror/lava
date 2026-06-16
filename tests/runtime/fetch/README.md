@@ -3,9 +3,15 @@
 Exercises the Odin-backed `fetch` network transport end to end against a real
 HTTP origin, comparing Lava's output to Node's.
 
-- `server.js` — a tiny Node origin server (Content-Length, chunked, and POST
-  echo routes).
+- `server.js` — a tiny Node origin server (Content-Length, chunked, POST echo,
+  large-body, 204, and truncated-body routes).
 - `cases.js` — fetch cases run under both Node and Lava; their stdout must match.
+  Besides the buffered paths, this covers streaming `response.body` (incremental
+  `getReader()` reads and `for await…of`), streaming/`Blob` request bodies,
+  single-consumption enforcement, empty (204) bodies, mid-stream cancellation,
+  and error propagation on a truncated body. Streaming assertions compare only
+  reassembled content (chunk boundaries are transport-defined and differ between
+  runtimes).
 
 Run it:
 

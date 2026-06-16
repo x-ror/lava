@@ -191,9 +191,11 @@ fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 	req.phase = .Reading // next readable event reads the response
 }
 
-// fetch_read drains the response from the plaintext socket until EOF, then
-// settles. https takes the parallel TLS path (fetch_tls_read) supplied by the
-// platform TLS backend.
+// fetch_read streams the response from the plaintext socket: each read is handed
+// to fetch_on_recv, which parses the head, then delivers decoded body bytes
+// incrementally. The loop stops when fetch_on_recv signals to (request settled,
+// body complete, or backpressure pause), when the socket would block (re-arm), or
+// on EOF. https takes the parallel TLS path (fetch_tls_read).
 fetch_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 	if req.is_https {
 		fetch_tls_read(loop, req)
@@ -204,18 +206,18 @@ fetch_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 		n, res := fetch_raw_recv(req, buf[:])
 		switch res {
 		case .Ok:
+			if !fetch_on_recv(loop, req, buf[:n]) do return
 		case .Would_Block:
 			if !fetch_set_watch_mode(loop, req, .Read) {
 				fetch_settle_error(req, "fetch: event loop watch failed")
 			}
 			return // wait for more data
 		case .Closed:
-			fetch_settle_response(req) // EOF — server closed, response complete
+			fetch_eof(req) // EOF — server closed
 			return
 		case .Failed:
 			fetch_settle_error(req, "fetch: receive failed")
 			return
 		}
-		append(&req.response, ..buf[:n])
 	}
 }

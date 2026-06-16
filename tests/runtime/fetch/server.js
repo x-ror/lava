@@ -50,6 +50,60 @@ const handler = (req, res) => {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('café ☕ 日本語\n');
       return;
+    case '/big':
+      // Large body via chunked framing (no Content-Length) — exercises
+      // incremental de-chunking and response-body backpressure at scale. The
+      // payload is deterministic so the client can recompute and compare it.
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('x'.repeat(200000));
+      return;
+    case '/big-cl': {
+      // Large body with explicit Content-Length — exercises identity-framed
+      // incremental streaming + backpressure.
+      const big = 'y'.repeat(200000);
+      res.writeHead(200, {
+        'content-type': 'text/plain',
+        'content-length': Buffer.byteLength(big),
+      });
+      res.end(big);
+      return;
+    }
+    case '/empty':
+      // 204 No Content — the response carries no body (response.body === null).
+      res.writeHead(204);
+      res.end();
+      return;
+    case '/slowbody':
+      // Send the head and one body chunk, then hold the connection open forever.
+      // Lets a client read part of the body and then abort — deterministically
+      // exercising abort-after-headers (the body never completes on its own).
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.write('partial');
+      return;
+    case '/badchunk': {
+      // Hijack the socket to emit a chunked body whose chunk data is followed by
+      // a non-CRLF terminator — a framing violation a client must reject. Written
+      // raw because the http module always frames chunks correctly.
+      const sock = res.socket;
+      if (sock) {
+        sock.write(
+          'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n',
+        );
+        sock.write('5\r\nhelloXX'); // "XX" where the chunk-terminating CRLF must be
+        setTimeout(() => sock.destroy(), 15);
+      }
+      return;
+    }
+    case '/truncate':
+      // Declare a Content-Length far longer than the bytes actually sent, then
+      // drop the connection — a truncated body the client must surface as an
+      // error (Node: TypeError) once it tries to read past what arrived.
+      res.writeHead(200, { 'content-type': 'text/plain', 'content-length': '1000' });
+      res.write('partial-body');
+      setTimeout(() => {
+        if (res.socket) res.socket.destroy();
+      }, 15);
+      return;
     case '/a':
       res.writeHead(200);
       res.end('AAA');
@@ -72,12 +126,22 @@ const handler = (req, res) => {
   }
 };
 
-http.createServer(handler).listen(port, '127.0.0.1');
+// guardSockets swallows per-connection socket errors. The /truncate route and the
+// client-side reader.cancel() both drop connections mid-response, which raises an
+// ECONNRESET on the server socket; without a handler that would crash the server
+// process and fail the smoke run.
+const guardSockets = (server) => {
+  server.on('connection', (sock) => sock.on('error', () => {}));
+  server.on('clientError', () => {});
+  return server;
+};
+
+guardSockets(http.createServer(handler)).listen(port, '127.0.0.1');
 // IPv6 loopback listener on the same port (a distinct address/family tuple), so
 // the smoke suite can exercise http://[::1]:<port>/ when IPv6 is available. A
 // bind failure on hosts without IPv6 loopback is ignored — the runner probes
 // reachability before enabling the IPv6 case.
-const server6 = http.createServer(handler);
+const server6 = guardSockets(http.createServer(handler));
 server6.on('error', () => {});
 server6.listen(port, '::1');
 

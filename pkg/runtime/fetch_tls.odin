@@ -115,8 +115,10 @@ fetch_tls_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 	req.phase = .Reading // next readable event reads the response
 }
 
-// fetch_tls_read decrypts response records until EOF, then settles. Mirrors the
-// plaintext fetch_read loop.
+// fetch_tls_read decrypts response records and streams them through fetch_on_recv
+// (head parse, then incremental body delivery), mirroring the plaintext
+// fetch_read loop. It stops when fetch_on_recv signals to (settled / complete /
+// backpressure pause), when OpenSSL wants more I/O, or on EOF.
 fetch_tls_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 	buf: [16384]byte
 	for {
@@ -125,12 +127,12 @@ fetch_tls_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 			switch fetch_tls_classify(loop, req, n) {
 			case .Pending:
 			case .Eof:
-				fetch_settle_response(req) // response complete
+				fetch_eof(req) // peer closed
 			case .Fatal:
 				fetch_settle_error(req, "fetch: TLS read failed")
 			}
 			return
 		}
-		append(&req.response, ..buf[:n])
+		if !fetch_on_recv(loop, req, buf[:int(n)]) do return
 	}
 }

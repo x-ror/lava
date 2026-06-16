@@ -86,6 +86,7 @@ Loop :: struct {
 	running_id:         Timer_ID,
 	active_io_count:    int,
 	io_events:          u64, // bumped by platform_poll each time a watcher callback fires
+	iteration:          u64, // bumped once per run_once; a monotonic loop-tick counter
 	// Set by platform_poll when the backend's blocking syscall fails fatally (any
 	// error other than EINTR — e.g. EBADF on a closed epoll/kqueue fd). The run
 	// drivers exit instead of busy-spinning on a syscall that can never make
@@ -305,6 +306,15 @@ backend_name :: proc(loop: ^Loop) -> string {
 
 now :: proc(loop: ^Loop) -> u64 {
 	return loop.now_ms
+}
+
+// iteration_count returns the monotonic loop-tick counter (bumped once per
+// run_once). Used to age out resources that an io_uring backend may still
+// reference via an already-submitted, uncancellable poll: a completion for a
+// closed fd surfaces at most one tick later, so a resource settled `iteration`
+// ticks ago is safe to free once two ticks have elapsed.
+iteration_count :: proc(loop: ^Loop) -> u64 {
+	return loop.iteration
 }
 
 // Returns the number of items keeping the loop alive.
@@ -598,6 +608,7 @@ drain_microtasks :: proc(loop: ^Loop) {
 // survive across ticks must copy it to a longer-lived allocator first.
 run_once :: proc(loop: ^Loop) -> bool {
 	defer free_all(context.temp_allocator)
+	loop.iteration += 1
 	did_work := false
 
 	// Sample the real clock first so the timer phase fires every timer whose

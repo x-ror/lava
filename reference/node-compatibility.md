@@ -39,10 +39,10 @@ Coverage of the Node.js public API surface in **lava**.
 | **module** / **modules** | ❌ | 🟡 | CommonJS `require` + `node:` resolution; ESM `.mjs` transform | `module.createRequire`, `register`, `isBuiltin`, `SourceMap`, `module.exports` resolve API | [require.odin](../pkg/runtime/require.odin), [js/internal/esm.js](../pkg/runtime/js/internal/esm.js) |
 | **net** | ❌ | 🟥 | — | `Socket`, `Server`, `connect`, `createServer` | — |
 | **tls** | ❌ | 🟥 | (used internally by fetch; not exposed) | `TLSSocket`, `connect`, `createSecureContext` | — |
-| **http** | ❌ | 🟥 | — | `request`, `createServer`, `Agent` (fetch covers client GET/POST) | — |
+| **http** | ❌ | 🟥 | — | `request`, `createServer`, `Agent` (fetch covers the client side — GET/POST, streaming response bodies, buffered streaming request bodies) | — |
 | **https** | ❌ | 🟥 | — | same as http over TLS | — |
 | **http2** | ❌ | 🟥 | — | entire module | — |
-| **stream** | ❌ | 🟥 | — | Readable/Writable/Duplex/Transform, `pipeline`, `finished` | — |
+| **stream** | ❌ | 🟥 | — | Readable/Writable/Duplex/Transform, `pipeline`, `finished` (a fetch-internal `ReadableStream` backs `response.body`, but `node:stream` and the web-stream globals are still unexposed) | — |
 | **dns** | ❌ | 🟥 | internal IPv4-only resolver inside fetch; **no public module** | `lookup`, `resolve*`, `Resolver`, `reverse` (implementation in progress) | [fetch_transport.odin](../pkg/runtime/fetch_transport.odin) |
 | **dgram** | ❌ | 🟥 | — | UDP `Socket` | — |
 | **os** | ❌ | 🟥 | — | platform/arch/cpus/hostname/networkInterfaces/homedir/tmpdir/… | — |
@@ -59,7 +59,7 @@ Coverage of the Node.js public API surface in **lava**.
 | **v8** | ❌ | 🟥 | — | serialize/deserialize, heap stats | — |
 | **test** | ❌ | 🟥 | — | `node:test`, `describe`/`it`, mocks | — |
 | **tty** | ❌ | 🟥 | — | `isatty`, `ReadStream`/`WriteStream` | — |
-| **webstreams** | ❌ | 🟥 | — | `ReadableStream`/`WritableStream`/`TransformStream` (also missing as globals) | — |
+| **webstreams** | ❌ | 🟡 | a fetch-internal `ReadableStream` backs `response.body` (`getReader`/`read`/async iteration/`cancel`/`tee`/`locked`) and is accepted as a request body | not exposed as `node:stream/web` or as the `ReadableStream`/`WritableStream`/`TransformStream` globals; no BYOB reader, `pipeTo`/`pipeThrough`, or `WritableStream` | [js/internal/fetch.js](../pkg/runtime/js/internal/fetch.js) |
 | **webcrypto** | ❌ | 🟡 | global `crypto.getRandomValues`, `crypto.randomUUID` | `crypto.subtle` (all SubtleCrypto) | [globals.odin](../pkg/runtime/globals.odin) |
 | **diagnostics_channel** | ❌ | 🟥 | — | channels/subscribe | — |
 | **inspector** | ❌ | 🟥 | — | inspector session/console | — |
@@ -75,7 +75,9 @@ Probed directly against `bin/lava`.
 
 **Present (30):** `global`, `globalThis`, `Buffer`, `fetch`, `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `AbortController`, `AbortSignal`, `structuredClone`, `queueMicrotask`, `setTimeout`, `setInterval`, `setImmediate`, `clearTimeout`, `clearInterval`, `clearImmediate`, `console`, `process`, `performance`, `Blob`, `File`, `crypto` (getRandomValues/randomUUID), `URL` (full WHATWG constructor + `createObjectURL`/`revokeObjectURL`), `URLSearchParams`, plus engine-provided `WebAssembly` and `Intl`.
 
-**Missing:** `atob`, `btoa` (global form), `Event`, `EventTarget`, `CustomEvent`, `ReadableStream`/`WritableStream`/`TransformStream`, `TextEncoderStream`/`TextDecoderStream`, `CompressionStream`, `MessageChannel`/`MessagePort`, `Worker`, `BroadcastChannel`, `navigator`, `reportError`, `crypto.subtle`.
+`fetch` streams bodies: `response.body` is a `ReadableStream` (incrementally fed by the transport — `getReader().read()`, `for await…of`, `cancel()`, `tee()`, `locked`), and the buffered accessors `text()`/`json()`/`arrayBuffer()`/`bytes()` drain that same stream (single-consumption enforced). Request bodies may be a `ReadableStream`, async iterable, or `Blob`, but are **buffered before send** in v1 (Content-Length framing; `duplex: 'half'` is required for stream bodies, matching Node) — true chunked upload is a follow-up. The standalone `ReadableStream`/`WritableStream` globals are still not exposed.
+
+**Missing:** `atob`, `btoa` (global form), `Event`, `EventTarget`, `CustomEvent`, `ReadableStream`/`WritableStream`/`TransformStream` (globals; an internal one backs `response.body`), `TextEncoderStream`/`TextDecoderStream`, `CompressionStream`, `MessageChannel`/`MessagePort`, `Worker`, `BroadcastChannel`, `navigator`, `reportError`, `crypto.subtle`.
 
 ## `Buffer` surface
 
