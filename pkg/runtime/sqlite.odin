@@ -580,19 +580,9 @@ sqlite_error_text :: proc(db: ^sqlite.Database, result: sqlite.Result) -> string
 }
 
 sqlite_blob_to_value :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef {
-	// Copy into a buffer JSC owns (freed by fs_buffer_deallocator on collection);
+	// Copy into a buffer JSC owns (make_uint8_array frees it on collection);
 	// sqlite's blob pointer is only valid until the next step/reset/finalize.
-	n := len(data)
-	buf := make([]byte, n)
-	if n > 0 do copy(buf, data)
-	array := jsc.JSObjectMakeTypedArrayWithBytesNoCopy(
-		ctx,
-		.Uint8Array,
-		raw_data(buf),
-		c.size_t(n),
-		fs_buffer_deallocator,
-		nil,
-		nil,
-	)
-	return cast(jsc.JSValueRef)array
+	buf := make([]byte, len(data))
+	if len(data) > 0 do copy(buf, data)
+	return make_uint8_array(ctx, buf)
 }
