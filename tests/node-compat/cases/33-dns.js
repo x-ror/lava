@@ -35,10 +35,13 @@ async function main() {
   assert.equal(typeof dnsPromises.lookup, 'function');
   assert.equal(dns.NOTFOUND, 'ENOTFOUND');
 
-  // getaddrinfo hint flags match Node's numeric values (callers do bitwise math).
-  assert.equal(dns.ADDRCONFIG, 32);
-  assert.equal(dns.V4MAPPED, 8);
-  assert.equal(dns.ALL, 16);
+  // getaddrinfo hint flags match Node's numeric values, which are platform-specific
+  // (Linux/glibc 32/8/16; Darwin and Windows 1024/2048/256). Callers do bitwise math
+  // with them, so assert the host platform's set.
+  const bsdLikeFlags = process.platform === 'darwin' || process.platform === 'win32';
+  assert.equal(dns.ADDRCONFIG, bsdLikeFlags ? 1024 : 32);
+  assert.equal(dns.V4MAPPED, bsdLikeFlags ? 2048 : 8);
+  assert.equal(dns.ALL, bsdLikeFlags ? 256 : 16);
 
   // ---- result-order API ----
   assert.equal(typeof dns.setDefaultResultOrder, 'function');

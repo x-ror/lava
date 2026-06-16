@@ -11,15 +11,17 @@
     throw new Error('node:dns is unavailable: native bindings missing');
   }
 
-  // getaddrinfo hint flags. These mirror Node's numeric values (which come from
-  // the platform getaddrinfo headers); user code does bitwise math with them, so
-  // the numbers must match. Lava's resolver is the core:net DNS client rather than
-  // a real getaddrinfo, so ADDRCONFIG/V4MAPPED have no behavioral effect yet — but
-  // they are still validated like Node so invalid hint masks throw rather than
-  // silently passing.
-  var ADDRCONFIG = 32;
-  var V4MAPPED = 8;
-  var ALL = 16;
+  // getaddrinfo hint flags. These mirror Node's numeric values, which come from
+  // the platform headers and so DIFFER by OS: Linux/glibc uses 32/8/16, while
+  // Darwin and Windows use 1024/2048/256 (<netdb.h> / ws2def.h). User code does
+  // bitwise math with them, so we pick the host platform's set. Lava's resolver is
+  // the core:net DNS client rather than a real getaddrinfo, so ADDRCONFIG/V4MAPPED
+  // have no behavioral effect yet — but they are still validated like Node so
+  // invalid hint masks throw rather than silently passing.
+  var _bsdLikeFlags = process.platform === 'darwin' || process.platform === 'win32';
+  var ADDRCONFIG = _bsdLikeFlags ? 1024 : 32;
+  var V4MAPPED = _bsdLikeFlags ? 2048 : 8;
+  var ALL = _bsdLikeFlags ? 256 : 16;
 
   // ---- Node-parity argument validation -------------------------------------
   // dns.lookup is strict about option types/values: Node throws synchronously on
