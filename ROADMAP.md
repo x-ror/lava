@@ -133,13 +133,27 @@ implementations — no `primordials`, no `internalBinding` coupling.
       Backpressure pauses the socket read when the consumer saturates the
       high-water mark and resumes on drain; an abandoned body no longer pins the
       loop (Node parity). Cross-platform via the shared transport
-      (`pkg/runtime/fetch_transport.odin`). Request bodies accept `ReadableStream`,
-      async iterables, and `Blob` but are **buffered before send** in v1 (no chunked
-      upload); true streaming upload is the remaining follow-up. Verified by
+      (`pkg/runtime/fetch_transport.odin`). Verified by
       `make test-fetch-smoke`. Lifetime note: io_uring has no `POLL_REMOVE`, so a
       paused-then-resumed read can leave an uncancellable poll outstanding; settled
       requests are reclaimed only after two loop iterations so a stale completion
       cannot land on freed memory (a real `POLL_REMOVE` path is still tracked).
+- [x] **Streaming fetch request bodies (#182)** — a `ReadableStream` / async-iterable
+      request body now streams **incrementally as `Transfer-Encoding: chunked`** rather
+      than being buffered to bytes first: the head is written, then chunks are pulled
+      one at a time from the JS producer (a `pushBody`/`endBody` ⇄ `onBodyDrain`
+      channel mirroring the response pull path), framed, and written to the socket —
+      no full-body buffer is kept on either side. Socket write backpressure pauses the
+      producer (the next pull is deferred until the current frame drains, mirroring the
+      response read resume); a producer error or an abort signal tears the in-flight
+      upload down. Cross-platform (plaintext + TLS) via the shared transport. A `Blob`
+      (known length) and string/Buffer/typed-array bodies keep the buffered
+      Content-Length fast path. Limitations: half-duplex only (the whole request body
+      is sent before the response is read, matching `duplex: 'half'`); an
+      immediately-empty producer is sent as an empty chunked body (terminator only)
+      rather than Node's `Content-Length: 0`; a server that rejects chunked request
+      bodies (or closes mid-upload) surfaces as a failed request. Verified by
+      `make test-fetch-smoke`.
 - [x] **Event-loop I/O driving** — fetch was the first real `watch_fd` consumer
       and exposed several gaps, now fixed (`pkg/runtime/eventloop/`):
       - io_uring `POLL_ADD` mask is written to `poll_events` (was `addr`, so no

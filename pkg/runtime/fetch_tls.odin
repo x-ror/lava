@@ -108,11 +108,29 @@ fetch_tls_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 		}
 		req.write_offset += int(n)
 	}
-	if !fetch_set_watch_mode(loop, req, .Read) {
-		fetch_settle_error(req, "fetch: event loop watch failed")
-		return
+	fetch_after_write_head(loop, req)
+}
+
+// fetch_tls_send_chunk writes one request-body frame over TLS, mapping the
+// SSL_write result onto a Fetch_IO_Result for the shared body-write state machine
+// (fetch_body_send). A non-positive return classifies as Would_Block (OpenSSL wants
+// more I/O — WANT_READ or WANT_WRITE), Closed (clean/EOF), or Failed; the caller
+// arms the socket for writability on Would_Block. The WANT_READ vs WANT_WRITE
+// direction is not distinguished here — request-body writes overwhelmingly want
+// write, and a rare renegotiation WANT_READ self-corrects on the next wake.
+fetch_tls_send_chunk :: proc(req: ^Fetch_Request, chunk: []byte) -> (n: int, res: Fetch_IO_Result) {
+	ret := SSL_write(cast(SSL)req.tls, raw_data(chunk), c.int(len(chunk)))
+	if ret > 0 do return int(ret), .Ok
+	switch SSL_get_error(cast(SSL)req.tls, ret) {
+	case SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE:
+		return 0, .Would_Block
+	case SSL_ERROR_ZERO_RETURN:
+		return 0, .Closed
+	case SSL_ERROR_SYSCALL:
+		return 0, ret == 0 ? .Closed : .Failed
+	case:
+		return 0, .Failed
 	}
-	req.phase = .Reading // next readable event reads the response
 }
 
 // fetch_tls_read decrypts response records and streams them through fetch_on_recv

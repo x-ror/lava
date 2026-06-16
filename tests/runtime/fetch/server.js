@@ -18,8 +18,20 @@ const handler = (req, res) => {
     });
     req.on('end', () => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      // Chunked (no explicit Content-Length) — exercises de-chunking.
-      res.end(JSON.stringify({ method: req.method, echo: body, len: body.length }));
+      // Chunked (no explicit Content-Length) — exercises de-chunking. Echo the
+      // request body framing (te/cl) so the client can assert chunked-upload vs
+      // Content-Length framing. (Chunk counts/sizes are NOT echoed: chunk
+      // boundaries legitimately differ between runtimes and would break the
+      // node-vs-lava output comparison.)
+      res.end(
+        JSON.stringify({
+          method: req.method,
+          echo: body,
+          len: body.length,
+          te: req.headers['transfer-encoding'] || null,
+          cl: req.headers['content-length'] || null,
+        }),
+      );
     });
     return;
   }
