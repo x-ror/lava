@@ -69,7 +69,7 @@
     }
     // lastIndex is intentionally not carried (Node resets it to 0).
     if (tag === '[object RegExp]') {
-      var re = new RegExp(value.source, value.flags);
+      var re = new RegExp(value);
       seen.set(value, re);
       return re;
     }
