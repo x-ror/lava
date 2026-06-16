@@ -5,6 +5,9 @@
 (function (require, module) {
   'use strict';
 
+  var customInspect =
+    typeof Symbol !== 'undefined' && Symbol.for ? Symbol.for('nodejs.util.inspect.custom') : null;
+
   function quote(s) {
     return "'" + s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n') + "'";
   }
@@ -26,6 +29,11 @@
     if (t === 'function') {
       var fn = v.name;
       return fn ? '[Function: ' + fn + ']' : '[Function (anonymous)]';
+    }
+    // Honor the util.inspect custom hook (Buffer renders as "<Buffer ..>").
+    if (customInspect && typeof v[customInspect] === 'function') {
+      var custom = v[customInspect](depth, opts);
+      if (typeof custom === 'string') return custom;
     }
     if (seen.indexOf(v) !== -1) return '[Circular *1]';
     if (v instanceof Error) return v.stack ? v.stack : v.name + ': ' + v.message;
