@@ -153,20 +153,32 @@ emit_utf16 :: proc "contextless" (out: []u16, cp: u32) -> int {
 // costs 2 units but 4 bytes, so the count never exceeds len(data) (+1 covers the
 // trailing replacement for an unfinished sequence at end of input).
 decode_utf8_to_utf16_whatwg :: proc "contextless" (data: []byte, out: []u16) -> (n: int) {
+	i := 0
+	// Fast path: copy the leading ASCII run verbatim. ASCII (and ASCII-heavy
+	// mixed text) is the common case for Buffer.toString('utf8'); a byte <= 0x7F
+	// decodes to itself, so we skip the state machine until the first non-ASCII
+	// byte. The slow loop below has the same shortcut for ASCII that resumes after
+	// a multi-byte sequence.
+	for i < len(data) && data[i] <= 0x7F {
+		out[n] = u16(data[i]);n += 1
+		i += 1
+	}
+
 	code_point: u32 = 0
 	bytes_needed := 0
 	bytes_seen := 0
 	lower: u8 = 0x80
 	upper: u8 = 0xBF
 
-	i := 0
 	for i < len(data) {
 		b := data[i]
 		if bytes_needed == 0 {
-			switch {
-			case b <= 0x7F:
+			if b <= 0x7F { 	// ASCII resumes after a completed multi-byte sequence
 				out[n] = u16(b);n += 1
 				i += 1
+				continue
+			}
+			switch {
 			case b >= 0xC2 && b <= 0xDF:
 				bytes_needed = 1;code_point = u32(b & 0x1F)
 				i += 1
@@ -198,7 +210,9 @@ decode_utf8_to_utf16_whatwg :: proc "contextless" (data: []byte, out: []u16) -> 
 				bytes_seen += 1
 				i += 1
 				if bytes_seen == bytes_needed {
-					n += emit_utf16(out[n:], code_point)
+					// #force_inline: hot path, but keep emit_utf16 a single named unit
+					// (no duplicated surrogate-pair logic).
+					n += #force_inline emit_utf16(out[n:], code_point)
 					code_point = 0;bytes_needed = 0;bytes_seen = 0
 				}
 			}
