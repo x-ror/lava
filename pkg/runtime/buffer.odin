@@ -139,7 +139,7 @@ emit_utf16 :: proc "contextless" (out: []u16, cp: u32) -> int {
 	return 2
 }
 
-// decode_utf8_to_utf16 decodes a UTF-8 byte slice into UTF-16 code units written
+// decode_utf8_to_utf16_whatwg decodes a UTF-8 byte slice into UTF-16 code units written
 // to `out`, implementing the WHATWG "UTF-8 decoder" / Unicode "U+FFFD
 // substitution of maximal subparts" rule that Node (V8) follows. The key
 // difference from a naive per-byte decode is the handling of an *invalid
@@ -152,7 +152,7 @@ emit_utf16 :: proc "contextless" (out: []u16, cp: u32) -> int {
 // emitted unit is charged to >= 1 consumed input byte, and an astral scalar
 // costs 2 units but 4 bytes, so the count never exceeds len(data) (+1 covers the
 // trailing replacement for an unfinished sequence at end of input).
-decode_utf8_to_utf16 :: proc "contextless" (data: []byte, out: []u16) -> (n: int) {
+decode_utf8_to_utf16_whatwg :: proc "contextless" (data: []byte, out: []u16) -> (n: int) {
 	code_point: u32 = 0
 	bytes_needed := 0
 	bytes_seen := 0
@@ -212,7 +212,7 @@ decode_utf8_to_utf16 :: proc "contextless" (data: []byte, out: []u16) -> (n: int
 }
 
 // utf8Decode(u8) -> string. Decodes via the WHATWG UTF-8 decoder
-// (decode_utf8_to_utf16) and builds the JS string from the code units, because
+// (decode_utf8_to_utf16_whatwg) and builds the JS string from the code units, because
 // JSStringCreateWithUTF8CString would truncate at an embedded NUL — Node keeps
 // it. Going through code units (rather than a UTF-8 C string) also lets us apply
 // the maximal-subpart replacement rule that Buffer.toString('utf8') / TextDecoder
@@ -233,7 +233,7 @@ buffer_utf8_decode_cb :: proc "c" (
 
 	// +1 headroom for a trailing-replacement at end of input (see proc docs).
 	units := make([]u16, len(data) + 1, context.temp_allocator)
-	n := decode_utf8_to_utf16(data, units)
+	n := decode_utf8_to_utf16_whatwg(data, units)
 
 	js_str := jsc.JSStringCreateWithCharacters(raw_data(units), c.size_t(n))
 	defer jsc.JSStringRelease(js_str)
