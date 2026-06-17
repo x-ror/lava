@@ -178,15 +178,18 @@ implementations — no `primordials`, no `internalBinding` coupling.
 
 ### Low priority / correctness polish
 
-- [ ] **`clearInterval` leaks** the `JS_Callback` heap binding + GC protection
-      (the loop drops the timer without firing the trampoline that frees it).
-- [ ] **`setTimeout`/`setInterval` ignore extra trailing args** (Node forwards
-      them to the callback).
+- [x] **`clearInterval` leaks** the `JS_Callback` heap binding + GC protection —
+      fixed: the loop's dispose hook (`js_callback_dispose` in
+      `pkg/runtime/globals.odin`) frees the binding when an interval is cleared.
+- [x] **`setTimeout`/`setInterval` ignore extra trailing args** — fixed:
+      `capture_timer_args` clones and GC-protects the trailing arguments and
+      forwards them to the callback (Node parity).
 - [ ] **Stack-trace line numbers are off by one** — the CommonJS wrapper
       prepends a line but `JSEvaluateScript` starts at line 1.
-- [ ] **Real wall-clock timers** — the loop advances a logical clock in
-      `run_until_idle`; `setTimeout(fn, 1000)` fires immediately rather than
-      after a second.
+- [x] **Real wall-clock timers** — fixed: in `real_time` mode the loop tracks the
+      monotonic wall clock (`sync_real_clock` / `real_now_ms` in
+      `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a
+      second instead of immediately.
 
 ### CI / tooling housekeeping
 
