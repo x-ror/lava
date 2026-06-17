@@ -197,9 +197,12 @@ when size_of(uintptr) >= 8 {
 }
 
 // max_buffer_alloc_bytes resolves the allocation ceiling, honoring an optional
-// LAVA_MAX_BUFFER_BYTES override — used by tests to exercise the cap with a tiny
-// limit (so no test allocates gigabytes), and by operators who want a tighter
-// bound. A malformed or negative value falls back to the platform default.
+// LAVA_MAX_BUFFER_BYTES override — used by the alloc-guard smoke test to exercise the
+// cap with a tiny limit (so no test allocates gigabytes), and by operators who want a
+// tighter bound. A malformed, negative, or zero value falls back to the platform
+// default: a non-positive ceiling is treated as "unset" here so it matches the JS
+// layers (buffer.js / alloc_guard.js both ignore a non-positive maxAllocBytes and
+// fall back), rather than silently capping every allocation to zero.
 max_buffer_alloc_bytes :: proc() -> f64 {
 	environ, err := os.environ(context.temp_allocator)
 	if err == os.ERROR_NONE {
@@ -207,7 +210,7 @@ max_buffer_alloc_bytes :: proc() -> f64 {
 			idx := strings.index_byte(entry, '=')
 			if idx <= 0 do continue
 			if entry[:idx] != "LAVA_MAX_BUFFER_BYTES" do continue
-			if n, ok := strconv.parse_f64(entry[idx + 1:]); ok && n >= 0 {
+			if n, ok := strconv.parse_f64(entry[idx + 1:]); ok && n > 0 {
 				return n
 			}
 			break

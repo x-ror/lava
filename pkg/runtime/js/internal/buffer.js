@@ -20,11 +20,12 @@
   // the largest buffer this runtime will allocate: native computes the practical
   // JavaScriptCore ceiling for the platform (overridable via LAVA_MAX_BUFFER_BYTES;
   // see max_buffer_alloc_bytes in buffer.odin) and passes it as maxAllocBytes.
-  // Unlike V8, JSC aborts the process on an allocation it cannot satisfy, so MAX_LENGTH
-  // is a hard, *enforced* ceiling here rather than the advisory Number.MAX_SAFE_INTEGER
-  // Node advertises on 64-bit — requests past it throw a catchable RangeError before
-  // JSC is asked to allocate. The default (4 GiB on 64-bit) matches the JSC/Bun
-  // array-buffer ceiling; packages read MAX_LENGTH to size work.
+  // JSC can abort the process on an allocation it cannot satisfy, so MAX_LENGTH is a
+  // hard, *enforced* ceiling here. The default (4 GiB on 64-bit) matches Bun, the
+  // other JSC-based runtime, which likewise reports kMaxLength === 4294967296 rather
+  // than the Number.MAX_SAFE_INTEGER that V8/Node advertise on 64-bit — this is the
+  // JSC-family convention, not a lava-only choice. Requests past it throw a catchable
+  // RangeError before JSC is asked to allocate; packages read MAX_LENGTH to size work.
   var MAX_SAFE = 9007199254740991; // Number.MAX_SAFE_INTEGER
   var MAX_ALLOC_BYTES =
     native && typeof native.maxAllocBytes === 'number' && native.maxAllocBytes > 0
@@ -390,7 +391,22 @@
     return writeBigUInt(buf, value, offset, littleEndian);
   }
 
-  class Buffer extends Uint8Array {
+  // Buffer extends the *unwrapped* Uint8Array so that every `new Buffer(n)` — the
+  // hottest allocation path in the module — skips the global alloc-guard Proxy trap
+  // (js/internal/alloc_guard.js). The Buffer constructor below already enforces the
+  // same ceiling with Node's coded error, so the trap would only re-validate. When
+  // the guard is installed, globalThis.Uint8Array is a Proxy, but its prototype's
+  // constructor is still the original native constructor (the Proxy has no `get`
+  // trap); when the guard is absent this is just Uint8Array. Either way Buffer stays
+  // a genuine Uint8Array subclass — instanceof, ArrayBuffer.isView, and the codecs
+  // are unaffected.
+  var BaseUint8Array =
+    (typeof Uint8Array === 'function' &&
+      Uint8Array.prototype &&
+      Uint8Array.prototype.constructor) ||
+    Uint8Array;
+
+  class Buffer extends BaseUint8Array {
     constructor(arg, byteOffset, length) {
       // A numeric first argument is the size form (new Buffer(size)). Validate it
       // against the practical ceiling *before* super() so an oversized request —

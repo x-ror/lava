@@ -5,6 +5,13 @@
 // Buffer layer so the request throws first. Every size here is rejected by the
 // length/range check *before* any memory is reserved, so the test never tries to
 // allocate gigabytes on either runtime — it is safe on Linux, macOS, and Windows.
+//
+// NOTE: the sizes below (> 2**53-1) are rejected by BOTH engines' own ToIndex check
+// before any allocation, so this case proves "throws RangeError" and Node parity but
+// does NOT prove the guard itself does anything. The guard's real job — rejecting a
+// size the engine *would* allocate, without aborting — is covered lava-only by
+// tests/runtime/alloc-guard/cap.js (run via `make test-alloc-guard-smoke`), which
+// uses a tiny LAVA_MAX_BUFFER_BYTES so it can reject kilobyte-sized requests.
 const assert = require('node:assert/strict');
 const buffer = require('node:buffer');
 

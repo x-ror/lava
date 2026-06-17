@@ -18,11 +18,19 @@
 // (JSObjectMakeTypedArrayWithBytesNoCopy in the Odin layer) never go through these
 // constructors and are unaffected.
 //
-// Accepted trade-off: `(new Uint8Array(n)).constructor === Uint8Array` is false
-// (the instance's constructor is the original, the global is the Proxy). No Node
-// API relies on that reference identity — robust code uses `instanceof` /
-// `ArrayBuffer.isView` — so the guard does not bother rewriting prototype
-// constructors (which would push every internal subarray/slice through the trap).
+// Accepted trade-offs (these apply to every wrapped global — ArrayBuffer and
+// SharedArrayBuffer as well as the TypedArrays):
+//   1. `(new Uint8Array(n)).constructor === Uint8Array` is false — the instance's
+//      constructor is the original, the global is the Proxy. No Node API relies on
+//      that reference identity (robust code uses `instanceof` / `ArrayBuffer.isView`),
+//      and rewriting the prototype constructors would push every internal
+//      subarray/slice through the trap, so the guard leaves them alone.
+//   2. The unwrapped constructor stays reachable as `Uint8Array.prototype.constructor`
+//      (the Proxy installs no `get` trap), so `new (someInstance.constructor)(huge)`
+//      can still reach JSC unguarded. This is deliberate: it is the very hatch the
+//      Buffer module uses to extend the original constructor at native speed (see
+//      buffer.js). The guard targets the common `new TypedArray(n)` / `new
+//      ArrayBuffer(n)` forms, not adversarial bypass — lava is not a sandbox.
 //
 // Factory shape mirrors the other internal preludes: (globalThis, maxAllocBytes).
 (function (globalThis, maxAllocBytes) {
@@ -36,13 +44,17 @@
       ? maxAllocBytes
       : 4294967296;
 
-  // A plain RangeError, matching V8's shape for `new TypedArray(tooBig)` /
-  // `new ArrayBuffer(tooBig)` (which carry no Node error code).
+  // A catchable RangeError carrying JavaScriptCore's own out-of-memory wording —
+  // the same error Bun (also JSC) throws for an over-cap allocation that still
+  // passes ToIndex (e.g. `new Uint8Array(2**40)`). Matching the engine's message
+  // keeps the guard indistinguishable from a native rejection. ToIndex failures
+  // (length > 2**53-1) keep JSC's distinct "Invalid …" message because those are
+  // left to the native constructor below.
   function makeRangeError() {
-    return new RangeError('Allocation size exceeds the maximum of ' + MAX + ' bytes');
+    return new RangeError('Out of memory');
   }
 
-  function wrap(name, bytesPerElement) {
+  function wrap(name, bytesPerElement, isArrayBufferLike) {
     var Original = globalThis[name];
     if (typeof Original !== 'function') return;
     var handler = {
@@ -56,15 +68,29 @@
         if (typeof first === 'number' && isFinite(first) && first > 0) {
           if (first * bytesPerElement > MAX) throw makeRangeError();
         }
+        // A resizable ArrayBuffer / growable SharedArrayBuffer reserves up to the
+        // options-bag maxByteLength even when the initial length is tiny, and JSC
+        // (like Bun) rejects an oversized reservation. Node currently allows it, but
+        // validating here keeps that reservation from reaching — and aborting — JSC.
+        // Only the *Buffer constructors take this options bag; a TypedArray's second
+        // argument is a numeric byteOffset, which the typeof-object check skips.
+        if (isArrayBufferLike && args.length > 1) {
+          var opts = args[1];
+          if (opts !== null && typeof opts === 'object') {
+            var mbl = opts.maxByteLength;
+            if (typeof mbl === 'number' && isFinite(mbl) && mbl > MAX) throw makeRangeError();
+          }
+        }
         return Reflect.construct(target, args, newTarget);
       },
     };
     globalThis[name] = new Proxy(Original, handler);
   }
 
-  // ArrayBuffer/SharedArrayBuffer take a byte length directly (1 byte per unit).
-  wrap('ArrayBuffer', 1);
-  if (typeof globalThis.SharedArrayBuffer === 'function') wrap('SharedArrayBuffer', 1);
+  // ArrayBuffer/SharedArrayBuffer take a byte length directly (1 byte per unit) and
+  // accept a { maxByteLength } options bag for the resizable/growable forms.
+  wrap('ArrayBuffer', 1, true);
+  if (typeof globalThis.SharedArrayBuffer === 'function') wrap('SharedArrayBuffer', 1, true);
 
   // TypedArrays take an element count; scale by BYTES_PER_ELEMENT to bytes.
   var typedArrays = [
@@ -83,6 +109,6 @@
   ];
   for (var i = 0; i < typedArrays.length; i++) {
     var ctor = globalThis[typedArrays[i]];
-    if (typeof ctor === 'function') wrap(typedArrays[i], ctor.BYTES_PER_ELEMENT || 1);
+    if (typeof ctor === 'function') wrap(typedArrays[i], ctor.BYTES_PER_ELEMENT || 1, false);
   }
 });

@@ -24,5 +24,8 @@ SKIP_KNOWN_LAVA_GAPS=1 "$ROOT_DIR/scripts/run-eventloop-oracle.sh"
 "$ROOT_DIR/scripts/run-fs-oracle.sh"
 "$ROOT_DIR/scripts/run-sqlite-oracle.sh"
 SKIP_KNOWN_LAVA_GAPS=1 "$ROOT_DIR/scripts/run-node-compat-all.sh"
+# Lava-only behavior check (no node oracle): the allocation guard rejects an
+# over-cap request catchably and the process survives. Cross-platform, no port.
+"$ROOT_DIR/scripts/run-alloc-guard-smoke.sh"
 
 printf '%s\n' 'all supported oracle suites passed'
