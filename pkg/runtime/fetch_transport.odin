@@ -94,6 +94,36 @@ fetch_register_socket :: proc(req: ^Fetch_Request, fd: uintptr) -> (ok: bool, er
 	return true, ""
 }
 
+// fetch_advance_connect connects to the next address in the resolved list (#145),
+// closing the current (failed or not-yet-started) socket first. A hostname resolves
+// to an ordered IPv4-then-IPv6 list; a connect failure — synchronous here, or async
+// via a failed SO_ERROR check in the Connecting phase — advances to the next entry,
+// settling an error only once the list is exhausted. A literal host has an empty
+// list (addr_count == 0), so it settles immediately, as before. Loop-thread only.
+fetch_advance_connect :: proc(req: ^Fetch_Request) {
+	if req.has_fd {
+		// Drop the failed attempt's socket before trying another address.
+		req.watcher.callback = nil
+		eventloop.unwatch_fd(req.loop, &req.watcher)
+		fetch_close_fd(req.fd)
+		req.has_fd = false
+	}
+	for req.addr_index < req.addr_count {
+		a := req.addrs[req.addr_index]
+		req.addr_index += 1
+		connected: bool
+		if a.is_v6 {
+			connected, _ = fetch_connect_ip6(req, a.v6, req.port)
+		} else {
+			connected, _ = fetch_connect_ip4(req, a.v4, req.port)
+		}
+		if connected do return // connect initiated; wait for the writable event
+		// A synchronous connect failure (socket create / immediate connect error)
+		// closed its own socket — fall through to the next address.
+	}
+	fetch_settle_error(req, "fetch: could not connect to host")
+}
+
 // fetch_watcher_cb advances the request whenever the socket is ready. Connect →
 // (TLS handshake for https) → write the whole request → read until EOF, then
 // settle. EAGAIN / WANT_* means "not ready, wait for the next event".
@@ -104,7 +134,9 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	switch req.phase {
 	case .Connecting:
 		if !fetch_connect_succeeded(req) {
-			fetch_settle_error(req, "fetch: connection failed")
+			// This address failed; try the next resolved one (if any) before giving
+			// up. A literal host has no list, so this settles immediately (#145).
+			fetch_advance_connect(req)
 			return
 		}
 		if req.is_https {

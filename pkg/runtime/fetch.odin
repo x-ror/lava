@@ -2,10 +2,20 @@ package lava_runtime
 
 import "base:runtime"
 import "core:c"
+import "core:net"
 import "core:strconv"
 import "core:strings"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
+
+// Fetch_Addr is one resolved address in the connect-fallback list (#145). A
+// hostname resolves to up to one IPv4 and one IPv6 address (net.resolve); the
+// connect path tries them in order (A then AAAA), advancing on failure.
+Fetch_Addr :: struct {
+	is_v6: bool,
+	v4:    [4]u8,
+	v6:    net.IP6_Address,
+}
 
 // Native backing for the WHATWG `fetch`. The JavaScript surface (Headers /
 // Request / Response / Body) lives in js/internal/fetch.js; this file provides
@@ -106,6 +116,14 @@ Fetch_Request :: struct {
 	// connect is driven from fetch_dns_pool_complete_cb on the loop thread. While a
 	// lookup is outstanding the request is pinned via drive_pending (so a cancel
 	// mid-lookup cannot free it under the pending completion).
+	//
+	// Resolved-address list + cursor (#145): a hostname resolves to up to one IPv4
+	// and one IPv6 address (ordered A then AAAA); fetch_advance_connect tries them in
+	// turn, advancing on a connect failure and settling an error only when the list
+	// is exhausted. A literal host bypasses this (addr_count stays 0, single connect).
+	addrs:         [2]Fetch_Addr,
+	addr_count:    int,
+	addr_index:    int,
 	response:      [dynamic]byte, // accumulates bytes until the header terminator is found
 	watcher:       eventloop.IO_Watcher,
 	fd:            uintptr,

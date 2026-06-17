@@ -34,13 +34,14 @@ FETCH_DNS_POOL_SIZE :: 4
 // DNS_Job is one resolution request. It owns `host` (a copy — the request's strings
 // may be freed independently) and carries the result back. Allocated on submit and
 // freed by its completion, or by fetch_dns_pool_shutdown for a job whose completion
-// is dropped when the loop tears down.
+// is dropped when the loop tears down. The result is an ordered address list (#145):
+// up to one IPv4 then one IPv6 address, tried in turn by the connect path.
 DNS_Job :: struct {
-	host: string,
-	loop: ^eventloop.Loop,
-	req:  ^Fetch_Request,
-	ip4:  [4]u8,
-	ok:   bool,
+	host:       string,
+	loop:       ^eventloop.Loop,
+	req:        ^Fetch_Request,
+	addrs:      [2]Fetch_Addr,
+	addr_count: int,
 }
 
 Fetch_DNS_Pool :: struct {
@@ -108,10 +109,23 @@ fetch_dns_pool_worker :: proc(data: rawptr) {
 		sync.unlock(&pool.mutex)
 
 		// Blocking resolution, off the loop. The worker writes only into `job`.
-		if ep, dns_err := net.resolve_ip4(job.host); dns_err == nil {
-			if ip4, ip_ok := ep.address.(net.IP4_Address); ip_ok {
-				job.ip4 = transmute([4]u8)ip4
-				job.ok = true
+		// net.resolve returns up to one IPv4 and one IPv6 endpoint and only errors
+		// when BOTH families fail, so an AAAA-only host still resolves (#145). The
+		// list is ordered A then AAAA; the connect path tries them in turn.
+		if ep4, ep6, dns_err := net.resolve(job.host); dns_err == nil {
+			if ip4, ip_ok := ep4.address.(net.IP4_Address); ip_ok {
+				job.addrs[job.addr_count] = Fetch_Addr {
+					is_v6 = false,
+					v4    = transmute([4]u8)ip4,
+				}
+				job.addr_count += 1
+			}
+			if ip6, ip_ok := ep6.address.(net.IP6_Address); ip_ok {
+				job.addrs[job.addr_count] = Fetch_Addr {
+					is_v6 = true,
+					v6    = ip6,
+				}
+				job.addr_count += 1
 			}
 		}
 		free_all(context.temp_allocator) // release this lookup's resolver scratch
@@ -128,19 +142,22 @@ fetch_dns_pool_worker :: proc(data: rawptr) {
 fetch_dns_pool_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	job := cast(^DNS_Job)user_data
 	req := job.req
-	ip4 := job.ip4
-	ok := job.ok
+	addrs := job.addrs
+	addr_count := job.addr_count
 	fetch_dns_pool_release_job(job)
 	if req == nil do return
 	req.drive_pending -= 1
 	if req.settled do return
-	if !ok {
+	if addr_count == 0 {
 		fetch_settle_error(req, "fetch: could not resolve host")
 		return
 	}
-	if connected, conn_err := fetch_connect_ip4(req, ip4, req.port); !connected {
-		fetch_settle_error(req, conn_err)
-	}
+	// Hand the resolved list to the request and connect to the first address;
+	// fetch_advance_connect falls through to the next on a connect failure (#145).
+	req.addrs = addrs
+	req.addr_count = addr_count
+	req.addr_index = 0
+	fetch_advance_connect(req)
 }
 
 // fetch_dns_pool_release_job removes a job from the loop-thread outstanding set and
