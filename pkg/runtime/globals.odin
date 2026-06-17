@@ -675,11 +675,6 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 	set_named(ctx, global, "globalThis", cast(jsc.JSValueRef)global)
 	set_named(ctx, global, "global", cast(jsc.JSValueRef)global)
 
-	// Guard the global typed-array / ArrayBuffer constructors before any user code
-	// (or the Buffer module that subclasses Uint8Array) runs, so an oversized
-	// allocation throws a catchable RangeError instead of aborting JSC.
-	install_alloc_guard(ctx, global)
-
 	inject_native_function(ctx, global, "setTimeout", set_timeout_cb)
 	inject_native_function(ctx, global, "setInterval", set_interval_cb)
 	inject_native_function(ctx, global, "setImmediate", set_immediate_cb)
@@ -988,30 +983,6 @@ require_builtin :: proc(
 	return result
 }
 
-// install_alloc_guard wraps the global ArrayBuffer / SharedArrayBuffer / TypedArray
-// constructors (ALLOC_GUARD_PRELUDE) so an oversized length throws a catchable
-// RangeError before JavaScriptCore attempts — and aborts on — the allocation. The
-// byte ceiling comes from the native layer (max_buffer_alloc_bytes); the Buffer
-// module enforces the same value in JS. A failure to install is reported and
-// non-fatal: the runtime falls back to the bare (crash-on-oversize) constructors.
-install_alloc_guard :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
-	factory := eval_internal(ctx, "lava:alloc-guard", ALLOC_GUARD_PRELUDE)
-	if factory == nil || !jsc.JSValueIsObject(ctx, factory) do return
-
-	cap_bytes := jsc.JSValueMakeNumber(ctx, max_buffer_alloc_bytes())
-	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)global, cap_bytes}
-	exception: jsc.JSValueRef
-	jsc.JSObjectCallAsFunction(
-		ctx,
-		cast(jsc.JSObjectRef)factory,
-		nil,
-		2,
-		raw_data(args[:]),
-		&exception,
-	)
-	if exception != nil do report_internal_exception(ctx, "lava:alloc-guard", exception)
-}
-
 // install_console builds the full `console` object. CONSOLE_PRELUDE evaluates
 // to a factory function `(out, err) => { … }`; we call it with the two native
 // write primitives passed directly as arguments. The primitives are therefore
@@ -1175,10 +1146,6 @@ CONSOLE_PRELUDE :: #load("js/console.js", string)
 // process.nextTick / queueMicrotask ordering shim (factory `(globalThis,
 // process) => {}`). Installed after `process` exists; see install_microtasks.
 MICROTASK_PRELUDE :: #load("js/internal/microtasks.js", string)
-
-// Oversized typed-array / ArrayBuffer allocation guard (factory `(globalThis,
-// maxAllocBytes) => {}`). Installed before user code; see install_alloc_guard.
-ALLOC_GUARD_PRELUDE :: #load("js/internal/alloc_guard.js", string)
 
 // Internal built-in modules, embedded at compile time. Each evaluates to a
 // factory `(require, module, exports) => exports?`; the loader wires them up.

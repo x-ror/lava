@@ -391,22 +391,7 @@
     return writeBigUInt(buf, value, offset, littleEndian);
   }
 
-  // Buffer extends the *unwrapped* Uint8Array so that every `new Buffer(n)` — the
-  // hottest allocation path in the module — skips the global alloc-guard Proxy trap
-  // (js/internal/alloc_guard.js). The Buffer constructor below already enforces the
-  // same ceiling with Node's coded error, so the trap would only re-validate. When
-  // the guard is installed, globalThis.Uint8Array is a Proxy, but its prototype's
-  // constructor is still the original native constructor (the Proxy has no `get`
-  // trap); when the guard is absent this is just Uint8Array. Either way Buffer stays
-  // a genuine Uint8Array subclass — instanceof, ArrayBuffer.isView, and the codecs
-  // are unaffected.
-  var BaseUint8Array =
-    (typeof Uint8Array === 'function' &&
-      Uint8Array.prototype &&
-      Uint8Array.prototype.constructor) ||
-    Uint8Array;
-
-  class Buffer extends BaseUint8Array {
+  class Buffer extends Uint8Array {
     constructor(arg, byteOffset, length) {
       // A numeric first argument is the size form (new Buffer(size)). Validate it
       // against the practical ceiling *before* super() so an oversized request —

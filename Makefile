@@ -7,7 +7,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-alloc-guard-smoke fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -34,7 +34,6 @@ help:
 	@printf '%s\n' '  make test-compat        Run all active Node compatibility tests with Node'
 	@printf '%s\n' '  make test-compat-lava   Build and compare active compatibility tests through Lava, skipping known gaps'
 	@printf '%s\n' '  make test-compat-lava-strict Build and compare active compatibility tests through Lava without skips'
-	@printf '%s\n' '  make test-alloc-guard-smoke Verify the oversized-allocation guard (lava-only; tiny LAVA_MAX_BUFFER_BYTES)'
 	@printf '%s\n' '  make test-odin          Run Odin tests for the CLI package'
 	@printf '%s\n' '  make test-eventloop-odin Run Odin event-loop core tests'
 	@printf '%s\n' '  make test-sqlite-node   Run SQLite std tests with Node as oracle'
@@ -165,12 +164,6 @@ test-eventloop-lava: build
 
 test-fetch-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-fetch-smoke.sh
-
-# Lava-only: verify the typed-array/ArrayBuffer/Buffer allocation guard rejects an
-# over-cap (but trivially allocatable) request with a catchable RangeError and the
-# process survives. Uses a tiny LAVA_MAX_BUFFER_BYTES so it allocates nothing large.
-test-alloc-guard-smoke: build
-	LAVA_BIN="$(LAVA)" ./scripts/run-alloc-guard-smoke.sh
 
 # test-lava runs every oracle suite the platform supports through one entry point
 # (scripts/run-oracles.sh) — the same script the Windows CI job runs against

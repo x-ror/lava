@@ -1,17 +1,11 @@
 // Oversized typed-array / ArrayBuffer / Buffer allocations must throw a catchable
-// error rather than aborting the process. Unlike V8 (Node), JavaScriptCore (Lava)
-// aborts on an in-range-but-too-large allocation it cannot satisfy; Lava guards the
-// global typed-array/ArrayBuffer constructors (js/internal/alloc_guard.js) and the
-// Buffer layer so the request throws first. Every size here is rejected by the
-// length/range check *before* any memory is reserved, so the test never tries to
-// allocate gigabytes on either runtime — it is safe on Linux, macOS, and Windows.
-//
-// NOTE: the sizes below (> 2**53-1) are rejected by BOTH engines' own ToIndex check
-// before any allocation, so this case proves "throws RangeError" and Node parity but
-// does NOT prove the guard itself does anything. The guard's real job — rejecting a
-// size the engine *would* allocate, without aborting — is covered lava-only by
-// tests/runtime/alloc-guard/cap.js (run via `make test-alloc-guard-smoke`), which
-// uses a tiny LAVA_MAX_BUFFER_BYTES so it can reject kilobyte-sized requests.
+// error rather than aborting the process. The sizes below (> 2**53-1) exceed both
+// V8's and JavaScriptCore's own length ceilings, so BOTH engines reject them via
+// their ToIndex/length check *before* any memory is reserved — the test never tries
+// to allocate gigabytes on either runtime, and is safe on Linux, macOS, and Windows.
+// Raw typed-array/ArrayBuffer requests rely on JSC's native catchable RangeError; the
+// Buffer paths additionally enforce Lava's Bun-parity kMaxLength (4 GiB) ceiling with
+// Node's coded ERR_OUT_OF_RANGE.
 const assert = require('node:assert/strict');
 const buffer = require('node:buffer');
 
@@ -67,8 +61,8 @@ assert.throws(() => Buffer.alloc(-1), rangeErr);
 assert.throws(() => Buffer.alloc(NaN), rangeErr);
 assert.throws(() => Buffer.alloc('10'), { code: 'ERR_INVALID_ARG_TYPE', name: 'TypeError' });
 
-// --- Regression: ordinary allocations and typed arrays still work, and the guard
-//     does not perturb instance identity, prototype, or behavior. -----------------
+// --- Regression: ordinary allocations and typed arrays still work, with correct
+//     instance identity, prototype, and behavior. -----------------------------------
 const small = new Uint8Array(8);
 small[0] = 255;
 assert.equal(small.length, 8);

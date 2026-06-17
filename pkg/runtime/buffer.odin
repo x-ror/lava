@@ -185,8 +185,8 @@ buffer_alloc_uninit_cb :: proc "c" (
 // array allocation when LAVA_MAX_BUFFER_BYTES is unset. Unlike V8 — which throws a
 // catchable RangeError when an in-range allocation cannot be satisfied —
 // JavaScriptCore aborts the process once a request exceeds what it can allocate.
-// The JS layer (Buffer + the global typed-array guard) refuses anything past this
-// ceiling with a catchable RangeError before JSC ever sees it. 4 GiB on 64-bit
+// The Buffer layer refuses anything past this ceiling with a catchable RangeError
+// before JSC ever sees it (raw typed arrays rely on JSC's own throw). 4 GiB on 64-bit
 // matches the JSC/Bun array-buffer ceiling; 2 GiB-1 on 32-bit is the addressable
 // signed limit. Allocations within the cap that still exhaust RAM remain a
 // documented JSC-vs-V8 difference (see reference/node-compatibility.md).
@@ -197,12 +197,11 @@ when size_of(uintptr) >= 8 {
 }
 
 // max_buffer_alloc_bytes resolves the allocation ceiling, honoring an optional
-// LAVA_MAX_BUFFER_BYTES override — used by the alloc-guard smoke test to exercise the
-// cap with a tiny limit (so no test allocates gigabytes), and by operators who want a
-// tighter bound. A malformed, negative, or zero value falls back to the platform
-// default: a non-positive ceiling is treated as "unset" here so it matches the JS
-// layers (buffer.js / alloc_guard.js both ignore a non-positive maxAllocBytes and
-// fall back), rather than silently capping every allocation to zero.
+// LAVA_MAX_BUFFER_BYTES override — for operators who want a tighter bound. A
+// malformed, negative, or zero value falls back to the platform default: a
+// non-positive ceiling is treated as "unset" here so it matches the JS layer
+// (buffer.js ignores a non-positive maxAllocBytes and falls back), rather than
+// silently capping every allocation to zero.
 max_buffer_alloc_bytes :: proc() -> f64 {
 	environ, err := os.environ(context.temp_allocator)
 	if err == os.ERROR_NONE {
@@ -229,8 +228,9 @@ make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "utf8Encode", buffer_utf8_encode_cb)
 	inject_native_function(ctx, bindings, "utf8Decode", buffer_utf8_decode_cb)
 	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
-	// The practical allocation ceiling Buffer enforces before `new Buffer(size)`
-	// reaches JSC. The global typed-array guard reads the same value (install_alloc_guard).
+	// The practical allocation ceiling; buffer.js reads it as kMaxLength (the
+	// Bun-parity 4 GiB) and enforces it on Buffer paths before `new Buffer(size)`
+	// reaches JSC.
 	set_named(ctx, bindings, "maxAllocBytes", jsc.JSValueMakeNumber(ctx, max_buffer_alloc_bytes()))
 	return bindings
 }
