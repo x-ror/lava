@@ -1128,3 +1128,65 @@ repeated_unwatch_never_dispatches_stale :: proc(t: ^testing.T) {
 	testing.expect_value(t, counter.fired, 0)
 	testing.expect_value(t, loop.active_io_count, 0)
 }
+
+// Rearm_Self unwatches and immediately re-watches the SAME watcher struct from
+// inside its own callback, until it has fired `limit` times. On io_uring this
+// releases the slot (bumping its generation) and allocates a fresh one mid-dispatch,
+// so the drain's post-callback re-validation must recognize the just-fired token as
+// stale and NOT re-arm it, while the freshly-armed poll keeps the watcher live.
+Rearm_Self :: struct {
+	loop:    ^Loop,
+	watcher: ^IO_Watcher,
+	fired:   int,
+	limit:   int,
+}
+
+rearm_self_cb :: proc(loop: ^Loop, user_data: rawptr) {
+	s := cast(^Rearm_Self)user_data
+	s.fired += 1
+	unwatch_fd(loop, s.watcher)
+	if s.fired >= s.limit {
+		s.watcher.callback = nil // stop: no re-watch, loop drains to idle
+		return
+	}
+	watch_fd(loop, s.watcher)
+}
+
+// A callback that unwatches then re-watches itself within a single dispatch must
+// keep firing via its fresh registration, with no stale re-arm double-counting. This
+// exercises the io_uring re-validation path that distinguishes a re-watch (new slot)
+// from the just-completed poll (released slot) after the callback returns.
+@(test)
+rewatch_within_callback_keeps_watcher_live :: proc(t: ^testing.T) {
+	client, server, ok := connect_loopback_pair(t)
+	if !ok do return
+	defer net.close(client)
+	defer net.close(server)
+
+	loop := init(real_time = true)
+	defer destroy(&loop)
+
+	// Make the fd permanently readable (the byte is never consumed), so each fresh
+	// poll completes and the watcher keeps firing until it stops itself.
+	_, serr := net.send_tcp(client, {1})
+	if !testing.expect_value(t, serr, nil) do return
+	time.sleep(20 * time.Millisecond)
+
+	s := Rearm_Self {
+		loop  = &loop,
+		limit = 3,
+	}
+	w := IO_Watcher {
+		fd        = uintptr(server),
+		mode      = .Read,
+		callback  = rearm_self_cb,
+		user_data = &s,
+	}
+	s.watcher = &w
+
+	if !testing.expect(t, watch_fd(&loop, &w)) do return
+	run_until_idle(&loop, 256)
+
+	testing.expect_value(t, s.fired, 3) // fired exactly limit times across re-arms
+	testing.expect_value(t, loop.active_io_count, 0) // final unwatch left nothing armed
+}

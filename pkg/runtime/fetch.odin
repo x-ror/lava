@@ -45,11 +45,13 @@ Chunk_State :: enum {
 // Fetch_Request owns everything an in-flight request needs. It outlives the
 // native call that created it: the JS callbacks are GC-protected and the struct
 // is heap-allocated, settled later from an event-loop I/O callback. A settled
-// request is queued onto pending_free and reclaimed on the next request (or at
-// teardown); the only thing it must outlive is an in-flight fetch_drive_read_cb
-// (tracked by drive_pending). Stale io_uring poll completions can no longer
-// reference it: unwatch_fd now truly cancels the poll and invalidates its token
-// (#183), so a completion that arrives after settle is dropped by the backend.
+// request is queued onto pending_free and reclaimed on a later request (or at
+// teardown). It must outlive two things: an in-flight fetch_drive_read_cb (tracked
+// by drive_pending), and — on the pointer-based backends (epoll/kqueue/select) —
+// any readiness event already copied into the in-flight platform_poll batch, which
+// dispatches via the raw watcher pointer (held one iteration past settle via
+// settle_tick). Stale io_uring poll completions can no longer reference it:
+// unwatch_fd truly cancels the poll and invalidates its generation token (#183).
 Fetch_Request :: struct {
 	ctx:           jsc.JSContextRef,
 	loop:          ^eventloop.Loop,
@@ -97,6 +99,7 @@ Fetch_Request :: struct {
 	read_paused:   bool, // socket reads suspended for backpressure (consumer saturated)
 	want_pause:    bool, // a delivered chunk reported the consumer is full this turn
 	drive_pending: int, // queued fetch_drive_read_cb completions referencing this req
+	settle_tick:   u64, // loop iteration at settle; reclaim holds the req one tick past it
 
 	// TLS state for https:// requests. is_https gates the TLS path in the
 	// transport; tls is an opaque ^SSL (rawptr so this cross-platform struct
@@ -658,16 +661,22 @@ fetch_reject_now :: proc(ctx: jsc.JSContextRef, on_error: jsc.JSObjectRef, messa
 
 // fetch_request_finish tears down a settled request: stop the watcher, close the
 // socket, release the GC-protected callbacks. The struct is queued onto
-// pending_free rather than freed here only because the drain loop may still read
-// this watcher once more (to decide re-arm) right after the callback returns, and
-// because an in-flight fetch_drive_read_cb may still hold a raw pointer to it
-// (drive_pending). It is reclaimed on the next request or at teardown. Clearing
-// req.watcher.callback below makes the request inert immediately; unwatch_fd then
-// truly cancels the io_uring poll (#183), so no stale completion can reach it.
+// pending_free rather than freed here because three things may still read it after
+// it settles: the io_uring drain loop (to decide re-arm right after the callback
+// returns), an in-flight fetch_drive_read_cb holding a raw pointer (drive_pending),
+// and — on the pointer-based backends (epoll/kqueue/select) — a readiness event for
+// it already sitting in the in-flight platform_poll batch, which dispatches via the
+// raw watcher pointer. Reclaim waits all three out (drive_pending + settle_tick; see
+// fetch_reclaim_pending). Clearing req.watcher.callback below makes the request
+// inert immediately; unwatch_fd then truly cancels the io_uring poll (#183).
 fetch_request_finish :: proc(req: ^Fetch_Request) {
 	if req.settled do return
 	fetch_release_dns_worker(req)
 	req.settled = true
+	// Stamp the settle iteration so fetch_reclaim_pending holds this request until the
+	// loop ticks past it — past the in-flight platform_poll batch that may still carry
+	// a readiness event for it on the pointer-based backends.
+	req.settle_tick = eventloop.iteration_count(req.loop)
 	if state := get_state_from_ctx(req.ctx); state != nil {
 		fetch_untrack_active(state, req)
 	}
@@ -788,24 +797,30 @@ fetch_free_request :: proc(req: ^Fetch_Request) {
 	free(req)
 }
 
-// fetch_reclaim_pending frees every settled request awaiting cleanup. Safe to
-// call any time after the settling loop iteration: a settled request has its
-// watcher callback cleared and its io_uring poll truly cancelled (#183), so no
-// later completion can reference it. Called at the start of each new request so
-// retention stays bounded to roughly the in-flight set rather than growing until
-// teardown.
+// fetch_reclaim_pending frees every settled request awaiting cleanup. Called at the
+// start of each new request so retention stays bounded to roughly the in-flight set
+// rather than growing until teardown.
 //
-// A request is kept (reclaimed on a later pass) only while an in-flight
-// fetch_drive_read_cb may still hold a raw pointer to it (drive_pending > 0); that
-// completion is queued on the loop's async queue and runs on a later tick. The
-// io_uring stale-poll concern that previously forced a two-iteration deferral is
-// gone: unwatch_fd cancels the poll and invalidates its generation token, so a
-// straggling completion is dropped by the backend, never dispatched onto freed
-// memory.
+// A request is kept (reclaimed on a later pass) while either of two things may still
+// reference its memory:
+//   1. drive_pending > 0 — an in-flight fetch_drive_read_cb still holds a raw pointer
+//      to it (the completion is queued on the loop's async queue, runs on a later tick).
+//   2. It settled during the CURRENT loop iteration — on the pointer-based backends
+//      (epoll/kqueue/select) a readiness event for it may still be sitting in the
+//      in-flight platform_poll batch, which dispatches via the raw watcher pointer
+//      captured before unwatch. A `fetch()` called synchronously from a JS callback
+//      (the microtask checkpoint runs mid-batch) can reach here while that batch is
+//      still being walked, so freeing now would let a later batch entry dereference
+//      freed memory. That batch is fully drained within the iteration it began in, so
+//      holding the request until iteration_count moves past settle_tick makes freeing
+//      it safe. (io_uring is already safe via generation tokens — a stale completion
+//      maps to a released slot and is dropped — but the one-tick hold is cheap and
+//      uniform; it replaces the old, heavier two-iteration deferral.)
 fetch_reclaim_pending :: proc(state: ^Runtime_State) {
 	kept := 0
 	for req in state.pending_free {
-		if req.drive_pending > 0 {
+		settled_this_tick := eventloop.iteration_count(req.loop) == req.settle_tick
+		if req.drive_pending > 0 || settled_this_tick {
 			state.pending_free[kept] = req
 			kept += 1
 			continue

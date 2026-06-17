@@ -44,6 +44,9 @@ Platform_Loop :: struct {
 	// reused across watchers; the array only grows to the high-water mark of
 	// concurrently watched fds, so retention stays bounded to the in-flight set.
 	watch_slots: [dynamic]Uring_Watch_Slot,
+	// Free-list of released watch_slots indices, so alloc/release are O(1) (no scan
+	// for a vacant slot). Holds exactly the indices whose slot is currently !in_use.
+	free_slots:  [dynamic]u32,
 }
 
 platform_name :: proc(loop: ^Loop) -> string {
@@ -69,6 +72,7 @@ platform_init :: proc(loop: ^Loop) -> bool {
 		// Bind the watcher table to the loop allocator (set before platform_init), so
 		// it does not adopt the allocator of whatever first appends to it.
 		loop.platform.watch_slots = make([dynamic]Uring_Watch_Slot, loop.allocator)
+		loop.platform.free_slots = make([dynamic]u32, loop.allocator)
 
 		arm_uring_poll(loop, u64(loop.platform.wakeup_pipe[0]), URING_WAKEUP_USER_DATA, {.IN})
 		return true
@@ -94,6 +98,8 @@ platform_destroy :: proc(loop: ^Loop) {
 	if loop.platform.use_uring {
 		delete(loop.platform.watch_slots)
 		loop.platform.watch_slots = nil
+		delete(loop.platform.free_slots)
+		loop.platform.free_slots = nil
 		uring.destroy(&loop.platform.ring)
 		loop.platform.use_uring = false
 	}
@@ -142,10 +148,13 @@ platform_watch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 		// reaches here for a NOT-yet-watched watcher, so each call is one new slot.
 		token := uring_alloc_slot(loop, watcher)
 		if arm_uring_poll(loop, u64(watcher.fd), token, events) {
+			// Record the slot on the watcher so unwatch_fd reaches it in O(1) without
+			// scanning the table.
+			watcher.backend_slot = uring_token_index(token)
 			return true
 		}
-		// Arm failed (SQ ring full and a submit-to-drain retry inside arm_uring_poll
-		// could not free a slot): release the slot so it is not stranded in_use.
+		// Arm failed even after arm_uring_poll's submit-and-retry (the SQ ring is still
+		// full): release the slot so it is not stranded in_use.
 		uring_release_slot(loop, uring_token_index(token))
 		return false
 	}
@@ -168,14 +177,24 @@ platform_unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 		//      backstop: ANY completion that still races through (the cancelled poll's
 		//      own -ECANCELED, or one already on the CQ before the cancel landed) now
 		//      carries a stale token and is dropped in drain_uring_completions WITHOUT
-		//      touching the watcher. The watcher (and its owning request) may therefore
-		//      be freed as soon as unwatch_fd returns — no deferred-reclaim needed.
+		//      touching the watcher. As far as io_uring is concerned the watcher (and
+		//      its owning request) may be freed the instant unwatch_fd returns — this
+		//      backend needs no deferred reclaim. (The pointer-based backends still hold
+		//      a settled request one loop tick for their in-flight poll batch, which
+		//      dispatches via the raw watcher pointer; see fetch_reclaim_pending.)
 		// Returns true unconditionally: the logical `watched` flag in the loop wrapper,
 		// not the kernel result, drives active_io_count, and a best-effort cancel that
 		// could not get an SQE is still covered by the generation check.
-		if index, found := uring_find_slot(loop, watcher); found {
-			uring_cancel_poll(loop, uring_encode_token(index, loop.platform.watch_slots[index].generation))
-			uring_release_slot(loop, index)
+		index := watcher.backend_slot
+		if int(index) < len(loop.platform.watch_slots) {
+			slot := loop.platform.watch_slots[index]
+			// Guard the O(1) lookup against a stale backend_slot: act only if the slot
+			// still holds THIS watcher (it always does while watched, but this keeps a
+			// desync from cancelling/releasing an unrelated slot).
+			if slot.in_use && slot.watcher == watcher {
+				uring_cancel_poll(loop, uring_encode_token(index, slot.generation))
+				uring_release_slot(loop, index)
+			}
 		}
 		return true
 	}
@@ -298,25 +317,16 @@ drain_uring_completions :: proc(loop: ^Loop) {
 
 			if cqe.user_data == URING_WAKEUP_USER_DATA {
 				drain_wakeup(loop)
-				// Re-arm the one-shot poll on the wakeup pipe for the next wakeup. If
-				// the SQ ring is momentarily full, submit to free slots and retry once
-				// rather than silently dropping the re-arm — otherwise this loop could
-				// never be woken across threads again (post_async could not break a
-				// parked poll). Mirrors the watcher re-arm below.
-				if !arm_uring_poll(
+				// Re-arm the one-shot poll on the wakeup pipe for the next wakeup.
+				// arm_uring_poll retries once if the SQ ring is momentarily full rather
+				// than silently dropping the re-arm — otherwise this loop could never be
+				// woken across threads again (post_async could not break a parked poll).
+				arm_uring_poll(
 					loop,
 					u64(loop.platform.wakeup_pipe[0]),
 					URING_WAKEUP_USER_DATA,
 					{.IN},
-				) {
-					uring.submit(&loop.platform.ring, 0, nil)
-					arm_uring_poll(
-						loop,
-						u64(loop.platform.wakeup_pipe[0]),
-						URING_WAKEUP_USER_DATA,
-						{.IN},
-					)
-				}
+				)
 				continue
 			}
 
@@ -352,13 +362,9 @@ drain_uring_completions :: proc(loop: ^Loop) {
 			if watcher == nil || watcher.callback == nil do continue
 
 			events: linux.Fd_Poll_Events = {.IN} if watcher.mode == .Read else {.OUT}
-			// If the SQ ring is momentarily full, submit to free slots and retry once
-			// rather than silently dropping the re-arm (which would strand the fd with
-			// no kernel poll).
-			if !arm_uring_poll(loop, u64(watcher.fd), cqe.user_data, events) {
-				uring.submit(&loop.platform.ring, 0, nil)
-				arm_uring_poll(loop, u64(watcher.fd), cqe.user_data, events)
-			}
+			// arm_uring_poll retries once if the SQ ring is momentarily full rather than
+			// silently dropping the re-arm (which would strand the fd with no kernel poll).
+			arm_uring_poll(loop, u64(watcher.fd), cqe.user_data, events)
 		}
 	}
 }
@@ -370,10 +376,17 @@ arm_uring_poll :: proc(
 	events: linux.Fd_Poll_Events,
 ) -> bool {
 	sqe, ok := uring.get_sqe(&loop.platform.ring)
-	if !ok do return false
+	if !ok {
+		// SQ ring momentarily full: submit to flush staged entries to the kernel
+		// (which frees SQEs), then retry once. Every caller — the fresh watch in
+		// platform_watch_fd, the wakeup re-arm, and the watcher re-arm — relies on
+		// this so a transient full ring never strands an fd with no kernel poll.
+		uring.submit(&loop.platform.ring, 0, nil)
+		sqe, ok = uring.get_sqe(&loop.platform.ring)
+		if !ok do return false
+	}
 
-	// Clear any stale state from a prior use of this SQE slot — get_sqe recycles
-	// ring entries and does not zero them.
+	// Defensive zero: do not depend on get_sqe clearing the recycled ring entry.
 	sqe^ = {}
 	sqe.opcode = .POLL_ADD
 	sqe.fd = cast(linux.Fd)fd // explicit cast to the distinct linux.Fd type
@@ -417,45 +430,37 @@ uring_slot_live :: proc(loop: ^Loop, index: u32, generation: u32) -> bool {
 }
 
 // uring_alloc_slot reserves a table slot for `watcher` and returns its POLL_ADD
-// token. A freed slot is reused before the array grows, so the table stays sized
-// to the high-water mark of concurrently watched fds. Generation starts at 1 (and
-// skips 0 on wrap) so a token is always >= 1<<32 — never a reserved sentinel.
+// token. A released index is popped off free_slots before the array grows, so the
+// table stays sized to the high-water mark of concurrently watched fds and the
+// allocation is O(1). A reused slot already carries a bumped, non-zero generation
+// (uring_release_slot skips 0 on wrap); a freshly appended slot starts at 1 — so a
+// token is always >= 1<<32, never a reserved sentinel.
 uring_alloc_slot :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> u64 {
-	for i in 0 ..< len(loop.platform.watch_slots) {
-		slot := &loop.platform.watch_slots[i]
-		if !slot.in_use {
-			slot.watcher = watcher
-			slot.in_use = true
-			if slot.generation == 0 do slot.generation = 1
-			return uring_encode_token(u32(i), slot.generation)
-		}
+	if len(loop.platform.free_slots) > 0 {
+		index := pop(&loop.platform.free_slots)
+		slot := &loop.platform.watch_slots[index]
+		slot.watcher = watcher
+		slot.in_use = true
+		return uring_encode_token(index, slot.generation)
 	}
 	append(&loop.platform.watch_slots, Uring_Watch_Slot{watcher = watcher, generation = 1, in_use = true})
 	return uring_encode_token(u32(len(loop.platform.watch_slots) - 1), 1)
 }
 
-// uring_find_slot returns the in-use slot index currently holding `watcher`. The
-// active set is the small in-flight-fd count, so the linear scan is cheap.
-uring_find_slot :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> (index: u32, found: bool) {
-	for i in 0 ..< len(loop.platform.watch_slots) {
-		slot := loop.platform.watch_slots[i]
-		if slot.in_use && slot.watcher == watcher {
-			return u32(i), true
-		}
-	}
-	return 0, false
-}
-
 // uring_release_slot frees a slot and bumps its generation so any completion still
 // in flight for the old token is recognized stale (uring_slot_live → false) and
-// dropped. Skipping generation 0 on wrap keeps tokens out of the sentinel range.
+// dropped. The freed index is pushed onto free_slots for O(1) reuse. Skipping
+// generation 0 on wrap keeps tokens out of the sentinel range. Idempotent: a slot
+// already free is left alone, so its index is never double-pushed onto free_slots.
 uring_release_slot :: proc(loop: ^Loop, index: u32) {
 	if int(index) >= len(loop.platform.watch_slots) do return
 	slot := &loop.platform.watch_slots[index]
+	if !slot.in_use do return
 	slot.in_use = false
 	slot.watcher = nil
 	slot.generation += 1
 	if slot.generation == 0 do slot.generation = 1
+	append(&loop.platform.free_slots, index)
 }
 
 // uring_cancel_poll asks the kernel to cancel the outstanding POLL_ADD identified

@@ -359,6 +359,37 @@ async function main() {
     console.log('abort then refetch:', fresh.length === BIG.length, fresh === BIG);
   }
 
+  // Concurrent streaming fetches where one reader's continuation cancels a sibling
+  // mid-flight and immediately starts another fetch. On Lava the microtask
+  // checkpoint runs inside the watcher dispatch, so this continuation executes while
+  // the poll batch is still being walked; freeing the cancelled sibling before its
+  // own readiness entry in that batch is dispatched was a use-after-free on the
+  // pointer-based backends (kqueue/select, or epoll without io_uring) — the
+  // generation-token io_uring backend was already safe. The run must stay clean and
+  // every third body must be byte-exact (#183 / #198).
+  {
+    let clean = true;
+    for (let i = 0; i < 10; i++) {
+      const ra = await fetch(base + '/big');
+      const rb = await fetch(base + '/big');
+      const readerA = ra.body.getReader();
+      const readerB = rb.body.getReader();
+      // Prime B so its socket readiness can land in the same poll batch as A's.
+      const pendingB = readerB.read().catch(() => {});
+      await readerA.read();
+      // Runs mid-batch on Lava: cancel() runs B's cancel steps synchronously
+      // (settling + queueing B's free), then a fresh fetch() whose reclaim would free
+      // B — while B's own batch entry may still be pending behind A's.
+      const pendingCancelB = readerB.cancel();
+      const c = await (await fetch(base + '/big')).text();
+      if (c !== BIG) clean = false;
+      await pendingCancelB.catch(() => {});
+      await pendingB;
+      await readerA.cancel();
+    }
+    console.log('concurrent cancel+refetch clean:', clean);
+  }
+
   // IPv6 literal host: parse [::1], connect over AF_INET6, and re-bracket the
   // Host header. Only runs when the runner confirmed IPv6 loopback is up (it
   // sets FETCH_BASE6), so Node and Lava take this branch identically.
