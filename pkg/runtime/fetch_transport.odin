@@ -261,6 +261,12 @@ fetch_after_write_head :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 		return
 	}
 	req.phase = .Body_Write
+	// Pin the loop for the whole upload so an in-flight chunked upload keeps the
+	// process alive like Node's outgoing socket: while idle (awaiting the producer)
+	// the fd is unwatched, so without this hold a body that pauses on a producer not
+	// itself backed by loop work could let the loop exit mid-upload. Released when the
+	// terminator is sent (fetch_pump_body) or the request settles (fetch_request_finish).
+	fetch_body_hold_loop(req)
 	fetch_body_go_idle(req) // ask the producer for the first chunk
 }
 
@@ -311,10 +317,17 @@ fetch_pump_body :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 			if req.settled do return // arming the watcher failed and settled the request
 			switch res {
 			case .Ok:
-				if n <= 0 do return // nothing written though Ok — wait for the next event
+				if n <= 0 {
+					// A 0-byte success for a non-empty frame should not happen (send /
+					// SSL_write never report Ok without progress on a non-empty buffer),
+					// but if it did, arm for writability rather than returning with no
+					// pending event — a bare return would strand the upload.
+					fetch_body_arm(req, .Write)
+					return
+				}
 				req.body_out_off += n
 			case .Would_Block:
-				return // fetch_body_send armed the fd for writability
+				return // fetch_body_send armed the fd for the right direction
 			case .Closed, .Failed:
 				fetch_settle_error(req, "fetch: request body send failed")
 				return
@@ -324,7 +337,9 @@ fetch_pump_body :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 		clear(&req.body_out)
 		req.body_out_off = 0
 		if req.body_term_written {
-			fetch_body_arm_read(req) // upload complete — watch for the response head
+			// Upload complete: drop the body-phase loop hold and watch for the response.
+			fetch_body_release_loop(req)
+			fetch_body_arm(req, .Read)
 			req.phase = .Reading
 			return
 		}
@@ -339,15 +354,20 @@ fetch_pump_body :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 }
 
 // fetch_body_send writes one slice of the current frame. On a would-block it arms the
-// socket for writability so the writable event resumes the flush. https delegates to
-// the TLS backend (fetch_tls_send_chunk).
+// socket for the direction the transport is waiting on so the readiness event resumes
+// the flush — plaintext always wants write, but TLS may want read (a renegotiation
+// mid-write), so the arm follows fetch_tls_send_chunk's want_read. https delegates to
+// the TLS backend.
 fetch_body_send :: proc(req: ^Fetch_Request, chunk: []byte) -> (n: int, res: Fetch_IO_Result) {
+	want_read: bool
 	if req.is_https {
-		n, res = fetch_tls_send_chunk(req, chunk)
+		n, res, want_read = fetch_tls_send_chunk(req, chunk)
 	} else {
 		n, res = fetch_raw_send(req, chunk)
 	}
-	if res == .Would_Block do fetch_body_arm_write(req)
+	// Stay in .Body_Write whichever direction we arm: the readiness event re-enters
+	// fetch_write_body_event, which retries the flush regardless of read/write wake.
+	if res == .Would_Block do fetch_body_arm(req, want_read ? .Read : .Write)
 	return
 }
 
@@ -417,33 +437,19 @@ fetch_body_drain_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	}
 }
 
-// fetch_body_arm_write arms the socket for writability so a blocked frame flush is
-// resumed by the writable event. Arms a fresh poll when coming from idle (the fd was
-// unwatched); otherwise just points existing interest at Write.
-fetch_body_arm_write :: proc(req: ^Fetch_Request) {
+// fetch_body_arm points the socket watch at `mode` and (re)registers it for the
+// body-write phase, settling the request if the loop rejects the watch. Arms a fresh
+// poll when coming from idle (the fd was unwatched); otherwise just points existing
+// interest at the new direction. Drives the frame-flush write arm, the post-terminator
+// read arm, and a TLS renegotiation read arm mid-write.
+fetch_body_arm :: proc(req: ^Fetch_Request, mode: eventloop.Poll_Mode) {
 	if req.settled || !req.has_fd do return
 	req.watcher.callback = fetch_watcher_cb
 	ok: bool
 	if req.watcher.watched {
-		ok = fetch_set_watch_mode(req.loop, req, .Write)
+		ok = fetch_set_watch_mode(req.loop, req, mode)
 	} else {
-		req.watcher.mode = .Write
-		ok = eventloop.watch_fd(req.loop, &req.watcher)
-	}
-	if !ok do fetch_settle_error(req, "fetch: event loop watch failed")
-}
-
-// fetch_body_arm_read arms the socket for readability for the response, once the
-// whole request body (including the terminator) is on the wire. Arms a fresh poll
-// when coming from idle (the fd was unwatched).
-fetch_body_arm_read :: proc(req: ^Fetch_Request) {
-	if req.settled || !req.has_fd do return
-	req.watcher.callback = fetch_watcher_cb
-	ok: bool
-	if req.watcher.watched {
-		ok = fetch_set_watch_mode(req.loop, req, .Read)
-	} else {
-		req.watcher.mode = .Read
+		req.watcher.mode = mode
 		ok = eventloop.watch_fd(req.loop, &req.watcher)
 	}
 	if !ok do fetch_settle_error(req, "fetch: event loop watch failed")

@@ -172,6 +172,20 @@ async function main() {
     console.log('large stream upload:', j.len === 30 * PART.length, j.te);
   }
 
+  // A single chunk larger than the socket send buffer forces a mid-frame partial
+  // write (body_out_off walking one frame across several writable events), distinct
+  // from the many-small-chunks backpressure above.
+  {
+    const ONE = 'q'.repeat(1 << 20); // 1 MiB in a single chunk
+    async function* oneBig() {
+      yield new TextEncoder().encode(ONE);
+    }
+    const j = await fetch(base + '/echo', { method: 'POST', body: oneBig(), duplex: 'half' }).then(
+      (r) => r.json(),
+    );
+    console.log('single large chunk:', j.len === ONE.length, j.te);
+  }
+
   // An empty streamed body delivers an empty request body. (Framing is NOT
   // asserted: Node sends Content-Length: 0 for an immediately-empty producer,
   // while Lava sends an empty chunked body — terminator only; the received body is
@@ -545,6 +559,36 @@ async function main() {
     });
     const se = await s3.json();
     console.log('https POST:', se.method, se.echo, se.len);
+
+    // A streamed (chunked) request body over TLS exercises fetch_tls_send_chunk —
+    // the buffered POST above only covers the Content-Length path. Byte-exact echo,
+    // te=chunked, no cl, matching Node.
+    async function* tlsGen() {
+      yield new TextEncoder().encode('tls-');
+      yield new TextEncoder().encode('stream');
+    }
+    const ss = await fetch(baseHttps + '/echo', {
+      method: 'POST',
+      body: tlsGen(),
+      duplex: 'half',
+    }).then((r) => r.json());
+    console.log('https stream upload:', JSON.stringify(ss.echo), ss.te, ss.cl);
+
+    // A large streamed body over TLS drives SSL_write backpressure (WANT_WRITE)
+    // across many records. Only the reassembled length/framing is compared.
+    {
+      const PART = 'y'.repeat(8192);
+      async function* tlsBig() {
+        for (let i = 0; i < 30; i++) yield new TextEncoder().encode(PART);
+      }
+      const sb = await fetch(baseHttps + '/echo', {
+        method: 'POST',
+        body: tlsBig(),
+        duplex: 'half',
+      }).then((r) => r.json());
+      console.log('https large stream upload:', sb.len === 30 * PART.length, sb.te);
+    }
+
     // Concurrent HTTPS requests each get their own TLS session.
     const [sa, sb] = await Promise.all([
       fetch(baseHttps + '/a').then((r) => r.text()),

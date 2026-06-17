@@ -78,6 +78,7 @@ Fetch_Request :: struct {
 	body_end_seen:     bool, // producer signalled end-of-body; terminator pending
 	body_term_written: bool, // the zero-size terminating chunk was appended to body_out
 	body_idle:         bool, // awaiting the next chunk from the producer (fd unwatched)
+	body_loop_held:    bool, // a loop keep-alive is held for the whole body-write phase
 
 	// Owned copies (the JSC-derived strings they came from do not outlive the call).
 	url:           string,
@@ -280,6 +281,26 @@ fetch_end_fn_cb :: proc "c" (
 		}
 	}
 	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// fetch_body_hold_loop / fetch_body_release_loop bracket the streaming-upload
+// (Body_Write) phase with a single loop keep-alive, so an in-flight chunked upload
+// pins the process like Node's outgoing request socket — even while idle awaiting the
+// producer, when the fd is unwatched. Idempotent and balanced via body_loop_held:
+// held once when the body phase begins (fetch_after_write_head), released once when
+// the body finishes (fetch_pump_body) or the request settles (fetch_request_finish).
+// Unlike the per-pull async_begin in fetch_body_go_idle, this hold has no matching
+// post_async, so it is released directly with async_cancel.
+fetch_body_hold_loop :: proc(req: ^Fetch_Request) {
+	if req.body_loop_held do return
+	req.body_loop_held = true
+	eventloop.async_begin(req.loop)
+}
+
+fetch_body_release_loop :: proc(req: ^Fetch_Request) {
+	if !req.body_loop_held do return
+	req.body_loop_held = false
+	eventloop.async_cancel(req.loop)
 }
 
 // make_fetch_bindings builds the `native` object handed to js/internal/fetch.js.
@@ -877,6 +898,11 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.resume_fn)
 		req.resume_fn = nil
 	}
+	// Release the body-write phase loop hold if it is still held — i.e. the request
+	// settled mid-upload, before the terminator went out. Idempotent with the release
+	// on the normal completion path in fetch_pump_body.
+	fetch_body_release_loop(req)
+
 	// Drop the streaming request-body channel's GC roots. As with cancel/resume, the
 	// JS pump may still hold pushBody/endBody after the request settles, so clear the
 	// back-pointer first: a later call then reads a nil private and no-ops.

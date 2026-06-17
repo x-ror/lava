@@ -625,6 +625,7 @@
       var bodyIterator = null; // async iterator, otherwise
       var producing = false; // a producer read is in flight
       var producerDone = false; // producer finished, errored, or was torn down
+      var sourceReleased = false; // the producer reader/iterator has been released once
 
       function setupProducer() {
         if (!streamSource) return;
@@ -641,9 +642,16 @@
 
       function cancelProducer(reason) {
         producerDone = true;
+        if (sourceReleased) return; // release the source reader/iterator exactly once
+        sourceReleased = true;
         try {
-          if (bodyReader && typeof bodyReader.cancel === 'function') bodyReader.cancel(reason);
-          else if (bodyIterator && typeof bodyIterator.return === 'function') bodyIterator.return();
+          var p = null;
+          if (bodyReader && typeof bodyReader.cancel === 'function') p = bodyReader.cancel(reason);
+          else if (bodyIterator && typeof bodyIterator.return === 'function')
+            p = bodyIterator.return();
+          // cancel()/return() return promises; swallow a rejected teardown so a
+          // throwing producer cleanup does not surface as an unhandled rejection.
+          if (p && typeof p.catch === 'function') p.catch(function () {});
         } catch (e) {}
       }
 
@@ -754,6 +762,10 @@
       }
 
       function onError(message) {
+        // Release a still-locked producer source on a pre-headers / synchronous
+        // failure (e.g. a bad URL rejects before the body is ever pumped); a no-op
+        // when there is no stream source or it was already released.
+        cancelProducer(new TypeError(String(message)));
         cleanup();
         reject(new TypeError(String(message)));
       }
