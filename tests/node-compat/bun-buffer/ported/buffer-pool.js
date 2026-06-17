@@ -10,8 +10,16 @@
 // relative, warm-state-independent invariants that hold in Node and Lava alike.
 const assert = require('node:assert/strict');
 
-assert.equal(Buffer.poolSize, 8192);
-const HALF = Buffer.poolSize >>> 1; // 4096 — Node's pool threshold (strictly <)
+// poolSize defaults differ by runtime (8192 on Node <= 25 / Bun, 65536 on Node
+// >= 26.3, which Lava follows), so assert the property both share rather than a
+// literal, and derive all pool-dependent sizes from poolSize so the invariants
+// hold regardless of its value.
+assert.ok(
+  Buffer.poolSize > 0 && (Buffer.poolSize & (Buffer.poolSize - 1)) === 0,
+  'poolSize is a positive power of two',
+);
+const HALF = Buffer.poolSize >>> 1; // exactly the pool threshold (strictly <, so not pooled)
+const BIG = Buffer.poolSize + 4096; // comfortably above the pool, and != poolSize
 
 // --- Small allocUnsafe shares one backing ArrayBuffer ----------------------
 // Over a short run of small allocations at most one pool recreation can occur,
@@ -63,9 +71,9 @@ const HALF = Buffer.poolSize >>> 1; // 4096 — Node's pool threshold (strictly 
   assert.equal(half.byteOffset, 0, 'poolSize/2 is not pooled');
   assert.equal(half.buffer.byteLength, HALF, 'unpooled buffer owns a right-sized store');
 
-  const big = Buffer.allocUnsafe(5000);
+  const big = Buffer.allocUnsafe(BIG);
   assert.equal(big.byteOffset, 0);
-  assert.equal(big.buffer.byteLength, 5000);
+  assert.equal(big.buffer.byteLength, BIG);
   assert.notEqual(big.buffer.byteLength, Buffer.poolSize);
 }
 
@@ -118,9 +126,9 @@ const HALF = Buffer.poolSize >>> 1; // 4096 — Node's pool threshold (strictly 
   assert.ok(arrShared, 'small Buffer.from(array) shares the pool');
 
   // A large string allocation is not pooled.
-  const bigStr = Buffer.from('x'.repeat(5000));
+  const bigStr = Buffer.from('x'.repeat(BIG));
   assert.equal(bigStr.byteOffset, 0);
-  assert.equal(bigStr.buffer.byteLength, 5000);
+  assert.equal(bigStr.buffer.byteLength, BIG);
 }
 
 // --- Mutation of one pooled buffer leaves its neighbor untouched ------------
@@ -204,7 +212,7 @@ const HALF = Buffer.poolSize >>> 1; // 4096 — Node's pool threshold (strictly 
   assert.deepEqual([...cut], [1, 2], 'concat truncates to totalLength');
 
   // A large concat result keeps its own right-sized backing store.
-  const big = Buffer.concat([Buffer.alloc(5000, 7)]);
+  const big = Buffer.concat([Buffer.alloc(BIG, 7)]);
   assert.equal(big.byteOffset, 0);
-  assert.equal(big.buffer.byteLength, 5000, 'large concat result is unpooled');
+  assert.equal(big.buffer.byteLength, BIG, 'large concat result is unpooled');
 }

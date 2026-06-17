@@ -204,6 +204,18 @@ implementations — no `primordials`, no `internalBinding` coupling.
       monotonic wall clock (`sync_real_clock` / `real_now_ms` in
       `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a
       second instead of immediately.
+- [x] **`Buffer` offset/value/UTF-8 validation parity (#107)** — fixed:
+      `write`/`fill`/`copy` reject negative & non-integer offsets (no wrap-around),
+      the `write*` integer accessors range-check their value, the variable-width
+      `read*`/`write*` require an integer `byteLength` 1..6, `fill` rejects an
+      unrepresentable value (`ERR_INVALID_ARG_VALUE`), and `toString('utf8')` uses
+      the Unicode maximal-subpart U+FFFD rule (`pkg/runtime/buffer.odin`). WHATWG
+      `TextDecoder` now honors `{ stream: true }` and `fatal` for utf-8/utf-16le
+      (`pkg/runtime/js/internal/encoding.js`). Verified vs Node 24 + Bun.
+- [x] **Catchable oversized-`Buffer` allocations (#186)** — `Buffer.alloc`/
+      `allocUnsafe` and raw `new Uint8Array(n)` past the practical JSC ceiling now
+      throw a catchable `RangeError` instead of aborting the process (the
+      `kMaxLength` cap + the typed-array allocation guard, #200).
 
 ### CI / tooling housekeeping
 

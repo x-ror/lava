@@ -48,3 +48,54 @@ assert.equal(new TextDecoder().decode(new Uint8Array([0xff])), '�');
 assert.equal(decoder.decode(new Uint8Array([0x41]).buffer), 'A');
 assert.equal(globalThis.TextEncoder, TextEncoder);
 assert.equal(globalThis.TextDecoder, TextDecoder);
+
+// --- {stream:true}: an incomplete multi-byte sequence carries to the next call ---
+{
+  const d = new TextDecoder(); // utf-8
+  assert.equal(d.decode(new Uint8Array([0xe2, 0x82]), { stream: true }), '');
+  assert.equal(d.decode(new Uint8Array([0xac])), '€'); // completed across chunks
+}
+{
+  const d = new TextDecoder('utf-16le'); // surrogate pair split across chunks
+  assert.equal(d.decode(new Uint8Array([0x3d, 0xd8]), { stream: true }), '');
+  assert.equal(d.decode(new Uint8Array([0x00, 0xde])), '😀');
+}
+{
+  const d = new TextDecoder('utf-16le'); // odd trailing byte held until paired
+  assert.equal(d.decode(new Uint8Array([0x41]), { stream: true }), '');
+  assert.equal(d.decode(new Uint8Array([0x00])), 'A');
+}
+{
+  const d = new TextDecoder(); // a BOM split across stream chunks is still stripped once
+  assert.equal(d.decode(new Uint8Array([0xef, 0xbb]), { stream: true }), '');
+  assert.equal(d.decode(new Uint8Array([0xbf, 0x61])), 'a');
+}
+
+// --- maximal-subpart U+FFFD substitution: one replacement per ill-formed run ---
+assert.equal(new TextDecoder().decode(new Uint8Array([0xf0, 0x9f])), '�');
+assert.deepEqual(
+  [
+    ...new TextDecoder().decode(new Uint8Array([0x61, 0xf1, 0x80, 0x80, 0xe1, 0x80, 0xc2, 0x62])),
+  ].map((c) => c.codePointAt(0)),
+  [97, 0xfffd, 0xfffd, 0xfffd, 98],
+);
+
+// --- utf-16le lone surrogates: U+FFFD (non-fatal), error (fatal) ---
+assert.equal(new TextDecoder('utf-16le').decode(new Uint8Array([0x00, 0xd8])), '�');
+assert.throws(
+  () => new TextDecoder('utf-16le', { fatal: true }).decode(new Uint8Array([0x00, 0xd8])),
+  {
+    code: 'ERR_ENCODING_INVALID_ENCODED_DATA',
+  },
+);
+// fatal: an incomplete tail is allowed mid-stream and only throws when flushed
+{
+  const d = new TextDecoder('utf-16le', { fatal: true });
+  assert.equal(d.decode(new Uint8Array([0x41]), { stream: true }), '');
+  assert.throws(() => d.decode(), { code: 'ERR_ENCODING_INVALID_ENCODED_DATA' });
+}
+{
+  const d = new TextDecoder('utf-8', { fatal: true });
+  assert.equal(d.decode(new Uint8Array([0xe2, 0x82]), { stream: true }), '');
+  assert.throws(() => d.decode(), { code: 'ERR_ENCODING_INVALID_ENCODED_DATA' });
+}
