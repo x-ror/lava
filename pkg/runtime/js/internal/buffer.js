@@ -15,6 +15,17 @@
   // backing the unpooled unsafe paths; null signals "fall back to a zero-filled
   // own-backing Buffer" (binding missing or allocation failed). See allocUnsafeNoZero.
   var nativeAllocUninit = typeof native.allocUninit === 'function' ? native.allocUninit : null;
+  // Native byte-op fast paths, feature-detected so an older native build still
+  // works through the JS fallbacks below. compare/indexOf are only used once an
+  // input is at least NATIVE_BYTEOP_MIN bytes — below that the FFI crossing costs
+  // more than the JS loop. isValidUtf8 replaces a JS decode/re-encode round-trip,
+  // and utf8WriteInto encodes straight into the destination Buffer (no temp array).
+  var nativeCompare = typeof native.compare === 'function' ? native.compare : null;
+  var nativeIndexOf = typeof native.indexOf === 'function' ? native.indexOf : null;
+  var nativeIsValidUtf8 = typeof native.isValidUtf8 === 'function' ? native.isValidUtf8 : null;
+  var nativeUtf8WriteInto =
+    typeof native.utf8WriteInto === 'function' ? native.utf8WriteInto : null;
+  var NATIVE_BYTEOP_MIN = 64; // bytes; below this, stay in JS
 
   // node:buffer length limits. MAX_STRING_LENGTH is V8's string cap. MAX_LENGTH is
   // the largest buffer this runtime will allocate: native computes the practical
@@ -340,11 +351,26 @@
     return value;
   }
 
+  // One cached DataView per Buffer rather than a fresh allocation on every numeric
+  // read/write. A Buffer's (buffer, byteOffset, byteLength) is fixed for its
+  // lifetime, so the view stays valid; the WeakMap keeps no Buffer alive and adds
+  // no observable own property. This removes the per-accessor allocation that drove
+  // GC pressure in tight binary-parsing loops — without the correctness traps of
+  // hand-rolled bitwise math (readUInt32 would need >>>0, signed reads need
+  // sign-extension, and floats can't be reinterpreted bitwise in JS at all).
+  var dataViewCache = new WeakMap();
   function viewOf(buf) {
-    return new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    var dv = dataViewCache.get(buf);
+    if (dv === undefined) {
+      dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+      dataViewCache.set(buf, dv);
+    }
+    return dv;
   }
 
   function compareBytes(a, b) {
+    if (nativeCompare !== null && (a.length >= NATIVE_BYTEOP_MIN || b.length >= NATIVE_BYTEOP_MIN))
+      return nativeCompare(a, b);
     var n = Math.min(a.length, b.length);
     for (var i = 0; i < n; i++) {
       if (a[i] < b[i]) return -1;
@@ -370,6 +396,11 @@
         ? clampIndex(byteOffset, buf.length, 0)
         : Math.min(clampIndex(byteOffset, buf.length, buf.length), buf.length);
     var start = clampIndex(byteOffset, buf.length, forward ? 0 : buf.length);
+    // Native byte search (Rabin-Karp) for large buffers; the empty-needle and
+    // clamping rules above stay in JS, so native only sees a non-empty needle.
+    if (nativeIndexOf !== null && buf.length >= NATIVE_BYTEOP_MIN && needle.length <= buf.length) {
+      return nativeIndexOf(buf, needle, start, forward);
+    }
     if (forward) {
       for (var i = start; i <= buf.length - needle.length; i++) {
         var ok = true;
@@ -598,14 +629,26 @@
           length = undefined;
         }
       }
-      var bytes = strToBytes(String(string), encoding || 'utf8');
+      var enc = normalizeEncoding(encoding || 'utf8');
+      var remaining = this.length - offset;
+      // UTF-8 fast path: encode straight into this buffer — no throwaway
+      // intermediate Uint8Array, no JS copy loop. maxLength is capped exactly as
+      // the fallback caps `length` below, so the byte count is identical (the
+      // native side truncates to it, possibly mid-character, like Node).
+      if (enc === 'utf8' && nativeUtf8WriteInto !== null) {
+        var max = length === undefined ? remaining : toInteger(length, 0);
+        if (max > remaining) max = remaining;
+        if (max <= 0) return 0;
+        return nativeUtf8WriteInto(this, String(string), offset, max);
+      }
+      var bytes = strToBytes(String(string), enc);
       length =
         length === undefined
           ? bytes.length
           : Math.min(toInteger(length, bytes.length), bytes.length);
-      length = Math.min(length, this.length - offset);
+      length = Math.min(length, remaining);
       if (length < 0) length = 0;
-      for (var i = 0; i < length; i++) this[offset + i] = bytes[i];
+      if (length > 0) this.set(bytes.subarray(0, length), offset);
       return length;
     }
 
@@ -1301,6 +1344,9 @@
     var bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : input;
     if (!(bytes instanceof Uint8Array))
       throw new TypeError('input must be a Buffer, ArrayBuffer, or TypedArray');
+    // Native strict validator (no allocation) when available; the JS fallback
+    // decodes to a string and re-encodes, which agrees on validity but allocates.
+    if (nativeIsValidUtf8 !== null) return nativeIsValidUtf8(bytes);
     return Buffer.from(bytesToString(bytes, 'utf8'), 'utf8').equals(Buffer.from(bytes));
   }
 
@@ -1317,19 +1363,36 @@
     return globalThis.process && globalThis.process.platform === 'win32' ? '\r\n' : '\n';
   }
 
-  // Only string parts are subject to line-ending conversion; binary parts (Blob,
-  // ArrayBuffer, views) are copied verbatim.
-  function blobPartToBytes(part, nativeEndings) {
-    if (part instanceof Blob) return part._bytes;
-    if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
+  // Returns a part's bytes as an array of Uint8Array chunks (never one giant
+  // copy): a Blob part contributes its existing immutable chunks by reference, so
+  // nesting Blobs adds no allocation. Only string parts are subject to line-ending
+  // conversion; binary parts (Blob, ArrayBuffer, views) are copied verbatim.
+  function blobPartToChunks(part, nativeEndings) {
+    if (part instanceof Blob) return part._parts; // shared, immutable
+    if (part instanceof ArrayBuffer) return [new Uint8Array(part.slice(0))];
     if (ArrayBuffer.isView(part)) {
-      return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+      return [
+        new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength)),
+      ];
     }
     var str = String(part);
     // Node converts "\n" and "\r\n" to the native newline but leaves a lone "\r"
     // untouched, i.e. /\r?\n/ rather than every CR.
     if (nativeEndings) str = str.replace(/\r?\n/g, nativeEol());
-    return new Uint8Array(Buffer.from(str, 'utf8'));
+    return [new Uint8Array(Buffer.from(str, 'utf8'))];
+  }
+
+  // Concatenate a Blob's chunks into one contiguous Uint8Array. Only the methods
+  // that must yield the whole content (arrayBuffer/bytes/text) call this; the
+  // constructor, size, stream, and slice never materialize the full blob.
+  function blobJoin(parts, total) {
+    var merged = new Uint8Array(total),
+      off = 0;
+    for (var i = 0; i < parts.length; i++) {
+      merged.set(parts[i], off);
+      off += parts[i].length;
+    }
+    return merged;
   }
 
   function normalizeBlobType(options) {
@@ -1344,6 +1407,10 @@
 
   function Blob(parts, options) {
     if (!(this instanceof Blob)) throw new TypeError("Constructor Blob requires 'new'");
+    // Store the parts as a list of chunks instead of eagerly concatenating them
+    // into one contiguous buffer. A Blob built from ten 100 MB parts costs ~0 extra
+    // memory at construction; the bytes are only joined on demand by
+    // arrayBuffer()/bytes()/text(), and stream() emits them chunk by chunk.
     var chunks = [],
       total = 0;
     if (parts !== undefined && parts !== null) {
@@ -1355,23 +1422,21 @@
       var nativeEndings = !!(options && options.endings === 'native');
       var list = Array.from(parts);
       for (var i = 0; i < list.length; i++) {
-        var bytes = blobPartToBytes(list[i], nativeEndings);
-        chunks.push(bytes);
-        total += bytes.length;
+        var cs = blobPartToChunks(list[i], nativeEndings);
+        for (var j = 0; j < cs.length; j++) {
+          if (cs[j].length === 0) continue; // empty parts contribute nothing
+          chunks.push(cs[j]);
+          total += cs[j].length;
+        }
       }
     }
-    var merged = new Uint8Array(total),
-      off = 0;
-    for (var j = 0; j < chunks.length; j++) {
-      merged.set(chunks[j], off);
-      off += chunks[j].length;
-    }
-    Object.defineProperty(this, '_bytes', { value: merged });
+    Object.defineProperty(this, '_parts', { value: chunks });
+    Object.defineProperty(this, '_size', { value: total });
     Object.defineProperty(this, '_type', { value: normalizeBlobType(options) });
   }
   Object.defineProperty(Blob.prototype, 'size', {
     get: function () {
-      return this._bytes.length;
+      return this._size; // O(1); no materialization
     },
     configurable: true,
   });
@@ -1382,38 +1447,52 @@
     configurable: true,
   });
   Blob.prototype.arrayBuffer = function () {
-    var b = this._bytes;
-    return Promise.resolve(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
+    // The merged Uint8Array owns a buffer sized exactly to _size, so its .buffer is
+    // already the right ArrayBuffer to hand back (a private copy of the contents).
+    return Promise.resolve(blobJoin(this._parts, this._size).buffer);
   };
   Blob.prototype.bytes = function () {
-    return Promise.resolve(new Uint8Array(this._bytes));
+    return Promise.resolve(blobJoin(this._parts, this._size));
   };
-  // stream() returns a WHATWG ReadableStream that emits the Blob's bytes. Node
-  // delivers an in-memory Blob as a single Uint8Array chunk, then closes; we do
-  // the same. The chunk is a fresh copy (new Uint8Array(...)), so a consumer that
-  // mutates a read chunk cannot write back into the Blob's immutable bytes —
-  // matching Node, whose chunk is also a copy. node:stream/web is required
-  // lazily here because it loads after node:buffer (see internal/loader.js), so
-  // it is not available at this module's evaluation time.
+  // stream() returns a WHATWG ReadableStream that emits the Blob's bytes. We emit
+  // each stored part as its own chunk (a fresh copy, so a consumer mutating a read
+  // chunk can't write back into the Blob's immutable bytes), then close — Node
+  // streams an in-memory Blob the same chunked way and likewise never materializes
+  // the whole thing. node:stream/web is required lazily because it loads after
+  // node:buffer (see internal/loader.js), so it is not available at eval time.
   Blob.prototype.stream = function () {
-    var bytes = this._bytes;
+    var parts = this._parts;
     var ReadableStream = require('node:stream/web').ReadableStream;
     return new ReadableStream({
       start: function (controller) {
-        if (bytes.length > 0) controller.enqueue(new Uint8Array(bytes));
+        for (var i = 0; i < parts.length; i++) controller.enqueue(new Uint8Array(parts[i]));
         controller.close();
       },
     });
   };
   Blob.prototype.text = function () {
-    return Promise.resolve(Buffer.from(this._bytes).toString('utf8'));
+    return Promise.resolve(Buffer.from(blobJoin(this._parts, this._size)).toString('utf8'));
   };
   Blob.prototype.slice = function (start, end, contentType) {
-    var len = this._bytes.length;
+    var len = this._size;
     var s = start === undefined ? 0 : start < 0 ? Math.max(len + start, 0) : Math.min(start, len);
     var e = end === undefined ? len : end < 0 ? Math.max(len + end, 0) : Math.min(end, len);
-    var sub = this._bytes.subarray(s, Math.max(e, s));
-    return new Blob([sub], contentType === undefined ? undefined : { type: contentType });
+    if (e < s) e = s;
+    // Collect only the chunks overlapping [s, e) and copy just that range — slicing
+    // a huge blob never materializes the whole thing. Each pushed subarray is a
+    // view; the Blob constructor copies it (ArrayBuffer.isView path) to the new blob.
+    var out = [];
+    var pos = 0;
+    var parts = this._parts;
+    for (var i = 0; i < parts.length && pos < e; i++) {
+      var part = parts[i];
+      var pEnd = pos + part.length;
+      if (pEnd > s) {
+        out.push(part.subarray(pos < s ? s - pos : 0, pEnd > e ? e - pos : part.length));
+      }
+      pos = pEnd;
+    }
+    return new Blob(out, contentType === undefined ? undefined : { type: contentType });
   };
   Blob.prototype.toString = function () {
     return '[object Blob]';

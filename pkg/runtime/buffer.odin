@@ -1,12 +1,14 @@
 package lava_runtime
 
 import "base:runtime"
+import "core:bytes"
 import "core:c"
 import "core:encoding/base64"
 import "core:encoding/hex"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:unicode/utf8"
 import jsc "lava:pkg/jsc"
 
 // Native codec backing for the node:buffer built-in. The hand-rolled JS
@@ -160,7 +162,7 @@ decode_utf8_to_utf16_whatwg :: proc "contextless" (data: []byte, out: []u16) -> 
 	// byte. The slow loop below has the same shortcut for ASCII that resumes after
 	// a multi-byte sequence.
 	for i < len(data) && data[i] <= 0x7F {
-		out[n] = u16(data[i]);n += 1
+		out[n] = u16(data[i]); n += 1
 		i += 1
 	}
 
@@ -174,38 +176,38 @@ decode_utf8_to_utf16_whatwg :: proc "contextless" (data: []byte, out: []u16) -> 
 		b := data[i]
 		if bytes_needed == 0 {
 			if b <= 0x7F { 	// ASCII resumes after a completed multi-byte sequence
-				out[n] = u16(b);n += 1
+				out[n] = u16(b); n += 1
 				i += 1
 				continue
 			}
 			switch {
 			case b >= 0xC2 && b <= 0xDF:
-				bytes_needed = 1;code_point = u32(b & 0x1F)
+				bytes_needed = 1; code_point = u32(b & 0x1F)
 				i += 1
 			case b >= 0xE0 && b <= 0xEF:
 				if b == 0xE0 do lower = 0xA0 // exclude overlong < U+0800
 				if b == 0xED do upper = 0x9F // exclude UTF-16 surrogates
-				bytes_needed = 2;code_point = u32(b & 0x0F)
+				bytes_needed = 2; code_point = u32(b & 0x0F)
 				i += 1
 			case b >= 0xF0 && b <= 0xF4:
 				if b == 0xF0 do lower = 0x90 // exclude overlong < U+10000
 				if b == 0xF4 do upper = 0x8F // exclude > U+10FFFF
-				bytes_needed = 3;code_point = u32(b & 0x07)
+				bytes_needed = 3; code_point = u32(b & 0x07)
 				i += 1
 			case:
 				// Invalid lead byte (0x80..0xC1, 0xF5..0xFF): one replacement.
-				out[n] = 0xFFFD;n += 1
+				out[n] = 0xFFFD; n += 1
 				i += 1
 			}
 		} else {
 			if b < lower || b > upper {
 				// Invalid continuation: flush a replacement for the bytes seen so
 				// far, reset state, and re-process this byte (do not advance i).
-				code_point = 0;bytes_needed = 0;bytes_seen = 0
-				lower = 0x80;upper = 0xBF
-				out[n] = 0xFFFD;n += 1
+				code_point = 0; bytes_needed = 0; bytes_seen = 0
+				lower = 0x80; upper = 0xBF
+				out[n] = 0xFFFD; n += 1
 			} else {
-				lower = 0x80;upper = 0xBF
+				lower = 0x80; upper = 0xBF
 				code_point = (code_point << 6) | u32(b & 0x3F)
 				bytes_seen += 1
 				i += 1
@@ -213,14 +215,14 @@ decode_utf8_to_utf16_whatwg :: proc "contextless" (data: []byte, out: []u16) -> 
 					// #force_inline: hot path, but keep emit_utf16 a single named unit
 					// (no duplicated surrogate-pair logic).
 					n += #force_inline emit_utf16(out[n:], code_point)
-					code_point = 0;bytes_needed = 0;bytes_seen = 0
+					code_point = 0; bytes_needed = 0; bytes_seen = 0
 				}
 			}
 		}
 	}
 	// Unfinished trailing sequence at end of input -> a single replacement.
 	if bytes_needed != 0 {
-		out[n] = 0xFFFD;n += 1
+		out[n] = 0xFFFD; n += 1
 	}
 	return n
 }
@@ -317,6 +319,133 @@ max_buffer_alloc_bytes :: proc() -> f64 {
 	return DEFAULT_MAX_BUFFER_BYTES
 }
 
+// compare(a, b) -> -1 | 0 | 1. Native lexicographic byte comparison with the
+// shorter-array-is-less tiebreak — the same total order as the JS compareBytes
+// fallback, but a single native pass instead of a JS loop. The JS layer only
+// routes here once at least one input is past a small size threshold (the FFI
+// crossing costs more than a JS loop for tiny buffers). Both views are read in
+// place; nothing is allocated.
+buffer_compare_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 2 do return jsc.JSValueMakeNumber(ctx, 0)
+	a, aok := typed_array_view(ctx, arguments[0])
+	b, bok := typed_array_view(ctx, arguments[1])
+	if !aok || !bok do return jsc.JSValueMakeNumber(ctx, 0)
+	n := min(len(a), len(b))
+	for i in 0 ..< n {
+		if a[i] < b[i] do return jsc.JSValueMakeNumber(ctx, -1)
+		if a[i] > b[i] do return jsc.JSValueMakeNumber(ctx, 1)
+	}
+	if len(a) < len(b) do return jsc.JSValueMakeNumber(ctx, -1)
+	if len(a) > len(b) do return jsc.JSValueMakeNumber(ctx, 1)
+	return jsc.JSValueMakeNumber(ctx, 0)
+}
+
+// indexOf(haystack, needle, start, forward) -> absolute index | -1. Native byte
+// search backing buf.indexOf / lastIndexOf / includes for large buffers, using
+// core:bytes' Rabin-Karp instead of the JS O(n*m) double loop. The JS layer keeps
+// Node's empty-needle and offset-clamping semantics and only calls here for a
+// non-empty needle; `start` is the first index to consider (forward) or the
+// highest index a match may start at (backward). Views are read in place.
+buffer_index_of_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 4 do return jsc.JSValueMakeNumber(ctx, -1)
+	hay, hok := typed_array_view(ctx, arguments[0])
+	needle, nok := typed_array_view(ctx, arguments[1])
+	if !hok || !nok do return jsc.JSValueMakeNumber(ctx, -1)
+	nlen := len(needle)
+	hlen := len(hay)
+	if nlen == 0 || nlen > hlen do return jsc.JSValueMakeNumber(ctx, -1)
+	start := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
+	forward := jsc.JSValueToBoolean(ctx, arguments[3])
+	if forward {
+		s := start
+		if s < 0 do s = 0
+		if s > hlen do return jsc.JSValueMakeNumber(ctx, -1)
+		idx := bytes.index(hay[s:], needle)
+		if idx < 0 do return jsc.JSValueMakeNumber(ctx, -1)
+		return jsc.JSValueMakeNumber(ctx, f64(s + idx))
+	}
+	// Backward: search the window [0, start+nlen) so the last match within it
+	// starts at the largest k <= start. bytes.last_index returns an absolute index
+	// (the window begins at 0) or -1.
+	end := start + nlen
+	if end > hlen do end = hlen
+	if end < nlen do return jsc.JSValueMakeNumber(ctx, -1)
+	return jsc.JSValueMakeNumber(ctx, f64(bytes.last_index(hay[:end], needle)))
+}
+
+// isValidUtf8(bytes) -> bool. Strict UTF-8 validation (rejects overlong forms,
+// surrogate-range code points, and truncated sequences) via core:unicode/utf8's
+// allocation-free validator. Replaces the JS round-trip in buffer.isUtf8 (decode
+// to a string, re-encode, compare) that TextDecoder fatal mode also leans on; the
+// view is validated in place with no string or buffer allocation.
+buffer_is_valid_utf8_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return jsc.JSValueMakeBoolean(ctx, true)
+	data, ok := typed_array_view(ctx, arguments[0])
+	if !ok do return jsc.JSValueMakeBoolean(ctx, false)
+	if len(data) == 0 do return jsc.JSValueMakeBoolean(ctx, true)
+	return jsc.JSValueMakeBoolean(ctx, b32(utf8.valid_string(string(data))))
+}
+
+// utf8WriteInto(target, string, offset, maxLength) -> bytesWritten. Encodes the
+// string to UTF-8 (JSC already produced those bytes when the value was read) and
+// copies up to maxLength of them straight into the caller's Buffer at offset —
+// eliminating the throwaway intermediate Uint8Array and the JS copy loop that
+// Buffer.prototype.write previously paid on every utf8 write. Truncation matches
+// the old strToBytes-then-copy path (a multibyte char may be cut at the
+// maxLength / remaining-space boundary); the JS layer computes maxLength so the
+// returned count equals the prior result.
+buffer_utf8_write_into_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 4 do return jsc.JSValueMakeNumber(ctx, 0)
+	target, tok := typed_array_view(ctx, arguments[0])
+	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
+	str, alloc := jsc_value_to_string_or_default(ctx, arguments[1])
+	defer if alloc do delete(str, context.allocator)
+	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
+	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
+	if offset < 0 do offset = 0
+	if offset > len(target) do offset = len(target)
+	avail := len(target) - offset
+	n := len(str)
+	if n > max do n = max
+	if n > avail do n = avail
+	if n <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	src := transmute([]byte)str
+	copy(target[offset:offset + n], src[:n])
+	return jsc.JSValueMakeNumber(ctx, f64(n))
+}
+
 // make_buffer_bindings builds the `native` object handed to js/internal/buffer.js.
 make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
@@ -327,6 +456,10 @@ make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "utf8Encode", buffer_utf8_encode_cb)
 	inject_native_function(ctx, bindings, "utf8Decode", buffer_utf8_decode_cb)
 	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
+	inject_native_function(ctx, bindings, "compare", buffer_compare_cb)
+	inject_native_function(ctx, bindings, "indexOf", buffer_index_of_cb)
+	inject_native_function(ctx, bindings, "isValidUtf8", buffer_is_valid_utf8_cb)
+	inject_native_function(ctx, bindings, "utf8WriteInto", buffer_utf8_write_into_cb)
 	// The practical allocation ceiling; buffer.js reads it as kMaxLength (the
 	// Bun-parity 4 GiB) and enforces it on Buffer paths before `new Buffer(size)`
 	// reaches JSC.
