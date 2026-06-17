@@ -741,6 +741,23 @@ async function main() {
   }
   console.log('dns failure rejected:', dnsFailed);
 
+  // Bounded DNS pool (#77): more concurrent hostname lookups than pool workers
+  // must all still resolve (queued, not dropped). localhost resolves on every host
+  // and both runtimes reach the loopback server. allSettled keeps the assertion
+  // robust — if a host somehow cannot resolve localhost, both runtimes report the
+  // same (zero) success count, so the smoke stays in lockstep.
+  {
+    const port = new URL(base).port;
+    const N = 12;
+    const settled = await Promise.allSettled(
+      Array.from({ length: N }, () =>
+        fetch('http://localhost:' + port + '/a').then((r) => r.text()),
+      ),
+    );
+    const ok = settled.filter((r) => r.status === 'fulfilled' && r.value === 'AAA').length;
+    console.log('dns pool concurrency:', ok === N);
+  }
+
   // Pre-aborted signal rejects immediately with an AbortError, never connects.
   let preAbortName = '';
   try {

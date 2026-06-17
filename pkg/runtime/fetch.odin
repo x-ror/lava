@@ -4,7 +4,6 @@ import "base:runtime"
 import "core:c"
 import "core:strconv"
 import "core:strings"
-import "core:thread"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 
@@ -102,11 +101,11 @@ Fetch_Request :: struct {
 	request_bytes: []byte,
 	write_offset:  int,
 
-	// Async DNS result, written by the resolver worker thread and read by the loop
-	// after post_async publishes it (see fetch_linux.odin). IPv4-only for now.
-	dns_ip4:       [4]u8,
-	dns_ok:        bool,
-	dns_worker:    ^thread.Thread,
+	// DNS for a hostname runs on the bounded resolver pool (#77, fetch_dns_pool.odin):
+	// the lookup result lives on the pool's DNS_Job, not on the request, and the
+	// connect is driven from fetch_dns_pool_complete_cb on the loop thread. While a
+	// lookup is outstanding the request is pinned via drive_pending (so a cancel
+	// mid-lookup cannot free it under the pending completion).
 	response:      [dynamic]byte, // accumulates bytes until the header terminator is found
 	watcher:       eventloop.IO_Watcher,
 	fd:            uintptr,
@@ -888,7 +887,10 @@ fetch_reject_now :: proc(ctx: jsc.JSContextRef, on_error: jsc.JSObjectRef, messa
 // inert immediately; unwatch_fd then truly cancels the io_uring poll (#183).
 fetch_request_finish :: proc(req: ^Fetch_Request) {
 	if req.settled do return
-	fetch_release_dns_worker(req)
+	// A DNS lookup may still be outstanding on the pool. We do NOT block to join it
+	// (the pool owns the worker lifetime); the request stays pinned via drive_pending
+	// — bumped at submit — so the pending completion finds live memory, sees
+	// req.settled, and reclaims it. See fetch_dns_pool.odin.
 	req.settled = true
 	// Stamp the settle iteration so fetch_reclaim_pending holds this request a couple
 	// of loop ticks — past the in-flight platform_poll batch that may still carry a
@@ -985,42 +987,28 @@ fetch_untrack_active :: proc(state: ^Runtime_State, req: ^Fetch_Request) {
 	}
 }
 
-// fetch_release_dns_worker joins and frees a request's DNS resolver thread, and is
-// a no-op once released (idempotent across the completion, cancel, and shutdown
-// paths). Loop-thread only.
-//
-// COST: thread.join BLOCKS the loop thread until the worker's proc returns. On the
-// normal path the worker has already posted its completion and is about to exit, so
-// this is effectively free. But on cancel-while-resolving (clear via the cancel
-// handle) and teardown-while-resolving, the worker is still inside a blocking
-// getaddrinfo with no cancellation, so the loop — and the whole process — parks
-// until the system resolver returns or times out. fetch_shutdown_active joins
-// serially, so N in-flight lookups can serialize. This is the simplest CORRECT
-// guarantee that no worker posts into a freed loop; a non-blocking handoff (worker
-// owns its inputs + a refcounted loop guard, or a cancellable resolver) is the
-// proper fix and is left as a tracked follow-up.
-fetch_release_dns_worker :: proc(req: ^Fetch_Request) {
-	if req == nil || req.dns_worker == nil do return
-	thread.join(req.dns_worker)
-	thread.destroy(req.dns_worker)
-	req.dns_worker = nil
-}
-
 // fetch_shutdown_active stops every in-flight request without invoking its JS
 // callbacks. It is used while the JS context is still alive but eval is already
-// returning (for example after a top-level throw). DNS workers are joined before
-// the request is finished so no background thread can post into a destroyed loop.
+// returning (for example after a top-level throw). After the requests are settled
+// it stops and joins the DNS resolver pool, so no background worker can post into a
+// loop about to be destroyed — the join blocks only on at most FETCH_DNS_POOL_SIZE
+// in-flight blocking resolves (see fetch_dns_pool.odin).
 //
 // Idempotent and intentionally called from several teardown entry points (eval's
 // deferred teardown, destroy_runtime_state, and fetch_destroy_pending): each
-// fetch_request_finish untracks its request, so a second pass sees an empty set.
+// fetch_request_finish untracks its request, so a second pass sees an empty set,
+// and fetch_dns_pool_shutdown is a no-op once the pool is stopped.
 fetch_shutdown_active :: proc(state: ^Runtime_State) {
 	if state == nil do return
 	for len(state.active_fetches) > 0 {
 		req := state.active_fetches[0]
-		fetch_release_dns_worker(req)
 		fetch_request_finish(req)
 	}
+	// Settle first (above), then quiesce the pool: any completion a worker posts
+	// during the join lands in the loop's async queue and is dropped at teardown
+	// (the request it targets is already settled), and the worker's job is freed by
+	// the shutdown rather than the (never-run) completion.
+	fetch_dns_pool_shutdown()
 }
 
 // fetch_free_request releases a settled request's owned allocations.

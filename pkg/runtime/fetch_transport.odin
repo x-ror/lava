@@ -3,7 +3,6 @@ package lava_runtime
 
 import "core:net"
 import "core:strings"
-import "core:thread"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 
@@ -26,10 +25,10 @@ Fetch_IO_Result :: enum {
 }
 
 // fetch_transport_start begins a request. An IPv6/IPv4 literal connects
-// synchronously; a hostname is resolved on a background thread and the connect is
-// deferred to fetch_dns_complete_cb (run back on the loop thread via post_async).
-// Returns ok=false with a message only for an immediate failure; the async path
-// returns ok=true and settles later.
+// synchronously; a hostname is resolved on the bounded DNS pool and the connect is
+// deferred to fetch_dns_pool_complete_cb (run back on the loop thread via
+// post_async). Returns ok=false with a message only for an immediate failure; the
+// async path returns ok=true and settles later.
 fetch_transport_start :: proc(
 	req: ^Fetch_Request,
 	host: string,
@@ -58,50 +57,20 @@ fetch_transport_start :: proc(
 		return fetch_connect_ip4(req, transmute([4]u8)ip4, port)
 	}
 
-	// A hostname: resolve off the loop. async_begin keeps the loop alive while the
-	// worker runs; the worker posts fetch_dns_complete_cb back to the loop thread.
-	// It must precede the spawn (the worker may post before this returns), so on a
-	// spawn failure we undo it — otherwise the loop would block forever on an
-	// in-flight count that never clears, and the fetch would never settle.
+	// A hostname: resolve off the loop via the bounded DNS pool (#77,
+	// fetch_dns_pool.odin). async_begin keeps the loop alive while the lookup runs;
+	// drive_pending pins the request so a cancel mid-lookup cannot free it before the
+	// completion runs. Both must precede the submit (a worker may post the completion
+	// before this returns); on a submit failure we undo them so the loop is not kept
+	// alive forever and the fetch settles.
 	eventloop.async_begin(req.loop)
-	worker := thread.create_and_start_with_data(req, fetch_dns_worker, nil, .Normal, false)
-	if worker == nil {
+	req.drive_pending += 1
+	if !fetch_dns_pool_submit(req, host) {
+		req.drive_pending -= 1
 		eventloop.async_cancel(req.loop)
-		return false, "fetch: could not start DNS resolver thread"
+		return false, "fetch: could not start DNS resolver"
 	}
-	req.dns_worker = worker
 	return true, ""
-}
-
-// fetch_dns_worker runs on a background thread: it resolves the host (blocking
-// getaddrinfo, off the loop), stashes the result on the request, and posts the
-// continuation back to the loop. It must not touch the request after post_async.
-fetch_dns_worker :: proc(data: rawptr) {
-	req := cast(^Fetch_Request)data
-	if ep, dns_err := net.resolve_ip4(req.host); dns_err == nil {
-		if ip4, ip_ok := ep.address.(net.IP4_Address); ip_ok {
-			req.dns_ip4 = transmute([4]u8)ip4
-			req.dns_ok = true
-		}
-	}
-	free_all(context.temp_allocator) // release this worker's resolver scratch
-	eventloop.post_async(req.loop, fetch_dns_complete_cb, req)
-}
-
-// fetch_dns_complete_cb runs on the loop thread once DNS finishes: it connects to
-// the resolved address (or rejects on failure). Reading req.dns_* here is safe —
-// post_async published the worker's writes.
-fetch_dns_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
-	req := cast(^Fetch_Request)user_data
-	fetch_release_dns_worker(req)
-	if req == nil || req.settled do return
-	if !req.dns_ok {
-		fetch_settle_error(req, "fetch: could not resolve host")
-		return
-	}
-	if connected, conn_err := fetch_connect_ip4(req, req.dns_ip4, req.port); !connected {
-		fetch_settle_error(req, conn_err)
-	}
 }
 
 // fetch_register_socket records the connecting socket on the request and watches
