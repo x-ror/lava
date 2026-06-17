@@ -145,9 +145,9 @@ emit_utf16 :: proc "contextless" (out: []u16, cp: u32) -> int {
 // difference from a naive per-byte decode is the handling of an *invalid
 // continuation* byte: the in-progress sequence emits a single U+FFFD and the
 // offending byte is then re-processed as a potential new lead, so an ill-formed
-// subsequence collapses to one replacement rather than one per byte. (Per-byte
-// replacement is what the previous utf16.encode_string-over-string path did,
-// e.g. Buffer.from([0xF0,0x9F]) -> "��" instead of Node's "�".)
+// subsequence collapses to one replacement rather than one per byte. A naive
+// per-byte decoder would instead emit one U+FFFD for each bad byte
+// (Buffer.from([0xF0,0x9F]) -> "��", where Node yields "�").
 // Embedded NULs are preserved. `out` must hold at least len(data)+1 units: every
 // emitted unit is charged to >= 1 consumed input byte, and an astral scalar
 // costs 2 units but 4 bytes, so the count never exceeds len(data) (+1 covers the

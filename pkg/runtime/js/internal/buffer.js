@@ -134,7 +134,7 @@
   // readIntLE/BE, writeUIntLE/BE, writeIntLE/BE). Node requires an integer in
   // 1..6: a missing/non-numeric byteLength is ERR_INVALID_ARG_TYPE, a fractional
   // one is ERR_OUT_OF_RANGE ("an integer"), and 0 / >6 is ERR_OUT_OF_RANGE
-  // (">= 1 and <= 6"). Lava previously skipped this and returned 0 / garbage.
+  // (">= 1 and <= 6").
   function validateByteLength(byteLength) {
     if (typeof byteLength !== 'number')
       throw errInvalidArgType('byteLength', 'of type number', byteLength);
@@ -192,11 +192,11 @@
     return e;
   }
 
-  // assertSize guards Buffer.alloc/allocUnsafe. Negative or non-numeric sizes
-  // previously slipped through `size >>> 0` and asked for a multi-gigabyte
-  // allocation (OOM); Node throws here instead. A size beyond K_MAX_LENGTH also
-  // throws (rather than aborting JSC). Fractional sizes are allowed — the
-  // Uint8Array constructor truncates them, matching Node.
+  // assertSize guards Buffer.alloc/allocUnsafe. A negative or non-numeric size
+  // throws ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE rather than reaching the
+  // Uint8Array constructor as a multi-gigabyte (or NaN) allocation, and a size
+  // beyond K_MAX_LENGTH throws rather than aborting JSC. Fractional sizes are
+  // allowed — the Uint8Array constructor truncates them, matching Node.
   function assertSize(size) {
     if (typeof size !== 'number') throw errInvalidArgType('size', 'number', size);
     if (!(size >= 0 && size <= K_MAX_LENGTH))
@@ -545,11 +545,11 @@
     }
 
     copy(target, targetStart, sourceStart, sourceEnd) {
-      // Node validates each index with toInteger (so a fractional index is
-      // floored, NOT rejected) and throws ERR_OUT_OF_RANGE for negatives. The
-      // upper bounds are clamped rather than thrown: a targetStart past the
-      // target, or sourceStart >= sourceEnd, copies nothing. Lava previously ran
-      // every index through clampIndex, so negatives wrapped from the end.
+      // Each index is coerced with toInteger (so a fractional index is floored,
+      // NOT rejected) and a negative one throws ERR_OUT_OF_RANGE — a negative
+      // offset is an error, not an index from the end. The upper bounds are
+      // clamped rather than thrown: a targetStart past the target, or
+      // sourceStart >= sourceEnd, copies nothing.
       if (!(target instanceof Uint8Array))
         throw errInvalidArgType('target', 'an instance of Buffer or Uint8Array', target);
       if (targetStart === undefined) {
@@ -666,10 +666,9 @@
       else end = validateWriteOffset(+end, this.length, 'end');
       // Resolve the repeating fill pattern. A number/boolean masks to one byte; a
       // Uint8Array is used as-is. A string is encoded with `encoding` (an unknown
-      // encoding throws ERR_UNKNOWN_ENCODING via strToBytes). Node fills the empty
-      // string with a single 0 byte, but treats any other zero-byte source (bad
-      // hex, an empty Buffer) as ERR_INVALID_ARG_VALUE — Lava previously zero-
-      // filled all of these instead of throwing.
+      // encoding throws ERR_UNKNOWN_ENCODING via strToBytes). The empty string
+      // fills with a single 0 byte, but any other source that yields zero bytes
+      // (bad hex, an empty Buffer) is ERR_INVALID_ARG_VALUE.
       var bytes;
       if (typeof value === 'number') {
         bytes = new Uint8Array([value & 0xff]);
@@ -1268,9 +1267,8 @@
     return Buffer.from(Array.prototype.slice.call(arguments));
   };
 
-  // Default pool size. Node raised this from 8192 to 65536 in v26.3.0; Lava
-  // tracks the newer default. (Bun and Node <= 25 still default to 8192, so this
-  // is a deliberate node>=26 choice — kMaxLength stays the JSC-family 4 GiB.)
+  // Default pool size, matching Node >= 26.3 (Node <= 25 and Bun default to
+  // 8192). It may be reassigned; kMaxLength stays the JSC-family 4 GiB.
   Buffer.poolSize = 65536;
 
   // Build the initial pool now that Buffer.poolSize is set. Nothing in this
@@ -1329,7 +1327,7 @@
     }
     var str = String(part);
     // Node converts "\n" and "\r\n" to the native newline but leaves a lone "\r"
-    // untouched (i.e. /\r?\n/, not every CR) — verified against Node.
+    // untouched, i.e. /\r?\n/ rather than every CR.
     if (nativeEndings) str = str.replace(/\r?\n/g, nativeEol());
     return new Uint8Array(Buffer.from(str, 'utf8'));
   }
