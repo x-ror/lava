@@ -42,6 +42,10 @@ DNS_Job :: struct {
 	req:        ^Fetch_Request,
 	addrs:      [2]Fetch_Addr,
 	addr_count: int,
+	// Set (under pool.mutex) when the owning request is aborted while this job is
+	// still queued; a worker that dequeues a cancelled job skips the blocking
+	// resolve and hands it straight back, so an aborted fetch does no DNS work.
+	cancelled:  bool,
 }
 
 Fetch_DNS_Pool :: struct {
@@ -68,6 +72,8 @@ fetch_dns_pool_submit :: proc(req: ^Fetch_Request, host: string) -> bool {
 	job.host = strings.clone(host)
 	job.loop = req.loop
 	job.req = req
+	// Back-pointer so an abort before the worker picks this up can cancel it.
+	req.dns_job = job
 	// outstanding is mutated only on the loop thread (here, the completion, and
 	// teardown), so it needs no lock; pending is shared with the workers.
 	append(&pool.outstanding, job)
@@ -105,32 +111,42 @@ fetch_dns_pool_worker :: proc(data: rawptr) {
 			sync.unlock(&pool.mutex)
 			return
 		}
-		job := pop(&pool.pending) // LIFO — resolution order does not matter
+		// FIFO: take the oldest queued job so a sustained burst of new submissions
+		// cannot starve an early request behind them. The queue stays small, so the
+		// O(n) shift in pop_front is negligible.
+		job := pop_front(&pool.pending)
+		// Read the cancel flag under the same mutex that sets it, so a job aborted
+		// while queued is observed here; a job already past this point (being
+		// resolved) cannot be interrupted, but that is bounded to the pool size.
+		cancelled := job.cancelled
 		sync.unlock(&pool.mutex)
 
-		// Blocking resolution, off the loop. The worker writes only into `job`.
-		// net.resolve returns up to one IPv4 and one IPv6 endpoint and only errors
-		// when BOTH families fail, so an AAAA-only host still resolves (#145). The
-		// list is ordered A then AAAA; the connect path tries them in turn.
-		if ep4, ep6, dns_err := net.resolve(job.host); dns_err == nil {
-			if ip4, ip_ok := ep4.address.(net.IP4_Address); ip_ok {
-				job.addrs[job.addr_count] = Fetch_Addr {
-					is_v6 = false,
-					v4    = transmute([4]u8)ip4,
+		if !cancelled {
+			// Blocking resolution, off the loop. The worker writes only into `job`.
+			// net.resolve returns up to one IPv4 and one IPv6 endpoint and only errors
+			// when BOTH families fail, so an AAAA-only host still resolves (#145). The
+			// list is ordered A then AAAA; the connect path tries them in turn.
+			if ep4, ep6, dns_err := net.resolve(job.host); dns_err == nil {
+				if ip4, ip_ok := ep4.address.(net.IP4_Address); ip_ok {
+					job.addrs[job.addr_count] = Fetch_Addr {
+						is_v6 = false,
+						v4    = transmute([4]u8)ip4,
+					}
+					job.addr_count += 1
 				}
-				job.addr_count += 1
-			}
-			if ip6, ip_ok := ep6.address.(net.IP6_Address); ip_ok {
-				job.addrs[job.addr_count] = Fetch_Addr {
-					is_v6 = true,
-					v6    = ip6,
+				if ip6, ip_ok := ep6.address.(net.IP6_Address); ip_ok {
+					job.addrs[job.addr_count] = Fetch_Addr {
+						is_v6 = true,
+						v6    = ip6,
+					}
+					job.addr_count += 1
 				}
-				job.addr_count += 1
 			}
+			free_all(context.temp_allocator) // release this lookup's resolver scratch
 		}
-		free_all(context.temp_allocator) // release this lookup's resolver scratch
 		// Hand back to the loop thread. After this the worker must not touch the job
-		// — the completion (or teardown) owns it now.
+		// — the completion (or teardown) owns it now. A cancelled job still posts so
+		// the completion balances the request's drive_pending / loop keep-alive.
 		eventloop.post_async(job.loop, fetch_dns_pool_complete_cb, job)
 	}
 }
@@ -144,6 +160,9 @@ fetch_dns_pool_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	req := job.req
 	addrs := job.addrs
 	addr_count := job.addr_count
+	// Drop the back-pointer before the job is freed: a later abort must not reach a
+	// freed job (this completion and fetch_request_finish both run on the loop thread).
+	if req != nil do req.dns_job = nil
 	fetch_dns_pool_release_job(job)
 	if req == nil do return
 	req.drive_pending -= 1
@@ -175,19 +194,36 @@ fetch_dns_pool_release_job :: proc(job: ^DNS_Job) {
 	free(job)
 }
 
+// fetch_dns_pool_cancel_job marks a still-queued lookup as cancelled so its worker
+// skips the blocking resolve when it dequeues it (the owning request has already
+// settled). Loop-thread only. The flag is set under pool.mutex — the same lock a
+// worker holds when it reads it right after dequeuing — so a job that is already
+// being resolved (past the dequeue) is simply unaffected: best-effort for in-flight
+// lookups, guaranteed for ones still in the queue.
+fetch_dns_pool_cancel_job :: proc(job: ^DNS_Job) {
+	pool := &g_fetch_dns_pool
+	sync.lock(&pool.mutex)
+	job.cancelled = true
+	sync.unlock(&pool.mutex)
+}
+
 // fetch_dns_pool_shutdown stops the pool and joins its workers, so no worker can
 // post into a loop about to be destroyed. Loop-thread only; idempotent (a no-op
-// once stopped). The join blocks until any in-flight blocking resolve returns —
-// bounded to at most FETCH_DNS_POOL_SIZE lookups, the same blocking the old
-// per-request join had. After the join, any job whose completion was posted but
-// will be dropped by the loop teardown is freed here (its request is freed
-// separately by fetch_destroy_pending). Workers are recreated lazily on the next
-// lookup.
+// once stopped). Queued-but-unstarted jobs are dropped under the lock before the
+// workers are woken, so the join blocks only on lookups already in flight — at most
+// FETCH_DNS_POOL_SIZE, not the whole backlog. After the join, every outstanding job
+// (the dropped-queue ones plus any whose completion was posted but will be discarded
+// at loop teardown) is freed here; its request is freed separately by
+// fetch_destroy_pending. Workers are recreated lazily on the next lookup.
 fetch_dns_pool_shutdown :: proc() {
 	pool := &g_fetch_dns_pool
 	if !pool.started do return
 	sync.lock(&pool.mutex)
 	pool.stopping = true
+	// Detach the queued backlog before broadcasting: each worker then wakes to an
+	// empty queue and exits at once (it only blocks on a resolve it had already
+	// started). These jobs remain in `outstanding` and are freed by the loop below.
+	clear(&pool.pending)
 	sync.cond_broadcast(&pool.wake)
 	sync.unlock(&pool.mutex)
 	for t in pool.threads {
@@ -202,6 +238,5 @@ fetch_dns_pool_shutdown :: proc() {
 		free(job)
 	}
 	clear(&pool.outstanding)
-	clear(&pool.pending)
 	pool.started = false
 }

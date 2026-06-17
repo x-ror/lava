@@ -124,6 +124,10 @@ Fetch_Request :: struct {
 	addrs:         [2]Fetch_Addr,
 	addr_count:    int,
 	addr_index:    int,
+	// Back-pointer to this request's outstanding DNS job (nil unless a pool lookup
+	// is in flight), so an abort can cancel a still-queued lookup. Set by
+	// fetch_dns_pool_submit, cleared by its completion; loop-thread-only.
+	dns_job:       ^DNS_Job,
 	response:      [dynamic]byte, // accumulates bytes until the header terminator is found
 	watcher:       eventloop.IO_Watcher,
 	fd:            uintptr,
@@ -565,7 +569,12 @@ parse_http_url :: proc(
 		if rb < 0 do return "", 0, "", "", false
 		host = authority[1:rb]
 		rest_after := authority[rb + 1:]
-		if len(rest_after) > 0 && rest_after[0] == ':' {
+		if len(rest_after) > 0 {
+			// Only a ":port" may follow the IPv6 literal's closing ']' (RFC 3986
+			// §3.2.2); any other trailing bytes ("[::1]foo") are malformed. new URL()
+			// rejects these, so this parser must too — defense in depth for callers
+			// that reach it directly.
+			if rest_after[0] != ':' do return "", 0, "", "", false
 			p, p_ok := parse_authority_port(rest_after[1:])
 			if !p_ok do return "", 0, "", "", false
 			if p >= 0 do port = p
@@ -597,6 +606,36 @@ parse_authority_port :: proc(s: string) -> (port: int, ok: bool) {
 	p, p_ok := strconv.parse_int(s)
 	if !p_ok || p < 0 || p > 65535 do return -1, false
 	return p, true
+}
+
+// fetch_parse_chunk_size parses an HTTP chunk-size field, which RFC 7230 defines as
+// 1*HEXDIG — unsigned hex, no sign. The previous signed strconv.parse_int accepted
+// "-1"/"+5" as valid syntax (a negative size then slipped through the decoder
+// instead of being rejected as a framing error). This rejects an empty field, any
+// non-hex byte (so a sign or stray space fails), and a value that would overflow a
+// positive int. Returns (size, true) only for a well-formed non-negative size.
+fetch_parse_chunk_size :: proc(s: string) -> (size: int, ok: bool) {
+	if len(s) == 0 do return 0, false
+	v: u64
+	limit := u64(max(int))
+	for c in transmute([]byte)s {
+		d: u64
+		switch {
+		case c >= '0' && c <= '9':
+			d = u64(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = u64(c - 'a' + 10)
+		case c >= 'A' && c <= 'F':
+			d = u64(c - 'A' + 10)
+		case:
+			return 0, false // non-hex byte (sign, space, etc.)
+		}
+		// Reject a size past the positive int range; such a chunk never legitimately
+		// occurs and would otherwise wrap to a negative chunk_remaining.
+		if v > (limit - d) / 16 do return 0, false
+		v = v * 16 + d
+	}
+	return int(v), true
 }
 
 // build_http_request serializes the request line, a Host header, the caller's
@@ -908,7 +947,10 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 	// A DNS lookup may still be outstanding on the pool. We do NOT block to join it
 	// (the pool owns the worker lifetime); the request stays pinned via drive_pending
 	// — bumped at submit — so the pending completion finds live memory, sees
-	// req.settled, and reclaims it. See fetch_dns_pool.odin.
+	// req.settled, and reclaims it. See fetch_dns_pool.odin. If the lookup is still
+	// queued, cancel it so the worker skips the blocking resolve rather than doing
+	// network work for an aborted fetch (and holding the loop alive until it returns).
+	if req.dns_job != nil do fetch_dns_pool_cancel_job(req.dns_job)
 	req.settled = true
 	// Stamp the settle iteration so fetch_reclaim_pending holds this request a couple
 	// of loop ticks — past the in-flight platform_poll batch that may still carry a
@@ -1231,9 +1273,10 @@ fetch_feed_chunked :: proc(req: ^Fetch_Request, data: []byte) {
 			}
 			size_str := string(buf[pos:line_end])
 			if semi := strings.index_byte(size_str, ';'); semi >= 0 do size_str = size_str[:semi]
-			size, size_ok := strconv.parse_int(strings.trim_space(size_str), 16)
+			size, size_ok := fetch_parse_chunk_size(strings.trim_space(size_str))
 			if !size_ok {
-				// Malformed chunk size — fail the body stream as a truncation.
+				// Malformed chunk size (non-hex, signed, empty, or overflowing) —
+				// fail the body stream as a truncation.
 				fetch_finish_body(req, "fetch: terminated")
 				return
 			}

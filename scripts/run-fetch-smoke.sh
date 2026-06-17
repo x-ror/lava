@@ -71,15 +71,27 @@ fi
 "$NODE_BIN" "$SERVER" "$PORT" &
 SRV_PID=$!
 
-# Wait for the origin to accept connections.
+# Wait for the origin to accept connections. A server that never binds (e.g.
+# `listen EPERM` in a sandbox, or the port already in use) must FAIL the run, not
+# silently fall through to a comparison of two empty outputs.
 i=0
+SERVER_UP=0
 while [ "$i" -lt 50 ]; do
 	if "$NODE_BIN" -e "require('net').connect($PORT,'127.0.0.1').on('connect',function(){process.exit(0)}).on('error',function(){process.exit(1)})" 2>/dev/null; then
+		SERVER_UP=1
+		break
+	fi
+	# Stop early if the server process has already exited — no listener is coming.
+	if ! kill -0 "$SRV_PID" 2>/dev/null; then
 		break
 	fi
 	i=$((i + 1))
 	sleep 0.1
 done
+if [ "$SERVER_UP" -ne 1 ]; then
+	printf '%s\n' 'fetch smoke FAILED: origin server never became reachable' >&2
+	exit 1
+fi
 
 # Enable the IPv6 case only when the loopback listener is actually reachable
 # (some CI sandboxes lack IPv6); both runtimes then see FETCH_BASE6 identically.
@@ -107,6 +119,22 @@ SSL_CERT_FILE="$CA_FILE_NATIVE" \
 	FETCH_BASE="http://127.0.0.1:$PORT" FETCH_BASE6="$FETCH_BASE6" \
 	FETCH_BASE_HTTPS="$FETCH_BASE_HTTPS" FETCH_BASE_HTTPS_BAD="$FETCH_BASE_HTTPS_BAD" \
 	"$LAVA_BIN" run "$CASE" >"$TMP_DIR/lava.out" 2>"$TMP_DIR/lava.err" || true
+
+# Both runs end with a `FETCH SMOKE OK` sentinel (cases.js) only if they reached
+# the end of the suite. Require it in BOTH outputs before trusting the diff —
+# otherwise two processes that each crash before any assertion produce matching
+# empty stdout and the diff would false-pass.
+SENTINEL='FETCH SMOKE OK'
+for who in node lava; do
+	if ! grep -q "$SENTINEL" "$TMP_DIR/$who.out"; then
+		printf '%s\n' "fetch smoke FAILED: $who run did not reach '$SENTINEL' (crashed or exited early)" >&2
+		printf '%s\n' "--- $who stdout ---" >&2
+		cat "$TMP_DIR/$who.out" >&2 || true
+		printf '%s\n' "--- $who stderr ---" >&2
+		cat "$TMP_DIR/$who.err" >&2 || true
+		exit 1
+	fi
+done
 
 if diff -u "$TMP_DIR/node.out" "$TMP_DIR/lava.out"; then
 	printf '%s\n' 'fetch smoke passed (lava output matches node)'

@@ -430,12 +430,18 @@
         // text/json, and arrayBuffer/bytes copy out).
         clonedBody = this._bodyBytes;
       }
-      return new Response(clonedBody, {
+      var cloned = new Response(clonedBody, {
         status: this.status,
         statusText: this.statusText,
         headers: this.headers,
         url: this.url,
       });
+      // The constructor resets these to their defaults (redirected=false,
+      // type='default'); a clone must mirror the source's observable metadata —
+      // e.g. a response produced by a followed redirect has redirected=true.
+      cloned.redirected = this.redirected;
+      cloned.type = this.type;
+      return cloned;
     }
   }
 
@@ -531,10 +537,28 @@
       // falling back to a default port in the native layer. A source Request's
       // url is already an absolute href, so this normalizes idempotently.
       var rawUrl = src ? src.url : String(input);
-      this.url = new URL(rawUrl).href;
+      // WHATWG fetch forbids credentials in a request URL. new URL() preserves any
+      // userinfo (and the native parser silently drops it), so reject it here for
+      // Node parity rather than connect to a host the visible URL can disguise
+      // (e.g. "http://example.com@127.0.0.1/"). This also covers redirect-created
+      // requests, since buildRedirectRequest resolves Location through new Request.
+      var parsedUrl = new URL(rawUrl);
+      if (parsedUrl.username || parsedUrl.password) {
+        throw new TypeError('fetch: request URL cannot contain credentials');
+      }
+      this.url = parsedUrl.href;
       // redirect mode: 'follow' (default) | 'manual' | 'error'. init overrides a
-      // source Request's mode (WHATWG fetch); fetch() consults it per response.
-      this.redirect = init.redirect !== undefined ? init.redirect : src ? src.redirect : 'follow';
+      // source Request's mode (WHATWG fetch); fetch() consults it per response. The
+      // value is coerced to a string (Web IDL enum semantics — Node accepts a String
+      // object or any toString-able), a symbol throws (ToString throws), and an
+      // unrecognized mode is a TypeError, not a silent 'follow'.
+      var redirect = init.redirect !== undefined ? init.redirect : src ? src.redirect : 'follow';
+      if (typeof redirect === 'symbol') throw new TypeError('fetch: invalid redirect mode');
+      redirect = String(redirect);
+      if (redirect !== 'follow' && redirect !== 'manual' && redirect !== 'error') {
+        throw new TypeError("fetch: invalid redirect mode '" + redirect + "'");
+      }
+      this.redirect = redirect;
       var method = init.method !== undefined ? init.method : src ? src.method : 'GET';
       this.method = String(method || 'GET').toUpperCase();
       // A GET/HEAD request cannot carry a body, whether that body came from
@@ -775,16 +799,23 @@
 
     var nextInit = { method: method, headers: headers, redirect: req.redirect };
 
-    // A method-preserving redirect (307/308 with a body) must resend it. A
-    // streaming request body has already been consumed and cannot be replayed —
-    // Node fails the redirect in that case, so do the same.
+    // A method-preserving redirect (307/308 with a body) must resend it. A Blob is
+    // a known-length, replayable body — its bytes are read non-mutatingly (see
+    // collectStreamBody), so resend the Blob itself; Node likewise resends it. A
+    // ReadableStream / async-iterable was consumed by the first hop and cannot be
+    // replayed, so the redirect fails (matching Node).
     if (!dropBody && method !== 'GET' && method !== 'HEAD') {
       if (req._streamBody) {
-        throw new TypeError(
-          'fetch: cannot follow a redirect that resends a streaming request body',
-        );
+        if (typeof Blob !== 'undefined' && req._streamBody instanceof Blob) {
+          nextInit.body = req._streamBody;
+        } else {
+          throw new TypeError(
+            'fetch: cannot follow a redirect that resends a streaming request body',
+          );
+        }
+      } else if (req._bodyBytes != null) {
+        nextInit.body = req._bodyBytes;
       }
-      if (req._bodyBytes != null) nextInit.body = req._bodyBytes;
     }
     return new Request(nextUrl, nextInit);
   }

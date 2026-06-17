@@ -555,6 +555,16 @@ async function main() {
     console.log('redirect follow:', r.status, await r.text(), r.redirected, r.url.endsWith('/a'));
   }
 
+  // clone() preserves redirected metadata: a clone of a followed-redirect response
+  // is still redirected=true (the constructor would otherwise reset it to false).
+  {
+    const r = await fetch(base + '/redirect');
+    const c = r.clone();
+    console.log('redirect clone redirected:', r.redirected, c.redirected);
+    await r.text();
+    await c.text();
+  }
+
   // A relative Location is resolved against the request URL.
   {
     const r = await fetch(base + '/redirect-rel');
@@ -572,6 +582,17 @@ async function main() {
     const r = await fetch(base + '/redirect-307', { method: 'POST', body: 'keep-me' });
     const j = await r.json();
     console.log('redirect 307 keeps body:', j.method, JSON.stringify(j.echo), r.redirected);
+  }
+
+  // 307 also resends a Blob body: a Blob is replayable (known length), so the
+  // upload survives the redirect rather than failing as a streaming body would.
+  {
+    const r = await fetch(base + '/redirect-307', {
+      method: 'POST',
+      body: new Blob(['blob ', 'payload']),
+    });
+    const j = await r.json();
+    console.log('redirect 307 keeps blob:', j.method, JSON.stringify(j.echo), r.redirected);
   }
 
   // redirect: 'manual' returns the 3xx response untouched (status, Location, body).
@@ -606,6 +627,41 @@ async function main() {
       name = e && e.constructor.name;
     }
     console.log('redirect loop bounded:', name);
+  }
+
+  // An invalid redirect mode is a TypeError at construction (not a silent 'follow').
+  {
+    let bad = false;
+    try {
+      new Request(base + '/a', { redirect: 'bogus' });
+    } catch (e) {
+      bad = e instanceof TypeError;
+    }
+    console.log('invalid redirect rejected:', bad);
+  }
+
+  // A coercible redirect value is accepted (Web IDL enum: ToString then validate),
+  // e.g. a String object — Node coerces it rather than rejecting.
+  {
+    let mode = '';
+    try {
+      mode = new Request(base + '/a', { redirect: new String('manual') }).redirect;
+    } catch (e) {
+      mode = 'THREW:' + e.constructor.name;
+    }
+    console.log('coercible redirect accepted:', mode);
+  }
+
+  // A request URL carrying credentials (userinfo) is rejected: WHATWG forbids it,
+  // and the visible host must not be disguisable behind a "user:pass@" prefix.
+  {
+    let bad = false;
+    try {
+      new Request('http://user:pass@127.0.0.1/');
+    } catch (e) {
+      bad = e instanceof TypeError;
+    }
+    console.log('credential URL rejected:', bad);
   }
 
   // Set-Cookie is not comma-joined: getSetCookie() returns each cookie intact,
