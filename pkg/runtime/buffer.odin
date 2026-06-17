@@ -7,7 +7,6 @@ import "core:encoding/hex"
 import "core:os"
 import "core:strconv"
 import "core:strings"
-import "core:unicode/utf16"
 import jsc "lava:pkg/jsc"
 
 // Native codec backing for the node:buffer built-in. The hand-rolled JS
@@ -127,10 +126,97 @@ buffer_utf8_encode_cb :: proc "c" (
 	return make_uint8_array(ctx, transmute([]byte)str)
 }
 
-// utf8Decode(u8) -> string. We decode to UTF-16 ourselves (utf16.encode_string
-// maps invalid UTF-8 to U+FFFD and preserves embedded NUL) and build the JS
-// string from code units, because JSStringCreateWithUTF8CString would truncate
-// at an embedded NUL — Node keeps it.
+// emit_utf16 appends a Unicode scalar value to `out` as 1 (BMP) or 2 (surrogate
+// pair) UTF-16 code units and returns how many it wrote.
+emit_utf16 :: proc "contextless" (out: []u16, cp: u32) -> int {
+	if cp <= 0xFFFF {
+		out[0] = u16(cp)
+		return 1
+	}
+	c := cp - 0x10000
+	out[0] = u16(0xD800 + (c >> 10))
+	out[1] = u16(0xDC00 + (c & 0x3FF))
+	return 2
+}
+
+// decode_utf8_to_utf16 decodes a UTF-8 byte slice into UTF-16 code units written
+// to `out`, implementing the WHATWG "UTF-8 decoder" / Unicode "U+FFFD
+// substitution of maximal subparts" rule that Node (V8) follows. The key
+// difference from a naive per-byte decode is the handling of an *invalid
+// continuation* byte: the in-progress sequence emits a single U+FFFD and the
+// offending byte is then re-processed as a potential new lead, so an ill-formed
+// subsequence collapses to one replacement rather than one per byte. (Per-byte
+// replacement is what the previous utf16.encode_string-over-string path did,
+// e.g. Buffer.from([0xF0,0x9F]) -> "��" instead of Node's "�".)
+// Embedded NULs are preserved. `out` must hold at least len(data)+1 units: every
+// emitted unit is charged to >= 1 consumed input byte, and an astral scalar
+// costs 2 units but 4 bytes, so the count never exceeds len(data) (+1 covers the
+// trailing replacement for an unfinished sequence at end of input).
+decode_utf8_to_utf16 :: proc "contextless" (data: []byte, out: []u16) -> (n: int) {
+	code_point: u32 = 0
+	bytes_needed := 0
+	bytes_seen := 0
+	lower: u8 = 0x80
+	upper: u8 = 0xBF
+
+	i := 0
+	for i < len(data) {
+		b := data[i]
+		if bytes_needed == 0 {
+			switch {
+			case b <= 0x7F:
+				out[n] = u16(b);n += 1
+				i += 1
+			case b >= 0xC2 && b <= 0xDF:
+				bytes_needed = 1;code_point = u32(b & 0x1F)
+				i += 1
+			case b >= 0xE0 && b <= 0xEF:
+				if b == 0xE0 do lower = 0xA0 // exclude overlong < U+0800
+				if b == 0xED do upper = 0x9F // exclude UTF-16 surrogates
+				bytes_needed = 2;code_point = u32(b & 0x0F)
+				i += 1
+			case b >= 0xF0 && b <= 0xF4:
+				if b == 0xF0 do lower = 0x90 // exclude overlong < U+10000
+				if b == 0xF4 do upper = 0x8F // exclude > U+10FFFF
+				bytes_needed = 3;code_point = u32(b & 0x07)
+				i += 1
+			case:
+				// Invalid lead byte (0x80..0xC1, 0xF5..0xFF): one replacement.
+				out[n] = 0xFFFD;n += 1
+				i += 1
+			}
+		} else {
+			if b < lower || b > upper {
+				// Invalid continuation: flush a replacement for the bytes seen so
+				// far, reset state, and re-process this byte (do not advance i).
+				code_point = 0;bytes_needed = 0;bytes_seen = 0
+				lower = 0x80;upper = 0xBF
+				out[n] = 0xFFFD;n += 1
+			} else {
+				lower = 0x80;upper = 0xBF
+				code_point = (code_point << 6) | u32(b & 0x3F)
+				bytes_seen += 1
+				i += 1
+				if bytes_seen == bytes_needed {
+					n += emit_utf16(out[n:], code_point)
+					code_point = 0;bytes_needed = 0;bytes_seen = 0
+				}
+			}
+		}
+	}
+	// Unfinished trailing sequence at end of input -> a single replacement.
+	if bytes_needed != 0 {
+		out[n] = 0xFFFD;n += 1
+	}
+	return n
+}
+
+// utf8Decode(u8) -> string. Decodes via the WHATWG UTF-8 decoder
+// (decode_utf8_to_utf16) and builds the JS string from the code units, because
+// JSStringCreateWithUTF8CString would truncate at an embedded NUL — Node keeps
+// it. Going through code units (rather than a UTF-8 C string) also lets us apply
+// the maximal-subpart replacement rule that Buffer.toString('utf8') / TextDecoder
+// require.
 buffer_utf8_decode_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -145,10 +231,9 @@ buffer_utf8_decode_cb :: proc "c" (
 	data, ok := typed_array_view(ctx, arguments[0])
 	if !ok || len(data) == 0 do return js_string_value(ctx, "")
 
-	// Each input byte yields at most one UTF-16 code unit, so len(data) is a
-	// safe upper bound.
-	units := make([]u16, len(data), context.temp_allocator)
-	n := utf16.encode_string(units, string(data))
+	// +1 headroom for a trailing-replacement at end of input (see proc docs).
+	units := make([]u16, len(data) + 1, context.temp_allocator)
+	n := decode_utf8_to_utf16(data, units)
 
 	js_str := jsc.JSStringCreateWithCharacters(raw_data(units), c.size_t(n))
 	defer jsc.JSStringRelease(js_str)

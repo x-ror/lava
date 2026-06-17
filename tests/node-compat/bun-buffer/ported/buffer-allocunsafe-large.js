@@ -17,10 +17,13 @@ process.noDeprecation = true; // silence Node's DEP0030 for SlowBuffer() (no-op 
 const assert = require('node:assert/strict');
 const { SlowBuffer } = require('node:buffer');
 
-const HALF = Buffer.poolSize >>> 1; // 4096 — exactly the pool threshold (not pooled)
+const HALF = Buffer.poolSize >>> 1; // exactly the pool threshold (not pooled)
+const BIG = Buffer.poolSize + 4096; // comfortably above the pool, and != poolSize
 
 // --- Large allocUnsafe: own right-sized store, fully usable -----------------
-for (const size of [HALF, 5000, 65536, 250000]) {
+// Sizes are derived from poolSize so they stay above the pool threshold (and
+// distinct from poolSize) regardless of the runtime's default (8192 vs 65536).
+for (const size of [HALF, BIG, Buffer.poolSize * 2, 250000]) {
   const b = Buffer.allocUnsafe(size);
   assert.ok(b instanceof Buffer, 'allocUnsafe returns a Buffer');
   assert.equal(b.length, size, 'allocUnsafe length');
@@ -41,7 +44,7 @@ for (const size of [HALF, 5000, 65536, 250000]) {
 
 // --- Native codecs honor a native-backed (byteOffset 0) buffer --------------
 {
-  const b = Buffer.allocUnsafe(5000);
+  const b = Buffer.allocUnsafe(BIG);
   b.fill(0);
   const pattern = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
   for (let i = 0; i < pattern.length; i++) b[i] = pattern[i];
@@ -70,7 +73,7 @@ for (const size of [HALF, 5000, 65536, 250000]) {
 
 // --- copy in/out of a native-backed buffer ----------------------------------
 {
-  const dst = Buffer.allocUnsafe(5000);
+  const dst = Buffer.allocUnsafe(BIG);
   dst.fill(0);
   const src = Buffer.from([1, 2, 3, 4, 5]);
   const n = src.copy(dst, 100);
@@ -108,21 +111,21 @@ for (const size of [1, 8, HALF, 70000]) {
 // zero-fill any tail an explicit length leaves uncovered, even though the
 // underlying store is now uninitialized.
 {
-  const text = 'q'.repeat(5000);
+  const text = 'q'.repeat(BIG);
   const fromStr = Buffer.from(text);
-  assert.equal(fromStr.buffer.byteLength, 5000, 'large from(string) is unpooled');
-  for (let i = 0; i < 5000; i++) assert.equal(fromStr[i], 0x71, 'from(string) byte ' + i);
+  assert.equal(fromStr.buffer.byteLength, BIG, 'large from(string) is unpooled');
+  for (let i = 0; i < BIG; i++) assert.equal(fromStr[i], 0x71, 'from(string) byte ' + i);
 
-  const arr = Array.from({ length: 5000 }, (_, i) => i & 0xff);
+  const arr = Array.from({ length: BIG }, (_, i) => i & 0xff);
   const fromArr = Buffer.from(arr);
-  for (let i = 0; i < 5000; i++) assert.equal(fromArr[i], i & 0xff, 'from(array) byte ' + i);
+  for (let i = 0; i < BIG; i++) assert.equal(fromArr[i], i & 0xff, 'from(array) byte ' + i);
 
-  const padded = Buffer.concat([Buffer.from([0xaa, 0xbb])], 5000);
-  assert.equal(padded.length, 5000);
-  assert.equal(padded.buffer.byteLength, 5000, 'large concat result is unpooled');
+  const padded = Buffer.concat([Buffer.from([0xaa, 0xbb])], BIG);
+  assert.equal(padded.length, BIG);
+  assert.equal(padded.buffer.byteLength, BIG, 'large concat result is unpooled');
   assert.equal(padded[0], 0xaa);
   assert.equal(padded[1], 0xbb);
-  for (let i = 2; i < 5000; i++) assert.equal(padded[i], 0, 'concat tail zero-filled at ' + i);
+  for (let i = 2; i < BIG; i++) assert.equal(padded[i], 0, 'concat tail zero-filled at ' + i);
 }
 
 // --- Buffer.alloc stays fully zero-filled (must NOT use the unsafe path) -----

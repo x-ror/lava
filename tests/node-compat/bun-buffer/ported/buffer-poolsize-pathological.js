@@ -1,5 +1,6 @@
 // Pathological Buffer.poolSize values (issue #213). Realistic code never touches
-// Buffer.poolSize (the default is 8192), but Node has well-defined behavior for
+// Buffer.poolSize (the default is 8192 on Node <= 25 / Bun, 65536 on Node >= 26.3,
+// which Lava follows), but Node has well-defined behavior for
 // fractional, negative, zero, NaN, and >= 2^32 values, and Lava now matches it:
 //   * poolSize is a plain data property — it stores and returns the raw value, with
 //     no >>> coercion on read.
@@ -12,9 +13,12 @@
 // All assertions are pure ArrayBuffer/Uint8Array semantics, identical on Linux,
 // macOS/Darwin, and Windows, and none of them allocates anything large.
 const assert = require('node:assert/strict');
-const DEFAULT = 8192;
+const DEFAULT = Buffer.poolSize; // runtime default (8192 on Node <= 25 / Bun, 65536 on Node >= 26.3)
 
-assert.equal(Buffer.poolSize, DEFAULT, 'default poolSize is 8192');
+assert.ok(
+  Buffer.poolSize > 0 && (Buffer.poolSize & (Buffer.poolSize - 1)) === 0,
+  'default poolSize is a positive power of two',
+);
 
 // --- poolSize getter returns the raw assigned value (no coercion) -----------
 for (const v of [8192, 8192.7, 0, 1, -1, -8192, NaN, 2 ** 31, 2 ** 32, 2 ** 32 + 100, 1e12]) {
@@ -24,7 +28,7 @@ for (const v of [8192, 8192.7, 0, 1, -1, -8192, NaN, 2 ** 31, 2 ** 32, 2 ** 32 +
 Buffer.poolSize = DEFAULT;
 
 // --- Pooling decision per poolSize, without forcing a re-pool ----------------
-// A single small allocUnsafe is served from the still-warm 8192-byte pool when
+// A single small allocUnsafe is served from the still-warm pool when
 // `size < (poolSize >>> 1)` and otherwise gets its own store; nothing here drains
 // the pool, so no re-pool (hence no large/throwing allocation) occurs. 'pool' means
 // the result is backed by the shared pool, 'own' means a right-sized private store.
@@ -63,12 +67,22 @@ assert.deepEqual(matrix, {
 // poolSize = -1 with a catchable RangeError — no multi-GiB allocation, no crash.
 // This is the LAST action: a failed re-pool leaves Node's internal pool state
 // inconsistent, so we must not allocate again afterward.
-Buffer.poolSize = DEFAULT;
-for (let i = 0; i < 1100; i++) Buffer.allocUnsafe(16); // drain the warm pool
+//
+// Shrink to a small pool and allocate until the backing store is recreated at
+// least once — that lands us on a known small pool regardless of the runtime's
+// default size (8192 vs 65536), so the subsequent drain is guaranteed to exhaust
+// it and trigger createPool(-1).
+Buffer.poolSize = 1024;
+let warm = Buffer.allocUnsafe(16).buffer;
+for (let i = 0; i < 200000; i++) {
+  const next = Buffer.allocUnsafe(16).buffer;
+  if (next !== warm) break; // re-pooled onto a fresh 1024-byte pool
+  warm = next;
+}
 Buffer.poolSize = -1;
 let threw = false;
 try {
-  for (let i = 0; i < 4000; i++) Buffer.allocUnsafe(8); // eventually forces createPool(-1)
+  for (let i = 0; i < 4000; i++) Buffer.allocUnsafe(8); // exhausts the small pool -> createPool(-1)
 } catch (e) {
   threw = e instanceof RangeError;
 }

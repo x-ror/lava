@@ -96,16 +96,88 @@
   }
 
   function errOutOfRange(name, range, received) {
+    // Node only digit-groups a received value whose magnitude exceeds 2**32
+    // (writeUInt16BE(65536) -> "65536", but writeUIntLE(2**48,..) ->
+    // "281_474_976_710_656"); a bigint additionally gets a trailing "n"
+    // (writeBigUInt64LE(2n**64n) -> "18_446_744_073_709_551_616n").
+    var rendered;
+    if (typeof received === 'bigint') {
+      var bigWide = received > BigInt('4294967296') || received < -BigInt('4294967296');
+      rendered = (bigWide ? numericSeparator(received) : received.toString()) + 'n';
+    } else if (typeof received === 'number' && (received > 4294967296 || received < -4294967296)) {
+      rendered = numericSeparator(received);
+    } else {
+      rendered = String(received);
+    }
     var e = new RangeError(
-      'The value of "' +
-        name +
-        '" is out of range. It must be ' +
-        range +
-        '. Received ' +
-        numericSeparator(received),
+      'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + rendered,
     );
     e.code = 'ERR_OUT_OF_RANGE';
     return e;
+  }
+
+  // Node throws ERR_INVALID_ARG_VALUE when a fill value cannot be represented in
+  // the requested encoding (a non-empty string that decodes to no bytes, or an
+  // empty Buffer/Uint8Array). The received value is rendered the way Node does:
+  // strings single-quoted, Buffers as "<Buffer ..>".
+  function errInvalidArgValue(name, value) {
+    var rendered;
+    if (typeof value === 'string') rendered = "'" + value + "'";
+    else if (value instanceof Uint8Array) rendered = inspectBuffer(value);
+    else rendered = describeType(value);
+    var e = new TypeError("The argument '" + name + "' is invalid. Received " + rendered);
+    e.code = 'ERR_INVALID_ARG_VALUE';
+    return e;
+  }
+
+  // validateByteLength guards the variable-width accessors (readUIntLE/BE,
+  // readIntLE/BE, writeUIntLE/BE, writeIntLE/BE). Node requires an integer in
+  // 1..6: a missing/non-numeric byteLength is ERR_INVALID_ARG_TYPE, a fractional
+  // one is ERR_OUT_OF_RANGE ("an integer"), and 0 / >6 is ERR_OUT_OF_RANGE
+  // (">= 1 and <= 6"). Lava previously skipped this and returned 0 / garbage.
+  function validateByteLength(byteLength) {
+    if (typeof byteLength !== 'number')
+      throw errInvalidArgType('byteLength', 'of type number', byteLength);
+    if (Math.floor(byteLength) !== byteLength)
+      throw errOutOfRange('byteLength', 'an integer', byteLength);
+    if (byteLength < 1 || byteLength > 6)
+      throw errOutOfRange('byteLength', '>= 1 and <= 6', byteLength);
+  }
+
+  // checkValueInt reproduces Node's checkInt() value-range guard for the integer
+  // writers. blMinus1 is Node's internal "byteLength" parameter (the real byte
+  // width minus one): when it exceeds 3 the message switches from the plain
+  // ">= min and <= max" form to the ">= 0 and < 2 ** N" / signed-power form Node
+  // emits for >32-bit writes; a bigint min/max appends the "n" suffix. The store
+  // (typed-array element or per-byte) truncates a fractional but in-range value,
+  // exactly as Node does — so only an out-of-range value throws here.
+  function checkValueInt(value, min, max, blMinus1) {
+    if (value > max || value < min) {
+      var n = typeof min === 'bigint' ? 'n' : '';
+      var range;
+      if (blMinus1 > 3) {
+        var bits = (blMinus1 + 1) * 8;
+        if (min === 0 || min === BigInt(0)) {
+          range = '>= 0' + n + ' and < 2' + n + ' ** ' + bits + n;
+        } else {
+          range =
+            '>= -(2' + n + ' ** ' + (bits - 1) + n + ') and < 2' + n + ' ** ' + (bits - 1) + n;
+        }
+      } else {
+        range = '>= ' + min + n + ' and <= ' + max + n;
+      }
+      throw errOutOfRange('value', range, value);
+    }
+  }
+
+  // validateWriteOffset enforces Node's write()/fill() offset contract: an
+  // integer in [0, max]. Note the "&&" message form — distinct from the "and"
+  // form checkBounds() uses for the fixed-width numeric accessors (Node spells
+  // these two error sites differently, and packages occasionally match on it).
+  function validateWriteOffset(offset, max, name) {
+    if (Math.floor(offset) !== offset) throw errOutOfRange(name, 'an integer', offset);
+    if (offset < 0 || offset > max) throw errOutOfRange(name, '>= 0 && <= ' + max, offset);
+    return offset;
   }
 
   function errUnknownEncoding(encoding) {
@@ -322,7 +394,18 @@
     return -1;
   }
 
+  // Coerce + range-check a fixed-width integer write value the way Node does
+  // (value before bounds): returns the coerced Number so the caller can store it
+  // through a DataView/typed-array slot, which truncates a fractional in-range
+  // value exactly as Node's writer does.
+  function checkFixed(value, min, max, blMinus1) {
+    value = +value;
+    checkValueInt(value, min, max, blMinus1);
+    return value;
+  }
+
   function readUInt(buf, offset, byteLength, littleEndian) {
+    validateByteLength(byteLength);
     offset = checkBounds(buf, offset, byteLength);
     var value = 0;
     if (littleEndian) {
@@ -334,6 +417,8 @@
   }
 
   function readInt(buf, offset, byteLength, littleEndian) {
+    // readUInt validates byteLength + bounds first, so the pow below only runs
+    // for a valid 1..6 width.
     var value = readUInt(buf, offset, byteLength, littleEndian);
     var sign = Math.pow(2, byteLength * 8 - 1);
     var full = sign * 2;
@@ -341,20 +426,37 @@
   }
 
   function writeUInt(buf, value, offset, byteLength, littleEndian) {
+    validateByteLength(byteLength);
+    // 2 ** (8 * byteLength) - 1 is exact for byteLength <= 6 (<= 2**48 - 1, well
+    // within MAX_SAFE_INTEGER). Range-check the raw value before flooring so a
+    // fractional but over-range value (e.g. 65535.5 into 2 bytes) still throws.
+    var max = Math.pow(2, 8 * byteLength) - 1;
+    value = +value;
+    checkValueInt(value, 0, max, byteLength - 1);
     offset = checkBounds(buf, offset, byteLength);
-    value = Math.floor(Number(value));
+    value = Math.floor(value);
     for (var i = 0; i < byteLength; i++) {
       var index = littleEndian ? offset + i : offset + byteLength - 1 - i;
-      buf[index] = value & 0xff;
+      buf[index] = value & 0xff; // ToInt32 preserves the low byte for value < 2**48
       value = Math.floor(value / 0x100);
     }
     return offset + byteLength;
   }
 
   function writeInt(buf, value, offset, byteLength, littleEndian) {
-    value = Math.floor(Number(value));
+    validateByteLength(byteLength);
+    var limit = Math.pow(2, 8 * byteLength - 1); // exact for byteLength <= 6
+    value = +value;
+    checkValueInt(value, -limit, limit - 1, byteLength - 1);
+    offset = checkBounds(buf, offset, byteLength);
+    value = Math.floor(value);
     if (value < 0) value += Math.pow(2, byteLength * 8);
-    return writeUInt(buf, value, offset, byteLength, littleEndian);
+    for (var i = 0; i < byteLength; i++) {
+      var index = littleEndian ? offset + i : offset + byteLength - 1 - i;
+      buf[index] = value & 0xff;
+      value = Math.floor(value / 0x100);
+    }
+    return offset + byteLength;
   }
 
   function readBigUInt(buf, offset, littleEndian) {
@@ -375,8 +477,10 @@
   }
 
   function writeBigUInt(buf, value, offset, littleEndian) {
-    offset = checkBounds(buf, offset, 8);
     value = BigInt(value);
+    // checkValueInt with blMinus1 = 7 yields Node's ">= 0n and < 2n ** 64n".
+    checkValueInt(value, BigInt(0), (BigInt(1) << BigInt(64)) - BigInt(1), 7);
+    offset = checkBounds(buf, offset, 8);
     for (var i = 0; i < 8; i++) {
       var index = littleEndian ? offset + i : offset + 7 - i;
       buf[index] = Number(value & BigInt(0xff));
@@ -387,12 +491,33 @@
 
   function writeBigInt(buf, value, offset, littleEndian) {
     value = BigInt(value);
-    if (value < 0) value += BigInt(1) << BigInt(64);
-    return writeBigUInt(buf, value, offset, littleEndian);
+    var limit = BigInt(1) << BigInt(63);
+    checkValueInt(value, -limit, limit - BigInt(1), 7); // ">= -(2n ** 63n) and < 2n ** 63n"
+    offset = checkBounds(buf, offset, 8);
+    if (value < 0) value += BigInt(1) << BigInt(64); // two's-complement, then write the bytes
+    for (var i = 0; i < 8; i++) {
+      var index = littleEndian ? offset + i : offset + 7 - i;
+      buf[index] = Number(value & BigInt(0xff));
+      value >>= BigInt(8);
+    }
+    return offset + 8;
   }
 
   class Buffer extends Uint8Array {
     constructor(arg, byteOffset, length) {
+      // The deprecated `new Buffer(string[, encoding])` form delegates to
+      // Buffer.from (Node keeps it working, just with a DEP0005 warning). Without
+      // this, `super(string, …)` would mis-encode the string — `new Buffer('abc')`
+      // yielded an empty buffer and `new Buffer('616263','hex')` random garbage. A
+      // derived constructor may return an object instead of calling super(), and
+      // Buffer.from for a string allocates a fresh (pooled) Buffer with no
+      // recursion (its inner alloc uses the numeric/ArrayBuffer-view forms). The
+      // array / Buffer / ArrayBuffer-view / size forms are equivalent to the
+      // Uint8Array super() call, so they pass straight through (with the ceiling
+      // check below). `new Buffer(size)` is zero-filled, matching Buffer.alloc.
+      if (typeof arg === 'string') {
+        return Buffer.from(arg, byteOffset);
+      }
       // A numeric first argument is the size form (new Buffer(size)). Validate it
       // against the practical ceiling *before* super() so an oversized request —
       // reached through any route (alloc/allocUnsafe, fromArrayLike, concat) —
@@ -420,31 +545,66 @@
     }
 
     copy(target, targetStart, sourceStart, sourceEnd) {
-      targetStart = clampIndex(targetStart, target.length, 0);
-      sourceStart = clampIndex(sourceStart, this.length, 0);
-      sourceEnd = clampIndex(sourceEnd, this.length, this.length);
+      // Node validates each index with toInteger (so a fractional index is
+      // floored, NOT rejected) and throws ERR_OUT_OF_RANGE for negatives. The
+      // upper bounds are clamped rather than thrown: a targetStart past the
+      // target, or sourceStart >= sourceEnd, copies nothing. Lava previously ran
+      // every index through clampIndex, so negatives wrapped from the end.
+      if (!(target instanceof Uint8Array))
+        throw errInvalidArgType('target', 'an instance of Buffer or Uint8Array', target);
+      if (targetStart === undefined) {
+        targetStart = 0;
+      } else {
+        targetStart = toInteger(targetStart, 0);
+        if (targetStart < 0) throw errOutOfRange('targetStart', '>= 0', targetStart);
+      }
+      if (sourceStart === undefined) {
+        sourceStart = 0;
+      } else {
+        sourceStart = toInteger(sourceStart, 0);
+        if (sourceStart < 0 || sourceStart > this.length)
+          throw errOutOfRange('sourceStart', '>= 0 && <= ' + this.length, sourceStart);
+      }
+      if (sourceEnd === undefined) {
+        sourceEnd = this.length;
+      } else {
+        sourceEnd = toInteger(sourceEnd, 0);
+        if (sourceEnd < 0) throw errOutOfRange('sourceEnd', '>= 0', sourceEnd);
+      }
+      if (sourceEnd > this.length) sourceEnd = this.length;
+      if (targetStart >= target.length || sourceStart >= sourceEnd) return 0;
       var len = Math.min(sourceEnd - sourceStart, target.length - targetStart);
-      if (len <= 0) return 0;
       target.set(this.subarray(sourceStart, sourceStart + len), targetStart);
       return len;
     }
 
     write(string, offset, length, encoding) {
-      if (typeof offset === 'string') {
+      if (offset === undefined) {
+        // write(string)
+        offset = 0;
+        length = this.length;
+      } else if (typeof offset === 'string') {
+        // write(string, encoding)
         encoding = offset;
         offset = 0;
         length = this.length;
-      } else if (typeof length === 'string') {
-        encoding = length;
-        length = undefined;
+      } else {
+        // write(string, offset[, length][, encoding]). Node validates offset as
+        // an integer in [0, length] and throws ERR_OUT_OF_RANGE otherwise; it no
+        // longer wraps a negative offset from the end the way clampIndex did.
+        offset = validateWriteOffset(+offset, this.length, 'offset');
+        if (typeof length === 'string') {
+          encoding = length;
+          length = undefined;
+        }
       }
-      offset = clampIndex(offset, this.length, 0);
       var bytes = strToBytes(String(string), encoding || 'utf8');
       length =
         length === undefined
           ? bytes.length
           : Math.min(toInteger(length, bytes.length), bytes.length);
       length = Math.min(length, this.length - offset);
+      if (length < 0) length = 0;
       for (var i = 0; i < length; i++) this[offset + i] = bytes[i];
       return length;
     }
@@ -496,18 +656,37 @@
         encoding = end;
         end = this.length;
       }
-      start = clampIndex(start, this.length, 0);
-      end = clampIndex(end, this.length, this.length);
-      if (end <= start) return this;
+      // Node validates start (which it names "offset") and end as integers and
+      // throws ERR_OUT_OF_RANGE for negatives. start has no enforced upper bound
+      // (a start past the end fills nothing); end must be within the buffer.
+      // Previously both ran through clampIndex, so negatives wrapped from the end.
+      if (start === undefined) start = 0;
+      else start = validateWriteOffset(+start, K_MAX_LENGTH, 'offset');
+      if (end === undefined) end = this.length;
+      else end = validateWriteOffset(+end, this.length, 'end');
+      // Resolve the repeating fill pattern. A number/boolean masks to one byte; a
+      // Uint8Array is used as-is. A string is encoded with `encoding` (an unknown
+      // encoding throws ERR_UNKNOWN_ENCODING via strToBytes). Node fills the empty
+      // string with a single 0 byte, but treats any other zero-byte source (bad
+      // hex, an empty Buffer) as ERR_INVALID_ARG_VALUE — Lava previously zero-
+      // filled all of these instead of throwing.
       var bytes;
       if (typeof value === 'number') {
         bytes = new Uint8Array([value & 0xff]);
+      } else if (typeof value === 'boolean') {
+        bytes = new Uint8Array([value ? 1 : 0]);
       } else if (value instanceof Uint8Array) {
-        bytes = value.length > 0 ? value : new Uint8Array([0]);
+        if (value.length === 0) throw errInvalidArgValue('value', value);
+        bytes = value;
       } else {
-        bytes = strToBytes(String(value), encoding || 'utf8');
-        if (bytes.length === 0) bytes = new Uint8Array([0]);
+        var str = String(value);
+        bytes = strToBytes(str, encoding || 'utf8');
+        if (bytes.length === 0) {
+          if (str.length !== 0) throw errInvalidArgValue('value', value);
+          bytes = new Uint8Array([0]); // fill('') zero-fills the range
+        }
       }
+      if (end <= start) return this;
       for (var i = start; i < end; i++) this[i] = bytes[(i - start) % bytes.length];
       return this;
     }
@@ -716,12 +895,17 @@
   }
 
   p.writeUInt8 = p.writeUint8 = function (value, offset) {
+    value = checkFixed(value, 0, 0xff, 0);
     offset = checkBounds(this, offset, 1);
-    this[offset] = Number(value) & 0xff;
+    this[offset] = value; // Uint8 store truncates a fractional in-range value (Node parity)
     return offset + 1;
   };
   p.writeInt8 = function (value, offset) {
-    return this.writeUInt8(value, offset);
+    // Distinct signed range: writeInt8(128) must throw, where writeUInt8(128) is fine.
+    value = checkFixed(value, -0x80, 0x7f, 0);
+    offset = checkBounds(this, offset, 1);
+    this[offset] = value; // store wraps a negative to its two's-complement byte
+    return offset + 1;
   };
   p.writeUIntLE = p.writeUintLE = function (value, offset, byteLength) {
     return writeUInt(this, value, offset, byteLength, true);
@@ -736,43 +920,51 @@
     return writeInt(this, value, offset, byteLength, false);
   };
   p.writeUInt16LE = p.writeUint16LE = function (value, offset) {
+    value = checkFixed(value, 0, 0xffff, 1);
     offset = checkBounds(this, offset, 2);
-    viewOf(this).setUint16(offset, Number(value), true);
+    viewOf(this).setUint16(offset, value, true);
     return offset + 2;
   };
   p.writeUInt16BE = p.writeUint16BE = function (value, offset) {
+    value = checkFixed(value, 0, 0xffff, 1);
     offset = checkBounds(this, offset, 2);
-    viewOf(this).setUint16(offset, Number(value), false);
+    viewOf(this).setUint16(offset, value, false);
     return offset + 2;
   };
   p.writeUInt32LE = p.writeUint32LE = function (value, offset) {
+    value = checkFixed(value, 0, 0xffffffff, 3);
     offset = checkBounds(this, offset, 4);
-    viewOf(this).setUint32(offset, Number(value), true);
+    viewOf(this).setUint32(offset, value, true);
     return offset + 4;
   };
   p.writeUInt32BE = p.writeUint32BE = function (value, offset) {
+    value = checkFixed(value, 0, 0xffffffff, 3);
     offset = checkBounds(this, offset, 4);
-    viewOf(this).setUint32(offset, Number(value), false);
+    viewOf(this).setUint32(offset, value, false);
     return offset + 4;
   };
   p.writeInt16LE = function (value, offset) {
+    value = checkFixed(value, -0x8000, 0x7fff, 1);
     offset = checkBounds(this, offset, 2);
-    viewOf(this).setInt16(offset, Number(value), true);
+    viewOf(this).setInt16(offset, value, true);
     return offset + 2;
   };
   p.writeInt16BE = function (value, offset) {
+    value = checkFixed(value, -0x8000, 0x7fff, 1);
     offset = checkBounds(this, offset, 2);
-    viewOf(this).setInt16(offset, Number(value), false);
+    viewOf(this).setInt16(offset, value, false);
     return offset + 2;
   };
   p.writeInt32LE = function (value, offset) {
+    value = checkFixed(value, -0x80000000, 0x7fffffff, 3);
     offset = checkBounds(this, offset, 4);
-    viewOf(this).setInt32(offset, Number(value), true);
+    viewOf(this).setInt32(offset, value, true);
     return offset + 4;
   };
   p.writeInt32BE = function (value, offset) {
+    value = checkFixed(value, -0x80000000, 0x7fffffff, 3);
     offset = checkBounds(this, offset, 4);
-    viewOf(this).setInt32(offset, Number(value), false);
+    viewOf(this).setInt32(offset, value, false);
     return offset + 4;
   };
   p.writeFloatLE = function (value, offset) {
@@ -1076,7 +1268,10 @@
     return Buffer.from(Array.prototype.slice.call(arguments));
   };
 
-  Buffer.poolSize = 8192;
+  // Default pool size. Node raised this from 8192 to 65536 in v26.3.0; Lava
+  // tracks the newer default. (Bun and Node <= 25 still default to 8192, so this
+  // is a deliberate node>=26 choice — kMaxLength stays the JSC-family 4 GiB.)
+  Buffer.poolSize = 65536;
 
   // Build the initial pool now that Buffer.poolSize is set. Nothing in this
   // module allocates Buffers during evaluation, so a single eager call is enough
@@ -1117,13 +1312,26 @@
 
   // --- Blob / File (Web platform classes also exported from node:buffer) ----
 
-  function blobPartToBytes(part) {
+  // WHATWG "convert line endings to native". Node uses require('os').EOL; Lava has
+  // no node:os, so the platform line ending is derived from process.platform (read
+  // lazily — process is installed natively and may post-date this module's eval).
+  function nativeEol() {
+    return globalThis.process && globalThis.process.platform === 'win32' ? '\r\n' : '\n';
+  }
+
+  // Only string parts are subject to line-ending conversion; binary parts (Blob,
+  // ArrayBuffer, views) are copied verbatim.
+  function blobPartToBytes(part, nativeEndings) {
     if (part instanceof Blob) return part._bytes;
     if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
     if (ArrayBuffer.isView(part)) {
       return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
     }
-    return new Uint8Array(Buffer.from(String(part), 'utf8'));
+    var str = String(part);
+    // Node converts "\n" and "\r\n" to the native newline but leaves a lone "\r"
+    // untouched (i.e. /\r?\n/, not every CR) — verified against Node.
+    if (nativeEndings) str = str.replace(/\r?\n/g, nativeEol());
+    return new Uint8Array(Buffer.from(str, 'utf8'));
   }
 
   function normalizeBlobType(options) {
@@ -1144,9 +1352,12 @@
       if (typeof parts !== 'object' || typeof parts[Symbol.iterator] !== 'function') {
         throw new TypeError('The "parts" argument must be an iterable object');
       }
+      // endings: 'native' converts line endings in string parts to the platform
+      // newline; 'transparent' (the default) leaves them as-is.
+      var nativeEndings = !!(options && options.endings === 'native');
       var list = Array.from(parts);
       for (var i = 0; i < list.length; i++) {
-        var bytes = blobPartToBytes(list[i]);
+        var bytes = blobPartToBytes(list[i], nativeEndings);
         chunks.push(bytes);
         total += bytes.length;
       }
