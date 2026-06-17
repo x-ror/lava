@@ -11,6 +11,46 @@ const http = require('node:http');
 const port = Number(process.argv[2] || 8799);
 
 const handler = (req, res) => {
+  // Redirect / Set-Cookie routes are dispatched before the generic POST echo so
+  // a POST can receive a 3xx response (the client then re-issues per the redirect
+  // rules) rather than being echoed. Exercises HTTP correctness (issue #99).
+  switch (req.url) {
+    case '/redirect':
+      // Absolute-path Location, followed by default redirect: 'follow'.
+      res.writeHead(302, { Location: '/a' });
+      res.end('moved');
+      return;
+    case '/redirect-rel':
+      // Relative Location ("a") resolved against the request URL.
+      res.writeHead(302, { Location: 'a' });
+      res.end('moved');
+      return;
+    case '/redirect-303':
+      // 303 turns any POST into a GET and drops the body.
+      res.writeHead(303, { Location: '/a' });
+      res.end('see other');
+      return;
+    case '/redirect-307':
+      // 307 preserves the method and resends the body (to the POST echo).
+      res.writeHead(307, { Location: '/echo' });
+      res.end('keep');
+      return;
+    case '/redirect-loop':
+      // Self-referential redirect: the client must bound the hop count.
+      res.writeHead(302, { Location: '/redirect-loop' });
+      res.end('loop');
+      return;
+    case '/set-cookies':
+      // Multiple Set-Cookie headers, one with a comma inside its Expires= date —
+      // they must survive as distinct cookies (getSetCookie), not be comma-joined.
+      res.writeHead(200, {
+        'content-type': 'text/plain',
+        'set-cookie': ['a=1', 'b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT', 'c=3'],
+      });
+      res.end('cookies');
+      return;
+  }
+
   if (req.method === 'POST') {
     let body = '';
     req.on('data', (chunk) => {

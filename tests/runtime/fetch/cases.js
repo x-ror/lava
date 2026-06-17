@@ -530,6 +530,116 @@ async function main() {
     console.log('concurrent cancel+refetch clean:', clean);
   }
 
+  // --- HTTP correctness (issue #99) ---
+
+  // HEAD with a Content-Length echo: a conforming server replies to HEAD with the
+  // GET's Content-Length and an empty body. The response must parse (status 200,
+  // header present) and expose a null body — not be rejected as malformed.
+  {
+    const r = await fetch(base + '/data.json', { method: 'HEAD' });
+    const body = await r.text();
+    console.log(
+      'HEAD:',
+      r.status,
+      r.headers.get('content-length') !== null,
+      body === '',
+      r.body === null,
+    );
+  }
+
+  // Redirect following (default redirect: 'follow'): a 302 is chased to its
+  // target; the final response carries the destination body and redirected=true,
+  // and its url is the destination.
+  {
+    const r = await fetch(base + '/redirect');
+    console.log('redirect follow:', r.status, await r.text(), r.redirected, r.url.endsWith('/a'));
+  }
+
+  // A relative Location is resolved against the request URL.
+  {
+    const r = await fetch(base + '/redirect-rel');
+    console.log('redirect relative:', r.status, await r.text(), r.url.endsWith('/a'));
+  }
+
+  // 303 turns a POST into a GET and drops the body: the destination sees a GET.
+  {
+    const r = await fetch(base + '/redirect-303', { method: 'POST', body: 'discard-me' });
+    console.log('redirect 303 POST->GET:', r.status, await r.text(), r.redirected);
+  }
+
+  // 307 preserves the method and resends the body: the echo reports POST + body.
+  {
+    const r = await fetch(base + '/redirect-307', { method: 'POST', body: 'keep-me' });
+    const j = await r.json();
+    console.log('redirect 307 keeps body:', j.method, JSON.stringify(j.echo), r.redirected);
+  }
+
+  // redirect: 'manual' returns the 3xx response untouched (status, Location, body).
+  {
+    const r = await fetch(base + '/redirect', { redirect: 'manual' });
+    console.log(
+      'redirect manual:',
+      r.status,
+      r.headers.get('location'),
+      await r.text(),
+      r.redirected,
+    );
+  }
+
+  // redirect: 'error' rejects on a 3xx.
+  {
+    let name = '';
+    try {
+      await fetch(base + '/redirect', { redirect: 'error' });
+    } catch (e) {
+      name = e && e.constructor.name;
+    }
+    console.log('redirect error mode:', name);
+  }
+
+  // An infinite redirect loop is bounded (max 20 hops) and rejects.
+  {
+    let name = '';
+    try {
+      await fetch(base + '/redirect-loop');
+    } catch (e) {
+      name = e && e.constructor.name;
+    }
+    console.log('redirect loop bounded:', name);
+  }
+
+  // Set-Cookie is not comma-joined: getSetCookie() returns each cookie intact,
+  // even the one carrying a comma inside its Expires= date.
+  {
+    const r = await fetch(base + '/set-cookies');
+    const cookies = r.headers.getSetCookie();
+    console.log('set-cookie count:', cookies.length);
+    console.log('set-cookie intact:', JSON.stringify(cookies));
+  }
+
+  // An invalid (non-numeric) port is rejected at Request construction — Node's URL
+  // parser throws — instead of silently connecting to port 80.
+  {
+    let name = '';
+    try {
+      await fetch('http://127.0.0.1:abc/');
+    } catch (e) {
+      name = e && e.constructor.name;
+    }
+    console.log('invalid port rejected:', name);
+  }
+
+  // A port above 65535 is likewise rejected (no u16 truncation).
+  {
+    let name = '';
+    try {
+      await fetch('http://127.0.0.1:99999/');
+    } catch (e) {
+      name = e && e.constructor.name;
+    }
+    console.log('out-of-range port rejected:', name);
+  }
+
   // IPv6 literal host: parse [::1], connect over AF_INET6, and re-bracket the
   // Host header. Only runs when the runner confirmed IPv6 loopback is up (it
   // sets FETCH_BASE6), so Node and Lava take this branch identically.

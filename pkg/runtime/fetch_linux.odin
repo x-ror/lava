@@ -25,7 +25,11 @@ fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: [4]u8, port: int) -> (ok: bo
 		sin_port   = u16be(port),
 		sin_addr   = ip4,
 	}
-	if conn_err := linux.connect(sock_fd, &addr); conn_err != .NONE && conn_err != .EINPROGRESS {
+	// EINTR: a signal interrupted connect() before it could report EINPROGRESS;
+	// the connection still proceeds asynchronously, so treat it like EINPROGRESS
+	// rather than a hard failure.
+	if conn_err := linux.connect(sock_fd, &addr);
+	   conn_err != .NONE && conn_err != .EINPROGRESS && conn_err != .EINTR {
 		linux.close(sock_fd)
 		return false, "fetch: connect failed"
 	}
@@ -49,7 +53,11 @@ fetch_connect_ip6 :: proc(
 		sin6_port   = u16be(port),
 		sin6_addr   = transmute([16]u8)ip6,
 	}
-	if conn_err := linux.connect(sock_fd, &addr); conn_err != .NONE && conn_err != .EINPROGRESS {
+	// EINTR: a signal interrupted connect() before it could report EINPROGRESS;
+	// the connection still proceeds asynchronously, so treat it like EINPROGRESS
+	// rather than a hard failure.
+	if conn_err := linux.connect(sock_fd, &addr);
+	   conn_err != .NONE && conn_err != .EINPROGRESS && conn_err != .EINTR {
 		linux.close(sock_fd)
 		return false, "fetch: connect failed"
 	}
@@ -82,6 +90,10 @@ fetch_raw_send :: proc(req: ^Fetch_Request, chunk: []byte) -> (n: int, res: Fetc
 	case .EAGAIN:
 		// == EWOULDBLOCK
 		return 0, .Would_Block
+	case .EINTR:
+		// Interrupted before any byte was sent — re-poll and retry rather than
+		// failing the request.
+		return 0, .Would_Block
 	case:
 		return 0, .Failed
 	}
@@ -96,6 +108,9 @@ fetch_raw_recv :: proc(req: ^Fetch_Request, buf: []byte) -> (n: int, res: Fetch_
 		return got, got == 0 ? .Closed : .Ok
 	case .EAGAIN:
 		// == EWOULDBLOCK
+		return 0, .Would_Block
+	case .EINTR:
+		// Interrupted before any byte arrived — re-poll and retry.
 		return 0, .Would_Block
 	case:
 		return 0, .Failed

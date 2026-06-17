@@ -25,6 +25,19 @@ import eventloop "lava:pkg/runtime/eventloop"
 // non-blocking on the event loop. Platforms with no transport reject the network
 // call entirely. See ROADMAP.
 
+// FETCH_MAX_HEADER_BYTES caps the response head buffer (req.response, which
+// accumulates only until the CRLFCRLF terminator). A server that never sends the
+// terminator would otherwise grow this without bound — an OOM vector. The body
+// itself is streamed (never buffered here), so this bounds the head alone. Set
+// generously above any realistic header set.
+FETCH_MAX_HEADER_BYTES :: 256 * 1024
+
+// FETCH_MAX_CHUNK_LINE caps a single Transfer-Encoding: chunked size line. The
+// carry buffer holds only undecoded framing (size lines + inter-chunk CRLFs),
+// never bulk data; a size line that never terminates must not grow it without
+// bound. A real chunk-size line is a handful of hex digits, so 16 KiB is ample.
+FETCH_MAX_CHUNK_LINE :: 16 * 1024
+
 Fetch_Phase :: enum {
 	Connecting,
 	TLS_Handshake, // https only: drive SSL_connect between Connecting and Writing
@@ -535,17 +548,38 @@ parse_http_url :: proc(
 		if rb < 0 do return "", 0, "", "", false
 		host = authority[1:rb]
 		rest_after := authority[rb + 1:]
-		if len(rest_after) > 1 && rest_after[0] == ':' {
-			if p, p_ok := strconv.parse_int(rest_after[1:]); p_ok do port = p
+		if len(rest_after) > 0 && rest_after[0] == ':' {
+			p, p_ok := parse_authority_port(rest_after[1:])
+			if !p_ok do return "", 0, "", "", false
+			if p >= 0 do port = p
 		}
 	} else if colon := strings.last_index_byte(authority, ':'); colon >= 0 {
 		host = authority[:colon]
-		if p, p_ok := strconv.parse_int(authority[colon + 1:]); p_ok do port = p
+		p, p_ok := parse_authority_port(authority[colon + 1:])
+		if !p_ok do return "", 0, "", "", false
+		if p >= 0 do port = p
 	}
 	if len(host) == 0 do return "", 0, "", "", false
 
 	ok = true
 	return
+}
+
+// parse_authority_port validates the optional ":port" of an authority. An empty
+// string (a bare trailing ':') is valid and keeps the scheme default in place
+// (returns -1, true). A non-empty port must be all ASCII digits and fit
+// 0..65535 — a non-numeric or out-of-range value is rejected (`ok == false`),
+// mirroring the WHATWG URL parser, rather than silently truncating via u16 or
+// falling back to port 80/443. The JS layer already validates through `new URL`,
+// so this is defense in depth for any caller that reaches the native parser.
+parse_authority_port :: proc(s: string) -> (port: int, ok: bool) {
+	if len(s) == 0 do return -1, true
+	for c in transmute([]byte)s {
+		if c < '0' || c > '9' do return -1, false
+	}
+	p, p_ok := strconv.parse_int(s)
+	if !p_ok || p < 0 || p > 65535 do return -1, false
+	return p, true
 }
 
 // build_http_request serializes the request line, a Host header, the caller's
@@ -621,7 +655,15 @@ fetch_on_recv :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, data: []byte) 
 	if !req.headers_done {
 		append(&req.response, ..data)
 		sep := find_header_end(req.response[:])
-		if sep < 0 do return true // head still incomplete — read more
+		if sep < 0 {
+			// A server that never terminates the head must not grow req.response
+			// without bound — reject once it crosses the cap.
+			if len(req.response) > FETCH_MAX_HEADER_BYTES {
+				fetch_settle_error(req, "fetch: response head too large")
+				return false
+			}
+			return true // head still incomplete — read more
+		}
 		if !fetch_deliver_headers(req, sep) do return false // settled with an error
 		if req.settled do return false // a consumer cancelled inside on_response
 		if req.no_body {
@@ -1087,15 +1129,29 @@ parse_http_head :: proc(
 	status = code
 
 	hdr_list := make([dynamic]string, 0, context.temp_allocator)
+	last_val_idx := -1
 	for i in 1 ..< len(lines) {
 		line := lines[i]
 		if len(line) == 0 do continue
+		// RFC 7230 obs-fold: a field-value continuation line begins with SP or HT.
+		// It is deprecated, but rather than drop it (silently corrupting the value)
+		// we unfold it — append the trimmed continuation to the previous value with
+		// a single space, the historical HTTP/1.1 interpretation.
+		if (line[0] == ' ' || line[0] == '\t') && last_val_idx >= 0 {
+			cont := strings.trim_space(line)
+			hdr_list[last_val_idx] = strings.concatenate(
+				{hdr_list[last_val_idx], " ", cont},
+				context.temp_allocator,
+			)
+			continue
+		}
 		colon := strings.index_byte(line, ':')
 		if colon < 0 do continue
 		name := strings.trim_space(line[:colon])
 		value := strings.trim_space(line[colon + 1:])
 		append(&hdr_list, name)
 		append(&hdr_list, value)
+		last_val_idx = len(hdr_list) - 1
 
 		lname := strings.to_lower(name, context.temp_allocator)
 		switch lname {
@@ -1158,7 +1214,15 @@ fetch_feed_chunked :: proc(req: ^Fetch_Request, data: []byte) {
 					break
 				}
 			}
-			if line_end < 0 do break loop // size line not complete yet
+			if line_end < 0 {
+				// A chunk-size line that never terminates must not grow carry
+				// without bound — fail the body as a framing violation.
+				if len(buf) - pos > FETCH_MAX_CHUNK_LINE {
+					fetch_finish_body(req, "fetch: terminated")
+					return
+				}
+				break loop // size line not complete yet
+			}
 			size_str := string(buf[pos:line_end])
 			if semi := strings.index_byte(size_str, ';'); semi >= 0 do size_str = size_str[:semi]
 			size, size_ok := strconv.parse_int(strings.trim_space(size_str), 16)
