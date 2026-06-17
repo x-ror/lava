@@ -128,6 +128,13 @@ IO_Watcher :: struct {
 	// that fails because the fd is already closed, a duplicate watch). Owned by the
 	// wrappers; callers must zero-initialize the watcher (a fresh IO_Watcher literal).
 	watched:   bool,
+	// backend_slot is io_uring-only scratch: the index of this watcher's entry in
+	// Platform_Loop.watch_slots while watched, so unwatch_fd reaches its slot in O(1)
+	// instead of scanning the table. Set by platform_watch_fd, read by
+	// platform_unwatch_fd; meaningful only while `watched`. Unused by the epoll/
+	// kqueue/select backends, which recover the watcher pointer straight from the
+	// kernel event. Owned by the platform layer; a zero-initialized watcher is fine.
+	backend_slot: u32,
 }
 
 // init creates a loop. Pass real_time=true (the lava runtime) to have timer
@@ -309,10 +316,13 @@ now :: proc(loop: ^Loop) -> u64 {
 }
 
 // iteration_count returns the monotonic loop-tick counter (bumped once per
-// run_once). Used to age out resources that an io_uring backend may still
-// reference via an already-submitted, uncancellable poll: a completion for a
-// closed fd surfaces at most one tick later, so a resource settled `iteration`
-// ticks ago is safe to free once two ticks have elapsed.
+// run_once). A general-purpose tick clock for embedders that need to age out or
+// order resources across loop iterations. The fetch transport uses it to hold a
+// just-settled request a couple of iterations before reclaim, so a stale readiness
+// event still pending in an in-flight platform_poll batch (epoll/kqueue/select
+// dispatch via the raw watcher pointer) cannot land on freed memory. (io_uring no
+// longer needs this — its poll is truly cancelled and its token invalidated, see
+// #183 / loop_linux.odin — but the guard is cheap and uniform across backends.)
 iteration_count :: proc(loop: ^Loop) -> u64 {
 	return loop.iteration
 }

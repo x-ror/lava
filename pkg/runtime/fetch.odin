@@ -44,9 +44,14 @@ Chunk_State :: enum {
 
 // Fetch_Request owns everything an in-flight request needs. It outlives the
 // native call that created it: the JS callbacks are GC-protected and the struct
-// is heap-allocated, settled later from an event-loop I/O callback. Freeing is
-// deferred to runtime teardown (see fetch_request_finish) because the io_uring
-// watcher may reference it once more after we stop it.
+// is heap-allocated, settled later from an event-loop I/O callback. A settled
+// request is queued onto pending_free and reclaimed on a later request (or at
+// teardown). It must outlive two things: an in-flight fetch_drive_read_cb (tracked
+// by drive_pending), and — on the pointer-based backends (epoll/kqueue/select) —
+// any readiness event already copied into an in-flight platform_poll batch, which
+// dispatches via the raw watcher pointer (held two iterations past settle via
+// settle_tick). Stale io_uring poll completions can no longer reference it:
+// unwatch_fd truly cancels the poll and invalidates its generation token (#183).
 Fetch_Request :: struct {
 	ctx:           jsc.JSContextRef,
 	loop:          ^eventloop.Loop,
@@ -94,7 +99,7 @@ Fetch_Request :: struct {
 	read_paused:   bool, // socket reads suspended for backpressure (consumer saturated)
 	want_pause:    bool, // a delivered chunk reported the consumer is full this turn
 	drive_pending: int, // queued fetch_drive_read_cb completions referencing this req
-	settle_tick:   u64, // loop iteration at settle; reclaim waits out stale io_uring polls
+	settle_tick:   u64, // loop iteration at settle; reclaim holds the req two ticks past it
 
 	// TLS state for https:// requests. is_https gates the TLS path in the
 	// transport; tls is an opaque ^SSL (rawptr so this cross-platform struct
@@ -656,14 +661,21 @@ fetch_reject_now :: proc(ctx: jsc.JSContextRef, on_error: jsc.JSObjectRef, messa
 
 // fetch_request_finish tears down a settled request: stop the watcher, close the
 // socket, release the GC-protected callbacks. The struct is queued onto
-// pending_free rather than freed here — the io_uring drain reads this watcher
-// once more (to decide re-arm) right after the callback returns, so freeing now
-// would be a use-after-free. It is reclaimed on the next request or at teardown,
-// both safely past that read.
+// pending_free rather than freed here because three things may still read it after
+// it settles: the io_uring drain loop (to decide re-arm right after the callback
+// returns), an in-flight fetch_drive_read_cb holding a raw pointer (drive_pending),
+// and — on the pointer-based backends (epoll/kqueue/select) — a readiness event for
+// it already sitting in the in-flight platform_poll batch, which dispatches via the
+// raw watcher pointer. Reclaim waits all three out (drive_pending + settle_tick; see
+// fetch_reclaim_pending). Clearing req.watcher.callback below makes the request
+// inert immediately; unwatch_fd then truly cancels the io_uring poll (#183).
 fetch_request_finish :: proc(req: ^Fetch_Request) {
 	if req.settled do return
 	fetch_release_dns_worker(req)
 	req.settled = true
+	// Stamp the settle iteration so fetch_reclaim_pending holds this request a couple
+	// of loop ticks — past the in-flight platform_poll batch that may still carry a
+	// readiness event for it on the pointer-based backends.
 	req.settle_tick = eventloop.iteration_count(req.loop)
 	if state := get_state_from_ctx(req.ctx); state != nil {
 		fetch_untrack_active(state, req)
@@ -785,22 +797,30 @@ fetch_free_request :: proc(req: ^Fetch_Request) {
 	free(req)
 }
 
-// fetch_reclaim_pending frees every settled request awaiting cleanup. Safe to
-// call any time after the settling loop iteration: a settled request has its
-// watcher callback cleared and no poll in flight, so no later completion can
-// reference it. Called at the start of each new request so retention stays
-// bounded to roughly the in-flight set rather than growing until teardown.
+// fetch_reclaim_pending frees every settled request awaiting cleanup. Called at the
+// start of each new request so retention stays bounded to roughly the in-flight set
+// rather than growing until teardown.
 //
-// A request is kept (reclaimed on a later pass) while anything may still reference
-// its memory: an outstanding fetch_drive_read_cb (drive_pending > 0), or — on the
-// io_uring backend — an already-submitted poll whose completion can surface for up
-// to one tick after the fd was closed. Waiting two loop iterations past settle
-// covers that uncancellable poll without a POLL_REMOVE (a tracked follow-up).
+// A request is kept (reclaimed on a later pass) while either of two things may still
+// reference its memory:
+//   1. drive_pending > 0 — an in-flight fetch_drive_read_cb still holds a raw pointer
+//      to it (the completion is queued on the loop's async queue, runs on a later tick).
+//   2. Fewer than two loop iterations have elapsed since it settled. On the pointer-
+//      based backends (epoll/kqueue/select) a readiness event for the request can be
+//      sitting in an in-flight platform_poll batch that dispatches via the raw watcher
+//      pointer captured before unwatch; because the settling callback runs mid-batch
+//      (the microtask checkpoint fires inside the dispatch, and a synchronous fetch()
+//      from JS reaches here while that batch is still being walked), freeing too early
+//      lets a later batch entry dereference freed memory. Two iterations is the window
+//      the pre-#198 transport used and is proven safe across all three pointer-based
+//      backends; io_uring is independently safe via generation tokens (a stale
+//      completion maps to a released slot and is dropped), so there the hold is just a
+//      cheap, uniform safety margin rather than a correctness requirement.
 fetch_reclaim_pending :: proc(state: ^Runtime_State) {
 	kept := 0
 	for req in state.pending_free {
-		stale_poll_possible := eventloop.iteration_count(req.loop) - req.settle_tick < 2
-		if req.drive_pending > 0 || stale_poll_possible {
+		within_stale_window := eventloop.iteration_count(req.loop) - req.settle_tick < 2
+		if req.drive_pending > 0 || within_stale_window {
 			state.pending_free[kept] = req
 			kept += 1
 			continue

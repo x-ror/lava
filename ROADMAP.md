@@ -136,10 +136,12 @@ implementations — no `primordials`, no `internalBinding` coupling.
       (`pkg/runtime/fetch_transport.odin`). Request bodies accept `ReadableStream`,
       async iterables, and `Blob` but are **buffered before send** in v1 (no chunked
       upload); true streaming upload is the remaining follow-up. Verified by
-      `make test-fetch-smoke`. Lifetime note: io_uring has no `POLL_REMOVE`, so a
-      paused-then-resumed read can leave an uncancellable poll outstanding; settled
-      requests are reclaimed only after two loop iterations so a stale completion
-      cannot land on freed memory (a real `POLL_REMOVE` path is still tracked).
+      `make test-fetch-smoke`. Lifetime note: the io_uring backend now truly
+      cancels a watcher's `POLL_ADD` on `unwatch_fd` (`IORING_OP_ASYNC_CANCEL`)
+      and keys every poll by a generation token, so a straggling completion after
+      a paused/resumed read or an abort is dropped without touching freed memory
+      (#183). Settled requests are therefore reclaimed on the next request again —
+      no iteration-counter deferral.
 - [x] **Event-loop I/O driving** — fetch was the first real `watch_fd` consumer
       and exposed several gaps, now fixed (`pkg/runtime/eventloop/`):
       - io_uring `POLL_ADD` mask is written to `poll_events` (was `addr`, so no

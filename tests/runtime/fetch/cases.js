@@ -301,6 +301,95 @@ async function main() {
     console.log('clone tee:', t1.length === BIG.length, t1 === t2);
   }
 
+  // --- Stale-poll cancellation regression (issue #183) ---
+  // Cancelling a streaming reader mid-body settles the request and frees its
+  // backing memory; the very next fetch reuses that memory. On the io_uring
+  // backend a stale poll completion landing on the reused request was a
+  // use-after-free. Looping cancel→refetch many times must stay clean — each body
+  // is marked used and the run completes without corruption.
+  {
+    let clean = true;
+    for (let i = 0; i < 12; i++) {
+      const r = await fetch(base + '/big');
+      const reader = r.body.getReader();
+      await reader.read(); // pull one chunk — a socket poll is outstanding here
+      await reader.cancel(); // settle + free mid-stream, with that poll still live
+      if (!r.bodyUsed) clean = false;
+    }
+    console.log('cancel churn clean:', clean);
+  }
+
+  // Backpressure resume racing body completion: yielding to a macrotask between
+  // reads invites the transport to pause and resume the socket read repeatedly, so
+  // the final chunk can arrive while a resume drive is still queued. The
+  // reassembled body must still be byte-exact and the stream must end cleanly.
+  {
+    const r = await fetch(base + '/big');
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let out = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += dec.decode(value, { stream: true });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    out += dec.decode();
+    console.log('slow-drain stream:', out.length === BIG.length, out === BIG);
+  }
+
+  // Abort mid-stream then immediately re-fetch and fully drain: the aborted
+  // request frees while its poll may still be outstanding, and the next request
+  // must read its body intact (not inherit a stale completion).
+  {
+    const ac = new AbortController();
+    const r = await fetch(base + '/big', { signal: ac.signal });
+    const reader = r.body.getReader();
+    await reader.read();
+    ac.abort();
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch {
+      // aborted read rejects — expected
+    }
+    const fresh = await (await fetch(base + '/big')).text();
+    console.log('abort then refetch:', fresh.length === BIG.length, fresh === BIG);
+  }
+
+  // Concurrent streaming fetches where one reader's continuation cancels a sibling
+  // mid-flight and immediately starts another fetch. On Lava the microtask
+  // checkpoint runs inside the watcher dispatch, so this continuation executes while
+  // the poll batch is still being walked; freeing the cancelled sibling before its
+  // own readiness entry in that batch is dispatched was a use-after-free on the
+  // pointer-based backends (kqueue/select, or epoll without io_uring) — the
+  // generation-token io_uring backend was already safe. The run must stay clean and
+  // every third body must be byte-exact (#183 / #198).
+  {
+    let clean = true;
+    for (let i = 0; i < 10; i++) {
+      const ra = await fetch(base + '/big');
+      const rb = await fetch(base + '/big');
+      const readerA = ra.body.getReader();
+      const readerB = rb.body.getReader();
+      // Prime B so its socket readiness can land in the same poll batch as A's.
+      const pendingB = readerB.read().catch(() => {});
+      await readerA.read();
+      // Runs mid-batch on Lava: cancel() runs B's cancel steps synchronously
+      // (settling + queueing B's free), then a fresh fetch() whose reclaim would free
+      // B — while B's own batch entry may still be pending behind A's.
+      const pendingCancelB = readerB.cancel();
+      const c = await (await fetch(base + '/big')).text();
+      if (c !== BIG) clean = false;
+      await pendingCancelB.catch(() => {});
+      await pendingB;
+      await readerA.cancel();
+    }
+    console.log('concurrent cancel+refetch clean:', clean);
+  }
+
   // IPv6 literal host: parse [::1], connect over AF_INET6, and re-bracket the
   // Host header. Only runs when the runner confirmed IPv6 loopback is up (it
   // sets FETCH_BASE6), so Node and Lava take this branch identically.
