@@ -152,6 +152,32 @@ buffer_utf8_decode_cb :: proc "c" (
 	return jsc.JSValueMakeString(ctx, js_str)
 }
 
+// allocUninit(size) -> Uint8Array | null. Hands back `size` bytes of native,
+// *uninitialized* memory (Node's allocUnsafe semantics) as a NoCopy Uint8Array
+// that the JS layer wraps as a Buffer view. Only the unpooled unsafe paths reach
+// here (large Buffer.allocUnsafe, Buffer.allocUnsafeSlow, SlowBuffer); the small
+// pooled path stays in JS. Returns null for a non-positive size or an allocation
+// failure, so the JS layer falls back to a zero-filled own-backing Buffer (which
+// throws for an impossible size, matching Node). The size is already validated by
+// assertSize on the JS side; the int() truncation here mirrors Node's allocator
+// flooring a fractional request.
+buffer_alloc_uninit_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return jsc.JSValueMakeNull(ctx)
+
+	n := int(jsc.JSValueToNumber(ctx, arguments[0], nil))
+	array, ok := make_uint8_array_uninit(ctx, n)
+	if !ok do return jsc.JSValueMakeNull(ctx)
+	return array
+}
+
 // make_buffer_bindings builds the `native` object handed to js/internal/buffer.js.
 make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
@@ -161,5 +187,6 @@ make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "base64Decode", buffer_base64_decode_cb)
 	inject_native_function(ctx, bindings, "utf8Encode", buffer_utf8_encode_cb)
 	inject_native_function(ctx, bindings, "utf8Decode", buffer_utf8_decode_cb)
+	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
 	return bindings
 }

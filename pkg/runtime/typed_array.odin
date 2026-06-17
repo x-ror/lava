@@ -2,6 +2,7 @@ package lava_runtime
 
 import "base:runtime"
 import "core:c"
+import "core:mem"
 import jsc "lava:pkg/jsc"
 
 // Shared JavaScriptCore <-> Odin TypedArray marshalling helpers. These are general
@@ -65,4 +66,43 @@ make_uint8_array :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef 
 	// C-API call on Linux/macOS. See pkg/jsc/jsc_init.odin.
 	array := jsc.make_uint8_nocopy_locked(ctx, ptr, c.size_t(n), jsc_buffer_deallocator)
 	return cast(jsc.JSValueRef)array
+}
+
+// MAX_UNINIT_ALLOC caps the native uninitialized fast-path. Above it the JS layer
+// falls back to a plain `new Buffer(size)`. The cap exists for safety, not policy:
+// JavaScriptCore's NoCopy typed-array creator RELEASE_ASSERT-aborts the process for
+// byte lengths past an internal limit (empirically between 4 and 8 GiB on the Linux
+// build, and the Windows/macOS JSC builds may differ), whereas the JS typed-array
+// constructor instead throws a catchable RangeError. 2 GiB-1 sits well below any of
+// those abort thresholds, comfortably above any realistic allocUnsafe, and keeps
+// behavior identical across Linux, macOS, and Windows. A request larger than this
+// is rare and simply takes the safe (zero-filled) own-backing path, exactly as
+// before this fast-path existed.
+MAX_UNINIT_ALLOC :: 0x7fff_ffff // 2^31 - 1 bytes
+
+// make_uint8_array_uninit hands JavaScriptCore `size` bytes of freshly allocated,
+// *uninitialized* memory as a NoCopy Uint8Array. It backs the node:buffer unpooled
+// unsafe-allocation paths — large Buffer.allocUnsafe, Buffer.allocUnsafeSlow, and
+// SlowBuffer — for which Node returns memory as-is. A JS `new Uint8Array(size)`
+// cannot reproduce that because every ArrayBuffer is zero-initialized; this
+// deliberately skips the zero-fill (alloc_bytes_non_zeroed, not make), so the bytes
+// hold whatever was previously in the region, like Node's malloc-not-calloc
+// allocator. Ownership matches make_uint8_array exactly: the region comes from
+// context.allocator and jsc_buffer_deallocator frees it once JSC collects the
+// backing ArrayBuffer, so any view kept by the JS layer (the Buffer wrapper, a
+// subarray, …) keeps the memory live for precisely as long as it is reachable —
+// no leak, no use-after-free, no double-free. Returns ok=false for a non-positive
+// or over-cap size, or an allocation failure, letting the caller fall back to a
+// safe zero-filled own-backing Buffer (which still throws for an impossible size,
+// as Node does).
+make_uint8_array_uninit :: proc(ctx: jsc.JSContextRef, size: int) -> (jsc.JSValueRef, bool) {
+	if size <= 0 || size > MAX_UNINIT_ALLOC do return nil, false
+	data, err := mem.alloc_bytes_non_zeroed(size, mem.DEFAULT_ALIGNMENT, context.allocator)
+	if err != nil || len(data) != size do return nil, false
+	array := jsc.make_uint8_nocopy_locked(ctx, raw_data(data), c.size_t(size), jsc_buffer_deallocator)
+	if array == nil {
+		free(raw_data(data)) // hand-off failed: free the region ourselves, don't leak it
+		return nil, false
+	}
+	return cast(jsc.JSValueRef)array, true
 }

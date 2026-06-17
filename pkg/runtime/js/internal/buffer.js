@@ -11,6 +11,10 @@
   var hexEncode = native.hexEncode; // (Uint8Array) -> string
   var hexDecode = native.hexDecode; // (string) -> Uint8Array
   var base64Encode = native.base64Encode; // (Uint8Array) -> string
+  // (size) -> uninitialized Uint8Array | null — native uninitialized allocation
+  // backing the unpooled unsafe paths; null signals "fall back to a zero-filled
+  // own-backing Buffer" (binding missing or allocation failed). See allocUnsafeNoZero.
+  var nativeAllocUninit = typeof native.allocUninit === 'function' ? native.allocUninit : null;
 
   // Match Node's advertised limits (node:buffer constants): MAX_LENGTH is
   // Number.MAX_SAFE_INTEGER on 64-bit builds, MAX_STRING_LENGTH is V8's string
@@ -801,15 +805,52 @@
   // once per runtime/context, so the pool is per-runtime and never leaks across
   // isolated runtimes. Pooled bytes are uninitialized — only allocUnsafe and the
   // Buffer.from(...) copy paths (where Node pools) draw from it; Buffer.alloc,
-  // allocUnsafeSlow, and SlowBuffer stay on their own zero-able backing store.
-  var poolBufferSize; // Buffer.poolSize snapshot taken when the pool was built
+  // allocUnsafeSlow, and SlowBuffer stay on their own backing store (alloc is
+  // zero-filled; the allocUnsafeSlow/SlowBuffer paths go through allocUnsafeNoZero).
+  var poolBufferSize; // byteLength of the live allocPool (its real size)
   var poolOffset; // next free byte in allocPool
   var allocPool; // shared backing ArrayBuffer
 
   function createPool() {
-    poolBufferSize = Buffer.poolSize >>> 0;
-    allocPool = new ArrayBuffer(poolBufferSize);
+    // Size the pool straight from Buffer.poolSize the way Node does — Node builds
+    // its pool with `new Uint8Array(Buffer.poolSize)`. Routing through a typed
+    // array (rather than `new ArrayBuffer(Buffer.poolSize >>> 0)`) reproduces Node's
+    // exact coercion: a fractional poolSize is truncated by ToIndex (8192.7 -> 8192),
+    // and a negative or non-finite poolSize throws a catchable RangeError on the
+    // (re-)pool — instead of `>>> 0` silently wrapping it (-1 -> a ~4 GiB request,
+    // 1e12 -> ~3.5 GiB, 2^32 -> 0). poolBufferSize reads back the realized byteLength
+    // so the carve math below uses the true size. One benign divergence remains: for
+    // a poolSize large enough to exceed JavaScriptCore's typed-array allocation cap
+    // (a few GiB), this throws RangeError where Node (V8's cap is ~2^53) would instead
+    // build a multi-gigabyte pool. That is only reachable by deliberately setting
+    // poolSize to gigabytes AND forcing a re-pool, and throwing is the safer choice —
+    // we never attempt the giant allocation. A failed (re-)pool also leaves the
+    // existing allocPool/poolBufferSize intact (they are assigned only on success),
+    // so the throw is recoverable.
+    allocPool = new Uint8Array(Buffer.poolSize).buffer;
+    poolBufferSize = allocPool.byteLength;
     poolOffset = 0;
+  }
+
+  // allocUnsafeNoZero(size) backs the *unpooled* unsafe allocations — large
+  // Buffer.allocUnsafe, Buffer.allocUnsafeSlow, and SlowBuffer. Node leaves these
+  // uninitialized (its allocator skips the zero-fill); a JS `new Buffer(size)`
+  // cannot, because every ArrayBuffer is zero-initialized. So we ask the native
+  // binding for an uninitialized region and wrap it as a Buffer *view* over the
+  // same backing store — no copy, byteOffset 0, buffer sized exactly to `size`.
+  // The native call returns null when the binding is unavailable or the allocation
+  // fails; we then fall back to a zero-filled own-backing Buffer, which is strictly
+  // safe and still throws the RangeError Node throws for an impossible size. The
+  // floor + guards keep a fractional/non-finite size off the native path (it stays
+  // on `new Buffer(size)`, matching Node's truncation / RangeError exactly).
+  function allocUnsafeNoZero(size) {
+    size = Math.floor(size);
+    if (size <= 0) return new Buffer(0);
+    if (nativeAllocUninit && size <= K_MAX_LENGTH) {
+      var raw = nativeAllocUninit(size);
+      if (raw) return new Buffer(raw.buffer, raw.byteOffset, raw.length);
+    }
+    return new Buffer(size);
   }
 
   // Round the next offset up to an 8-byte boundary, matching Node's alignPool();
@@ -821,9 +862,10 @@
   // allocate(size) mirrors Node's internal allocate(): sizes strictly below
   // poolSize/2 are served from the shared pool (uninitialized); anything larger
   // (or exactly poolSize/2 — Node's threshold is `< (poolSize >>> 1)`) gets its
-  // own backing ArrayBuffer. The pool is recreated when the request no longer
-  // fits in what remains. Callers that expose the bytes (Buffer.from) overwrite
-  // the whole view; allocUnsafe deliberately leaves stale pool bytes visible.
+  // own backing store via allocUnsafeNoZero (native-uninitialized, like Node). The
+  // pool is recreated when the request no longer fits in what remains. Callers that
+  // expose the bytes (Buffer.from) overwrite the whole view; allocUnsafe
+  // deliberately leaves stale pool / uninitialized bytes visible.
   function allocate(size) {
     if (!(size > 0)) return new Buffer(0); // 0, negative, or NaN
     if (size < Buffer.poolSize >>> 1) {
@@ -835,7 +877,7 @@
       alignPool();
       return b;
     }
-    return new Buffer(size); // Infinity stays Infinity -> ctor throws, like Node
+    return allocUnsafeNoZero(size); // own store, uninitialized; Infinity -> ctor throws, like Node
   }
 
   // fromArrayLike copies element values (each coerced to a byte) into a small
@@ -916,7 +958,7 @@
 
   Buffer.allocUnsafeSlow = function (size) {
     assertSize(size);
-    return new Buffer(size); // never pooled — its own backing store, like Node
+    return allocUnsafeNoZero(size); // never pooled — its own uninitialized backing store, like Node
   };
 
   Buffer.isBuffer = function (b) {
@@ -1019,7 +1061,7 @@
 
   function SlowBuffer(size) {
     assertSize(size);
-    return new Buffer(size); // SlowBuffer is unpooled by definition
+    return allocUnsafeNoZero(size); // unpooled + uninitialized by definition
   }
 
   function atob(data) {
