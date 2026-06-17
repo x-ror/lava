@@ -259,3 +259,67 @@ crypto.scrypt('password', 'salt', 32, (err, dk) => {
   assert.ifError(err);
   assert.equal(dk.toString('hex'), scryptDefault);
 });
+
+// ---------------------------------------------------------------------------
+// Argument validation (#106). Bad input must fail with Node's error class/code
+// instead of being silently coerced into a hang, a wrong key, or a short fill.
+
+// pbkdf2: iterations is validated 1..2^31-1 — -1 no longer wraps to 4294967295
+// (a permanent sync hang) and >= 2^32 no longer truncates to a different key.
+assert.throws(() => crypto.pbkdf2Sync('p', 's', -1, 32, 'sha256'), {
+  name: 'RangeError',
+  code: 'ERR_OUT_OF_RANGE',
+});
+assert.throws(() => crypto.pbkdf2Sync('p', 's', 0, 32, 'sha256'), { code: 'ERR_OUT_OF_RANGE' });
+assert.throws(() => crypto.pbkdf2Sync('p', 's', 2 ** 32, 32, 'sha256'), {
+  code: 'ERR_OUT_OF_RANGE',
+});
+assert.throws(() => crypto.pbkdf2Sync('p', 's', 1.5, 32, 'sha256'), { code: 'ERR_OUT_OF_RANGE' });
+// keylen out of the int32 range throws ERR_OUT_OF_RANGE; keylen 0 is rejected
+// by the underlying KDF (OpenSSL/Odin both refuse a zero-length derivation).
+assert.throws(() => crypto.pbkdf2Sync('p', 's', 1, -1, 'sha256'), { code: 'ERR_OUT_OF_RANGE' });
+assert.throws(() => crypto.pbkdf2Sync('p', 's', 1, 2 ** 31, 'sha256'), {
+  code: 'ERR_OUT_OF_RANGE',
+});
+assert.throws(() => crypto.pbkdf2Sync('p', 's', 1, 0, 'sha256'));
+// digest must be a string; password/salt must be byte sources (not numbers).
+assert.throws(() => crypto.pbkdf2Sync('p', 's', 1, 8, 123), { code: 'ERR_INVALID_ARG_TYPE' });
+assert.throws(() => crypto.pbkdf2Sync(5, 's', 1, 8, 'sha256'), { code: 'ERR_INVALID_ARG_TYPE' });
+// Known-answer test at a non-trivial iteration count (RFC 6070 vector): proves
+// the full count runs and is neither wrapped nor truncated.
+assert.equal(
+  crypto.pbkdf2Sync('password', 'salt', 4096, 20, 'sha1').toString('hex'),
+  '4b007901b765489abead49d926f721d065a429c1',
+);
+
+// randomBytes: a negative/NaN size throws instead of a huge allocation; a
+// fractional size is truncated (Node parity), a non-number is a type error.
+assert.throws(() => crypto.randomBytes(-1), { name: 'RangeError', code: 'ERR_OUT_OF_RANGE' });
+assert.throws(() => crypto.randomBytes(NaN), { code: 'ERR_OUT_OF_RANGE' });
+assert.throws(() => crypto.randomBytes('4'), { code: 'ERR_INVALID_ARG_TYPE' });
+assert.equal(crypto.randomBytes(1.5).length, 1);
+
+// randomFillSync: range is validated (no silent truncation) and only the
+// requested window is touched; ArrayBuffer and DataView inputs are supported.
+assert.throws(() => crypto.randomFillSync(Buffer.alloc(4), 0, 10), { code: 'ERR_OUT_OF_RANGE' });
+assert.throws(() => crypto.randomFillSync(Buffer.alloc(4), -1), { code: 'ERR_OUT_OF_RANGE' });
+const windowed = new Uint8Array(8);
+crypto.randomFillSync(windowed, 2, 3); // fills bytes [2,5) only
+assert.equal(windowed[0], 0);
+assert.equal(windowed[1], 0);
+assert.equal(windowed[5], 0);
+assert.equal(windowed[6], 0);
+assert.equal(windowed[7], 0);
+const abFill = new ArrayBuffer(16);
+crypto.randomFillSync(abFill);
+assert.ok(new Uint8Array(abFill).some((b) => b !== 0));
+const dvFill = new DataView(new ArrayBuffer(16));
+crypto.randomFillSync(dvFill);
+assert.ok(new Uint8Array(dvFill.buffer).some((b) => b !== 0));
+
+// Numeric/string inputs are rejected where Node rejects them (used to be
+// silently zero-filled — timingSafeEqual(5, 5) wrongly returned true).
+assert.throws(() => crypto.createHash('sha256').update(5), { code: 'ERR_INVALID_ARG_TYPE' });
+assert.throws(() => crypto.createHmac('sha256', 5), { code: 'ERR_INVALID_ARG_TYPE' });
+assert.throws(() => crypto.timingSafeEqual(5, 5), { code: 'ERR_INVALID_ARG_TYPE' });
+assert.throws(() => crypto.timingSafeEqual('abc', 'abc'), { code: 'ERR_INVALID_ARG_TYPE' });
