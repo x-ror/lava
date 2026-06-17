@@ -4,6 +4,9 @@ import "base:runtime"
 import "core:c"
 import "core:encoding/base64"
 import "core:encoding/hex"
+import "core:os"
+import "core:strconv"
+import "core:strings"
 import "core:unicode/utf16"
 import jsc "lava:pkg/jsc"
 
@@ -178,6 +181,43 @@ buffer_alloc_uninit_cb :: proc "c" (
 	return array
 }
 
+// DEFAULT_MAX_BUFFER_BYTES is the practical ceiling for a single Buffer / typed
+// array allocation when LAVA_MAX_BUFFER_BYTES is unset. Unlike V8 — which throws a
+// catchable RangeError when an in-range allocation cannot be satisfied —
+// JavaScriptCore aborts the process once a request exceeds what it can allocate.
+// The Buffer layer refuses anything past this ceiling with a catchable RangeError
+// before JSC ever sees it (raw typed arrays rely on JSC's own throw). 4 GiB on 64-bit
+// matches the JSC/Bun array-buffer ceiling; 2 GiB-1 on 32-bit is the addressable
+// signed limit. Allocations within the cap that still exhaust RAM remain a
+// documented JSC-vs-V8 difference (see reference/node-compatibility.md).
+when size_of(uintptr) >= 8 {
+	DEFAULT_MAX_BUFFER_BYTES :: 4294967296.0
+} else {
+	DEFAULT_MAX_BUFFER_BYTES :: 2147483647.0
+}
+
+// max_buffer_alloc_bytes resolves the allocation ceiling, honoring an optional
+// LAVA_MAX_BUFFER_BYTES override — for operators who want a tighter bound. A
+// malformed, negative, or zero value falls back to the platform default: a
+// non-positive ceiling is treated as "unset" here so it matches the JS layer
+// (buffer.js ignores a non-positive maxAllocBytes and falls back), rather than
+// silently capping every allocation to zero.
+max_buffer_alloc_bytes :: proc() -> f64 {
+	environ, err := os.environ(context.temp_allocator)
+	if err == os.ERROR_NONE {
+		for entry in environ {
+			idx := strings.index_byte(entry, '=')
+			if idx <= 0 do continue
+			if entry[:idx] != "LAVA_MAX_BUFFER_BYTES" do continue
+			if n, ok := strconv.parse_f64(entry[idx + 1:]); ok && n > 0 {
+				return n
+			}
+			break
+		}
+	}
+	return DEFAULT_MAX_BUFFER_BYTES
+}
+
 // make_buffer_bindings builds the `native` object handed to js/internal/buffer.js.
 make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
@@ -188,5 +228,9 @@ make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "utf8Encode", buffer_utf8_encode_cb)
 	inject_native_function(ctx, bindings, "utf8Decode", buffer_utf8_decode_cb)
 	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
+	// The practical allocation ceiling; buffer.js reads it as kMaxLength (the
+	// Bun-parity 4 GiB) and enforces it on Buffer paths before `new Buffer(size)`
+	// reaches JSC.
+	set_named(ctx, bindings, "maxAllocBytes", jsc.JSValueMakeNumber(ctx, max_buffer_alloc_bytes()))
 	return bindings
 }

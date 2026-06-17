@@ -16,12 +16,22 @@
   // own-backing Buffer" (binding missing or allocation failed). See allocUnsafeNoZero.
   var nativeAllocUninit = typeof native.allocUninit === 'function' ? native.allocUninit : null;
 
-  // Match Node's advertised limits (node:buffer constants): MAX_LENGTH is
-  // Number.MAX_SAFE_INTEGER on 64-bit builds, MAX_STRING_LENGTH is V8's string
-  // cap. Packages read these to size work; the real allocation ceiling is still
-  // bounded by available memory.
+  // node:buffer length limits. MAX_STRING_LENGTH is V8's string cap. MAX_LENGTH is
+  // the largest buffer this runtime will allocate: native computes the practical
+  // JavaScriptCore ceiling for the platform (overridable via LAVA_MAX_BUFFER_BYTES;
+  // see max_buffer_alloc_bytes in buffer.odin) and passes it as maxAllocBytes.
+  // JSC can abort the process on an allocation it cannot satisfy, so MAX_LENGTH is a
+  // hard, *enforced* ceiling here. The default (4 GiB on 64-bit) matches Bun, the
+  // other JSC-based runtime, which likewise reports kMaxLength === 4294967296 rather
+  // than the Number.MAX_SAFE_INTEGER that V8/Node advertise on 64-bit — this is the
+  // JSC-family convention, not a lava-only choice. Requests past it throw a catchable
+  // RangeError before JSC is asked to allocate; packages read MAX_LENGTH to size work.
   var MAX_SAFE = 9007199254740991; // Number.MAX_SAFE_INTEGER
-  var K_MAX_LENGTH = MAX_SAFE;
+  var MAX_ALLOC_BYTES =
+    native && typeof native.maxAllocBytes === 'number' && native.maxAllocBytes > 0
+      ? Math.min(native.maxAllocBytes, MAX_SAFE)
+      : 4294967296;
+  var K_MAX_LENGTH = MAX_ALLOC_BYTES;
   var K_STRING_MAX_LENGTH = 536870888;
   var inspectMaxBytes = 50;
 
@@ -112,12 +122,13 @@
 
   // assertSize guards Buffer.alloc/allocUnsafe. Negative or non-numeric sizes
   // previously slipped through `size >>> 0` and asked for a multi-gigabyte
-  // allocation (OOM); Node throws here instead. Fractional sizes are allowed —
-  // the Uint8Array constructor truncates them, matching Node.
+  // allocation (OOM); Node throws here instead. A size beyond K_MAX_LENGTH also
+  // throws (rather than aborting JSC). Fractional sizes are allowed — the
+  // Uint8Array constructor truncates them, matching Node.
   function assertSize(size) {
     if (typeof size !== 'number') throw errInvalidArgType('size', 'number', size);
-    if (!(size >= 0 && size <= MAX_SAFE))
-      throw errOutOfRange('size', '>= 0 && <= ' + MAX_SAFE, size);
+    if (!(size >= 0 && size <= K_MAX_LENGTH))
+      throw errOutOfRange('size', '>= 0 && <= ' + K_MAX_LENGTH, size);
   }
 
   function normalizeEncoding(encoding) {
@@ -381,6 +392,19 @@
   }
 
   class Buffer extends Uint8Array {
+    constructor(arg, byteOffset, length) {
+      // A numeric first argument is the size form (new Buffer(size)). Validate it
+      // against the practical ceiling *before* super() so an oversized request —
+      // reached through any route (alloc/allocUnsafe, fromArrayLike, concat) —
+      // throws a catchable RangeError instead of aborting the process inside JSC.
+      // The ArrayBuffer/SharedArrayBuffer view form (object first arg) shares
+      // existing memory and allocates nothing, so it is passed straight through.
+      if (typeof arg === 'number' && arg > K_MAX_LENGTH) {
+        throw errOutOfRange('size', '>= 0 && <= ' + K_MAX_LENGTH, arg);
+      }
+      super(arg, byteOffset, length);
+    }
+
     toString(encoding, start, end) {
       // Node's slowToString clamps a negative start to 0 (it does NOT wrap like
       // slice/subarray), and a start past the end yields ''. end clamps to the
@@ -1014,8 +1038,8 @@
       if (typeof totalLength !== 'number') throw errInvalidArgType('length', 'number', totalLength);
       if (Math.floor(totalLength) !== totalLength)
         throw errOutOfRange('length', 'an integer', totalLength);
-      if (totalLength < 0 || totalLength > MAX_SAFE)
-        throw errOutOfRange('length', '>= 0 && <= ' + MAX_SAFE, totalLength);
+      if (totalLength < 0 || totalLength > K_MAX_LENGTH)
+        throw errOutOfRange('length', '>= 0 && <= ' + K_MAX_LENGTH, totalLength);
     }
     // Pooled like Node: small concat results share the per-runtime pool. The
     // copies below write [0, offset); any tail left when an explicit totalLength
