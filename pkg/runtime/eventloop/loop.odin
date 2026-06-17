@@ -318,8 +318,8 @@ now :: proc(loop: ^Loop) -> u64 {
 // iteration_count returns the monotonic loop-tick counter (bumped once per
 // run_once). A general-purpose tick clock for embedders that need to age out or
 // order resources across loop iterations. The fetch transport uses it to hold a
-// just-settled request for one extra iteration before reclaim, so a stale readiness
-// event still pending in the in-flight platform_poll batch (epoll/kqueue/select
+// just-settled request a couple of iterations before reclaim, so a stale readiness
+// event still pending in an in-flight platform_poll batch (epoll/kqueue/select
 // dispatch via the raw watcher pointer) cannot land on freed memory. (io_uring no
 // longer needs this — its poll is truly cancelled and its token invalidated, see
 // #183 / loop_linux.odin — but the guard is cheap and uniform across backends.)

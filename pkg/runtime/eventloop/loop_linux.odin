@@ -180,8 +180,8 @@ platform_unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 		//      touching the watcher. As far as io_uring is concerned the watcher (and
 		//      its owning request) may be freed the instant unwatch_fd returns — this
 		//      backend needs no deferred reclaim. (The pointer-based backends still hold
-		//      a settled request one loop tick for their in-flight poll batch, which
-		//      dispatches via the raw watcher pointer; see fetch_reclaim_pending.)
+		//      a settled request a couple of loop ticks for their in-flight poll batch,
+		//      which dispatches via the raw watcher pointer; see fetch_reclaim_pending.)
 		// Returns true unconditionally: the logical `watched` flag in the loop wrapper,
 		// not the kernel result, drives active_io_count, and a best-effort cancel that
 		// could not get an SQE is still covered by the generation check.
