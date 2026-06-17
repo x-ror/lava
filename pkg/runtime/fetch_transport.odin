@@ -4,6 +4,7 @@ package lava_runtime
 import "core:net"
 import "core:strings"
 import "core:thread"
+import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 
 // Shared fetch transport for the readiness-based backends (Linux epoll/io_uring,
@@ -154,6 +155,9 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	case .Writing:
 		fetch_write(loop, req)
 
+	case .Body_Write:
+		fetch_write_body_event(loop, req)
+
 	case .Reading:
 		fetch_read(loop, req)
 	}
@@ -184,11 +188,7 @@ fetch_write :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 		if n <= 0 do return
 		req.write_offset += n
 	}
-	if !fetch_set_watch_mode(loop, req, .Read) {
-		fetch_settle_error(req, "fetch: event loop watch failed")
-		return
-	}
-	req.phase = .Reading // next readable event reads the response
+	fetch_after_write_head(loop, req)
 }
 
 // fetch_read streams the response from the plaintext socket: each read is handed
@@ -220,4 +220,237 @@ fetch_read :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
 			return
 		}
 	}
+}
+
+// ============================================================================
+// Streaming request body — true chunked upload (Transfer-Encoding: chunked)
+// ============================================================================
+//
+// Once the request head is on the wire, a streamed body is pulled from the JS
+// producer one chunk at a time and framed incrementally — no full-body buffer is
+// kept on either side. The flow (half-duplex: the whole request body is sent
+// before the response is read):
+//
+//   fetch_after_write_head → fetch_body_go_idle: defers a producer pull
+//     (post_async → fetch_body_drain_cb → on_body_drain). The JS pump reads its
+//     source and calls push_body_fn → fetch_push_body, which frames the chunk and
+//     flushes it (fetch_pump_body). When the frame fully drains, fetch_body_go_idle
+//     pulls the next chunk; a blocked write arms the fd for writability and the
+//     writable event (fetch_write_body_event) resumes the flush. Socket write
+//     backpressure therefore pauses the producer (the next pull is not scheduled
+//     until the current frame drains). end_body_fn → fetch_end_body writes the
+//     terminating zero-size chunk and flips to reading the response.
+//
+// Recursion / liveness: the producer pull is DEFERRED via post_async (mirroring the
+// response-read resume in fetch.odin) rather than invoked inline — a synchronous
+// invoke would recurse one stack frame per chunk through JSC's microtask auto-drain
+// (read → push → drain → pull → read …). post_async breaks that and, paired with
+// async_begin + drive_pending, keeps the loop alive across the pull and pins the
+// request against reclaim until the deferred completion has run.
+
+// fetch_after_write_head runs once the request head is fully written. A buffered
+// body was written with it, so flip straight to reading; a streamed body now pulls
+// its first chunk from the producer.
+fetch_after_write_head :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+	if !req.body_streaming {
+		if !fetch_set_watch_mode(loop, req, .Read) {
+			fetch_settle_error(req, "fetch: event loop watch failed")
+			return
+		}
+		req.phase = .Reading // next readable event reads the response
+		return
+	}
+	req.phase = .Body_Write
+	// Pin the loop for the whole upload so an in-flight chunked upload keeps the
+	// process alive like Node's outgoing socket: while idle (awaiting the producer)
+	// the fd is unwatched, so without this hold a body that pauses on a producer not
+	// itself backed by loop work could let the loop exit mid-upload. Released when the
+	// terminator is sent (fetch_pump_body) or the request settles (fetch_request_finish).
+	fetch_body_hold_loop(req)
+	fetch_body_go_idle(req) // ask the producer for the first chunk
+}
+
+// fetch_write_body_event resumes a blocked frame flush when the socket becomes
+// writable. While idle (awaiting the producer) the fd is unwatched, so a delivered
+// event always has a partially-written frame to flush.
+fetch_write_body_event :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+	if req.body_idle do return // defensive: a stale completion while awaiting the producer
+	fetch_pump_body(loop, req)
+}
+
+// fetch_push_body frames one producer chunk as a chunked frame and flushes it. The
+// pull/push protocol guarantees body_out is empty on entry (one chunk in flight).
+// Runs on the loop thread (push_body_fn, from the JS pump).
+fetch_push_body :: proc(req: ^Fetch_Request, data: []byte) {
+	if req.settled || !req.body_streaming || req.phase != .Body_Write do return
+	req.body_idle = false
+	if len(data) == 0 {
+		fetch_body_go_idle(req) // an empty chunk frames to nothing — pull the next
+		return
+	}
+	fetch_frame_chunk(req, data)
+	fetch_pump_body(req.loop, req)
+}
+
+// fetch_end_body writes the terminating zero-size chunk once the producer is done.
+// Runs on the loop thread (end_body_fn) while idle, so body_out is empty;
+// fetch_pump_body appends and flushes the terminator, then flips to reading.
+fetch_end_body :: proc(req: ^Fetch_Request) {
+	if req.settled || !req.body_streaming || req.phase != .Body_Write do return
+	req.body_idle = false
+	req.body_end_seen = true
+	// Idle ⇒ nothing pending: drive the terminator now. (If a frame were still in
+	// flight, fetch_pump_body's drain would append the terminator itself.)
+	if req.body_out_off >= len(req.body_out) {
+		fetch_pump_body(req.loop, req)
+	}
+}
+
+// fetch_pump_body flushes the current frame (body_out) to the socket, then decides
+// what comes next: append+flush the terminator if the producer has ended, transition
+// to reading once the terminator is out, or pull the next chunk. A blocked write arms
+// the fd for writability and returns; the writable event re-enters here.
+fetch_pump_body :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request) {
+	for {
+		for req.body_out_off < len(req.body_out) {
+			n, res := fetch_body_send(req, req.body_out[req.body_out_off:])
+			if req.settled do return // arming the watcher failed and settled the request
+			switch res {
+			case .Ok:
+				if n <= 0 {
+					// A 0-byte success for a non-empty frame should not happen (send /
+					// SSL_write never report Ok without progress on a non-empty buffer),
+					// but if it did, arm for writability rather than returning with no
+					// pending event — a bare return would strand the upload.
+					fetch_body_arm(req, .Write)
+					return
+				}
+				req.body_out_off += n
+			case .Would_Block:
+				return // fetch_body_send armed the fd for the right direction
+			case .Closed, .Failed:
+				fetch_settle_error(req, "fetch: request body send failed")
+				return
+			}
+		}
+		// The current frame is fully written.
+		clear(&req.body_out)
+		req.body_out_off = 0
+		if req.body_term_written {
+			// Upload complete: drop the body-phase loop hold and watch for the response.
+			fetch_body_release_loop(req)
+			fetch_body_arm(req, .Read)
+			req.phase = .Reading
+			return
+		}
+		if req.body_end_seen {
+			append(&req.body_out, '0', '\r', '\n', '\r', '\n') // terminating zero chunk
+			req.body_term_written = true
+			continue // loop to flush the terminator
+		}
+		fetch_body_go_idle(req) // pull the next chunk from the producer
+		return
+	}
+}
+
+// fetch_body_send writes one slice of the current frame. On a would-block it arms the
+// socket for the direction the transport is waiting on so the readiness event resumes
+// the flush — plaintext always wants write, but TLS may want read (a renegotiation
+// mid-write), so the arm follows fetch_tls_send_chunk's want_read. https delegates to
+// the TLS backend.
+fetch_body_send :: proc(req: ^Fetch_Request, chunk: []byte) -> (n: int, res: Fetch_IO_Result) {
+	want_read: bool
+	if req.is_https {
+		n, res, want_read = fetch_tls_send_chunk(req, chunk)
+	} else {
+		n, res = fetch_raw_send(req, chunk)
+	}
+	// Stay in .Body_Write whichever direction we arm: the readiness event re-enters
+	// fetch_write_body_event, which retries the flush regardless of read/write wake.
+	if res == .Would_Block do fetch_body_arm(req, want_read ? .Read : .Write)
+	return
+}
+
+// fetch_frame_chunk builds one Transfer-Encoding: chunked frame —
+// "<hex-size>\r\n<data>\r\n" — into body_out (empty on entry).
+fetch_frame_chunk :: proc(req: ^Fetch_Request, data: []byte) {
+	clear(&req.body_out)
+	req.body_out_off = 0
+	fetch_append_hex(&req.body_out, len(data))
+	append(&req.body_out, '\r', '\n')
+	append(&req.body_out, ..data)
+	append(&req.body_out, '\r', '\n')
+}
+
+// fetch_append_hex appends value as lowercase hex with no leading zeros — the
+// chunk-size line of a chunked frame.
+fetch_append_hex :: proc(buf: ^[dynamic]byte, value: int) {
+	if value == 0 {
+		append(buf, '0')
+		return
+	}
+	digits := "0123456789abcdef"
+	tmp: [16]byte
+	n := value
+	i := 0
+	for n > 0 {
+		tmp[i] = digits[n & 0xf]
+		n >>= 4
+		i += 1
+	}
+	for j := i - 1; j >= 0; j -= 1 {
+		append(buf, tmp[j])
+	}
+}
+
+// fetch_body_go_idle parks the request until the producer yields the next chunk:
+// drop the socket watch (nothing to write yet) and DEFER a producer pull. The pull
+// is deferred (not invoked inline) to break the per-chunk recursion through JSC's
+// microtask auto-drain; async_begin keeps the loop alive across the pull and
+// drive_pending pins the request against reclaim until the deferred pull has run.
+fetch_body_go_idle :: proc(req: ^Fetch_Request) {
+	if req.settled do return
+	req.body_idle = true
+	if req.has_fd && req.watcher.watched {
+		req.watcher.callback = nil
+		eventloop.unwatch_fd(req.loop, &req.watcher)
+	}
+	req.drive_pending += 1
+	eventloop.async_begin(req.loop)
+	eventloop.post_async(req.loop, fetch_body_drain_cb, req)
+}
+
+// fetch_body_drain_cb runs the deferred producer pull on the loop thread: it invokes
+// on_body_drain so the JS pump reads its source and pushes the next chunk. It runs
+// even for a request that has since settled (to balance drive_pending) but only
+// pulls when still idle in the body-write phase.
+fetch_body_drain_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	req := cast(^Fetch_Request)user_data
+	if req == nil do return
+	req.drive_pending -= 1
+	if req.settled || !req.body_idle || req.on_body_drain == nil do return
+	exception: jsc.JSValueRef
+	invoke_user_callback(req.ctx, req.on_body_drain, nil, 0, &exception)
+	if exception != nil {
+		report_uncaught(req.ctx, exception)
+		mark_async_failed(req.ctx)
+	}
+}
+
+// fetch_body_arm points the socket watch at `mode` and (re)registers it for the
+// body-write phase, settling the request if the loop rejects the watch. Arms a fresh
+// poll when coming from idle (the fd was unwatched); otherwise just points existing
+// interest at the new direction. Drives the frame-flush write arm, the post-terminator
+// read arm, and a TLS renegotiation read arm mid-write.
+fetch_body_arm :: proc(req: ^Fetch_Request, mode: eventloop.Poll_Mode) {
+	if req.settled || !req.has_fd do return
+	req.watcher.callback = fetch_watcher_cb
+	ok: bool
+	if req.watcher.watched {
+		ok = fetch_set_watch_mode(req.loop, req, mode)
+	} else {
+		req.watcher.mode = mode
+		ok = eventloop.watch_fd(req.loop, &req.watcher)
+	}
+	if !ok do fetch_settle_error(req, "fetch: event loop watch failed")
 }
