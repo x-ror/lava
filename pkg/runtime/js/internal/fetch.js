@@ -155,6 +155,11 @@
     if (body === null || body === undefined) return null;
     if (body instanceof Uint8Array) return body;
     if (body instanceof ArrayBuffer) return new Uint8Array(body);
+    // A Blob/File body: join its in-memory chunks synchronously. Lava's Blob keeps
+    // its bytes in memory (_parts), so no async read is needed; concatChunks yields
+    // null for an empty Blob (absent body). A Blob used as a *request* body instead
+    // takes Request's async _streamBody path and never reaches here.
+    if (typeof Blob !== 'undefined' && body instanceof Blob) return concatChunks(body._parts || []);
     var text = typeof body === 'string' ? body : String(body);
     // An empty string (passed directly or produced by String(body)) has no
     // bytes — treat it as an absent body.
@@ -358,6 +363,7 @@
       this.status = init.status === undefined ? 200 : init.status;
       this.statusText = init.statusText === undefined ? '' : init.statusText;
       this.headers = new Headers(init.headers);
+      applyBlobContentType(this.headers, body);
       this.ok = this.status >= 200 && this.status < 300;
       this.redirected = false;
       this.type = 'default';
@@ -411,6 +417,20 @@
     if (typeof b.getReader === 'function') return true;
     if (typeof b[Symbol.asyncIterator] === 'function') return true;
     return false;
+  }
+
+  // Per WHATWG, extracting a body from a Blob contributes a Content-Type equal to
+  // the Blob's `type` (when non-empty) — applied only if the caller didn't already
+  // set one via init.headers (or an inherited source Request's headers).
+  function applyBlobContentType(headers, body) {
+    if (
+      typeof Blob !== 'undefined' &&
+      body instanceof Blob &&
+      body.type &&
+      !headers.has('content-type')
+    ) {
+      headers.set('content-type', body.type);
+    }
   }
 
   class Request extends Body {
@@ -470,6 +490,7 @@
       }
       var headersInit = init.headers !== undefined ? init.headers : src ? src.headers : undefined;
       this.headers = new Headers(headersInit);
+      applyBlobContentType(this.headers, bodyInit);
     }
   }
 
@@ -652,7 +673,7 @@
           // cancel()/return() return promises; swallow a rejected teardown so a
           // throwing producer cleanup does not surface as an unhandled rejection.
           if (p && typeof p.catch === 'function') p.catch(function () {});
-        } catch (e) {}
+        } catch {}
       }
 
       // failProducer aborts the request: cancel the source and tell the native side
