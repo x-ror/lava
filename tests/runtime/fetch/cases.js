@@ -222,7 +222,7 @@ async function main() {
     let failed = false;
     try {
       await fetch(base + '/echo', { method: 'POST', body: boom(), duplex: 'half' });
-    } catch (error) {
+    } catch {
       failed = true;
     }
     console.log('producer error aborts:', failed);
