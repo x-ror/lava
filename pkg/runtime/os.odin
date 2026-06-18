@@ -2,6 +2,7 @@ package lava_runtime
 
 import "base:runtime"
 import "core:c"
+import "core:fmt"
 import "core:os"
 import jsc "lava:pkg/jsc"
 
@@ -316,6 +317,26 @@ os_userinfo_cb :: proc "c" (
 }
 
 // --- priority ---------------------------------------------------------------
+//
+// js/internal/os.js validates pid/priority (int32; priority in [-20, 19]) and
+// throws the Node-shaped TypeError/RangeError before calling these, so the native
+// side only performs the syscall. A failed syscall (unknown pid -> ESRCH, or
+// EPERM) becomes an ERR_SYSTEM_ERROR, matching Node's _getPriority/_setPriority.
+
+// make_os_system_error builds the Node SystemError thrown when a priority syscall
+// fails: code ERR_SYSTEM_ERROR plus the errno/syscall fields callers inspect. The
+// errno is reported as the negative value, as Node/libuv do.
+make_os_system_error :: proc(ctx: jsc.JSContextRef, syscall: string, err: int) -> jsc.JSValueRef {
+	msg := fmt.tprintf("A system error occurred: %s returned errno %d", syscall, err)
+	e := make_js_named_error(ctx, "SystemError", msg)
+	if jsc.JSValueIsObject(ctx, e) {
+		o := cast(jsc.JSObjectRef)e
+		set_named(ctx, o, "code", js_string_value(ctx, "ERR_SYSTEM_ERROR"))
+		set_named(ctx, o, "errno", jsc.JSValueMakeNumber(ctx, f64(-err)))
+		set_named(ctx, o, "syscall", js_string_value(ctx, syscall))
+	}
+	return e
+}
 
 os_getpriority_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
@@ -330,9 +351,9 @@ os_getpriority_cb :: proc "c" (
 	if argument_count >= 1 {
 		pid = int(jsc.JSValueToNumber(ctx, arguments[0], nil))
 	}
-	value, ok := os_get_priority(pid)
-	if !ok {
-		if exception != nil do exception^ = make_js_error(ctx, "os.getPriority: no such process")
+	value, err := os_get_priority(pid)
+	if err != 0 {
+		if exception != nil do exception^ = make_os_system_error(ctx, "getpriority", err)
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	return jsc.JSValueMakeNumber(ctx, f64(value))
@@ -353,11 +374,8 @@ os_setpriority_cb :: proc "c" (
 	}
 	pid := int(jsc.JSValueToNumber(ctx, arguments[0], nil))
 	value := int(jsc.JSValueToNumber(ctx, arguments[1], nil))
-	// Node clamps the priority into the libuv band [-20, 19] before applying it.
-	if value < -20 do value = -20
-	if value > 19 do value = 19
-	if !os_set_priority(pid, value) {
-		if exception != nil do exception^ = make_js_error(ctx, "os.setPriority: operation not permitted")
+	if err := os_set_priority(pid, value); err != 0 {
+		if exception != nil do exception^ = make_os_system_error(ctx, "setpriority", err)
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	return jsc.JSValueMakeUndefined(ctx)

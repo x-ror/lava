@@ -109,10 +109,10 @@ os_network_interfaces :: proc() -> []Os_Net_Iface {
 	return nil // Not implemented on Windows (needs a GetAdaptersAddresses walk).
 }
 
-os_get_priority :: proc(pid: int) -> (value: int, ok: bool) {
-	return 0, true // PRIORITY_NORMAL; real priority classes are not wired up.
+os_get_priority :: proc(pid: int) -> (value: int, err: int) {
+	return 0, 0 // PRIORITY_NORMAL; real priority classes are not wired up.
 }
 
-os_set_priority :: proc(pid: int, value: int) -> bool {
-	return true // No-op until SetPriorityClass is wired up.
+os_set_priority :: proc(pid: int, value: int) -> (err: int) {
+	return 0 // No-op (success) until SetPriorityClass is wired up.
 }

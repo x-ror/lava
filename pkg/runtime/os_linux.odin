@@ -5,6 +5,7 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sys/linux"
+import "core:sys/posix"
 
 // Linux memory/uptime come from the sysinfo(2) syscall (core:sys/linux); per-CPU
 // model/speed/times are parsed from /proc, matching what libuv reads. (hostname,
@@ -52,34 +53,31 @@ os_uptime :: proc() -> f64 {
 	return f64(si.uptime)
 }
 
-// os_avail_parallelism counts the online CPUs, i.e. the "cpuN" lines of
-// /proc/stat (the kernel lists only online CPUs there) — sysconf's
-// _SC_NPROCESSORS_ONLN constant is private in core:sys/posix, so /proc is the
-// portable read. Matches os_cpus()'s length.
+// os_avail_parallelism returns the number of CPUs the process may actually run on,
+// honoring CPU affinity / cpuset limits — core:os.get_processor_core_count() uses
+// sched_getaffinity(2) on Linux, which is what uv_available_parallelism() does. This
+// can be smaller than os.cpus().length inside a container or a pinned process; Node
+// reports the same split (cpus() = all online CPUs, availableParallelism() = mask).
 os_avail_parallelism :: proc() -> int {
-	count := 0
-	if data, err := os.read_entire_file("/proc/stat", context.temp_allocator);
-	   err == os.ERROR_NONE {
-		for line in strings.split(string(data), "\n", context.temp_allocator) {
-			if len(line) < 4 || !strings.has_prefix(line, "cpu") {
-				continue
-			}
-			if line[3] >= '0' && line[3] <= '9' {
-				count += 1
-			}
-		}
-	}
-	if count < 1 {
+	n := os.get_processor_core_count()
+	if n < 1 {
 		return 1
 	}
-	return count
+	return n
 }
 
-// USER_HZ: clock ticks per second that /proc/stat counts in. It is configurable
-// but is 100 on virtually every Linux build; libuv assumes the same. Ticks are
-// scaled to milliseconds (Node reports cpu times in ms) by 1000 / USER_HZ.
+// clk_tck reads sysconf(_SC_CLK_TCK): the clock-tick rate /proc/stat counts in. It
+// is almost always 100 but is configurable, so it is read rather than hardcoded.
+// /proc/stat ticks scale to milliseconds (Node reports cpu times in ms) as
+// ticks * 1000 / hz.
 @(private = "file")
-TICKS_TO_MS :: 10 // 1000 / 100
+clk_tck :: proc() -> i64 {
+	hz := i64(posix.sysconf(._CLK_TCK))
+	if hz <= 0 {
+		return 100
+	}
+	return hz
+}
 
 // field_i64 returns the n-th (0-based) whitespace-delimited token of `line`
 // parsed as an integer, tolerating runs of spaces (the aggregate /proc/stat line
@@ -119,6 +117,7 @@ value_after_colon :: proc(line: string) -> string {
 
 os_cpus :: proc() -> []Os_Cpu {
 	cpus := make([dynamic]Os_Cpu, 0, 8, context.temp_allocator)
+	hz := clk_tck()
 
 	// Per-CPU tick counters: the "cpuN" lines of /proc/stat (the bare "cpu " total
 	// is skipped). Columns are user, nice, system, idle, iowait, irq, softirq, ...
@@ -134,11 +133,11 @@ os_cpus :: proc() -> []Os_Cpu {
 			append(
 				&cpus,
 				Os_Cpu {
-					user = field_i64(line, 1) * TICKS_TO_MS,
-					nice = field_i64(line, 2) * TICKS_TO_MS,
-					sys = field_i64(line, 3) * TICKS_TO_MS,
-					idle = field_i64(line, 4) * TICKS_TO_MS,
-					irq = field_i64(line, 6) * TICKS_TO_MS,
+					user = field_i64(line, 1) * 1000 / hz,
+					nice = field_i64(line, 2) * 1000 / hz,
+					sys = field_i64(line, 3) * 1000 / hz,
+					idle = field_i64(line, 4) * 1000 / hz,
+					irq = field_i64(line, 6) * 1000 / hz,
 				},
 			)
 		}
