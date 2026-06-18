@@ -158,15 +158,13 @@ for (const name of Object.keys(nifs)) {
     }
   }
 }
-// On POSIX the loopback interface is always present with an internal record.
-// Lava's Windows networkInterfaces is a stub that returns no entries, so this
-// existence check is POSIX-only; the per-record shape checks above still apply.
-if (process.platform !== 'win32') {
-  const loopbackName = Object.keys(nifs).find((name) =>
-    nifs[name].some((rec) => rec.internal && rec.address.startsWith('127.')),
-  );
-  assert.ok(loopbackName !== undefined, 'an internal IPv4 loopback address exists');
-}
+// Every platform exposes a loopback interface with an internal IPv4 record
+// (127.0.0.1 on POSIX; the "Loopback Pseudo-Interface" on Windows). Lava's Windows
+// networkInterfaces walks GetAdaptersAddresses for real, so this holds there too.
+const loopbackName = Object.keys(nifs).find((name) =>
+  nifs[name].some((rec) => rec.internal && rec.address.startsWith('127.')),
+);
+assert.ok(loopbackName !== undefined, 'an internal IPv4 loopback address exists');
 
 // ---- userInfo(): the five fields, plus the buffer-encoding variant ----------
 const info = os.userInfo();
