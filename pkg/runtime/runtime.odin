@@ -302,9 +302,10 @@ resolve_exit_code :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) -> int {
 process_exit_code :: proc(ctx: jsc.JSContextRef) -> int {
 	global := jsc.JSContextGetGlobalObject(ctx)
 	process := get_named(ctx, global, "process")
-	// Gate on JSValueGetType, not the b32-returning JSValueIs* calls, which are
-	// unreliable across the FFI (the same heisenbug process_exit_cb avoids; the
-	// sqlite readBigInts / bind bugs are the other instances).
+	// JSValueGetType classifies the value in one call (Object vs the Undefined/Null
+	// switch below); the JSValueIs* predicates are equally ABI-safe now that they
+	// return a 1-byte `bool` (see cmd/lava jsc_value_predicates, #159) — the former
+	// "unreliable across the FFI" note described the retired `b32` return.
 	if process == nil || jsc.JSValueGetType(ctx, process) != .Object do return 0
 	code := get_named(ctx, cast(jsc.JSObjectRef)process, "exitCode")
 	if code == nil do return 0

@@ -518,11 +518,11 @@ sqlite_read_big_ints :: proc(
 	index: int,
 ) -> bool {
 	if int(argument_count) <= index do return false
-	// Read via JSValueToNumber (0/1), NOT JSValueToBoolean: the latter's b32 return
-	// is unreliable across the FFI in a JSC `proc "c"` callback (a JS `false` comes
-	// back true), the same heisenbug seen in the bind path. A JS boolean converts
-	// to 0/1, so a nonzero number is `true`.
-	return jsc.JSValueToNumber(ctx, arguments[index], nil) != 0
+	// JSValueToBoolean is ABI-safe now that the binding returns a 1-byte `bool`
+	// (the old `b32` return read undefined upper bytes, so a JS `false` came back
+	// `true` — the historical "heisenbug" this once worked around with a
+	// JSValueToNumber 0/1 hack). Pinned by cmd/lava jsc_value_predicates (#159).
+	return jsc.JSValueToBoolean(ctx, arguments[index])
 }
 
 // sqlite_int_value converts an i64 column/rowid value to a JS value honoring the
