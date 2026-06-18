@@ -621,9 +621,9 @@ process_exit_cb :: proc "c" (
 	// process.exitCode (Node parity). An explicit numeric code overrides it; a NaN
 	// code is a RangeError (ERR_OUT_OF_RANGE) in Node, not a silent garbage exit.
 	code := process_exit_code(ctx)
-	// Gate on JSValueGetType, not JSValueIsUndefined: the b32-returning JSValueIs*
-	// calls are unreliable across the FFI in a `proc "c"` callback (see the sqlite
-	// readBigInts / bind heisenbugs).
+	// JSValueGetType reads the value's type directly; JSValueIsUndefined is equally
+	// ABI-safe now that it returns a 1-byte `bool` (see cmd/lava jsc_value_predicates,
+	// #159 — the retired `b32` return was the old hazard).
 	if argument_count >= 1 && jsc.JSValueGetType(ctx, arguments[0]) != .Undefined {
 		n := jsc.JSValueToNumber(ctx, arguments[0], nil)
 		if n != n {

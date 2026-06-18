@@ -167,16 +167,26 @@ DNS pool today. There are no `worker_threads`, no isolates, and no general threa
 pool — so blocking work (synchronous `fs` reads, `crypto` KDFs) runs on the loop
 thread. This is the central scalability ceiling (§5.2).
 
-### 4.3 The FFI trust boundary
+### 4.3 The FFI trust boundary — resolved (#159)
 
-A recurring theme in the code is *distrust of the FFI boundary*: several sites
-deliberately avoid the `b32`/`bool`-returning `JSValueIs*` predicates in favor of
-`JSValueGetType`, with comments calling them "unreliable across the FFI"
-(`runtime.odin:307`, `globals.odin:625`, plus sqlite "heisenbugs"). The bindings
-themselves declare these as `bool` (1 byte) on all three platforms, which is the
-correct C `_Bool` ABI — so the workaround is treating a *symptom* whose root cause
-is not pinned down. This is the single most important consistency issue in an
-otherwise rigorous codebase (§5.1).
+The code once carried a *distrust of the FFI boundary*: several sites avoided the
+`JSValueIs*` / `JSValueToBoolean` predicates in favor of `JSValueGetType`, with
+comments calling them "unreliable across the FFI" (the sqlite readBigInts / bind
+"heisenbugs" — *a JS `false` came back `true`*).
+
+**Root cause, now pinned down:** the predicates were historically declared
+`-> b32` (a 4-byte boolean). JSC's C API returns C `_Bool` (1 byte); on SysV-AMD64
+and AArch64 the value sits in the low byte of the return register and the upper
+bytes are *undefined*. Reading 4 bytes picked up that garbage, so a `false` (low
+byte 0, upper bytes nonzero) read back truthy. The bindings already declare these
+`-> bool` (Odin `bool` is 1 byte, reads only the low byte) — the ABI-correct fix —
+and the codebase already trusts `JSValueToBoolean` in dns/fetch/fs/buffer; only one
+stale workaround (sqlite `readBigInts`) and a few misleading comments remained.
+
+`cmd/lava/jsc_predicates_test.odin` now pins the full predicate matrix down,
+including from inside a `proc "c"` callback (the context the comments blamed), so a
+regression to a wide return type fails loudly. The stale workaround and comments
+are gone. This closes the consistency issue.
 
 ### 4.4 Error handling
 
@@ -192,32 +202,23 @@ for the Node `ERR_*` taxonomy spanning the native and JS halves (§5.1).
 Severity: **P0** trust/correctness foundations · **P1** scalability/perf · **P2**
 documentation/process.
 
-### 5.1 [P0] Close the FFI trust boundary + unify the error layer
+### 5.1 [P0] Close the FFI trust boundary ✓ + unify the error layer
 
-**Problem.** The "`JSValueIs*` is unreliable" workaround is applied case-by-case.
-Either the predicates are sound (then the inconsistency is noise that will mislead
-future contributors) or there is a real bug (then it is latent everywhere the
-predicates *are* still used). A best-in-class runtime cannot have an internal
-boundary it describes as unreliable.
+**FFI boundary — done (#159).** The "`JSValueIs*` is unreliable" workaround was
+root-caused to the retired `-> b32` (4-byte) return reading undefined upper bytes
+of a 1-byte C `_Bool` (§4.3). The bindings already return the ABI-correct `-> bool`;
+`cmd/lava/jsc_predicates_test.odin` now proves the predicate matrix from both a
+normal context and a `proc "c"` callback, the last stale workaround (sqlite
+`readBigInts`) uses `JSValueToBoolean` again, and the misleading comments are
+corrected. The remaining `JSValueGetType` uses are idiomatic multi-way type
+switches, not hazard workarounds.
 
-**Investigation plan (no guessing).**
-1. Build a minimal harness: from inside a `proc "c"` callback, call each
-   `JSValueIs*` on values of known type and compare against `JSValueGetType`.
-   Vary JIT tiers (the Windows note already implicates baseline JIT) and optimization
-   levels. Capture the disassembly of one call site to confirm the return register
-   width Odin reads vs. what JSC writes.
-2. Hypotheses to confirm/eliminate, in order of likelihood:
-   - **Uninitialized `context`** in a `"c"` callback before
-     `context = runtime.default_context()` — a predicate called too early reads a
-     garbage context. (Cheap to rule out; check call ordering.)
-   - **Return-width / ABI**: confirm JSC's `bool` is genuinely 1 byte on the
-     bun-webkit Windows build, and that Odin zero-extends correctly.
-   - **JIT tier interaction** specific to the Windows build (already half-known).
-3. **Outcome A** (predicates are sound): adopt them consistently, delete the
-   `JSValueGetType` workarounds, and document the resolved root cause where the
-   warnings used to be.
-   **Outcome B** (a real defect): fix it once at the binding layer (e.g. a wrapper
-   that normalizes the return), and keep one short note explaining the fix.
+**Error layer — remaining.** The **native** half still builds errors ad hoc
+(`make_js_error` + `make_js_named_error` + manual `code`). Introduce a single
+`errors.odin` Node-error factory (`err(ctx, code, message_fmt, ...)`) owning the
+`ERR_*` → message/`name`/`code` mapping, mirrored with the JS layer's code list so
+both halves stay in lockstep. This makes error output *predictable* and is a
+prerequisite for honest Node-parity error tests.
 
 **Unified error layer.** Introduce a single `errors.odin` Node-error factory
 (`err(ctx, code, message_fmt, ...)`) that owns the `ERR_*` → message/`name`/`code`
@@ -325,7 +326,7 @@ foundations as §5.2.
 
 | # | Work | Class | Rationale |
 |---|------|-------|-----------|
-| 1 | FFI root-cause + unified `ERR_*` error layer | P0 | Removes the one "unreliable" internal boundary; foundation of trust and of parity tests |
+| 1 | ~~FFI root-cause~~ ✓ (#159) + unified `ERR_*` error layer | P0 | FFI boundary now proven (§4.3); error layer still pending — foundation of parity tests |
 | 2 | Generic thread pool → async `fs`/`crypto` | P1 | Removes the loop-blocking ceiling; reuses the proven `post_async` primitive |
 | 3 | Benchmark harness + CI perf gate | P1 | Makes "fast" provable instead of asserted |
 | 4 | `node:net` + `node:http` server | P1 | Unlocks server-side applications |
