@@ -69,6 +69,13 @@ make test-sqlite-lava
 - `pkg/install` - future package install and lockfile work
 - `scripts` - project helper scripts
 
+## Architecture
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the pieces fit
+together (engine FFI, event loop, module system, the native + embedded-JS
+standard library), a review of risks and inconsistencies, and the forward-looking
+roadmap toward a best-in-class runtime.
+
 ## Roadmap
 
 1. Link JSC and evaluate source through `JSEvaluateScript`.

@@ -1,0 +1,346 @@
+# Lava Architecture
+
+> An architectural overview and forward-looking review of the Lava runtime.
+> Companion to `README.md` (how to build/run) and `ROADMAP.md` (feature status).
+> This document explains *how the pieces fit together*, *why the boundaries are
+> where they are*, and *where the architecture should go next* to become the most
+> elegant, fast, and predictable JavaScript runtime we can build.
+
+---
+
+## 1. What Lava is
+
+Lava is a Node-compatible JavaScript runtime built on **JavaScriptCore (JSC)** as
+the execution engine and **Odin** as the systems language for everything around
+it: the engine FFI, the event loop, the I/O transports, and the native half of
+the standard library. Compatibility targets modern Node (22+/24 behavior) rather
+than legacy APIs.
+
+Two design decisions shape the whole system:
+
+1. **JSC is the VM; Odin owns the runtime.** Lava does not embed V8 or write its
+   own interpreter. It drives JSC through its C API and builds the *runtime* — the
+   event loop, module system, timers, I/O, process model — natively in Odin.
+2. **The standard library is layered: native primitives + embedded JS.** Hot or
+   unsafe operations (byte codecs, hashing, sockets, the loop) live in Odin; the
+   ergonomic, spec-shaped surface (`Buffer`, `fetch`, Web Streams, `URL`,
+   `console`) is JavaScript embedded into the binary at compile time and wired up
+   by a small loader. See §3.3.
+
+---
+
+## 2. System overview
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  cmd/lava (CLI)                          main.odin                     │
+│  parses argv → builds an eventloop.Loop → calls runtime.eval/run_file  │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                 │
+┌───────────────────────────────▼──────────────────────────────────────┐
+│  pkg/runtime  (orchestration)                                          │
+│                                                                        │
+│   runtime.odin      eval(): JSC context lifecycle, ownership, drains   │
+│   globals.odin      global surface, Runtime_State, JS↔loop callbacks   │
+│   require.odin      CommonJS loader (cache, .js/.cjs/.mjs/.json)        │
+│   module_resolution native resolver (file/dir/node_modules/main)       │
+│   fs / buffer / crypto / dns / sqlite / fetch*  native primitives      │
+│                                                                        │
+│   js/internal/*.js  embedded spec surface (Buffer, fetch, streams, …)  │
+│   js/console.js     console implemented in JS over two write prims     │
+└───────────────┬───────────────────────────────────┬──────────────────┘
+                │                                     │
+┌───────────────▼─────────────┐      ┌────────────────▼─────────────────┐
+│  pkg/jsc  (engine FFI)       │      │  pkg/runtime/eventloop            │
+│   bindings_{linux,darwin,    │      │   loop.odin   phases, timers,     │
+│     windows}.odin            │      │     microtasks, async handoff     │
+│   jsc_init* (Windows bring-  │      │   loop_{linux,darwin,windows}     │
+│     up + locked typed-array) │      │     io_uring/epoll · kqueue · IOCP│
+└──────────────────────────────┘      └───────────────────────────────────┘
+```
+
+Supporting packages `pkg/bundler` and `pkg/install` are placeholders today
+(README only) — reserved for the transpile/bundle and package-manager stories.
+
+---
+
+## 3. Component architecture
+
+### 3.1 The event loop (`pkg/runtime/eventloop`)
+
+The strongest part of the system, and the right thing to have gotten right first.
+
+- **Node-faithful phases.** `run_once` (`loop.odin:619`) runs the canonical order:
+  next-tick → microtasks → timers → poll (I/O completions, then block) → check
+  (`setImmediate`) → close. Each phase uses a *sequence limit* so callbacks queued
+  *during* a phase defer to the next iteration — this is what makes ordering
+  deterministic and matchable against Node.
+- **Timers are a binary min-heap** keyed on `(due_ms, seq)` (`timer_heap_*`), so
+  ties fire in FIFO order (Node parity) and push/pop are O(log n). Cancelled
+  timers are dropped lazily at the root rather than compacted every tick.
+- **Two clocks.** `real_time` mode tracks the monotonic wall clock; the default
+  (used by tests) advances a *logical* clock explicitly. This dual-clock design is
+  quietly powerful — it is the seed of a future deterministic record/replay mode
+  (§6).
+- **Cross-thread completion handoff** mirrors libuv's `uv_async`:
+  `async_begin`/`post_async`/`drain_async` (`loop.odin:248-302`) let an off-loop
+  worker enqueue a completion under a mutex and wake the loop, which drains it on
+  its own thread. `active_async` keeps the loop alive and blocked in `poll` until
+  the worker finishes. **This primitive already exists but is under-used** — it is
+  the foundation the thread pool in §5.2 should build on.
+- **Lifecycle accounting is meticulous.** `watched`/`active_io_count`,
+  `reffed_timer_count`, and the `dispose` hook contract (`loop.odin:8-14`) ensure a
+  handle's GC-protected binding is released exactly once — on fire or on
+  cancellation, never both, never neither.
+
+### 3.2 Engine FFI (`pkg/jsc`)
+
+Thin, per-platform `foreign` declarations of JSC's C API. Highlights:
+
+- The global object is created from a custom `LavaGlobal` JSClass whose private
+  slot stores `Runtime_State` (`globals.odin:154`), so the loop pointer and module
+  cache are **unreachable from user JavaScript** — no writable `__loop_ptr__`.
+- `jsc_init.odin` carries a Windows-only bring-up shim (`JSC::initialize` +
+  disabling a broken baseline-JIT tier in the bun-webkit build) and a
+  `make_uint8_nocopy_locked` helper that enters the VM lock when creating typed
+  arrays from outside a JSC callback (e.g. the fetch streaming body driven from the
+  loop). Both are no-ops on Linux/macOS — a clean conditional-compilation pattern.
+
+### 3.3 Standard library: native + embedded JS
+
+Built-ins are JS factories `#load`-embedded at compile time (`globals.odin:1144`)
+and instantiated by `loader.js`. Each factory receives `(require, module, exports,
+native)`; the native fourth argument carries Odin-backed bindings (crypto, buffer,
+fetch, sqlite, dns) so **nothing transient lands on `globalThis`**
+(`install_internal_modules`, `globals.odin:878`). This is an elegant boundary:
+the spec surface is readable JS, the sharp edges are native, and the seam is one
+well-defined argument.
+
+The JS layer is substantial and high quality: `url.js` (2071 LOC, WHATWG URL),
+`streams.js` (2027, Web Streams), `buffer.js` (1646), `fetch.js` (1054),
+`crypto.js` (917). Errors use Node-shaped coded errors (`ERR_INVALID_ARG_TYPE`,
+`ERR_OUT_OF_RANGE`, …). Native byte ops are gated by a size threshold
+(`NATIVE_BYTEOP_MIN`) so small inputs avoid FFI overhead — a thoughtful perf call.
+
+### 3.4 Module system (`require.odin`, `module_resolution.odin`)
+
+- CommonJS is the substrate. `native_require_cb` consults, in order: the module
+  cache → JS internal builtins (`require_builtin`) → native `fs` → filesystem
+  resolution. Circular requires terminate via a pre-registered partial-exports
+  entry (`__lava_precache`), and a module that throws while loading is *removed*
+  from the cache so a later require re-runs it (Node parity).
+- `.mjs`/static `import`/`export` are handled by a **source transform**
+  (`esm.js`) that rewrites ESM onto the CommonJS `require`, not by JSC's native
+  module records (the classic C API only runs script-goal source). This is
+  pragmatic and works, with documented divergences (named imports from CJS).
+- Resolution (`module_resolution.odin`) covers file probes, directory `main`/
+  `index`, and `node_modules` walking. **`package.json` `"exports"` conditional
+  resolution is not yet implemented** — a real gap for modern packages.
+
+### 3.5 I/O transports (`fetch_*`, `dns.odin`, `tls.odin`)
+
+`fetch_transport.odin` is a platform-agnostic connect→[TLS]→write→read state
+machine; each platform supplies only narrow socket primitives, and TLS is a
+swappable backend (OpenSSL, or a rejecting stub). DNS resolves off-loop on a
+bounded 4-worker pool. Streaming request *and* response bodies are real
+incremental `ReadableStream`s with backpressure. This is the second-strongest
+subsystem after the loop, and it validates the `post_async` design end to end.
+
+---
+
+## 4. Cross-cutting concerns
+
+### 4.1 Memory model
+
+Disciplined and consistent. A per-tick `free_all(context.temp_allocator)` at the
+single choke point in `run_once` (`loop.odin:620`), mirrored per-require
+(`require.odin:58`) and per-eval (`runtime.odin:106`), bounds scratch growth. JSC
+values held across loop turns are explicitly `JSValueProtect`/`Unprotect`'d with
+the lifecycle documented at every site. Queue buffers are bound to the loop
+allocator up front (`loop.odin:157`) so a worker thread's `post_async` cannot
+accidentally adopt the wrong allocator.
+
+### 4.2 Concurrency model
+
+**Single VM, single JS thread, single context.** Off-loop work is limited to the
+DNS pool today. There are no `worker_threads`, no isolates, and no general thread
+pool — so blocking work (synchronous `fs` reads, `crypto` KDFs) runs on the loop
+thread. This is the central scalability ceiling (§5.2).
+
+### 4.3 The FFI trust boundary
+
+A recurring theme in the code is *distrust of the FFI boundary*: several sites
+deliberately avoid the `b32`/`bool`-returning `JSValueIs*` predicates in favor of
+`JSValueGetType`, with comments calling them "unreliable across the FFI"
+(`runtime.odin:307`, `globals.odin:625`, plus sqlite "heisenbugs"). The bindings
+themselves declare these as `bool` (1 byte) on all three platforms, which is the
+correct C `_Bool` ABI — so the workaround is treating a *symptom* whose root cause
+is not pinned down. This is the single most important consistency issue in an
+otherwise rigorous codebase (§5.1).
+
+### 4.4 Error handling
+
+The JS layer has good Node-shaped coded errors, but the **native** layer builds
+errors ad hoc (`make_js_error` + `make_js_named_error` + manual `code` property,
+e.g. `require.odin:260`, `globals.odin:631`). There is no single source of truth
+for the Node `ERR_*` taxonomy spanning the native and JS halves (§5.1).
+
+---
+
+## 5. Findings & prioritized recommendations
+
+Severity: **P0** trust/correctness foundations · **P1** scalability/perf · **P2**
+documentation/process.
+
+### 5.1 [P0] Close the FFI trust boundary + unify the error layer
+
+**Problem.** The "`JSValueIs*` is unreliable" workaround is applied case-by-case.
+Either the predicates are sound (then the inconsistency is noise that will mislead
+future contributors) or there is a real bug (then it is latent everywhere the
+predicates *are* still used). A best-in-class runtime cannot have an internal
+boundary it describes as unreliable.
+
+**Investigation plan (no guessing).**
+1. Build a minimal harness: from inside a `proc "c"` callback, call each
+   `JSValueIs*` on values of known type and compare against `JSValueGetType`.
+   Vary JIT tiers (the Windows note already implicates baseline JIT) and optimization
+   levels. Capture the disassembly of one call site to confirm the return register
+   width Odin reads vs. what JSC writes.
+2. Hypotheses to confirm/eliminate, in order of likelihood:
+   - **Uninitialized `context`** in a `"c"` callback before
+     `context = runtime.default_context()` — a predicate called too early reads a
+     garbage context. (Cheap to rule out; check call ordering.)
+   - **Return-width / ABI**: confirm JSC's `bool` is genuinely 1 byte on the
+     bun-webkit Windows build, and that Odin zero-extends correctly.
+   - **JIT tier interaction** specific to the Windows build (already half-known).
+3. **Outcome A** (predicates are sound): adopt them consistently, delete the
+   `JSValueGetType` workarounds, and document the resolved root cause where the
+   warnings used to be.
+   **Outcome B** (a real defect): fix it once at the binding layer (e.g. a wrapper
+   that normalizes the return), and keep one short note explaining the fix.
+
+**Unified error layer.** Introduce a single `errors.odin` Node-error factory
+(`err(ctx, code, message_fmt, ...)`) that owns the `ERR_*` → message/`name`/`code`
+mapping, replacing the scattered `make_js_named_error` + manual `code` sets. Mirror
+its code list with the JS layer's so both halves stay in lockstep. This makes error
+output *predictable* and is a prerequisite for honest Node-parity error tests.
+
+*Chosen as a starting direction.*
+
+### 5.2 [P1] A real thread pool → non-blocking `fs` and `crypto`
+
+**Problem.** Synchronous file reads and CPU-bound KDFs run on the loop thread, so a
+single large `fs.readFile` or `pbkdf2` stalls all timers and I/O. The ROADMAP
+itself notes `fs.readFile`'s "read is synchronous for now."
+
+**The good news: the hard part is already built.** `async_begin` / `post_async` /
+`drain_async` is exactly libuv's completion-handoff contract, already proven by the
+DNS pool and the fetch transport. What's missing is a *generic* worker pool that
+sits on top of it.
+
+**Design sketch (`pkg/runtime/eventloop/threadpool.odin`).**
+- A fixed pool (size = `min(CPU, N)`, configurable) of OS threads, each blocking on
+  a shared MPMC work queue.
+- `pool_submit(loop, work_fn, done_cb, user_data)`: `async_begin(loop)`, push the
+  job; a worker runs `work_fn` (off-loop, no JSC access), then `post_async`'s
+  `done_cb` to run on the loop thread (where JSC *is* safe to touch).
+- The invariant that **workers never call into JSC** keeps the single-VM model
+  intact; only the loop-thread completion materializes JS values.
+- Migrate `fs.readFile`/`writeFile` and `crypto.pbkdf2`/`scrypt` async forms onto
+  it. Synchronous `*Sync` APIs stay on the loop thread (Node does the same).
+
+This single primitive unblocks async `fs.stat`/`readdir`/`mkdir`, `fs.promises`,
+and any future blocking op — and it makes "predictable latency under load" a real
+property rather than an aspiration.
+
+*Chosen as a starting direction.*
+
+### 5.3 [P1] Make "fast" provable: a benchmark harness with CI gating
+
+The README promises speed; nothing measures it. Add `bench/` with micro
+(startup, `require`, JSON, Buffer codecs) and macro (fetch throughput, fs
+throughput) benchmarks, recorded against Node as the same oracle the tests use.
+Gate CI on regressions beyond a threshold. Without this, every perf claim and
+every "is this change faster?" question is unfalsifiable.
+
+### 5.4 [P1] Server-side networking (`node:net`, `node:http`)
+
+Lava can make HTTP requests but cannot accept them. `node:net` (TCP server/socket)
+and a `node:http` server unlock a whole class of applications and reuse the
+existing transport/loop machinery. This is the highest-leverage *capability* gap.
+
+### 5.5 [P2] Consolidate primordials in the JS layer
+
+The agent survey found `Object.create(null)` and `hasOwnProperty` guards
+replicated across ~5 internal modules with no shared hardened baseline. Centralize
+a `primordials.js` (frozen references to `Object`, `Array`, `Function.prototype`
+methods, etc.), load it first, and have modules consume it — closing the
+prototype-pollution surface uniformly instead of per-module vigilance.
+
+### 5.6 [P2] Documentation & process gaps
+
+- **No `package.json` `"exports"`** resolution — note it explicitly and plan it.
+- **Event-loop backend tradeoffs undocumented** — add a short
+  `pkg/runtime/eventloop/PLATFORMS.md` (io_uring vs epoll vs kqueue vs IOCP, and the
+  fallback logic).
+- **Odin unit tests are orphaned** in `pkg/` rather than discoverable from a test
+  index — document their locations.
+- **Windows provisioning is duplicated** between `ci.yml` and
+  `bootstrap-windows-deps.sh`; the pinned `WEBKIT_TAG` should have a single source
+  of truth.
+- **`known-lava-gaps.txt`** has no structured format or CI enforcement — define
+  `file:reason` tuples and check them so a regression cannot silently widen a gap.
+- **`process.env` is a one-shot snapshot** (`globals.odin:1122`), not live — revisit
+  with a Proxy-backed object when child processes land.
+- **Stack-trace line numbers** are off by one (known) — fix once the loader wrapper
+  no longer shifts line 1.
+
+---
+
+## 6. The longer view: what would make Lava *best in class*
+
+Three differentiators, each a natural extension of architecture that already
+exists rather than a bolt-on:
+
+1. **TypeScript/JSX-first.** Native transpile-on-load (the empty `pkg/bundler`
+   becomes a real transform stage) removes the build step that Node still imposes.
+   This is the largest single "why Lava over Node" lever.
+2. **Deterministic by construction.** The loop's existing dual clock (real vs
+   logical) is half of a record/replay engine. Capture every nondeterministic input
+   — timer firings, I/O completions, `Math.random`, `Date.now` — and replay them
+   byte-for-byte. A runtime where any run can be deterministically reproduced for
+   debugging would be genuinely novel, and the oracle test methodology already
+   thinks this way.
+3. **Capability-based security in the loader.** A permissions model finer than
+   Deno's, enforced at the module/native-binding boundary that Lava already funnels
+   everything through.
+
+Then the table-stakes parallelism story: `worker_threads` (multiple JSC contexts,
+one per thread, message-passed), built on the same thread-pool and `post_async`
+foundations as §5.2.
+
+---
+
+## 7. Recommended sequence
+
+| # | Work | Class | Rationale |
+|---|------|-------|-----------|
+| 1 | FFI root-cause + unified `ERR_*` error layer | P0 | Removes the one "unreliable" internal boundary; foundation of trust and of parity tests |
+| 2 | Generic thread pool → async `fs`/`crypto` | P1 | Removes the loop-blocking ceiling; reuses the proven `post_async` primitive |
+| 3 | Benchmark harness + CI perf gate | P1 | Makes "fast" provable instead of asserted |
+| 4 | `node:net` + `node:http` server | P1 | Unlocks server-side applications |
+| 5 | `package.json` `"exports"`; consolidate primordials | P2 | Modern-package compat; uniform pollution safety |
+| 6 | TypeScript/JSX transpile-on-load | Vision | Biggest differentiator vs Node |
+| 7 | `worker_threads`; deterministic record/replay | Vision | Parallelism + a genuinely unique capability |
+
+---
+
+## 8. Verdict
+
+Lava is, today, a **carefully engineered early-stage runtime** whose core — the
+event loop, the FFI lifetime discipline, the native/JS layering, and the
+oracle-based test methodology — already meets a high bar. The work ahead is not
+rescue work; it is *extension and hardening*: pin down the one boundary the code
+distrusts, lift blocking work off the loop thread, prove the performance, and then
+reach for the differentiators (TS-first, determinism, capabilities) that the
+existing architecture is unusually well-positioned to deliver.
