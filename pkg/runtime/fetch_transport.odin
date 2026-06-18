@@ -54,7 +54,7 @@ fetch_transport_start :: proc(
 
 	// An IPv4 literal needs no lookup — connect on the spot (no worker thread).
 	if ip4, ip_ok := net.parse_ip4_address(host); ip_ok {
-		return fetch_connect_ip4(req, transmute([4]u8)ip4, port)
+		return fetch_connect_ip4(req, ip4, port)
 	}
 
 	// A hostname: resolve off the loop via the bounded DNS pool (#77,

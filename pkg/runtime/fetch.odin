@@ -13,7 +13,7 @@ import eventloop "lava:pkg/runtime/eventloop"
 // connect path tries them in order (A then AAAA), advancing on failure.
 Fetch_Addr :: struct {
 	is_v6: bool,
-	v4:    [4]u8,
+	v4:    net.IP4_Address,
 	v6:    net.IP6_Address,
 }
 

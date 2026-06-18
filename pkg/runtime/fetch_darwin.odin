@@ -52,7 +52,7 @@ fetch_new_socket :: proc(family: posix.AF) -> posix.FD {
 // connect(), and hand off to fetch_register_socket (which watches for writability
 // == connect completion). A non-blocking connect returns EINPROGRESS, which is
 // expected; any other failure rejects. Both run on the loop thread.
-fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: [4]u8, port: int) -> (ok: bool, err: string) {
+fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: net.IP4_Address, port: int) -> (ok: bool, err: string) {
 	fd := fetch_new_socket(.INET)
 	if fd < 0 do return false, "fetch: could not create socket"
 	addr := posix.sockaddr_in {

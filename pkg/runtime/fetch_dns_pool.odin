@@ -130,7 +130,7 @@ fetch_dns_pool_worker :: proc(data: rawptr) {
 				if ip4, ip_ok := ep4.address.(net.IP4_Address); ip_ok {
 					job.addrs[job.addr_count] = Fetch_Addr {
 						is_v6 = false,
-						v4    = transmute([4]u8)ip4,
+						v4    = ip4,
 					}
 					job.addr_count += 1
 				}

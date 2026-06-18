@@ -17,13 +17,14 @@ fetch_close_fd :: proc(fd: uintptr) {
 // fetch_connect_ip4 / fetch_connect_ip6 open a non-blocking socket, kick off
 // connect(), and hand off to fetch_register_socket (which watches for writability
 // == connect completion). Both run on the loop thread.
-fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: [4]u8, port: int) -> (ok: bool, err: string) {
+fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: net.IP4_Address, port: int) -> (ok: bool, err: string) {
 	sock_fd, sock_err := linux.socket(.INET, .STREAM, {.NONBLOCK}, .TCP)
 	if sock_err != .NONE do return false, "fetch: could not create socket"
+	// net.IP4_Address is [4]u8 in network order — exactly the bytes sin_addr wants.
 	addr := linux.Sock_Addr_In {
 		sin_family = .INET,
 		sin_port   = u16be(port),
-		sin_addr   = ip4,
+		sin_addr   = transmute([4]u8)ip4,
 	}
 	// EINTR: a signal interrupted connect() before it could report EINPROGRESS;
 	// the connection still proceeds asynchronously, so treat it like EINPROGRESS
