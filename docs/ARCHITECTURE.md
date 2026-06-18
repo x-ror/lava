@@ -280,14 +280,20 @@ pristine; modules consume it via `require('primordials')` and get the cached tab
 This is the JS-layer analog of the native error-intrinsic capture (§4.3/§5.1).
 
 `events.js` (EventEmitter) is the first fully migrated consumer — its internal
-`Array`/`Object`/`Reflect`/`Promise` use now routes through primordials, and
-`tests/node-compat/cases/36-primordials-pollution.js` proves it stays correct while
-`Array.prototype.{push,unshift,slice,splice,map}` and `Object.create` are
-overwritten (compared against Node, which is likewise immune). Remaining modules
-adopt it incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
-(Minor: internal helper modules, primordials included, are requireable by user code
-via the builtin resolver — a pre-existing divergence from Node's hidden internals;
-an internal-only gate is a future follow-up.)
+`Array`/`Object`/`Reflect`/`Promise` use routes through primordials, and listener
+arrays are copied/spliced via species-free helpers (`arrayClone`/`spliceOne`, array
+literal + index only) so a poisoned `Array[Symbol.species]` cannot reach `emit()`
+either. `cmd/lava/primordials_test.odin` (a Lava-only Odin test — Node's own
+EventEmitter is *not* immune here, so this can't be a Node oracle) proves it stays
+correct while `Array.prototype.{push,unshift,slice,splice,map}`, `Object.create`,
+and `Array[Symbol.species]` are all overwritten. Remaining modules adopt primordials
+incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
+
+`primordials` is internal-only: the loader serves it to internal factories but
+hides it from the public resolver native `require()` consults, so it neither
+shadows a user package named `primordials` nor answers `require('node:primordials')`
+(which Node rejects). Gating the other internal helper modules the same way is a
+future follow-up.
 
 ### 5.6 [P2] Documentation & process gaps
 

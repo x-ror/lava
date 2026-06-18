@@ -60,5 +60,15 @@
   req('structured_clone');
   req('crypto');
 
-  return req;
+  // primordials is internal-only: internal factories require() it through `req`
+  // above, but it must NOT be reachable through the public resolver native
+  // require() consults — Node has no such builtin (require('node:primordials')
+  // is ERR_UNKNOWN_BUILTIN_MODULE), and a user package named "primordials" must
+  // not be shadowed. publicReq hides it; everything else resolves as before.
+  function publicReq(name) {
+    if (normalize(name) === 'primordials') return undefined;
+    return req(name);
+  }
+
+  return publicReq;
 });

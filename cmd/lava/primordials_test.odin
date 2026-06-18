@@ -23,6 +23,7 @@ const realSlice = Array.prototype.slice;
 const realSplice = Array.prototype.splice;
 const realMap = Array.prototype.map;
 const realCreate = Object.create;
+const speciesDesc = Object.getOwnPropertyDescriptor(Array, Symbol.species);
 const boom = function () {
   throw new Error('intrinsic pollution leaked into a built-in');
 };
@@ -33,6 +34,14 @@ Array.prototype.slice = boom;
 Array.prototype.splice = boom;
 Array.prototype.map = boom;
 Object.create = boom;
+// Poison Array[Symbol.species] too: slice/map/splice consult it, so a clean run
+// proves EventEmitter copies its listener arrays without going through species.
+Object.defineProperty(Array, Symbol.species, {
+  configurable: true,
+  get: function () {
+    throw new Error('species pollution leaked into a built-in');
+  },
+});
 
 let calls = 0;
 const ee = new EventEmitter();
@@ -57,6 +66,7 @@ Array.prototype.slice = realSlice;
 Array.prototype.splice = realSplice;
 Array.prototype.map = realMap;
 Object.create = realCreate;
+Object.defineProperty(Array, Symbol.species, speciesDesc);
 
 if (calls !== 7) throw new Error('calls=' + calls);
 if (namesLen !== 1) throw new Error('namesLen=' + namesLen);

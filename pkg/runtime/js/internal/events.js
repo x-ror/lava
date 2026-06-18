@@ -8,6 +8,23 @@
   var P = require('primordials');
   var defaultMaxListeners = 10;
 
+  // Species-free array helpers. Array.prototype.slice/map/splice consult
+  // constructor[Symbol.species] (ArraySpeciesCreate), so a polluted species could
+  // throw inside emit()/listeners() before any listener runs. These copy/remove via
+  // an array literal and index access only — no prototype method, no species — so a
+  // listener array cannot be hijacked through @@species (matches Node's arrayClone/
+  // spliceOne).
+  function arrayClone(arr) {
+    var n = arr.length;
+    var copy = [];
+    for (var i = 0; i < n; i++) copy[i] = arr[i];
+    return copy;
+  }
+  function spliceOne(list, index) {
+    for (; index + 1 < list.length; index++) list[index] = list[index + 1];
+    P.ArrayPrototypePop(list);
+  }
+
   function EventEmitter() {
     EventEmitter.init.call(this);
   }
@@ -100,7 +117,7 @@
         }
       }
       if (position < 0) return this;
-      P.ArrayPrototypeSplice(list, position, 1);
+      spliceOne(list, position);
       if (list.length === 1) this._events[type] = list[0];
     }
     return this;
@@ -136,7 +153,7 @@
     if (typeof handler === 'function') {
       P.FunctionPrototypeApply(handler, this, args);
     } else {
-      var listeners = P.ArrayPrototypeSlice(handler);
+      var listeners = arrayClone(handler);
       for (var i = 0; i < listeners.length; i++) {
         P.FunctionPrototypeApply(listeners[i], this, args);
       }
@@ -150,9 +167,9 @@
     var handler = events[type];
     if (handler === undefined) return [];
     if (typeof handler === 'function') return [handler.listener || handler];
-    return P.ArrayPrototypeMap(handler, function (h) {
-      return h.listener || h;
-    });
+    var copy = arrayClone(handler);
+    for (var i = 0; i < copy.length; i++) copy[i] = copy[i].listener || copy[i];
+    return copy;
   };
 
   EventEmitter.prototype.rawListeners = function (type) {
@@ -160,7 +177,7 @@
     if (events === undefined) return [];
     var handler = events[type];
     if (handler === undefined) return [];
-    return typeof handler === 'function' ? [handler] : P.ArrayPrototypeSlice(handler);
+    return typeof handler === 'function' ? [handler] : arrayClone(handler);
   };
 
   EventEmitter.prototype.listenerCount = function (type) {
