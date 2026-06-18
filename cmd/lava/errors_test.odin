@@ -90,8 +90,8 @@ node_error_received_types :: proc(t: ^testing.T) {
 		want: string, // its Node "Received …" clause
 	}
 	cases := []Case {
-		{"10n", "type bigint (10)"},
-		{"-7n", "type bigint (-7)"},
+		{"10n", "type bigint (10n)"},
+		{"-7n", "type bigint (-7n)"},
 		{"'abc'", "type string"},
 		{"Symbol('s')", "type symbol"},
 		{"5", "type number (5)"},

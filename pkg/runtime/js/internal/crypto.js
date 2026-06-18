@@ -32,8 +32,10 @@
     if (value === null) return 'null';
     var t = typeof value;
     if (t === 'undefined') return 'undefined';
-    if (t === 'number' || t === 'boolean' || t === 'bigint')
-      return 'type ' + t + ' (' + value + ')';
+    if (t === 'number' || t === 'boolean') return 'type ' + t + ' (' + value + ')';
+    // A bigint keeps Node's trailing "n" (util.inspect(10n) === '10n'), which bare
+    // string coercion ('' + 10n === '10') drops — matches os.js/buffer.js.
+    if (t === 'bigint') return 'type bigint (' + value + 'n)';
     if (t === 'string') return 'type string';
     if (t === 'symbol') return 'type symbol';
     if (t === 'function') return 'function ' + (value.name || '(anonymous)');

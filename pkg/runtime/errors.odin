@@ -158,6 +158,7 @@ err_invalid_arg_type :: proc(
 //
 //	null / undefined        -> "null" / "undefined"
 //	number / boolean        -> "type number (5)" / "type boolean (true)"
+//	bigint                  -> "type bigint (10n)"
 //	string                  -> "type string"
 //	symbol                  -> "type symbol"
 //	function                -> "function <name>" (or "function (anonymous)")
@@ -169,10 +170,12 @@ determine_received_type :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) ->
 	// no kJSTypeBigInt), and a given JSC build may report it as .Object or as an
 	// out-of-enum value. Detect it by elimination (see value_is_bigint) so this is
 	// independent of the engine's BigInt reporting, and render it like the JS-side
-	// inspectReceived: "type bigint (10)".
+	// inspectReceived: "type bigint (10n)". The trailing "n" matches Node's
+	// util.inspect(10n) === "10n"; JSC's string conversion ("10") drops it, so it
+	// is appended here.
 	if value_is_bigint(ctx, value) {
 		s, allocated := value_to_string(ctx, value)
-		out := fmt.tprintf("type bigint (%s)", s)
+		out := fmt.tprintf("type bigint (%sn)", s)
 		if allocated do delete(s)
 		return out
 	}
