@@ -325,13 +325,14 @@ os_userinfo_cb :: proc "c" (
 
 // make_os_system_error builds the Node SystemError thrown when a priority syscall
 // fails: code ERR_SYSTEM_ERROR plus the errno/syscall fields callers inspect. The
-// errno is reported as the negative value, as Node/libuv do.
+// (name, message, code) shape comes from the centralized factory (errors.odin);
+// errno/syscall are the SystemError-specific extras the generic factory doesn't
+// model. The errno is reported as the negative value, as Node/libuv do.
 make_os_system_error :: proc(ctx: jsc.JSContextRef, syscall: string, err: int) -> jsc.JSValueRef {
 	msg := fmt.tprintf("A system error occurred: %s returned errno %d", syscall, err)
-	e := make_js_named_error(ctx, "SystemError", msg)
+	e := make_native_error(ctx, "SystemError", msg, "ERR_SYSTEM_ERROR")
 	if jsc.JSValueIsObject(ctx, e) {
 		o := cast(jsc.JSObjectRef)e
-		set_named(ctx, o, "code", js_string_value(ctx, "ERR_SYSTEM_ERROR"))
 		set_named(ctx, o, "errno", jsc.JSValueMakeNumber(ctx, f64(-err)))
 		set_named(ctx, o, "syscall", js_string_value(ctx, syscall))
 	}
