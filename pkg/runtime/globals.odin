@@ -900,6 +900,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"sqlite", INTERNAL_SQLITE},
 		{"dns", INTERNAL_DNS},
 		{"dns/promises", INTERNAL_DNS_PROMISES},
+		{"os", INTERNAL_OS},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -921,6 +922,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "fetch", cast(jsc.JSValueRef)make_fetch_bindings(ctx))
 	set_named(ctx, natives, "sqlite", cast(jsc.JSValueRef)make_sqlite_bindings(ctx))
 	set_named(ctx, natives, "dns", cast(jsc.JSValueRef)make_dns_bindings(ctx))
+	set_named(ctx, natives, "os", cast(jsc.JSValueRef)make_os_bindings(ctx))
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef
@@ -1166,6 +1168,7 @@ INTERNAL_PATH :: #load("js/internal/path.js", string)
 INTERNAL_SQLITE :: #load("js/internal/sqlite.js", string)
 INTERNAL_DNS :: #load("js/internal/dns.js", string)
 INTERNAL_DNS_PROMISES :: #load("js/internal/dns_promises.js", string)
+INTERNAL_OS :: #load("js/internal/os.js", string)
 
 // ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
 // the module resolver (see install_internal_modules); evaluates to a function.
