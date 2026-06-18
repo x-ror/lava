@@ -71,6 +71,53 @@ node_error_factory :: proc(t: ^testing.T) {
 	)
 }
 
+// node_error_received_types pins determine_received_type's "Received …" rendering
+// (via err_invalid_arg_type's message) across every value kind — including BigInt,
+// the primitive JSValueGetType's enum omits — so it matches the JS-side
+// inspectReceived (js/internal/crypto.js). A bare context suffices: only the
+// message text is asserted here, which does not depend on captured intrinsics.
+@(test)
+node_error_received_types :: proc(t: ^testing.T) {
+	jsc.lava_jsc_init()
+	gctx := jsc.JSGlobalContextCreate(nil)
+	testing.expect(t, gctx != nil, "could not create a JSC global context")
+	if gctx == nil do return
+	defer jsc.JSGlobalContextRelease(gctx)
+	ctx := cast(jsc.JSContextRef)gctx
+
+	Case :: struct {
+		expr: string, // evaluated to the received value
+		want: string, // its Node "Received …" clause
+	}
+	cases := []Case {
+		{"10n", "type bigint (10)"},
+		{"-7n", "type bigint (-7)"},
+		{"'abc'", "type string"},
+		{"Symbol('s')", "type symbol"},
+		{"5", "type number (5)"},
+		{"true", "type boolean (true)"},
+		{"null", "null"},
+		{"undefined", "undefined"},
+		{"({})", "an instance of Object"},
+		{"[]", "an instance of Array"},
+		{"new Date(0)", "an instance of Date"},
+		{"(function named(){})", "function named"},
+		{"(function(){})", "function (anonymous)"},
+		{"Object.create(null)", "type object"},
+	}
+	for c in cases {
+		val := eval_value(ctx, c.expr)
+		e := lava.err_invalid_arg_type(ctx, "x", "string", val)
+		if !testing.expectf(t, jsc.JSValueIsObject(ctx, e), "%s: error must be an object", c.expr) {
+			continue
+		}
+		msg, allocated := lava.value_to_string(ctx, lava.get_named(ctx, cast(jsc.JSObjectRef)e, "message"))
+		want := fmt.tprintf("The \"x\" argument must be of type string. Received %s", c.want)
+		testing.expectf(t, msg == want, "%s: got %q want %q", c.expr, msg, want)
+		if allocated do delete(msg)
+	}
+}
+
 // expect_error_shape asserts that `err` is a real instance of `instanceof_ctor`
 // (checked through real JS, with the error exposed as the global `__e`) and has
 // the expected name, message, and code. An empty want_code asserts err.code is
@@ -121,4 +168,18 @@ eval_truthy :: proc(ctx: jsc.JSContextRef, expr: string) -> bool {
 	v := jsc.JSEvaluateScript(ctx, src, nil, nil, 1, &exc)
 	if exc != nil || v == nil do return false
 	return jsc.JSValueToBoolean(ctx, v)
+}
+
+// eval_value evaluates `expr` and returns its completion value (undefined on
+// error). Used to mint received values of every type for determine_received_type.
+@(private = "file")
+eval_value :: proc(ctx: jsc.JSContextRef, expr: string) -> jsc.JSValueRef {
+	c_expr, err := strings.clone_to_cstring(expr, context.temp_allocator)
+	if err != nil do return jsc.JSValueMakeUndefined(ctx)
+	src := jsc.JSStringCreateWithUTF8CString(c_expr)
+	defer jsc.JSStringRelease(src)
+	exc: jsc.JSValueRef
+	v := jsc.JSEvaluateScript(ctx, src, nil, nil, 1, &exc)
+	if exc != nil || v == nil do return jsc.JSValueMakeUndefined(ctx)
+	return v
 }
