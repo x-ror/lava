@@ -15,11 +15,26 @@ import lava "lava:pkg/runtime"
 @(test)
 node_error_factory :: proc(t: ^testing.T) {
 	jsc.lava_jsc_init()
-	gctx := jsc.JSGlobalContextCreate(nil)
+	// A LavaGlobal-classed context (private-data slot) + Runtime_State, so this
+	// exercises the *production* path: capture_error_intrinsics snapshots the error
+	// constructors before any user code, and make_native_error builds from those
+	// captured intrinsics (not the mutable global). A bare context would have no
+	// state and silently fall back to a base Error, defeating the instanceof checks.
+	gclass := lava.make_global_class()
+	gctx := jsc.JSGlobalContextCreate(gclass)
 	testing.expect(t, gctx != nil, "could not create a JSC global context")
-	if gctx == nil do return
+	if gctx == nil {
+		jsc.JSClassRelease(gclass)
+		return
+	}
+	defer jsc.JSClassRelease(gclass)
 	defer jsc.JSGlobalContextRelease(gctx)
 	ctx := cast(jsc.JSContextRef)gctx
+
+	state := lava.new_runtime_state(nil)
+	jsc.JSObjectSetPrivate(jsc.JSContextGetGlobalObject(ctx), cast(rawptr)state)
+	lava.capture_error_intrinsics(ctx, state)
+	defer lava.destroy_runtime_state(ctx, state)
 
 	// A coded RangeError is a real RangeError instance (not a base Error with an
 	// overridden name), carries the message, and exposes err.code.
@@ -42,15 +57,16 @@ node_error_factory :: proc(t: ^testing.T) {
 		"ERR_OUT_OF_RANGE",
 	)
 
-	// err_invalid_arg_type is a real TypeError with the Node template + code.
-	te := lava.err_invalid_arg_type(ctx, "buf", "Uint8Array", "number")
+	// err_invalid_arg_type is a real TypeError with the Node template + code, and
+	// renders the received value Node-exactly ("type number (5)", not bare "number").
+	te := lava.err_invalid_arg_type(ctx, "buf", "Uint8Array", jsc.JSValueMakeNumber(ctx, 5))
 	expect_error_shape(
 		t,
 		ctx,
 		te,
 		"TypeError",
 		"TypeError",
-		"The \"buf\" argument must be of type Uint8Array. Received number",
+		"The \"buf\" argument must be of type Uint8Array. Received type number (5)",
 		"ERR_INVALID_ARG_TYPE",
 	)
 }

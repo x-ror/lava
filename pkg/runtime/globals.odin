@@ -16,6 +16,13 @@ Runtime_State :: struct {
 	module_cache:      map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
 	builtin_require:   jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
 	esm_transform:     jsc.JSValueRef, // js/internal/esm.js transform(source,url,filename,dirname); GC-protected
+	// Standard JS error constructors (Error/TypeError/RangeError/…) snapshotted and
+	// GC-protected from globalThis at context init, before any user code runs (see
+	// capture_error_intrinsics). make_native_error builds native throws from these
+	// instead of re-reading the mutable global, so a script that overwrites e.g.
+	// globalThis.RangeError cannot intercept or alter a native error (errors.odin).
+	// Keys are static literals; values unprotected on destroy.
+	error_intrinsics:  map[string]jsc.JSValueRef,
 	// Set when an uncaught exception escapes an async callback or a promise
 	// rejects with no handler. The process then exits non-zero even though the
 	// initial JSEvaluateScript returned cleanly (see resolve_exit_code).
@@ -90,6 +97,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state := new(Runtime_State)
 	state.loop = loop
 	state.module_cache = make(map[string]jsc.JSValueRef)
+	state.error_intrinsics = make(map[string]jsc.JSValueRef)
 	state.active_fetches = make([dynamic]^Fetch_Request)
 	state.active_dns = make([dynamic]^Dns_Lookup_Request)
 	state.sqlite_dbs = make(map[u64]rawptr)
@@ -109,6 +117,10 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 		delete(key)
 	}
 	delete(state.module_cache)
+	for _, ctor in state.error_intrinsics {
+		unprotect_before_eval_exit(ctx, ctor)
+	}
+	delete(state.error_intrinsics)
 	unprotect_before_eval_exit(ctx, state.builtin_require)
 	unprotect_before_eval_exit(ctx, state.esm_transform)
 	unprotect_before_eval_exit(ctx, state.rejection_handler)

@@ -139,6 +139,14 @@ eval :: proc(
 	// JSValueUnprotect on cached modules still has a live context.
 	defer destroy_runtime_state(cast(jsc.JSContextRef)ctx, state)
 
+	// Snapshot the standard error constructors while globalThis is still pristine —
+	// before setup_module_environment's builtin JS and, crucially, before any user
+	// code. make_native_error builds native throws from these captured intrinsics, so
+	// a script that later overwrites globalThis.RangeError/TypeError/etc. cannot
+	// intercept or reshape a native error (matches Node, whose internal errors never
+	// route through user-patched globals). See errors.odin.
+	capture_error_intrinsics(cast(jsc.JSContextRef)ctx, state)
+
 	// eval owns the loop's teardown (see the OWNERSHIP note above). A deferred
 	// destroy — not a tail call after eventloop.run — so that EVERY return once the
 	// context exists tears the loop down: a thrown top-level exception (which may
