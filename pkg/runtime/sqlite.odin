@@ -544,11 +544,7 @@ sqlite_int_value :: proc(
 				"Value is too large to be represented as a JavaScript number: %d",
 				v,
 			)
-			err := make_js_named_error(ctx, "RangeError", msg)
-			if jsc.JSValueIsObject(ctx, err) {
-				set_named(ctx, cast(jsc.JSObjectRef)err, "code", js_string_value(ctx, "ERR_OUT_OF_RANGE"))
-			}
-			exception^ = err
+			exception^ = make_native_error(ctx, "RangeError", msg, "ERR_OUT_OF_RANGE")
 		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}

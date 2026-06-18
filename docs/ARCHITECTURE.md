@@ -190,10 +190,16 @@ are gone. This closes the consistency issue.
 
 ### 4.4 Error handling
 
-The JS layer has good Node-shaped coded errors, but the **native** layer builds
-errors ad hoc (`make_js_error` + `make_js_named_error` + manual `code` property,
-e.g. `require.odin:260`, `globals.odin:631`). There is no single source of truth
-for the Node `ERR_*` taxonomy spanning the native and JS halves (§5.1).
+`pkg/runtime/errors.odin` is the single source of truth for native error
+construction. `make_native_error(ctx, ctor_name, message, code)` builds a **real**
+instance of the named JS error constructor (so `err instanceof TypeError` holds, as
+in Node — not just `err.name`), attaches Node's `err.code`, and falls back to a
+base Error with an overridden name only when the constructor is unreachable.
+`make_js_error` / `make_js_named_error` and the typed `ERR_*` helpers
+(`err_out_of_range`, `err_invalid_arg_type`, …) all route through it; the ad-hoc
+"base Error + manual `name`/`code` patch" sites (process.exit, sqlite, module
+resolution) were migrated. The JS layer still sets `err.code` per module; growing
+the `ERR_*` helper list lets native sites adopt the same codes as they need them.
 
 ---
 
@@ -202,7 +208,7 @@ for the Node `ERR_*` taxonomy spanning the native and JS halves (§5.1).
 Severity: **P0** trust/correctness foundations · **P1** scalability/perf · **P2**
 documentation/process.
 
-### 5.1 [P0] Close the FFI trust boundary ✓ + unify the error layer
+### 5.1 [P0] Close the FFI trust boundary ✓ + unify the error layer ✓
 
 **FFI boundary — done (#159).** The "`JSValueIs*` is unreliable" workaround was
 root-caused to the retired `-> b32` (4-byte) return reading undefined upper bytes
@@ -213,20 +219,13 @@ normal context and a `proc "c"` callback, the last stale workaround (sqlite
 corrected. The remaining `JSValueGetType` uses are idiomatic multi-way type
 switches, not hazard workarounds.
 
-**Error layer — remaining.** The **native** half still builds errors ad hoc
-(`make_js_error` + `make_js_named_error` + manual `code`). Introduce a single
-`errors.odin` Node-error factory (`err(ctx, code, message_fmt, ...)`) owning the
-`ERR_*` → message/`name`/`code` mapping, mirrored with the JS layer's code list so
-both halves stay in lockstep. This makes error output *predictable* and is a
-prerequisite for honest Node-parity error tests.
-
-**Unified error layer.** Introduce a single `errors.odin` Node-error factory
-(`err(ctx, code, message_fmt, ...)`) that owns the `ERR_*` → message/`name`/`code`
-mapping, replacing the scattered `make_js_named_error` + manual `code` sets. Mirror
-its code list with the JS layer's so both halves stay in lockstep. This makes error
-output *predictable* and is a prerequisite for honest Node-parity error tests.
-
-*Chosen as a starting direction.*
+**Error layer — done.** `pkg/runtime/errors.odin` is now the single source of
+truth (§4.4): `make_native_error` builds real error instances (so `instanceof`
+matches Node) carrying `err.code`, with typed `ERR_*` helpers mirroring Node's
+message templates. `make_js_error` / `make_js_named_error` route through it and the
+ad-hoc code-setting sites were migrated; `cmd/lava/errors_test.odin` pins the shape
+(instanceof + name + message + code). The `ERR_*` helper set grows as native call
+sites adopt coded errors — the mechanism and parity contract are in place.
 
 ### 5.2 [P1] A real thread pool → non-blocking `fs` and `crypto`
 
@@ -326,7 +325,7 @@ foundations as §5.2.
 
 | # | Work | Class | Rationale |
 |---|------|-------|-----------|
-| 1 | ~~FFI root-cause~~ ✓ (#159) + unified `ERR_*` error layer | P0 | FFI boundary now proven (§4.3); error layer still pending — foundation of parity tests |
+| 1 | ~~FFI root-cause (#159) + unified `ERR_*` error layer~~ ✓ | P0 | FFI boundary proven (§4.3); `errors.odin` factory in place (§4.4) — foundation of parity tests |
 | 2 | Generic thread pool → async `fs`/`crypto` | P1 | Removes the loop-blocking ceiling; reuses the proven `post_async` primitive |
 | 3 | Benchmark harness + CI perf gate | P1 | Makes "fast" provable instead of asserted |
 | 4 | `node:net` + `node:http` server | P1 | Unlocks server-side applications |

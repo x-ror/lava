@@ -412,24 +412,8 @@ callback_arg :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> jsc.JSObje
 	return obj
 }
 
-make_js_error :: proc(ctx: jsc.JSContextRef, message: string) -> jsc.JSValueRef {
-	msg := js_string_value(ctx, message)
-	args := [1]jsc.JSValueRef{msg}
-	err := jsc.JSObjectMakeError(ctx, 1, raw_data(args[:]), nil)
-	return cast(jsc.JSValueRef)err
-}
-
-// make_js_named_error builds an Error whose `name` is overridden (e.g.
-// "SyntaxError"), so `err.name` and the default stringification match the
-// corresponding native error subclass even though JSObjectMakeError always
-// produces a base Error.
-make_js_named_error :: proc(ctx: jsc.JSContextRef, name, message: string) -> jsc.JSValueRef {
-	err := make_js_error(ctx, message)
-	if jsc.JSValueIsObject(ctx, err) {
-		set_named(ctx, cast(jsc.JSObjectRef)err, "name", js_string_value(ctx, name))
-	}
-	return err
-}
+// make_js_error / make_js_named_error and the Node ERR_* helpers live in
+// errors.odin (the single source of truth for native error construction).
 
 // --- Timer / scheduling callbacks ---
 
@@ -628,20 +612,7 @@ process_exit_cb :: proc "c" (
 		n := jsc.JSValueToNumber(ctx, arguments[0], nil)
 		if n != n {
 			if exception != nil {
-				err := make_js_named_error(
-					ctx,
-					"RangeError",
-					"The value of \"code\" is out of range. It must be an integer. Received NaN",
-				)
-				if jsc.JSValueIsObject(ctx, err) {
-					set_named(
-						ctx,
-						cast(jsc.JSObjectRef)err,
-						"code",
-						js_string_value(ctx, "ERR_OUT_OF_RANGE"),
-					)
-				}
-				exception^ = err
+				exception^ = err_out_of_range(ctx, "code", "an integer", "NaN")
 			}
 			return jsc.JSValueMakeUndefined(ctx)
 		}

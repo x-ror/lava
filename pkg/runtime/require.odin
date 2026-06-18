@@ -258,11 +258,12 @@ native_require_cb :: proc "c" (
 // make_module_not_found builds the Error Node throws for an unresolved require,
 // including the `code: 'MODULE_NOT_FOUND'` property user code commonly checks.
 make_module_not_found :: proc(ctx: jsc.JSContextRef, specifier: string) -> jsc.JSValueRef {
-	err := make_js_error(ctx, fmt.tprintf("Cannot find module '%s'", specifier))
-	if jsc.JSValueIsObject(ctx, err) {
-		set_named(ctx, cast(jsc.JSObjectRef)err, "code", js_string_value(ctx, "MODULE_NOT_FOUND"))
-	}
-	return err
+	return make_native_error(
+		ctx,
+		"Error",
+		fmt.tprintf("Cannot find module '%s'", specifier),
+		"MODULE_NOT_FOUND",
+	)
 }
 
 inject_native_function :: proc(
