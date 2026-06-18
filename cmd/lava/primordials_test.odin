@@ -90,3 +90,44 @@ primordials_pollution_immunity :: proc(t: ^testing.T) {
 	)
 	testing.expectf(t, result.exit_code == 0, "eval exit code=%d (want 0)", result.exit_code)
 }
+
+// primordials is an internal-only module: internal factories require() it, but it
+// must not leak through the public resolver (it would shadow a user package named
+// "primordials" and wrongly answer require('node:primordials')). This evals user
+// code and asserts both specifiers fail with MODULE_NOT_FOUND while a genuine
+// builtin still resolves. A clean run means the loader's publicReq gate holds.
+HIDDEN_FROM_REQUIRE_SCRIPT :: `
+'use strict';
+function notFound(fn) {
+  try {
+    fn();
+    return false;
+  } catch (e) {
+    return e && e.code === 'MODULE_NOT_FOUND';
+  }
+}
+if (!notFound(function () { require('primordials'); }))
+  throw new Error("require('primordials') must not resolve");
+if (!notFound(function () { require('node:primordials'); }))
+  throw new Error("require('node:primordials') must not resolve");
+if (typeof require('node:events') !== 'function')
+  throw new Error('a real builtin must still resolve');
+console.log('primordials-hidden ok');
+`
+
+@(test)
+primordials_hidden_from_user_require :: proc(t: ^testing.T) {
+	loop := eventloop.init()
+	result := lava.eval(HIDDEN_FROM_REQUIRE_SCRIPT, "<primordials-hidden-test>", &loop, false)
+	defer lava.result_destroy(&result)
+
+	testing.expectf(
+		t,
+		result.status == .Ok,
+		"eval did not complete cleanly: status=%v message=%q",
+		result.status,
+		result.message,
+	)
+	testing.expectf(t, result.exit_code == 0, "eval exit code=%d (want 0)", result.exit_code)
+}
+
