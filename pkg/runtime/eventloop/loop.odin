@@ -108,6 +108,9 @@ Loop :: struct {
 	async_scratch:      [dynamic]Task, // swapped with async_queue under the lock to drain
 	async_mutex:        sync.Mutex,
 	active_async:       int,
+	// Per-loop worker pool for off-loop blocking/CPU-bound work (threadpool.odin).
+	// Zero-valued until first use (lazily started); joined and freed by destroy.
+	pool:               Thread_Pool,
 }
 
 Poll_Mode :: enum {
@@ -208,7 +211,7 @@ destroy :: proc(loop: ^Loop) {
 	// Stop and join the worker pool first, so no off-loop worker can post into the
 	// async_queue we are about to tear down (see threadpool.odin / the PRECONDITION
 	// note below). A no-op when the pool was never started.
-	pool_shutdown()
+	pool_shutdown(loop)
 	dispose_pending_tasks(&loop.next_ticks)
 	dispose_pending_tasks(&loop.next_ticks_scratch)
 	dispose_pending_tasks(&loop.microtasks)
@@ -236,6 +239,11 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.cancelled_ids)
 	delete(loop.async_queue)
 	delete(loop.async_scratch)
+	// Pool arrays are nil unless the pool was used (pool_shutdown cleared but did not
+	// free their backing); delete is a no-op on a nil dynamic array.
+	delete(loop.pool.pending)
+	delete(loop.pool.threads)
+	delete(loop.pool.outstanding)
 	loop^ = Loop{}
 }
 
