@@ -2,11 +2,20 @@ package lava_runtime
 
 import "base:runtime"
 import "core:c"
+import "core:net"
 import "core:strconv"
 import "core:strings"
-import "core:thread"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
+
+// Fetch_Addr is one resolved address in the connect-fallback list (#145). A
+// hostname resolves to up to one IPv4 and one IPv6 address (net.resolve); the
+// connect path tries them in order (A then AAAA), advancing on failure.
+Fetch_Addr :: struct {
+	is_v6: bool,
+	v4:    net.IP4_Address,
+	v6:    net.IP6_Address,
+}
 
 // Native backing for the WHATWG `fetch`. The JavaScript surface (Headers /
 // Request / Response / Body) lives in js/internal/fetch.js; this file provides
@@ -24,6 +33,19 @@ import eventloop "lava:pkg/runtime/eventloop"
 // Linux, macOS, and Windows. DNS is blocking off the loop; the transport runs
 // non-blocking on the event loop. Platforms with no transport reject the network
 // call entirely. See ROADMAP.
+
+// FETCH_MAX_HEADER_BYTES caps the response head buffer (req.response, which
+// accumulates only until the CRLFCRLF terminator). A server that never sends the
+// terminator would otherwise grow this without bound — an OOM vector. The body
+// itself is streamed (never buffered here), so this bounds the head alone. Set
+// generously above any realistic header set.
+FETCH_MAX_HEADER_BYTES :: 256 * 1024
+
+// FETCH_MAX_CHUNK_LINE caps a single Transfer-Encoding: chunked size line. The
+// carry buffer holds only undecoded framing (size lines + inter-chunk CRLFs),
+// never bulk data; a size line that never terminates must not grow it without
+// bound. A real chunk-size line is a handful of hex digits, so 16 KiB is ample.
+FETCH_MAX_CHUNK_LINE :: 16 * 1024
 
 Fetch_Phase :: enum {
 	Connecting,
@@ -89,11 +111,23 @@ Fetch_Request :: struct {
 	request_bytes: []byte,
 	write_offset:  int,
 
-	// Async DNS result, written by the resolver worker thread and read by the loop
-	// after post_async publishes it (see fetch_linux.odin). IPv4-only for now.
-	dns_ip4:       [4]u8,
-	dns_ok:        bool,
-	dns_worker:    ^thread.Thread,
+	// DNS for a hostname runs on the bounded resolver pool (#77, fetch_dns_pool.odin):
+	// the lookup result lives on the pool's DNS_Job, not on the request, and the
+	// connect is driven from fetch_dns_pool_complete_cb on the loop thread. While a
+	// lookup is outstanding the request is pinned via drive_pending (so a cancel
+	// mid-lookup cannot free it under the pending completion).
+	//
+	// Resolved-address list + cursor (#145): a hostname resolves to up to one IPv4
+	// and one IPv6 address (ordered A then AAAA); fetch_advance_connect tries them in
+	// turn, advancing on a connect failure and settling an error only when the list
+	// is exhausted. A literal host bypasses this (addr_count stays 0, single connect).
+	addrs:         [2]Fetch_Addr,
+	addr_count:    int,
+	addr_index:    int,
+	// Back-pointer to this request's outstanding DNS job (nil unless a pool lookup
+	// is in flight), so an abort can cancel a still-queued lookup. Set by
+	// fetch_dns_pool_submit, cleared by its completion; loop-thread-only.
+	dns_job:       ^DNS_Job,
 	response:      [dynamic]byte, // accumulates bytes until the header terminator is found
 	watcher:       eventloop.IO_Watcher,
 	fd:            uintptr,
@@ -535,17 +569,73 @@ parse_http_url :: proc(
 		if rb < 0 do return "", 0, "", "", false
 		host = authority[1:rb]
 		rest_after := authority[rb + 1:]
-		if len(rest_after) > 1 && rest_after[0] == ':' {
-			if p, p_ok := strconv.parse_int(rest_after[1:]); p_ok do port = p
+		if len(rest_after) > 0 {
+			// Only a ":port" may follow the IPv6 literal's closing ']' (RFC 3986
+			// §3.2.2); any other trailing bytes ("[::1]foo") are malformed. new URL()
+			// rejects these, so this parser must too — defense in depth for callers
+			// that reach it directly.
+			if rest_after[0] != ':' do return "", 0, "", "", false
+			p, p_ok := parse_authority_port(rest_after[1:])
+			if !p_ok do return "", 0, "", "", false
+			if p >= 0 do port = p
 		}
 	} else if colon := strings.last_index_byte(authority, ':'); colon >= 0 {
 		host = authority[:colon]
-		if p, p_ok := strconv.parse_int(authority[colon + 1:]); p_ok do port = p
+		p, p_ok := parse_authority_port(authority[colon + 1:])
+		if !p_ok do return "", 0, "", "", false
+		if p >= 0 do port = p
 	}
 	if len(host) == 0 do return "", 0, "", "", false
 
 	ok = true
 	return
+}
+
+// parse_authority_port validates the optional ":port" of an authority. An empty
+// string (a bare trailing ':') is valid and keeps the scheme default in place
+// (returns -1, true). A non-empty port must be all ASCII digits and fit
+// 0..65535 — a non-numeric or out-of-range value is rejected (`ok == false`),
+// mirroring the WHATWG URL parser, rather than silently truncating via u16 or
+// falling back to port 80/443. The JS layer already validates through `new URL`,
+// so this is defense in depth for any caller that reaches the native parser.
+parse_authority_port :: proc(s: string) -> (port: int, ok: bool) {
+	if len(s) == 0 do return -1, true
+	for c in transmute([]byte)s {
+		if c < '0' || c > '9' do return -1, false
+	}
+	p, p_ok := strconv.parse_int(s)
+	if !p_ok || p < 0 || p > 65535 do return -1, false
+	return p, true
+}
+
+// fetch_parse_chunk_size parses an HTTP chunk-size field, which RFC 7230 defines as
+// 1*HEXDIG — unsigned hex, no sign. The previous signed strconv.parse_int accepted
+// "-1"/"+5" as valid syntax (a negative size then slipped through the decoder
+// instead of being rejected as a framing error). This rejects an empty field, any
+// non-hex byte (so a sign or stray space fails), and a value that would overflow a
+// positive int. Returns (size, true) only for a well-formed non-negative size.
+fetch_parse_chunk_size :: proc(s: string) -> (size: int, ok: bool) {
+	if len(s) == 0 do return 0, false
+	v: u64
+	limit := u64(max(int))
+	for c in transmute([]byte)s {
+		d: u64
+		switch {
+		case c >= '0' && c <= '9':
+			d = u64(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = u64(c - 'a' + 10)
+		case c >= 'A' && c <= 'F':
+			d = u64(c - 'A' + 10)
+		case:
+			return 0, false // non-hex byte (sign, space, etc.)
+		}
+		// Reject a size past the positive int range; such a chunk never legitimately
+		// occurs and would otherwise wrap to a negative chunk_remaining.
+		if v > (limit - d) / 16 do return 0, false
+		v = v * 16 + d
+	}
+	return int(v), true
 }
 
 // build_http_request serializes the request line, a Host header, the caller's
@@ -621,7 +711,15 @@ fetch_on_recv :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, data: []byte) 
 	if !req.headers_done {
 		append(&req.response, ..data)
 		sep := find_header_end(req.response[:])
-		if sep < 0 do return true // head still incomplete — read more
+		if sep < 0 {
+			// A server that never terminates the head must not grow req.response
+			// without bound — reject once it crosses the cap.
+			if len(req.response) > FETCH_MAX_HEADER_BYTES {
+				fetch_settle_error(req, "fetch: response head too large")
+				return false
+			}
+			return true // head still incomplete — read more
+		}
 		if !fetch_deliver_headers(req, sep) do return false // settled with an error
 		if req.settled do return false // a consumer cancelled inside on_response
 		if req.no_body {
@@ -846,7 +944,13 @@ fetch_reject_now :: proc(ctx: jsc.JSContextRef, on_error: jsc.JSObjectRef, messa
 // inert immediately; unwatch_fd then truly cancels the io_uring poll (#183).
 fetch_request_finish :: proc(req: ^Fetch_Request) {
 	if req.settled do return
-	fetch_release_dns_worker(req)
+	// A DNS lookup may still be outstanding on the pool. We do NOT block to join it
+	// (the pool owns the worker lifetime); the request stays pinned via drive_pending
+	// — bumped at submit — so the pending completion finds live memory, sees
+	// req.settled, and reclaims it. See fetch_dns_pool.odin. If the lookup is still
+	// queued, cancel it so the worker skips the blocking resolve rather than doing
+	// network work for an aborted fetch (and holding the loop alive until it returns).
+	if req.dns_job != nil do fetch_dns_pool_cancel_job(req.dns_job)
 	req.settled = true
 	// Stamp the settle iteration so fetch_reclaim_pending holds this request a couple
 	// of loop ticks — past the in-flight platform_poll batch that may still carry a
@@ -943,42 +1047,28 @@ fetch_untrack_active :: proc(state: ^Runtime_State, req: ^Fetch_Request) {
 	}
 }
 
-// fetch_release_dns_worker joins and frees a request's DNS resolver thread, and is
-// a no-op once released (idempotent across the completion, cancel, and shutdown
-// paths). Loop-thread only.
-//
-// COST: thread.join BLOCKS the loop thread until the worker's proc returns. On the
-// normal path the worker has already posted its completion and is about to exit, so
-// this is effectively free. But on cancel-while-resolving (clear via the cancel
-// handle) and teardown-while-resolving, the worker is still inside a blocking
-// getaddrinfo with no cancellation, so the loop — and the whole process — parks
-// until the system resolver returns or times out. fetch_shutdown_active joins
-// serially, so N in-flight lookups can serialize. This is the simplest CORRECT
-// guarantee that no worker posts into a freed loop; a non-blocking handoff (worker
-// owns its inputs + a refcounted loop guard, or a cancellable resolver) is the
-// proper fix and is left as a tracked follow-up.
-fetch_release_dns_worker :: proc(req: ^Fetch_Request) {
-	if req == nil || req.dns_worker == nil do return
-	thread.join(req.dns_worker)
-	thread.destroy(req.dns_worker)
-	req.dns_worker = nil
-}
-
 // fetch_shutdown_active stops every in-flight request without invoking its JS
 // callbacks. It is used while the JS context is still alive but eval is already
-// returning (for example after a top-level throw). DNS workers are joined before
-// the request is finished so no background thread can post into a destroyed loop.
+// returning (for example after a top-level throw). After the requests are settled
+// it stops and joins the DNS resolver pool, so no background worker can post into a
+// loop about to be destroyed — the join blocks only on at most FETCH_DNS_POOL_SIZE
+// in-flight blocking resolves (see fetch_dns_pool.odin).
 //
 // Idempotent and intentionally called from several teardown entry points (eval's
 // deferred teardown, destroy_runtime_state, and fetch_destroy_pending): each
-// fetch_request_finish untracks its request, so a second pass sees an empty set.
+// fetch_request_finish untracks its request, so a second pass sees an empty set,
+// and fetch_dns_pool_shutdown is a no-op once the pool is stopped.
 fetch_shutdown_active :: proc(state: ^Runtime_State) {
 	if state == nil do return
 	for len(state.active_fetches) > 0 {
 		req := state.active_fetches[0]
-		fetch_release_dns_worker(req)
 		fetch_request_finish(req)
 	}
+	// Settle first (above), then quiesce the pool: any completion a worker posts
+	// during the join lands in the loop's async queue and is dropped at teardown
+	// (the request it targets is already settled), and the worker's job is freed by
+	// the shutdown rather than the (never-run) completion.
+	fetch_dns_pool_shutdown()
 }
 
 // fetch_free_request releases a settled request's owned allocations.
@@ -1087,15 +1177,29 @@ parse_http_head :: proc(
 	status = code
 
 	hdr_list := make([dynamic]string, 0, context.temp_allocator)
+	last_val_idx := -1
 	for i in 1 ..< len(lines) {
 		line := lines[i]
 		if len(line) == 0 do continue
+		// RFC 7230 obs-fold: a field-value continuation line begins with SP or HT.
+		// It is deprecated, but rather than drop it (silently corrupting the value)
+		// we unfold it — append the trimmed continuation to the previous value with
+		// a single space, the historical HTTP/1.1 interpretation.
+		if (line[0] == ' ' || line[0] == '\t') && last_val_idx >= 0 {
+			cont := strings.trim_space(line)
+			hdr_list[last_val_idx] = strings.concatenate(
+				{hdr_list[last_val_idx], " ", cont},
+				context.temp_allocator,
+			)
+			continue
+		}
 		colon := strings.index_byte(line, ':')
 		if colon < 0 do continue
 		name := strings.trim_space(line[:colon])
 		value := strings.trim_space(line[colon + 1:])
 		append(&hdr_list, name)
 		append(&hdr_list, value)
+		last_val_idx = len(hdr_list) - 1
 
 		lname := strings.to_lower(name, context.temp_allocator)
 		switch lname {
@@ -1158,12 +1262,21 @@ fetch_feed_chunked :: proc(req: ^Fetch_Request, data: []byte) {
 					break
 				}
 			}
-			if line_end < 0 do break loop // size line not complete yet
+			if line_end < 0 {
+				// A chunk-size line that never terminates must not grow carry
+				// without bound — fail the body as a framing violation.
+				if len(buf) - pos > FETCH_MAX_CHUNK_LINE {
+					fetch_finish_body(req, "fetch: terminated")
+					return
+				}
+				break loop // size line not complete yet
+			}
 			size_str := string(buf[pos:line_end])
 			if semi := strings.index_byte(size_str, ';'); semi >= 0 do size_str = size_str[:semi]
-			size, size_ok := strconv.parse_int(strings.trim_space(size_str), 16)
+			size, size_ok := fetch_parse_chunk_size(strings.trim_space(size_str))
 			if !size_ok {
-				// Malformed chunk size — fail the body stream as a truncation.
+				// Malformed chunk size (non-hex, signed, empty, or overflowing) —
+				// fail the body stream as a truncation.
 				fetch_finish_body(req, "fetch: terminated")
 				return
 			}

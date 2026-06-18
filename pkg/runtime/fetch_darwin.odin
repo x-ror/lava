@@ -52,7 +52,7 @@ fetch_new_socket :: proc(family: posix.AF) -> posix.FD {
 // connect(), and hand off to fetch_register_socket (which watches for writability
 // == connect completion). A non-blocking connect returns EINPROGRESS, which is
 // expected; any other failure rejects. Both run on the loop thread.
-fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: [4]u8, port: int) -> (ok: bool, err: string) {
+fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: net.IP4_Address, port: int) -> (ok: bool, err: string) {
 	fd := fetch_new_socket(.INET)
 	if fd < 0 do return false, "fetch: could not create socket"
 	addr := posix.sockaddr_in {
@@ -61,10 +61,14 @@ fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: [4]u8, port: int) -> (ok: bo
 		sin_port   = u16be(port),
 		sin_addr   = {s_addr = transmute(posix.in_addr_t)ip4},
 	}
-	if posix.connect(fd, cast(^posix.sockaddr)&addr, posix.socklen_t(size_of(addr))) != .OK &&
-	   posix.errno() != .EINPROGRESS {
-		posix.close(fd)
-		return false, "fetch: connect failed"
+	if posix.connect(fd, cast(^posix.sockaddr)&addr, posix.socklen_t(size_of(addr))) != .OK {
+		// EINPROGRESS (and EINTR, a signal interrupting the call) both mean the
+		// connect proceeds asynchronously; anything else is a hard failure.
+		e := posix.errno()
+		if e != .EINPROGRESS && e != .EINTR {
+			posix.close(fd)
+			return false, "fetch: connect failed"
+		}
 	}
 	return fetch_register_socket(req, uintptr(fd))
 }
@@ -80,10 +84,14 @@ fetch_connect_ip6 :: proc(req: ^Fetch_Request, ip6: net.IP6_Address, port: int) 
 		sin6_port   = u16be(port),
 	}
 	addr.sin6_addr.s6_addr = transmute([16]u8)ip6
-	if posix.connect(fd, cast(^posix.sockaddr)&addr, posix.socklen_t(size_of(addr))) != .OK &&
-	   posix.errno() != .EINPROGRESS {
-		posix.close(fd)
-		return false, "fetch: connect failed"
+	if posix.connect(fd, cast(^posix.sockaddr)&addr, posix.socklen_t(size_of(addr))) != .OK {
+		// EINPROGRESS (and EINTR, a signal interrupting the call) both mean the
+		// connect proceeds asynchronously; anything else is a hard failure.
+		e := posix.errno()
+		if e != .EINPROGRESS && e != .EINTR {
+			posix.close(fd)
+			return false, "fetch: connect failed"
+		}
 	}
 	return fetch_register_socket(req, uintptr(fd))
 }
@@ -105,6 +113,8 @@ fetch_raw_send :: proc(req: ^Fetch_Request, chunk: []byte) -> (n: int, res: Fetc
 	#partial switch posix.errno() {
 	case .EAGAIN: // == EWOULDBLOCK on Darwin
 		return 0, .Would_Block
+	case .EINTR: // interrupted before any byte was sent — re-poll and retry
+		return 0, .Would_Block
 	case:
 		return 0, .Failed
 	}
@@ -118,6 +128,8 @@ fetch_raw_recv :: proc(req: ^Fetch_Request, buf: []byte) -> (n: int, res: Fetch_
 	if got == 0 do return 0, .Closed
 	#partial switch posix.errno() {
 	case .EAGAIN: // == EWOULDBLOCK on Darwin
+		return 0, .Would_Block
+	case .EINTR: // interrupted before any byte arrived — re-poll and retry
 		return 0, .Would_Block
 	case:
 		return 0, .Failed

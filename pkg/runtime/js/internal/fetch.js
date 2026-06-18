@@ -95,6 +95,11 @@
   class Headers {
     constructor(init) {
       this._map = new Map();
+      // Set-Cookie is the one header that must NOT be comma-joined: each
+      // Set-Cookie is its own list entry (cookie Expires= values themselves
+      // contain commas, so a join is lossy and corrupts them). It is held apart
+      // from _map and exposed individually via getSetCookie(). See _append.
+      this._cookies = [];
       if (init instanceof Headers) {
         init.forEach((value, key) => this.append(key, value));
       } else if (Array.isArray(init)) {
@@ -109,43 +114,86 @@
       this._append(header.name, header.value);
     }
     // _append stores without validation — for response headers parsed off the
-    // wire, which the transport has already framed line-by-line.
+    // wire, which the transport has already framed line-by-line. Set-Cookie is
+    // appended to its own list (never comma-joined) so getSetCookie() can return
+    // each cookie intact.
     _append(name, value) {
       var key = normalizeName(name);
+      if (key === 'set-cookie') {
+        this._cookies.push(String(value));
+        return;
+      }
       var existing = this._map.get(key);
       this._map.set(key, existing === undefined ? String(value) : existing + ', ' + value);
     }
     set(name, value) {
       var header = normalizeAndValidate(name, value);
-      this._map.set(normalizeName(header.name), header.value);
+      var key = normalizeName(header.name);
+      if (key === 'set-cookie') {
+        this._cookies = [header.value];
+        return;
+      }
+      this._map.set(key, header.value);
     }
     get(name) {
       assertValidHeaderName(String(name));
-      var v = this._map.get(normalizeName(name));
+      var key = normalizeName(name);
+      // get('set-cookie') returns the cookies joined by ', ' (Node parity); the
+      // separation is preserved only through getSetCookie().
+      if (key === 'set-cookie') return this._cookies.length ? this._cookies.join(', ') : null;
+      var v = this._map.get(key);
       return v === undefined ? null : v;
+    }
+    // getSetCookie returns each Set-Cookie value as its own string, uncorrupted
+    // by comma-joining (WHATWG Headers.getSetCookie()).
+    getSetCookie() {
+      return this._cookies.slice();
     }
     has(name) {
       assertValidHeaderName(String(name));
-      return this._map.has(normalizeName(name));
+      var key = normalizeName(name);
+      if (key === 'set-cookie') return this._cookies.length > 0;
+      return this._map.has(key);
     }
     delete(name) {
       assertValidHeaderName(String(name));
-      this._map.delete(normalizeName(name));
+      var key = normalizeName(name);
+      if (key === 'set-cookie') {
+        this._cookies = [];
+        return;
+      }
+      this._map.delete(key);
+    }
+    // _entryList snapshots all header entries — the comma-joined _map values plus
+    // one entry per individual Set-Cookie — so iteration surfaces every cookie
+    // separately (the spec does not combine Set-Cookie in the iterator).
+    _entryList() {
+      var out = [];
+      this._map.forEach((value, key) => out.push([key, value]));
+      for (var i = 0; i < this._cookies.length; i++) out.push(['set-cookie', this._cookies[i]]);
+      return out;
     }
     forEach(callback, thisArg) {
-      this._map.forEach((value, key) => callback.call(thisArg, value, key, this));
+      var entries = this._entryList();
+      for (var i = 0; i < entries.length; i++) {
+        callback.call(thisArg, entries[i][1], entries[i][0], this);
+      }
     }
     keys() {
-      return this._map.keys();
+      return this._entryList()
+        .map((e) => e[0])
+        [Symbol.iterator]();
     }
     values() {
-      return this._map.values();
+      return this._entryList()
+        .map((e) => e[1])
+        [Symbol.iterator]();
     }
     entries() {
-      return this._map.entries();
+      return this._entryList()[Symbol.iterator]();
     }
     [Symbol.iterator]() {
-      return this._map.entries();
+      return this._entryList()[Symbol.iterator]();
     }
   }
 
@@ -382,12 +430,18 @@
         // text/json, and arrayBuffer/bytes copy out).
         clonedBody = this._bodyBytes;
       }
-      return new Response(clonedBody, {
+      var cloned = new Response(clonedBody, {
         status: this.status,
         statusText: this.statusText,
         headers: this.headers,
         url: this.url,
       });
+      // The constructor resets these to their defaults (redirected=false,
+      // type='default'); a clone must mirror the source's observable metadata —
+      // e.g. a response produced by a followed redirect has redirected=true.
+      cloned.redirected = this.redirected;
+      cloned.type = this.type;
+      return cloned;
     }
   }
 
@@ -477,7 +531,34 @@
         this._streamNeedsDuplex = false;
       }
 
-      this.url = src ? src.url : input == null ? '' : String(input);
+      // Parse the URL through the WHATWG parser (Node parity): an absent base
+      // means relative URLs, a non-numeric or out-of-range port, and other
+      // malformed inputs all throw a TypeError here rather than silently
+      // falling back to a default port in the native layer. A source Request's
+      // url is already an absolute href, so this normalizes idempotently.
+      var rawUrl = src ? src.url : String(input);
+      // WHATWG fetch forbids credentials in a request URL. new URL() preserves any
+      // userinfo (and the native parser silently drops it), so reject it here for
+      // Node parity rather than connect to a host the visible URL can disguise
+      // (e.g. "http://example.com@127.0.0.1/"). This also covers redirect-created
+      // requests, since buildRedirectRequest resolves Location through new Request.
+      var parsedUrl = new URL(rawUrl);
+      if (parsedUrl.username || parsedUrl.password) {
+        throw new TypeError('fetch: request URL cannot contain credentials');
+      }
+      this.url = parsedUrl.href;
+      // redirect mode: 'follow' (default) | 'manual' | 'error'. init overrides a
+      // source Request's mode (WHATWG fetch); fetch() consults it per response. The
+      // value is coerced to a string (Web IDL enum semantics — Node accepts a String
+      // object or any toString-able), a symbol throws (ToString throws), and an
+      // unrecognized mode is a TypeError, not a silent 'follow'.
+      var redirect = init.redirect !== undefined ? init.redirect : src ? src.redirect : 'follow';
+      if (typeof redirect === 'symbol') throw new TypeError('fetch: invalid redirect mode');
+      redirect = String(redirect);
+      if (redirect !== 'follow' && redirect !== 'manual' && redirect !== 'error') {
+        throw new TypeError("fetch: invalid redirect mode '" + redirect + "'");
+      }
+      this.redirect = redirect;
       var method = init.method !== undefined ? init.method : src ? src.method : 'GET';
       this.method = String(method || 'GET').toUpperCase();
       // A GET/HEAD request cannot carry a body, whether that body came from
@@ -593,22 +674,43 @@
       return Promise.reject(signal.reason);
     }
 
+    return runFetch(req, signal, 0, false);
+  }
+
+  // Statuses that trigger a redirect when accompanied by a Location header.
+  var REDIRECT_STATUSES = { 301: 1, 302: 1, 303: 1, 307: 1, 308: 1 };
+
+  // Request headers dropped when a redirect discards the body (301/302 POST→GET
+  // and 303 →GET): the body and everything describing it must not carry over.
+  var BODY_HEADERS = [
+    'content-length',
+    'content-type',
+    'content-encoding',
+    'content-language',
+    'content-location',
+  ];
+
+  // serializeHeaders renders a Request's user headers into the wire
+  // "Name: Value\r\n" block, dropping the transport-owned headers (Host /
+  // Content-Length / Connection / Transfer-Encoding) the native side sets itself.
+  function serializeHeaders(headers) {
     var headerLines = '';
-    req.headers.forEach(function (value, key) {
+    headers.forEach(function (value, key) {
       if (TRANSPORT_OWNED_HEADERS[key]) return;
-      // Names/values were CR/LF/NUL-validated when set (see Headers.append),
-      // so a header cannot split the request line here.
+      // Names/values were CR/LF/NUL-validated when set (see Headers.append), so a
+      // header cannot split the request line here.
       headerLines += key + ': ' + String(value) + '\r\n';
     });
+    return headerLines;
+  }
 
-    // Request body framing:
-    //   - A Blob is a known-length body — Node frames it with Content-Length — so
-    //     it keeps the buffered fast path (collect to bytes, then send).
-    //   - A ReadableStream / async-iterable body (the ones that required
-    //     duplex:'half') is streamed incrementally as Transfer-Encoding: chunked,
-    //     never materialized in full (true upload streaming).
-    // The duplex:'half' requirement was already enforced at Request construction;
-    // _streamNeedsDuplex is false for a Blob and true for the stream-like bodies.
+  // sendOne issues a single HTTP exchange (no redirect handling) and resolves
+  // with its Response. The body-framing branch matches fetch()'s contract:
+  //   - a Blob (known length) keeps the buffered Content-Length fast path;
+  //   - a ReadableStream / async-iterable (duplex:'half') streams as chunked;
+  //   - any other body is sent buffered.
+  function sendOne(req, signal) {
+    var headerLines = serializeHeaders(req.headers);
     if (req._streamBody) {
       if (!req._streamNeedsDuplex) {
         return collectStreamBody(req._streamBody, signal).then(function (bytes) {
@@ -618,6 +720,104 @@
       return startFetch(req, headerLines, null, req._streamBody, signal);
     }
     return startFetch(req, headerLines, req._bodyBytes, null, signal);
+  }
+
+  // cancelBody discards a response body we will not surface (an intermediate
+  // redirect): cancel() tears the transport stream down; a rejected teardown is
+  // swallowed so it never surfaces as an unhandled rejection.
+  function cancelBody(response) {
+    if (!response.body) return;
+    try {
+      var canceled = response.body.cancel();
+      if (canceled && typeof canceled.catch === 'function') canceled.catch(function () {});
+    } catch {}
+  }
+
+  // runFetch performs the request and follows redirects per req.redirect (WHATWG
+  // fetch). 'follow' (default) chases up to 20 hops, normalizing the method/body
+  // per the 3xx status; 'manual' returns the redirect response untouched; 'error'
+  // rejects. `redirected` is propagated onto the final Response.
+  function runFetch(req, signal, redirectCount, redirected) {
+    // Re-check between hops: an abort that lands after a redirect response has
+    // resolved (but before the next hop starts) must stop the chain.
+    if (signal && signal.aborted) return Promise.reject(signal.reason);
+    return sendOne(req, signal).then(function (response) {
+      if (!REDIRECT_STATUSES[response.status] || !response.headers.has('location')) {
+        response.redirected = redirected;
+        return response;
+      }
+      if (req.redirect === 'manual') {
+        response.redirected = redirected;
+        return response;
+      }
+      // From here the 3xx response is never surfaced to the caller — discard its
+      // body so the connection does not linger, whether we follow, error, or hit
+      // the hop limit.
+      cancelBody(response);
+      if (req.redirect === 'error') {
+        throw new TypeError('fetch: unexpected redirect (redirect mode is "error")');
+      }
+      if (redirectCount >= 20) {
+        throw new TypeError('fetch: too many redirects');
+      }
+      var nextReq = buildRedirectRequest(req, response, response.headers.get('location'));
+      return runFetch(nextReq, signal, redirectCount + 1, true);
+    });
+  }
+
+  // buildRedirectRequest constructs the next request for a followed redirect: it
+  // resolves Location against the current URL, normalizes the method/body per the
+  // 3xx status, and carries the headers (minus body headers when the body is
+  // dropped, and minus credentials on a cross-origin hop).
+  function buildRedirectRequest(req, response, location) {
+    var status = response.status;
+    var nextUrl = new URL(location, req.url).href;
+    var method = req.method;
+    var dropBody = false;
+
+    // 303 → GET (a HEAD stays HEAD); 301/302 turn a POST into a GET. Both drop
+    // the request body. 307/308 preserve the method and resend the body.
+    if (status === 303 && method !== 'GET' && method !== 'HEAD') {
+      method = 'GET';
+      dropBody = true;
+    } else if ((status === 301 || status === 302) && method === 'POST') {
+      method = 'GET';
+      dropBody = true;
+    }
+
+    var headers = new Headers(req.headers);
+    if (dropBody) {
+      for (var i = 0; i < BODY_HEADERS.length; i++) headers.delete(BODY_HEADERS[i]);
+    }
+    // Cross-origin redirect: strip credentials (WHATWG drops Authorization; undici
+    // also drops Cookie / Proxy-Authorization when the origin changes).
+    if (new URL(nextUrl).origin !== new URL(req.url).origin) {
+      headers.delete('authorization');
+      headers.delete('cookie');
+      headers.delete('proxy-authorization');
+    }
+
+    var nextInit = { method: method, headers: headers, redirect: req.redirect };
+
+    // A method-preserving redirect (307/308 with a body) must resend it. A Blob is
+    // a known-length, replayable body — its bytes are read non-mutatingly (see
+    // collectStreamBody), so resend the Blob itself; Node likewise resends it. A
+    // ReadableStream / async-iterable was consumed by the first hop and cannot be
+    // replayed, so the redirect fails (matching Node).
+    if (!dropBody && method !== 'GET' && method !== 'HEAD') {
+      if (req._streamBody) {
+        if (typeof Blob !== 'undefined' && req._streamBody instanceof Blob) {
+          nextInit.body = req._streamBody;
+        } else {
+          throw new TypeError(
+            'fetch: cannot follow a redirect that resends a streaming request body',
+          );
+        }
+      } else if (req._bodyBytes != null) {
+        nextInit.body = req._bodyBytes;
+      }
+    }
+    return new Request(nextUrl, nextInit);
   }
 
   // startFetch hands the request to the Odin transport and wires its streaming

@@ -61,7 +61,7 @@ fetch_start_connect :: proc(
 
 // fetch_connect_ip4 / fetch_connect_ip6 open a non-blocking socket and start the
 // connect. Both run on the loop thread.
-fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: [4]u8, port: int) -> (ok: bool, err: string) {
+fetch_connect_ip4 :: proc(req: ^Fetch_Request, ip4: net.IP4_Address, port: int) -> (ok: bool, err: string) {
 	sock := fetch_new_socket(windows.AF_INET)
 	if sock == windows.INVALID_SOCKET do return false, "fetch: could not create socket"
 	addr := windows.sockaddr_in {

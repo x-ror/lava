@@ -118,10 +118,17 @@ implementations — no `primordials`, no `internalBinding` coupling.
       `core:sys/linux`), **macOS** (kqueue, `core:sys/posix`), and **Windows**
       (`select`, Winsock). TLS uses OpenSSL (`pkg/runtime/tls.odin`); on Windows the
       machine certificate store is loaded into OpenSSL's trust store. DNS resolves
-      off the loop on a worker thread. All three platforms build and run for real in
-      CI — the Windows job links a JavaScriptCore-backed `lava.exe` and runs it.
-      Follow-ups: native Security.framework TLS on macOS (#143), a resolved-address
-      list for IPv6 hostnames + Happy Eyeballs (#145), and HTTP correctness (#99).
+      off the loop on a **bounded resolver pool** (4 workers, lazily created;
+      `pkg/runtime/fetch_dns_pool.odin`), which resolves both families and returns an
+      ordered IPv4-then-IPv6 list (#77, #145) — replacing the former one-thread-per-
+      lookup. All three platforms build and run for real in CI — the Windows job links
+      a JavaScriptCore-backed `lava.exe` and runs it. HTTP correctness landed too —
+      redirect following, `Set-Cookie`/`getSetCookie()`, URL/port validation, response
+      head + chunk-size caps, EINTR retries (#99) — and the connect path now falls back
+      across the resolved-address list (#145).
+      Follow-ups: native Security.framework TLS on macOS (#143); Happy Eyeballs —
+      staggered/raced IPv4/IPv6 connects — and multiple A/AAAA records beyond the first
+      per family (remaining part of #145).
 - [x] **Streaming fetch bodies (#31)** — `response.body` is a real, incrementally
       fed `ReadableStream` (`getReader().read()`, async iteration, `cancel()`,
       `tee()`, `locked`). The transport delivers status + headers as soon as they

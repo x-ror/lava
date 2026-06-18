@@ -36,6 +36,9 @@ parse_http_url_cases :: proc(t: ^testing.T) {
 		{"http://[::1/", "", 0, "", "", false},
 		{"http://[]/", "", 0, "", "", false},
 		{"ftp://example.com/", "", 0, "", "", false},
+		// Junk after the IPv6 literal's closing ']' (only ":port" may follow) rejects.
+		{"http://[::1]foo/", "", 0, "", "", false},
+		{"http://[::1]x", "", 0, "", "", false},
 	}
 	for c in cases {
 		host, port, path, scheme, ok := lava_runtime.parse_http_url(c.url)
@@ -45,5 +48,37 @@ parse_http_url_cases :: proc(t: ^testing.T) {
 		testing.expectf(t, port == c.port, "%s: port=%d want %d", c.url, port, c.port)
 		testing.expectf(t, path == c.path, "%s: path=%q want %q", c.url, path, c.path)
 		testing.expectf(t, scheme == c.scheme, "%s: scheme=%q want %q", c.url, scheme, c.scheme)
+	}
+}
+
+// Exercises fetch_parse_chunk_size: RFC 7230 chunk-size is unsigned hex (1*HEXDIG).
+// A signed/empty/non-hex/overflowing field must be rejected so the chunked decoder
+// fails the framing rather than advancing on a negative size.
+@(test)
+fetch_parse_chunk_size_cases :: proc(t: ^testing.T) {
+	Case :: struct {
+		text: string,
+		size: int,
+		ok:   bool,
+	}
+	cases := []Case {
+		{"0", 0, true},
+		{"a", 10, true},
+		{"FF", 255, true},
+		{"ff", 255, true},
+		{"1000", 4096, true},
+		// Rejected: empty, signed, non-hex, and overflow past int range.
+		{"", 0, false},
+		{"-1", 0, false},
+		{"+5", 0, false},
+		{"1g", 0, false},
+		{"0x10", 0, false}, // the 'x' is not a hex digit
+		{"ffffffffffffffff", 0, false}, // 2^64-1 overflows a positive int
+	}
+	for c in cases {
+		size, ok := lava_runtime.fetch_parse_chunk_size(c.text)
+		testing.expectf(t, ok == c.ok, "%q: ok=%v want %v", c.text, ok, c.ok)
+		if !c.ok do continue
+		testing.expectf(t, size == c.size, "%q: size=%d want %d", c.text, size, c.size)
 	}
 }
