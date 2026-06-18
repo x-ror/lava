@@ -867,6 +867,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		source: string,
 	}
 	modules := [?]Module {
+		{"primordials", INTERNAL_PRIMORDIALS},
 		{"util", INTERNAL_UTIL},
 		{"events", INTERNAL_EVENTS},
 		{"assert", INTERNAL_ASSERT},
@@ -1135,6 +1136,7 @@ MICROTASK_PRELUDE :: #load("js/internal/microtasks.js", string)
 // Internal built-in modules, embedded at compile time. Each evaluates to a
 // factory `(require, module, exports) => exports?`; the loader wires them up.
 INTERNAL_LOADER :: #load("js/internal/loader.js", string)
+INTERNAL_PRIMORDIALS :: #load("js/internal/primordials.js", string)
 INTERNAL_UTIL :: #load("js/internal/util.js", string)
 INTERNAL_EVENTS :: #load("js/internal/events.js", string)
 INTERNAL_ASSERT :: #load("js/internal/assert.js", string)

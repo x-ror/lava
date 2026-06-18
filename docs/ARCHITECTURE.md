@@ -269,13 +269,25 @@ Lava can make HTTP requests but cannot accept them. `node:net` (TCP server/socke
 and a `node:http` server unlock a whole class of applications and reuse the
 existing transport/loop machinery. This is the highest-leverage *capability* gap.
 
-### 5.5 [P2] Consolidate primordials in the JS layer
+### 5.5 [P2] Consolidate primordials in the JS layer — foundation laid
 
-The agent survey found `Object.create(null)` and `hasOwnProperty` guards
-replicated across ~5 internal modules with no shared hardened baseline. Centralize
-a `primordials.js` (frozen references to `Object`, `Array`, `Function.prototype`
-methods, etc.), load it first, and have modules consume it — closing the
-prototype-pollution surface uniformly instead of per-module vigilance.
+`pkg/runtime/js/internal/primordials.js` is the shared hardened baseline: a frozen
+table of pristine intrinsics (captured statics + *uncurried* prototype methods via
+the classic `bind.bind(call)`), so `ArrayPrototypePush(arr, x)` is a
+pollution-proof `arr.push(x)`. The loader **eager-loads it first**, before any
+other internal module and before user code, so the captured references are
+pristine; modules consume it via `require('primordials')` and get the cached table.
+This is the JS-layer analog of the native error-intrinsic capture (§4.3/§5.1).
+
+`events.js` (EventEmitter) is the first fully migrated consumer — its internal
+`Array`/`Object`/`Reflect`/`Promise` use now routes through primordials, and
+`tests/node-compat/cases/36-primordials-pollution.js` proves it stays correct while
+`Array.prototype.{push,unshift,slice,splice,map}` and `Object.create` are
+overwritten (compared against Node, which is likewise immune). Remaining modules
+adopt it incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
+(Minor: internal helper modules, primordials included, are requireable by user code
+via the builtin resolver — a pre-existing divergence from Node's hidden internals;
+an internal-only gate is a future follow-up.)
 
 ### 5.6 [P2] Documentation & process gaps
 

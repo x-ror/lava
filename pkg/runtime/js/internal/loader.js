@@ -47,6 +47,10 @@
   // revokeObjectURL statics buffer attaches) and after `encoding` (which installs
   // the TextEncoder/TextDecoder globals url uses); url also lazily creates its
   // codecs, so the order is belt-and-suspenders rather than load-bearing.
+  // primordials is eager-loaded FIRST, before any other internal module and well
+  // before user code, so it captures pristine intrinsics (see primordials.js).
+  // Other modules require('primordials') and get this cached, pristine table.
+  req('primordials');
   req('buffer');
   req('stream/web');
   req('fetch');
