@@ -58,7 +58,8 @@ os_uptime :: proc() -> f64 {
 // portable read. Matches os_cpus()'s length.
 os_avail_parallelism :: proc() -> int {
 	count := 0
-	if data, err := os.read_entire_file("/proc/stat", context.temp_allocator); err == os.ERROR_NONE {
+	if data, err := os.read_entire_file("/proc/stat", context.temp_allocator);
+	   err == os.ERROR_NONE {
 		for line in strings.split(string(data), "\n", context.temp_allocator) {
 			if len(line) < 4 || !strings.has_prefix(line, "cpu") {
 				continue
@@ -121,7 +122,8 @@ os_cpus :: proc() -> []Os_Cpu {
 
 	// Per-CPU tick counters: the "cpuN" lines of /proc/stat (the bare "cpu " total
 	// is skipped). Columns are user, nice, system, idle, iowait, irq, softirq, ...
-	if data, err := os.read_entire_file("/proc/stat", context.temp_allocator); err == os.ERROR_NONE {
+	if data, err := os.read_entire_file("/proc/stat", context.temp_allocator);
+	   err == os.ERROR_NONE {
 		for line in strings.split(string(data), "\n", context.temp_allocator) {
 			if len(line) < 4 || !strings.has_prefix(line, "cpu") {
 				continue
@@ -147,7 +149,8 @@ os_cpus :: proc() -> []Os_Cpu {
 	// is exactly what Node reports in the same situation.
 	models := make([dynamic]string, 0, 8, context.temp_allocator)
 	speeds := make([dynamic]int, 0, 8, context.temp_allocator)
-	if data, err := os.read_entire_file("/proc/cpuinfo", context.temp_allocator); err == os.ERROR_NONE {
+	if data, err := os.read_entire_file("/proc/cpuinfo", context.temp_allocator);
+	   err == os.ERROR_NONE {
 		cur_model := ""
 		cur_speed := 0
 		have := false

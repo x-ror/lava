@@ -10,5 +10,5 @@ import "core:sys/posix"
 // SIGPIPE disposition. Socket sends additionally pass MSG_NOSIGNAL where the
 // platform supports it; this covers every other fd. Idempotent.
 ignore_sigpipe :: proc() {
-	posix.signal(.SIGPIPE, cast(proc "c" (posix.Signal))posix.SIG_IGN)
+	posix.signal(.SIGPIPE, cast(proc "c" (_: posix.Signal))posix.SIG_IGN)
 }

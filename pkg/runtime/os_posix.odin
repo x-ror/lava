@@ -207,8 +207,5 @@ format_v6 :: proc(s6: [16]u8) -> string {
 	for i in 0 ..< 8 {
 		g[i] = (u16(s6[i * 2]) << 8) | u16(s6[i * 2 + 1])
 	}
-	return fmt.tprintf(
-		"%x:%x:%x:%x:%x:%x:%x:%x",
-		g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
-	)
+	return fmt.tprintf("%x:%x:%x:%x:%x:%x:%x:%x", g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7])
 }

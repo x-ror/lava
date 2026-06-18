@@ -21,8 +21,8 @@ import jsc "lava:pkg/jsc"
 // layer (Node/libuv report ms). speed is in MHz (0 when the host does not expose
 // a frequency, matching Node on virtualized/ARM hosts).
 Os_Cpu :: struct {
-	model:                    string,
-	speed:                    int,
+	model:                      string,
+	speed:                      int,
 	user, nice, sys, idle, irq: i64,
 }
 
