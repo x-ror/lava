@@ -12,9 +12,9 @@ Coverage of the Node.js public API surface in **lava**.
 
 | Status | Count | Modules / surfaces |
 |--------|------:|--------------------|
-| ✅ Full | 7 | assert, buffer, events, intl*, path, sqlite, url |
+| ✅ Full | 8 | assert, buffer, events, intl*, os, path, sqlite, url |
 | 🟡 Partial | 15 | console, crypto, esm, fs, globals, module/modules, packages, perf_hooks, process, timers, util, webcrypto, webstreams, environment_variables |
-| 🟥 Missing | 38 | net, http(s), http2, stream, dns, dgram, tls, os, zlib, child_process, worker_threads, querystring, string_decoder, async_hooks, readline, repl, vm, v8, test, … |
+| 🟥 Missing | 37 | net, http(s), http2, stream, dns, dgram, tls, zlib, child_process, worker_threads, querystring, string_decoder, async_hooks, readline, repl, vm, v8, test, … |
 | ⚪ N/A | 10 | addons, cli, debugger, deprecations, documentation, embedding, errors, index, n-api, synopsis |
 
 \* `intl` is provided by the JavaScriptCore engine, not by lava code.
@@ -45,7 +45,7 @@ Coverage of the Node.js public API surface in **lava**.
 | **stream** | ❌ | 🟥 | — | Node `Readable`/`Writable`/`Duplex`/`Transform`, `pipeline`, `finished` (the **Web** Streams live in `node:stream/web` — see `webstreams` — but the classic `node:stream` object-mode API and `node:stream` ↔ Web Stream bridging are not wired yet) | — |
 | **dns** | ❌ | 🟥 | internal IPv4-only resolver inside fetch; **no public module** | `lookup`, `resolve*`, `Resolver`, `reverse` (implementation in progress) | [fetch_transport.odin](../pkg/runtime/fetch_transport.odin) |
 | **dgram** | ❌ | 🟥 | — | UDP `Socket` | — |
-| **os** | ❌ | 🟥 | — | platform/arch/cpus/hostname/networkInterfaces/homedir/tmpdir/… | — |
+| **os** | ✅ | ✅ | platform/arch/type/release/version/machine/endianness/EOL/devNull/`constants`, homedir/tmpdir, hostname/totalmem/freemem/uptime/loadavg, **cpus**, availableParallelism, **networkInterfaces** (+cidr), userInfo, getPriority/setPriority | per-CPU `times` are zero on macOS (no mach `host_processor_info` binding) and interface `mac` is `00:..:00` (link-layer walk omitted); Windows is best-effort (memory/cpu-count/uptime real, the rest stubbed) | [os.odin](../pkg/runtime/os.odin), [os_posix.odin](../pkg/runtime/os_posix.odin), [os_linux.odin](../pkg/runtime/os_linux.odin), [os_darwin.odin](../pkg/runtime/os_darwin.odin), [js/internal/os.js](../pkg/runtime/js/internal/os.js) |
 | **zlib** | ❌ | 🟥 | — | gzip/deflate/brotli (sync + streams) | — |
 | **querystring** | ❌ | 🟥 | — | parse/stringify/escape/unescape | — |
 | **string_decoder** | ❌ | 🟥 | — | `StringDecoder` | — |
@@ -121,7 +121,7 @@ WHATWG Web Streams ([js/internal/streams.js](../pkg/runtime/js/internal/streams.
 - **Encodings:** `utf8`/`utf-8`, `utf16le`/`ucs2`, `latin1`/`binary`, `ascii`, `hex`, `base64`, `base64url` (with Node's lenient base64 normalization and `ascii` high-bit masking).
 - **Errors:** Node `err.code`s and message shapes for `ERR_INVALID_ARG_TYPE`, `ERR_INVALID_ARG_VALUE`, `ERR_OUT_OF_RANGE`, `ERR_BUFFER_OUT_OF_BOUNDS`, `ERR_UNKNOWN_ENCODING`, `ERR_INVALID_BUFFER_SIZE`.
 - **Rendering:** `util.inspect`/`console.log` emit `<Buffer ..>` (honoring `INSPECT_MAX_BYTES`) via the `nodejs.util.inspect.custom` hook.
-- **Module extras:** `Blob`, `File`, `SlowBuffer`, `atob`/`btoa`, `isAscii`, `isUtf8`, `transcode`, `resolveObjectURL`, `kMaxLength`/`kStringMaxLength`/`constants`/`INSPECT_MAX_BYTES`. `Blob`/`File` honor the `endings: 'native'` option (string parts have `\n`/`\r\n` converted to the platform newline — derived from `process.platform`, since `node:os` is absent — while a lone `\r` and binary parts are left verbatim, matching Node).
+- **Module extras:** `Blob`, `File`, `SlowBuffer`, `atob`/`btoa`, `isAscii`, `isUtf8`, `transcode`, `resolveObjectURL`, `kMaxLength`/`kStringMaxLength`/`constants`/`INSPECT_MAX_BYTES`. `Blob`/`File` honor the `endings: 'native'` option (string parts have `\n`/`\r\n` converted to the platform newline — derived from `process.platform` — while a lone `\r` and binary parts are left verbatim, matching Node).
 
 **Intentional differences / deferred:**
 
@@ -146,7 +146,7 @@ WHATWG Web Streams ([js/internal/streams.js](../pkg/runtime/js/internal/streams.
 1. **Networking stack** — `net`/`tls`/`http`/`https`/`http2`/`dgram`. fetch covers outbound HTTP(S) client only; there is no server or raw-socket capability.
 2. **Streams** — Web Streams (`node:stream/web`) now ship (see above); the classic object-mode `node:stream` (`Readable`/`Writable`/`Duplex`/`Transform`, `pipeline`/`finished`) and `node:stream` ↔ Web Stream bridging remain, blocking fs streams, classic http bodies, and zlib piping.
 3. **`util` helpers** — `promisify`/`callbackify`/`types`/`inherits` are load-bearing for many packages.
-4. **`os`**, **`zlib`**, **`querystring`**, **`string_decoder`** — small, high-frequency modules that are cheap wins.
+4. **`zlib`**, **`querystring`**, **`string_decoder`** — small, high-frequency modules that are cheap wins (**`os`** ✅ shipped).
 5. **`crypto` asymmetric/cipher** — hashing/HMAC/KDFs (incl. scrypt) and digest aliases are real; the asymmetric/cipher surface (keys, sign/verify, ciphers, ECDH/DH, X.509, argon2, subtle) is still stubbed and needs OpenSSL wiring (TLS already links it).
 6. **`dns`** — public module (in progress; c-ares planned).
 7. **Concurrency** — `worker_threads`/`child_process` entirely absent.
