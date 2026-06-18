@@ -1,0 +1,82 @@
+#+build linux, darwin
+package main
+
+import "core:testing"
+import lava "lava:pkg/runtime"
+import eventloop "lava:pkg/runtime/eventloop"
+
+// Proves the primordials hardening (pkg/runtime/js/internal/primordials.js): a
+// script that overwrites the Array/Object intrinsics EventEmitter uses internally
+// must not be able to break it. This is a Lava-only test, NOT a node-compat oracle
+// case: Node's own EventEmitter is *not* immune here (its _addListener calls a raw
+// Array.prototype.push), so Lava is deliberately stronger than Node and the two
+// diverge — which an oracle could not express. The script self-asserts (throws on
+// any wrong value) and restores the intrinsics before printing, so a clean eval
+// (status Ok, exit 0) means EventEmitter stayed correct throughout the pollution.
+POLLUTION_SCRIPT :: `
+'use strict';
+const EventEmitter = require('node:events');
+
+const realPush = Array.prototype.push;
+const realUnshift = Array.prototype.unshift;
+const realSlice = Array.prototype.slice;
+const realSplice = Array.prototype.splice;
+const realMap = Array.prototype.map;
+const realCreate = Object.create;
+const boom = function () {
+  throw new Error('intrinsic pollution leaked into a built-in');
+};
+
+Array.prototype.push = boom;
+Array.prototype.unshift = boom;
+Array.prototype.slice = boom;
+Array.prototype.splice = boom;
+Array.prototype.map = boom;
+Object.create = boom;
+
+let calls = 0;
+const ee = new EventEmitter();
+const a = function () { calls = calls + 1; };
+const b = function () { calls = calls + 1; };
+const c = function () { calls = calls + 1; };
+const d = function () { calls = calls + 1; };
+
+ee.on('e', a);
+ee.on('e', b);
+ee.on('e', c);
+ee.prependListener('e', d);
+ee.emit('e');
+ee.removeListener('e', b);
+const namesLen = ee.eventNames().length;
+const listenerCount = ee.listeners('e').length;
+ee.emit('e');
+
+Array.prototype.push = realPush;
+Array.prototype.unshift = realUnshift;
+Array.prototype.slice = realSlice;
+Array.prototype.splice = realSplice;
+Array.prototype.map = realMap;
+Object.create = realCreate;
+
+if (calls !== 7) throw new Error('calls=' + calls);
+if (namesLen !== 1) throw new Error('namesLen=' + namesLen);
+if (listenerCount !== 3) throw new Error('listenerCount=' + listenerCount);
+console.log('primordials-pollution ok');
+`
+
+@(test)
+primordials_pollution_immunity :: proc(t: ^testing.T) {
+	loop := eventloop.init()
+	// eval consumes (destroys) the loop on every path; do not destroy it here.
+	result := lava.eval(POLLUTION_SCRIPT, "<primordials-test>", &loop, false)
+	defer lava.result_destroy(&result)
+
+	testing.expectf(
+		t,
+		result.status == .Ok,
+		"eval did not complete cleanly: status=%v message=%q",
+		result.status,
+		result.message,
+	)
+	testing.expectf(t, result.exit_code == 0, "eval exit code=%d (want 0)", result.exit_code)
+}

@@ -137,7 +137,9 @@
       P.FunctionPrototypeApply(handler, this, args);
     } else {
       var listeners = P.ArrayPrototypeSlice(handler);
-      for (var i = 0; i < listeners.length; i++) P.FunctionPrototypeApply(listeners[i], this, args);
+      for (var i = 0; i < listeners.length; i++) {
+        P.FunctionPrototypeApply(listeners[i], this, args);
+      }
     }
     return true;
   };
