@@ -35,9 +35,15 @@ trap cleanup EXIT
 "$NODE_BIN" --version >/dev/null
 
 # Optional HTTPS case: generate a self-signed cert for 127.0.0.1 and tell both
-# runtimes to trust it (Node via NODE_EXTRA_CA_CERTS, Lava via OpenSSL's
-# SSL_CERT_FILE). Skipped if the openssl CLI is unavailable; the HTTP cases
-# still run and the suite stays green.
+# runtimes to trust it (Node via NODE_EXTRA_CA_CERTS, Lava via SSL_CERT_FILE).
+# Skipped if the openssl CLI is unavailable; the HTTP cases still run and the suite
+# stays green. Runs on every platform: Lava honors SSL_CERT_FILE on Linux/Windows
+# (OpenSSL) and on macOS (#143).
+#
+# extendedKeyUsage=serverAuth is required: Apple's TLS trust policy rejects a server
+# cert without the serverAuth EKU (errSecInvalidExtendedKeyUsage), and OpenSSL
+# accepts an EKU-bearing cert just the same — so it is needed on macOS and harmless
+# elsewhere.
 TLS_PORT=$((PORT + 1))
 TLS_BADPORT=$((PORT + 2))
 TLS_CERT="$TMP_DIR/cert.pem"
@@ -51,7 +57,8 @@ if command -v openssl >/dev/null 2>&1; then
 	# Good cert: SAN covers 127.0.0.1 — the positive HTTPS case connects to it.
 	if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_KEY" -out "$TLS_CERT" \
 		-days 2 -subj "/CN=127.0.0.1" \
-		-addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1; then
+		-addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
+		-addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; then
 		FETCH_BASE_HTTPS="https://127.0.0.1:$TLS_PORT"
 		export LAVA_TLS_CERT="$(winpath "$TLS_CERT")" LAVA_TLS_KEY="$(winpath "$TLS_KEY")" LAVA_TLS_PORT="$TLS_PORT"
 		cp "$TLS_CERT" "$TLS_CA"
@@ -60,7 +67,8 @@ if command -v openssl >/dev/null 2>&1; then
 		# verification (the negative case). Only enabled if it too generates.
 		if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_BADKEY" -out "$TLS_BADCERT" \
 			-days 2 -subj "/CN=example.com" \
-			-addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; then
+			-addext "subjectAltName=DNS:example.com" \
+			-addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; then
 			cat "$TLS_BADCERT" >>"$TLS_CA"
 			FETCH_BASE_HTTPS_BAD="https://127.0.0.1:$TLS_BADPORT"
 			export LAVA_TLS_BADCERT="$(winpath "$TLS_BADCERT")" LAVA_TLS_BADKEY="$(winpath "$TLS_BADKEY")" LAVA_TLS_BADPORT="$TLS_BADPORT"
@@ -101,9 +109,10 @@ if "$NODE_BIN" -e "require('net').connect($PORT,'::1').on('connect',function(){p
 fi
 
 # Both runtimes trust the self-signed CA bundle (good + mismatched certs): Node
-# via NODE_EXTRA_CA_CERTS, Lava's OpenSSL via SSL_CERT_FILE (honoured by
-# SSL_CTX_set_default_verify_paths). Trusting both certs isolates the negative
-# case to a hostname mismatch rather than an untrusted issuer.
+# via NODE_EXTRA_CA_CERTS, Lava via SSL_CERT_FILE. Trusting both certs isolates the
+# negative case to a hostname mismatch rather than an untrusted issuer. When no cert
+# was generated the env vars point at a path that does not exist, which is harmless:
+# the HTTPS cases are gated by FETCH_BASE_HTTPS being empty.
 CA_FILE="$TLS_CA"
 [ -f "$CA_FILE" ] || CA_FILE="$TLS_CERT"
 CA_FILE_NATIVE="$(winpath "$CA_FILE")"

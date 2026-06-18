@@ -29,8 +29,8 @@ Fetch_Addr :: struct {
 // side needs no JSObjectMakeDeferredPromise binding; it simply invokes one of
 // those two callbacks exactly once when the request settles.
 //
-// Scope: http:// and https:// (TLS via OpenSSL libssl/libcrypto; see tls.odin) on
-// Linux, macOS, and Windows. DNS is blocking off the loop; the transport runs
+// Scope: http:// and https:// (TLS via a platform TLS backend; see
+// fetch_transport.odin) on Linux, macOS, and Windows. DNS is blocking off the loop; the transport runs
 // non-blocking on the event loop. Platforms with no transport reject the network
 // call entirely. See ROADMAP.
 
@@ -153,9 +153,9 @@ Fetch_Request :: struct {
 	settle_tick:   u64, // loop iteration at settle; reclaim holds the req two ticks past it
 
 	// TLS state for https:// requests. is_https gates the TLS path in the
-	// transport; tls is an opaque ^SSL (rawptr so this cross-platform struct
-	// stays free of the OpenSSL binding), set at handshake start and released by
-	// fetch_tls_cleanup in fetch_request_finish.
+	// transport; tls is an opaque per-backend session handle kept as rawptr so this
+	// cross-platform struct stays free of any TLS binding, set at handshake start and
+	// released by fetch_tls_cleanup in fetch_request_finish.
 	is_https:      bool,
 	tls:           rawptr,
 }

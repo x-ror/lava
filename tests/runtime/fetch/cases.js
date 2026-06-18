@@ -709,9 +709,9 @@ async function main() {
   }
 
   // HTTPS over TLS: same assertions as the plaintext path, against a self-signed
-  // origin the runner taught both runtimes to trust (NODE_EXTRA_CA_CERTS for
-  // Node, SSL_CERT_FILE for Lava's OpenSSL). Only runs when the runner started
-  // the TLS listener, so Node and Lava take this branch identically.
+  // origin the runner taught both runtimes to trust (NODE_EXTRA_CA_CERTS for Node,
+  // SSL_CERT_FILE for Lava). Only runs when the runner started the TLS listener, so
+  // Node and Lava take this branch identically.
   const baseHttps = process.env.FETCH_BASE_HTTPS;
   if (baseHttps) {
     const s1 = await fetch(baseHttps + '/hello.txt');

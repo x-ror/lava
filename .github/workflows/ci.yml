@@ -73,11 +73,6 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install OpenSSL
-        # The fetch TLS transport links Homebrew OpenSSL on Darwin (keg-only;
-        # scripts/build.sh adds its lib path). brew is preinstalled on the runner.
-        run: brew install openssl@3
-
       - name: Setup Odin
         uses: laytan/setup-odin@v2
         with:
@@ -96,10 +91,10 @@ jobs:
       - name: Test (Lava behavior)
         run: make test-lava
 
-      # Same fetch smoke as Linux over the Darwin (kqueue + BSD-socket) transport.
-      # macOS's system openssl is LibreSSL, whose `req -addext` may not run, so the
-      # script falls back to HTTP-only cases there; the HTTP/IPv6 transport is the
-      # coverage this adds (Linux still gates the HTTPS/TLS path).
+      # Same fetch smoke as Linux over the Darwin (kqueue + BSD-socket) transport,
+      # including the HTTPS cases: Lava honors SSL_CERT_FILE on macOS too (#143), so
+      # the runner's generated CA is trusted and the TLS handshake/read/write,
+      # certificate + hostname verification, and streaming TLS upload all run here.
       - name: Fetch transport smoke
         run: make test-fetch-smoke
 
