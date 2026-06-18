@@ -158,6 +158,7 @@ err_invalid_arg_type :: proc(
 //
 //	null / undefined        -> "null" / "undefined"
 //	number / boolean        -> "type number (5)" / "type boolean (true)"
+//	bigint                  -> "type bigint (10n)"
 //	string                  -> "type string"
 //	symbol                  -> "type symbol"
 //	function                -> "function <name>" (or "function (anonymous)")
@@ -165,6 +166,19 @@ err_invalid_arg_type :: proc(
 //
 // (Number/boolean values are stringified by JSC, matching JS `'' + value`.)
 determine_received_type :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> string {
+	// BigInt is the one JS primitive the stable JSValueGetType enum omits (there is
+	// no kJSTypeBigInt), and a given JSC build may report it as .Object or as an
+	// out-of-enum value. Detect it by elimination (see value_is_bigint) so this is
+	// independent of the engine's BigInt reporting, and render it like the JS-side
+	// inspectReceived: "type bigint (10n)". The trailing "n" matches Node's
+	// util.inspect(10n) === "10n"; JSC's string conversion ("10") drops it, so it
+	// is appended here.
+	if value_is_bigint(ctx, value) {
+		s, allocated := value_to_string(ctx, value)
+		out := fmt.tprintf("type bigint (%sn)", s)
+		if allocated do delete(s)
+		return out
+	}
 	#partial switch jsc.JSValueGetType(ctx, value) {
 	case .Undefined:
 		return "undefined"
@@ -204,4 +218,20 @@ determine_received_type :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) ->
 		return "type object"
 	}
 	return "type object"
+}
+
+// value_is_bigint reports whether `value` is a primitive BigInt. BigInt is the
+// only JS primitive type absent from JSValueGetType's enum, so it is detected by
+// elimination: a value that is neither an object nor any of the enumerated
+// primitive types must be a BigInt. This holds regardless of whether a given JSC
+// build reports a BigInt as .Object or as an out-of-enum value. A BigInt *wrapper
+// object* (Object(10n)) is a real object and is handled as such, not here.
+@(private = "file")
+value_is_bigint :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> bool {
+	if jsc.JSValueIsObject(ctx, value) do return false
+	#partial switch jsc.JSValueGetType(ctx, value) {
+	case .Undefined, .Null, .Boolean, .Number, .String, .Symbol:
+		return false
+	}
+	return true
 }
