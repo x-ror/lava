@@ -99,7 +99,12 @@ make_uint8_array_uninit :: proc(ctx: jsc.JSContextRef, size: int) -> (jsc.JSValu
 	if size <= 0 || size > MAX_UNINIT_ALLOC do return nil, false
 	data, err := mem.alloc_bytes_non_zeroed(size, mem.DEFAULT_ALIGNMENT, context.allocator)
 	if err != nil || len(data) != size do return nil, false
-	array := jsc.make_uint8_nocopy_locked(ctx, raw_data(data), c.size_t(size), jsc_buffer_deallocator)
+	array := jsc.make_uint8_nocopy_locked(
+		ctx,
+		raw_data(data),
+		c.size_t(size),
+		jsc_buffer_deallocator,
+	)
 	if array == nil {
 		free(raw_data(data)) // hand-off failed: free the region ourselves, don't leak it
 		return nil, false

@@ -448,7 +448,13 @@ sqlite_row_cb :: proc "c" (
 		value: jsc.JSValueRef
 		switch sqlite.column_type(stmt, i) {
 		case .Integer:
-			value = sqlite_int_value(ctx, sqlite.column_int(stmt, i), read_big_ints, true, exception)
+			value = sqlite_int_value(
+				ctx,
+				sqlite.column_int(stmt, i),
+				read_big_ints,
+				true,
+				exception,
+			)
 			// An out-of-range INTEGER throws (ERR_OUT_OF_RANGE) — abandon the row.
 			if exception != nil && exception^ != nil do return jsc.JSValueMakeUndefined(ctx)
 		case .Float:
@@ -561,7 +567,14 @@ sqlite_make_bigint :: proc(ctx: jsc.JSContextRef, v: i64) -> jsc.JSValueRef {
 	fn := jsc.JSObjectGetProperty(ctx, global, name, nil)
 	if !jsc.JSValueIsObject(ctx, fn) do return jsc.JSValueMakeNumber(ctx, f64(v))
 	args := [1]jsc.JSValueRef{js_string_value(ctx, s)}
-	result := jsc.JSObjectCallAsFunction(ctx, cast(jsc.JSObjectRef)fn, nil, 1, raw_data(args[:]), nil)
+	result := jsc.JSObjectCallAsFunction(
+		ctx,
+		cast(jsc.JSObjectRef)fn,
+		nil,
+		1,
+		raw_data(args[:]),
+		nil,
+	)
 	if result == nil do return jsc.JSValueMakeNumber(ctx, f64(v))
 	return result
 }
