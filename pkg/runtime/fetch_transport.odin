@@ -8,11 +8,11 @@ import eventloop "lava:pkg/runtime/eventloop"
 
 // Shared fetch transport for the readiness-based backends (Linux epoll/io_uring,
 // Darwin kqueue, Windows select). The connect→[TLS handshake]→write→read state
-// machine and the DNS hand-off live here and are OpenSSL-free. Each platform
+// machine and the DNS hand-off live here and are TLS-backend-agnostic. Each platform
 // supplies only the socket primitives (create/connect, send/recv, SO_ERROR check,
 // watch-mode flip, close) in fetch_{linux,darwin,windows}.odin, plus a TLS backend
-// (fetch_tls.odin = OpenSSL; fetch_tls_stub.odin = reject) that the https branches
-// delegate to. Targets with no transport at all fall back to fetch_other.odin.
+// (fetch_tls{,_darwin,_stub}.odin) that the https branches delegate to. Targets with
+// no transport at all fall back to fetch_other.odin.
 
 // Fetch_IO_Result is the outcome of a raw (plaintext) socket read/write, mapped
 // by the platform primitives from the OS error so the state machine stays
@@ -140,10 +140,8 @@ fetch_watcher_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			return
 		}
 		if req.is_https {
-			// TLS is a platform-swappable backend (real OpenSSL on Linux/Darwin/
-			// Windows, a reject stub on transport-less platforms): set up the session
-			// and run the first handshake step, settling on its own error if
-			// unsupported.
+			// TLS is a platform-swappable backend: set up the session and run the first
+			// handshake step, settling on its own error if unsupported.
 			fetch_tls_start_handshake(loop, req)
 			return
 		}

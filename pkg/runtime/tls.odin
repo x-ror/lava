@@ -1,17 +1,15 @@
-#+build linux, darwin, windows
+#+build linux, windows
 package lava_runtime
 
 import "core:c"
 import "core:net"
 import "core:strings"
 
-// Minimal OpenSSL client bindings for the fetch HTTPS transport (Linux, Darwin,
-// Windows). We link libssl/libcrypto and bind only the handful of client-side
+// Minimal OpenSSL client bindings for the fetch HTTPS transport on Linux and
+// Windows. We link libssl/libcrypto and bind only the handful of client-side
 // symbols the non-blocking handshake/read/write needs. TLS records replace raw
 // socket bytes in fetch_transport.odin; everything else (HTTP framing, the event
-// loop) is shared with the plaintext path. On macOS, libssl comes from Homebrew
-// OpenSSL (the build adds its lib path); a native Security.framework backend is
-// future work (see #143).
+// loop) is shared with the plaintext path.
 //
 // Non-blocking model: the socket is the same non-blocking fd the plaintext path
 // uses. SSL_connect/SSL_read/SSL_write return <= 0 with SSL_get_error reporting
@@ -21,11 +19,11 @@ import "core:strings"
 // libssl provides the SSL_*/SSL_CTX_* symbols; libcrypto provides the X509
 // verification-parameter helpers (e.g. X509_VERIFY_PARAM_set1_ip_asc). Both must
 // be on the link line, so import them as a group. The library names differ by
-// platform: the Unix linker's `system:` -l convention on Linux/Darwin (same as
+// platform: the Unix linker's `system:` -l convention on Linux (same as
 // sqlite3/javascriptcoregtk), and the import-lib filenames on Windows (as built
-// by vcpkg / the OpenSSL installer). All three use the `system:` prefix so the
-// names resolve via the linker's library search path — the build (CI Windows job)
-// is responsible for putting the OpenSSL lib dir on that path.
+// by vcpkg / the OpenSSL installer). Both use the `system:` prefix so the names
+// resolve via the linker's library search path — the build (CI Windows job) is
+// responsible for putting the OpenSSL lib dir on that path.
 when ODIN_OS == .Windows {
 	// `system:` makes Odin search these via the linker's LIB path (like JSC's
 	// import in pkg/jsc/bindings_windows.odin); a bare "libssl.lib" would instead
@@ -102,10 +100,10 @@ g_tls_ctx: SSL_CTX
 // its self-signed CA.
 //
 // TRUST STORE: set_default_verify_paths reads OpenSSL's compiled-in default cert
-// locations, which find the system roots on Linux/macOS but NOT the native
-// Windows certificate store (OpenSSL has no Windows-store backend). So we then
-// call the platform root hook (tls_load_platform_roots): a no-op on Linux/macOS,
-// and on Windows it loads the machine ROOT/CA stores into this context's
+// locations, which find the system roots on Linux but NOT the native Windows
+// certificate store (OpenSSL has no Windows-store backend). So we then call the
+// platform root hook (tls_load_platform_roots): a no-op on Linux, and on Windows
+// it loads the machine ROOT/CA stores into this context's
 // X509_STORE so a plain `fetch("https://...")` verifies against the OS roots.
 // SSL_CERT_FILE still works everywhere as an explicit override (both sources feed
 // the same store).

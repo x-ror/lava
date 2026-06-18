@@ -113,11 +113,13 @@ implementations — no `primordials`, no `internalBinding` coupling.
 - [x] **Real network transport for `fetch()`** — `http://` and `https://` over
       non-blocking sockets on the event loop. The connect→[TLS]→write→read state
       machine is shared (`pkg/runtime/fetch_transport.odin`); each platform
-      supplies narrow socket primitives plus a swappable TLS backend
-      (`pkg/runtime/fetch_tls.odin`). Implemented for **Linux** (io_uring/epoll,
-      `core:sys/linux`), **macOS** (kqueue, `core:sys/posix`), and **Windows**
-      (`select`, Winsock). TLS uses OpenSSL (`pkg/runtime/tls.odin`); on Windows the
-      machine certificate store is loaded into OpenSSL's trust store. DNS resolves
+      supplies narrow socket primitives plus a swappable TLS backend. Implemented for
+      **Linux** (io_uring/epoll, `core:sys/linux`), **macOS** (kqueue,
+      `core:sys/posix`), and **Windows** (`select`, Winsock). TLS uses OpenSSL on
+      Linux/Windows (`pkg/runtime/tls.odin`); on Windows the machine certificate store
+      is loaded into OpenSSL's trust store; on **macOS** it uses Apple's
+      Security.framework / SecureTransport natively (`pkg/runtime/tls_darwin.odin`,
+      #143), verifying against the system keychain with no OpenSSL dependency. DNS resolves
       off the loop on a **bounded resolver pool** (4 workers, lazily created;
       `pkg/runtime/fetch_dns_pool.odin`), which resolves both families and returns an
       ordered IPv4-then-IPv6 list (#77, #145) — replacing the former one-thread-per-
@@ -126,9 +128,8 @@ implementations — no `primordials`, no `internalBinding` coupling.
       redirect following, `Set-Cookie`/`getSetCookie()`, URL/port validation, response
       head + chunk-size caps, EINTR retries (#99) — and the connect path now falls back
       across the resolved-address list (#145).
-      Follow-ups: native Security.framework TLS on macOS (#143); Happy Eyeballs —
-      staggered/raced IPv4/IPv6 connects — and multiple A/AAAA records beyond the first
-      per family (remaining part of #145).
+      Follow-ups: Happy Eyeballs — staggered/raced IPv4/IPv6 connects — and multiple
+      A/AAAA records beyond the first per family (remaining part of #145).
 - [x] **Streaming fetch bodies (#31)** — `response.body` is a real, incrementally
       fed `ReadableStream` (`getReader().read()`, async iteration, `cancel()`,
       `tee()`, `locked`). The transport delivers status + headers as soon as they

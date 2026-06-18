@@ -17,16 +17,9 @@ check_pkg() {
 check_pkg javascriptcoregtk-6.0
 check_pkg sqlite3
 
-# OpenSSL (fetch HTTPS/TLS): Linux exposes it via pkg-config; macOS uses keg-only
-# Homebrew OpenSSL, which is usually not on the pkg-config path, so check brew.
-if [ "$(uname -s)" = "Darwin" ]; then
-	if command -v brew >/dev/null 2>&1 && brew --prefix openssl@3 >/dev/null 2>&1; then
-		printf 'openssl@3 (brew) %s\n' "$(brew --prefix openssl@3)"
-	else
-		printf '%s\n' 'missing: openssl@3 (run: brew install openssl@3)'
-		missing=1
-	fi
-else
+# OpenSSL (fetch HTTPS/TLS): only Linux needs it (exposed via pkg-config). macOS has
+# no OpenSSL dependency for fetch TLS (#143), so there is nothing to check there.
+if [ "$(uname -s)" != "Darwin" ]; then
 	check_pkg openssl
 fi
 

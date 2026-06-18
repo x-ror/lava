@@ -1,14 +1,15 @@
-#+build linux, darwin, windows
+#+build linux, windows
 package lava_runtime
 
 import "core:c"
 import eventloop "lava:pkg/runtime/eventloop"
 
-// OpenSSL TLS backend for the fetch transport. fetch_transport.odin is kept
-// OpenSSL-free and platform-agnostic; the https branches there delegate to the
-// procs in this file, which a platform without OpenSSL replaces with reject stubs
-// (fetch_tls_stub.odin). The req.tls handle is an opaque ^SSL stored as rawptr so
-// the cross-platform Fetch_Request never names the OpenSSL binding.
+// OpenSSL TLS backend for the fetch transport on Linux and Windows.
+// fetch_transport.odin is kept OpenSSL-free and platform-agnostic; the https
+// branches there delegate to the procs in this file, which a platform without a TLS
+// backend replaces with reject stubs (fetch_tls_stub.odin). The req.tls handle is an
+// opaque ^SSL stored as rawptr so the cross-platform Fetch_Request never names the
+// OpenSSL binding.
 
 // fetch_tls_supported lets the shared transport reject https:// up front (before
 // DNS/connect) on backends that have no TLS. True here — OpenSSL is available.

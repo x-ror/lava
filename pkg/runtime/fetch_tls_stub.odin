@@ -5,11 +5,11 @@ package lava_runtime
 
 import eventloop "lava:pkg/runtime/eventloop"
 
-// Reject stub for the fetch TLS backend on platforms with no OpenSSL link and no
-// fetch transport at all (everything outside Linux/Darwin/Windows). Those three
-// use the real OpenSSL backend in fetch_tls.odin; here an https:// request is
-// rejected up front by fetch_transport_start (fetch_tls_supported == false) and
-// never reaches these procs, which remain a defensive backstop only.
+// Reject stub for the fetch TLS backend on platforms with no TLS backend and no
+// fetch transport at all (everything outside Linux/Darwin/Windows). Those three have
+// a real TLS backend; here an https:// request is rejected up front by
+// fetch_transport_start (fetch_tls_supported == false) and never reaches these
+// procs, which remain a defensive backstop only.
 
 // fetch_tls_supported lets the shared transport reject https:// up front (before
 // DNS/connect). False here — there is no TLS, so https never reaches the procs
