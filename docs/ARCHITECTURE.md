@@ -269,13 +269,31 @@ Lava can make HTTP requests but cannot accept them. `node:net` (TCP server/socke
 and a `node:http` server unlock a whole class of applications and reuse the
 existing transport/loop machinery. This is the highest-leverage *capability* gap.
 
-### 5.5 [P2] Consolidate primordials in the JS layer
+### 5.5 [P2] Consolidate primordials in the JS layer — foundation laid
 
-The agent survey found `Object.create(null)` and `hasOwnProperty` guards
-replicated across ~5 internal modules with no shared hardened baseline. Centralize
-a `primordials.js` (frozen references to `Object`, `Array`, `Function.prototype`
-methods, etc.), load it first, and have modules consume it — closing the
-prototype-pollution surface uniformly instead of per-module vigilance.
+`pkg/runtime/js/internal/primordials.js` is the shared hardened baseline: a frozen
+table of pristine intrinsics (captured statics + *uncurried* prototype methods via
+the classic `bind.bind(call)`), so `ArrayPrototypePush(arr, x)` is a
+pollution-proof `arr.push(x)`. The loader **eager-loads it first**, before any
+other internal module and before user code, so the captured references are
+pristine; modules consume it via `require('primordials')` and get the cached table.
+This is the JS-layer analog of the native error-intrinsic capture (§4.3/§5.1).
+
+`events.js` (EventEmitter) is the first fully migrated consumer — its internal
+`Array`/`Object`/`Reflect`/`Promise` use routes through primordials, and listener
+arrays are copied/spliced via species-free helpers (`arrayClone`/`spliceOne`, array
+literal + index only) so a poisoned `Array[Symbol.species]` cannot reach `emit()`
+either. `cmd/lava/primordials_test.odin` (a Lava-only Odin test — Node's own
+EventEmitter is *not* immune here, so this can't be a Node oracle) proves it stays
+correct while `Array.prototype.{push,unshift,slice,splice,map}`, `Object.create`,
+and `Array[Symbol.species]` are all overwritten. Remaining modules adopt primordials
+incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
+
+`primordials` is internal-only: the loader serves it to internal factories but
+hides it from the public resolver native `require()` consults, so it neither
+shadows a user package named `primordials` nor answers `require('node:primordials')`
+(which Node rejects). Gating the other internal helper modules the same way is a
+future follow-up.
 
 ### 5.6 [P2] Documentation & process gaps
 

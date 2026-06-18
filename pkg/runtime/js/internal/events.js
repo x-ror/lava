@@ -3,15 +3,35 @@
 (function (require, module) {
   'use strict';
 
+  // Pristine intrinsics (see primordials.js) so a script that mutates
+  // Array.prototype/Object/etc. cannot alter EventEmitter's internal bookkeeping.
+  var P = require('primordials');
   var defaultMaxListeners = 10;
+
+  // Species-free array helpers. Array.prototype.slice/map/splice consult
+  // constructor[Symbol.species] (ArraySpeciesCreate), so a polluted species could
+  // throw inside emit()/listeners() before any listener runs. These copy/remove via
+  // an array literal and index access only — no prototype method, no species — so a
+  // listener array cannot be hijacked through @@species (matches Node's arrayClone/
+  // spliceOne).
+  function arrayClone(arr) {
+    var n = arr.length;
+    var copy = [];
+    for (var i = 0; i < n; i++) copy[i] = arr[i];
+    return copy;
+  }
+  function spliceOne(list, index) {
+    for (; index + 1 < list.length; index++) list[index] = list[index + 1];
+    P.ArrayPrototypePop(list);
+  }
 
   function EventEmitter() {
     EventEmitter.init.call(this);
   }
 
   EventEmitter.init = function () {
-    if (this._events === undefined || this._events === Object.getPrototypeOf(this)._events) {
-      this._events = Object.create(null);
+    if (this._events === undefined || this._events === P.ObjectGetPrototypeOf(this)._events) {
+      this._events = P.ObjectCreate(null);
       this._eventsCount = 0;
     }
     this._maxListeners = this._maxListeners || undefined;
@@ -42,9 +62,9 @@
     } else if (typeof existing === 'function') {
       events[type] = prepend ? [listener, existing] : [existing, listener];
     } else if (prepend) {
-      existing.unshift(listener);
+      P.ArrayPrototypeUnshift(existing, listener);
     } else {
-      existing.push(listener);
+      P.ArrayPrototypePush(existing, listener);
     }
     return target;
   }
@@ -64,7 +84,7 @@
       if (fired) return;
       fired = true;
       target.removeListener(type, wrapped);
-      return listener.apply(target, arguments);
+      return P.FunctionPrototypeApply(listener, target, arguments);
     }
     wrapped.listener = listener;
     return wrapped;
@@ -86,7 +106,7 @@
     var list = this._events[type];
     if (list === undefined) return this;
     if (list === listener || list.listener === listener) {
-      if (--this._eventsCount === 0) this._events = Object.create(null);
+      if (--this._eventsCount === 0) this._events = P.ObjectCreate(null);
       else delete this._events[type];
     } else if (typeof list !== 'function') {
       var position = -1;
@@ -97,7 +117,7 @@
         }
       }
       if (position < 0) return this;
-      list.splice(position, 1);
+      spliceOne(list, position);
       if (list.length === 1) this._events[type] = list[0];
     }
     return this;
@@ -107,10 +127,10 @@
   EventEmitter.prototype.removeAllListeners = function (type) {
     if (this._events === undefined) return this;
     if (arguments.length === 0) {
-      this._events = Object.create(null);
+      this._events = P.ObjectCreate(null);
       this._eventsCount = 0;
     } else if (this._events[type] !== undefined) {
-      if (--this._eventsCount === 0) this._events = Object.create(null);
+      if (--this._eventsCount === 0) this._events = P.ObjectCreate(null);
       else delete this._events[type];
     }
     return this;
@@ -129,12 +149,14 @@
       }
       return false;
     }
-    var args = Array.prototype.slice.call(arguments, 1);
+    var args = P.ArrayPrototypeSlice(arguments, 1);
     if (typeof handler === 'function') {
-      handler.apply(this, args);
+      P.FunctionPrototypeApply(handler, this, args);
     } else {
-      var listeners = handler.slice();
-      for (var i = 0; i < listeners.length; i++) listeners[i].apply(this, args);
+      var listeners = arrayClone(handler);
+      for (var i = 0; i < listeners.length; i++) {
+        P.FunctionPrototypeApply(listeners[i], this, args);
+      }
     }
     return true;
   };
@@ -145,9 +167,9 @@
     var handler = events[type];
     if (handler === undefined) return [];
     if (typeof handler === 'function') return [handler.listener || handler];
-    return handler.map(function (h) {
-      return h.listener || h;
-    });
+    var copy = arrayClone(handler);
+    for (var i = 0; i < copy.length; i++) copy[i] = copy[i].listener || copy[i];
+    return copy;
   };
 
   EventEmitter.prototype.rawListeners = function (type) {
@@ -155,7 +177,7 @@
     if (events === undefined) return [];
     var handler = events[type];
     if (handler === undefined) return [];
-    return typeof handler === 'function' ? [handler] : handler.slice();
+    return typeof handler === 'function' ? [handler] : arrayClone(handler);
   };
 
   EventEmitter.prototype.listenerCount = function (type) {
@@ -167,16 +189,16 @@
   };
 
   EventEmitter.prototype.eventNames = function () {
-    return this._eventsCount > 0 ? Reflect.ownKeys(this._events) : [];
+    return this._eventsCount > 0 ? P.ReflectOwnKeys(this._events) : [];
   };
 
   // once(emitter, name) — resolves with the emitted arguments on the next
   // matching event, or rejects if 'error' fires first.
   function once(emitter, name) {
-    return new Promise(function (resolve, reject) {
+    return new P.Promise(function (resolve, reject) {
       function eventListener() {
         if (errorListener !== undefined) emitter.removeListener('error', errorListener);
-        resolve(Array.prototype.slice.call(arguments));
+        resolve(P.ArrayPrototypeSlice(arguments));
       }
       var errorListener;
       if (name !== 'error') {
