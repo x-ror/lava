@@ -16,6 +16,13 @@ Runtime_State :: struct {
 	module_cache:      map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
 	builtin_require:   jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
 	esm_transform:     jsc.JSValueRef, // js/internal/esm.js transform(source,url,filename,dirname); GC-protected
+	// Standard JS error constructors (Error/TypeError/RangeError/…) snapshotted and
+	// GC-protected from globalThis at context init, before any user code runs (see
+	// capture_error_intrinsics). make_native_error builds native throws from these
+	// instead of re-reading the mutable global, so a script that overwrites e.g.
+	// globalThis.RangeError cannot intercept or alter a native error (errors.odin).
+	// Keys are static literals; values unprotected on destroy.
+	error_intrinsics:  map[string]jsc.JSValueRef,
 	// Set when an uncaught exception escapes an async callback or a promise
 	// rejects with no handler. The process then exits non-zero even though the
 	// initial JSEvaluateScript returned cleanly (see resolve_exit_code).
@@ -90,6 +97,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state := new(Runtime_State)
 	state.loop = loop
 	state.module_cache = make(map[string]jsc.JSValueRef)
+	state.error_intrinsics = make(map[string]jsc.JSValueRef)
 	state.active_fetches = make([dynamic]^Fetch_Request)
 	state.active_dns = make([dynamic]^Dns_Lookup_Request)
 	state.sqlite_dbs = make(map[u64]rawptr)
@@ -109,6 +117,10 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 		delete(key)
 	}
 	delete(state.module_cache)
+	for _, ctor in state.error_intrinsics {
+		unprotect_before_eval_exit(ctx, ctor)
+	}
+	delete(state.error_intrinsics)
 	unprotect_before_eval_exit(ctx, state.builtin_require)
 	unprotect_before_eval_exit(ctx, state.esm_transform)
 	unprotect_before_eval_exit(ctx, state.rejection_handler)
@@ -412,24 +424,8 @@ callback_arg :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> jsc.JSObje
 	return obj
 }
 
-make_js_error :: proc(ctx: jsc.JSContextRef, message: string) -> jsc.JSValueRef {
-	msg := js_string_value(ctx, message)
-	args := [1]jsc.JSValueRef{msg}
-	err := jsc.JSObjectMakeError(ctx, 1, raw_data(args[:]), nil)
-	return cast(jsc.JSValueRef)err
-}
-
-// make_js_named_error builds an Error whose `name` is overridden (e.g.
-// "SyntaxError"), so `err.name` and the default stringification match the
-// corresponding native error subclass even though JSObjectMakeError always
-// produces a base Error.
-make_js_named_error :: proc(ctx: jsc.JSContextRef, name, message: string) -> jsc.JSValueRef {
-	err := make_js_error(ctx, message)
-	if jsc.JSValueIsObject(ctx, err) {
-		set_named(ctx, cast(jsc.JSObjectRef)err, "name", js_string_value(ctx, name))
-	}
-	return err
-}
+// make_js_error / make_js_named_error and the Node ERR_* helpers live in
+// errors.odin (the single source of truth for native error construction).
 
 // --- Timer / scheduling callbacks ---
 
@@ -628,20 +624,7 @@ process_exit_cb :: proc "c" (
 		n := jsc.JSValueToNumber(ctx, arguments[0], nil)
 		if n != n {
 			if exception != nil {
-				err := make_js_named_error(
-					ctx,
-					"RangeError",
-					"The value of \"code\" is out of range. It must be an integer. Received NaN",
-				)
-				if jsc.JSValueIsObject(ctx, err) {
-					set_named(
-						ctx,
-						cast(jsc.JSObjectRef)err,
-						"code",
-						js_string_value(ctx, "ERR_OUT_OF_RANGE"),
-					)
-				}
-				exception^ = err
+				exception^ = err_out_of_range(ctx, "code", "an integer", "NaN")
 			}
 			return jsc.JSValueMakeUndefined(ctx)
 		}
