@@ -205,6 +205,10 @@ sync_real_clock :: proc(loop: ^Loop) {
 // race the read here and could post into freed memory. The lava runtime enforces
 // this by calling fetch_shutdown_active (which joins the workers) before destroy.
 destroy :: proc(loop: ^Loop) {
+	// Stop and join the worker pool first, so no off-loop worker can post into the
+	// async_queue we are about to tear down (see threadpool.odin / the PRECONDITION
+	// note below). A no-op when the pool was never started.
+	pool_shutdown()
 	dispose_pending_tasks(&loop.next_ticks)
 	dispose_pending_tasks(&loop.next_ticks_scratch)
 	dispose_pending_tasks(&loop.microtasks)

@@ -571,6 +571,62 @@ run_ignores_stale_wakeup_while_async_is_active :: proc(t: ^testing.T) {
 	testing.expect_value(t, pending_count(&loop), 0)
 }
 
+// --- Thread pool ---
+
+Pool_Test_Job :: struct {
+	rec:      ^Recorder,
+	computed: int, // a worker writes this off-loop; the loop-thread done reads it back
+}
+
+// pool_test_work runs OFF the loop thread: a small sleep, then a write into the job.
+// It must not touch the loop — post_async publishes the write when it hands back.
+pool_test_work :: proc(user_data: rawptr) {
+	job := cast(^Pool_Test_Job)user_data
+	time.sleep(5 * time.Millisecond)
+	job.computed = 42
+}
+
+// pool_test_done runs ON the loop thread and records the off-loop result.
+pool_test_done :: proc(loop: ^Loop, user_data: rawptr) {
+	job := cast(^Pool_Test_Job)user_data
+	if job.rec != nil do append(&job.rec.events, job.computed)
+}
+
+@(test)
+threadpool_runs_work_offloop_and_completes_on_loop :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	jobs: [3]Pool_Test_Job
+	for i in 0 ..< len(jobs) {
+		jobs[i] = Pool_Test_Job{rec = &rec}
+		testing.expect(t, pool_submit(&loop, pool_test_work, pool_test_done, &jobs[i]))
+	}
+	// Each submit pins the loop alive (active_async) until its completion posts.
+	testing.expect_value(t, pending_count(&loop), 3)
+
+	testing.expect(t, run_until_idle(&loop))
+	// All three completions ran on the loop thread, each recording the off-loop result.
+	expect_events(t, rec.events[:], []int{42, 42, 42})
+	testing.expect_value(t, loop.active_async, 0)
+	testing.expect_value(t, pending_count(&loop), 0)
+}
+
+@(test)
+threadpool_shutdown_joins_inflight_work :: proc(t: ^testing.T) {
+	// Submitting then destroying without running the loop must not hang or leak: the
+	// worker is joined, the job wrapper is freed, and the dropped completion's task is
+	// never invoked (so the freed wrapper is not dereferenced).
+	loop := init()
+	job := Pool_Test_Job{}
+	testing.expect(t, pool_submit(&loop, pool_test_work, pool_test_done, &job))
+	destroy(&loop) // joins the worker mid-flight; reaching the next line is the assertion
+	testing.expect(t, true)
+}
+
 // --- Per-tick temp arena reset ---
 
 record_and_alloc_temp :: proc(loop: ^Loop, user_data: rawptr) {
