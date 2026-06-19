@@ -28,6 +28,9 @@ let o16 = sd16.write(emoji.subarray(0, 2));
 o16 += sd16.write(emoji.subarray(2));
 o16 += sd16.end();
 assert.equal(o16, '😀');
+// accepts a non-Buffer Uint8Array, and supports base64url
+assert.equal(new StringDecoder('utf8').end(Uint8Array.from([0x68, 0x69])), 'hi');
+assert.equal(new StringDecoder('base64url').end(Buffer.from('fo')), 'Zm8');
 
 // --- util/types ---
 const types = require('node:util/types');
@@ -43,6 +46,9 @@ assert.equal(types.isAnyArrayBuffer(new ArrayBuffer(1)), true);
 assert.equal(types.isNativeError(new TypeError('x')), true);
 assert.equal(types.isTypedArray([]), false);
 assert.equal(types.isDate({}), false);
+// also reachable as require('util').types, the same object
+assert.equal(require('node:util').types.isDate(new Date()), true);
+assert.equal(require('node:util').types, require('node:util/types'));
 
 // --- timers: re-exports the real global timer functions ---
 assert.equal(typeof timers.setTimeout, 'function');

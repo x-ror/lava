@@ -21,6 +21,8 @@
         return 'latin1';
       case 'base64':
         return 'base64';
+      case 'base64url':
+        return 'base64url';
       case 'ascii':
         return 'ascii';
       case 'hex':
@@ -42,6 +44,7 @@
         this.end = utf16End;
         break;
       case 'base64':
+      case 'base64url':
         this.text = base64Text;
         this.end = base64End;
         break;
@@ -58,7 +61,19 @@
     }
   }
 
+  // Node's API accepts a Buffer, any TypedArray, or a DataView. Normalize a non-Buffer
+  // ArrayBuffer view to a Buffer over the same bytes (no copy) so the Buffer methods
+  // below (copy/toString) work and a Uint8Array isn't stringified as "97,98,...".
+  function asBuffer(buf) {
+    if (Buffer.isBuffer(buf)) return buf;
+    if (ArrayBuffer.isView(buf)) {
+      return Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+    }
+    return buf;
+  }
+
   StringDecoder.prototype.write = function write(buf) {
+    buf = asBuffer(buf);
     if (buf.length === 0) return '';
     var r;
     var i = 0;
@@ -199,7 +214,7 @@
 
   function base64Text(buf, i) {
     var n = (buf.length - i) % 3;
-    if (n === 0) return buf.toString('base64', i);
+    if (n === 0) return buf.toString(this.encoding, i);
     this.lastNeed = 3 - n;
     this.lastTotal = 3;
     if (n === 1) {
@@ -208,13 +223,13 @@
       this.lastChar[0] = buf[buf.length - 2];
       this.lastChar[1] = buf[buf.length - 1];
     }
-    return buf.toString('base64', i, buf.length - n);
+    return buf.toString(this.encoding, i, buf.length - n);
   }
 
   function base64End(buf) {
     var r = buf && buf.length ? this.write(buf) : '';
     if (this.lastNeed) {
-      return r + this.lastChar.toString('base64', 0, 3 - this.lastNeed);
+      return r + this.lastChar.toString(this.encoding, 0, 3 - this.lastNeed);
     }
     return r;
   }

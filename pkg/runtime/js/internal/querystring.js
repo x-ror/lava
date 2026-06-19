@@ -102,9 +102,10 @@
 
   function decodeComponent(s, decode) {
     if (s.length === 0) return s;
-    // The query-string convention maps '+' to a space; parse() applies it before
-    // decoding, regardless of the decoder in use (Node does the same at scan time).
-    if (s.indexOf('+') !== -1) s = s.replace(/\+/g, ' ');
+    // The query-string convention maps '+' to a space. Node rewrites '+' to '%20'
+    // (not a literal space) before decoding, so the default decoder turns it into a
+    // space AND a custom decodeURIComponent still sees an encoded space.
+    if (s.indexOf('+') !== -1) s = s.replace(/\+/g, '%20');
     try {
       return decode(s);
     } catch {
