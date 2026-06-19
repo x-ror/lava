@@ -13,6 +13,14 @@ import eventloop "lava:pkg/runtime/eventloop"
 // to JavaScript, so user code can neither read nor corrupt the loop pointer.
 Runtime_State :: struct {
 	loop:              ^eventloop.Loop,
+	// Allocator that owns the module_cache key strings. Captured from the caller's
+	// context at state creation and used EXPLICITLY when cloning/freeing keys, because
+	// keys are cloned inside `proc "c"` require callbacks (where context is reset to
+	// runtime.default_context — the heap allocator) but freed later in
+	// destroy_runtime_state under the caller's context. Without an explicit allocator
+	// those two contexts can differ (e.g. an embedder/test using a custom or tracking
+	// allocator), causing a bad free. The map itself carries its own bound allocator.
+	allocator:         runtime.Allocator,
 	module_cache:      map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
 	builtin_require:   jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
 	esm_transform:     jsc.JSValueRef, // js/internal/esm.js transform(source,url,filename,dirname); GC-protected
@@ -96,6 +104,8 @@ when ODIN_ARCH == .amd64 {
 new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state := new(Runtime_State)
 	state.loop = loop
+	// Capture the owning allocator for module_cache keys (see the field comment).
+	state.allocator = context.allocator
 	state.module_cache = make(map[string]jsc.JSValueRef)
 	state.error_intrinsics = make(map[string]jsc.JSValueRef)
 	state.active_fetches = make([dynamic]^Fetch_Request)
@@ -114,7 +124,7 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	sqlite_destroy_state(state)
 	for key, value in state.module_cache {
 		unprotect_before_eval_exit(ctx, value)
-		delete(key)
+		delete(key, state.allocator)
 	}
 	delete(state.module_cache)
 	for _, ctor in state.error_intrinsics {
@@ -188,7 +198,7 @@ module_cache_put :: proc(
 ) {
 	if state == nil do return
 	if _, ok := state.module_cache[key]; ok do return
-	cloned, err := strings.clone(key)
+	cloned, err := strings.clone(key, state.allocator)
 	if err != nil do return
 	jsc.JSValueProtect(ctx, value)
 	state.module_cache[cloned] = value
@@ -213,7 +223,7 @@ module_cache_set :: proc(
 		state.module_cache[key] = value // reuse the existing (owned) key string
 		return
 	}
-	cloned, err := strings.clone(key)
+	cloned, err := strings.clone(key, state.allocator)
 	if err != nil do return
 	jsc.JSValueProtect(ctx, value)
 	state.module_cache[cloned] = value
@@ -237,7 +247,7 @@ module_cache_remove :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State, key: s
 		}
 	}
 	delete_key(&state.module_cache, key)
-	if len(stored_key) > 0 do delete(stored_key)
+	if len(stored_key) > 0 do delete(stored_key, state.allocator)
 }
 
 // --- JS callback bridge ---
