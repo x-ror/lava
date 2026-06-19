@@ -108,6 +108,9 @@ Loop :: struct {
 	async_scratch:      [dynamic]Task, // swapped with async_queue under the lock to drain
 	async_mutex:        sync.Mutex,
 	active_async:       int,
+	// Per-loop worker pool for off-loop blocking/CPU-bound work (threadpool.odin).
+	// Zero-valued until first use (lazily started); joined and freed by destroy.
+	pool:               Thread_Pool,
 }
 
 Poll_Mode :: enum {
@@ -164,6 +167,9 @@ init :: proc(allocator := context.allocator, real_time := false) -> Loop {
 	loop.timers = make([dynamic]Timer, allocator)
 	loop.async_queue = make([dynamic]Task, allocator)
 	loop.async_scratch = make([dynamic]Task, allocator)
+	// Bind the worker pool's containers to the loop allocator too (zero capacity —
+	// no backing or threads until the first pool_submit). See threadpool.odin.
+	pool_init(&loop.pool, allocator)
 
 	if real_time {
 		loop.start_tick = time.tick_now()
@@ -205,6 +211,10 @@ sync_real_clock :: proc(loop: ^Loop) {
 // race the read here and could post into freed memory. The lava runtime enforces
 // this by calling fetch_shutdown_active (which joins the workers) before destroy.
 destroy :: proc(loop: ^Loop) {
+	// Stop and join the worker pool first, so no off-loop worker can post into the
+	// async_queue we are about to tear down (see threadpool.odin / the PRECONDITION
+	// note below). A no-op when the pool was never started.
+	pool_shutdown(loop)
 	dispose_pending_tasks(&loop.next_ticks)
 	dispose_pending_tasks(&loop.next_ticks_scratch)
 	dispose_pending_tasks(&loop.microtasks)
@@ -232,6 +242,7 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.cancelled_ids)
 	delete(loop.async_queue)
 	delete(loop.async_scratch)
+	pool_destroy(&loop.pool, loop.allocator) // frees the pool backings (workers already joined above)
 	loop^ = Loop{}
 }
 

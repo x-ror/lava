@@ -571,6 +571,124 @@ run_ignores_stale_wakeup_while_async_is_active :: proc(t: ^testing.T) {
 	testing.expect_value(t, pending_count(&loop), 0)
 }
 
+// --- Thread pool ---
+
+Pool_Test_Job :: struct {
+	rec:      ^Recorder,
+	computed: int, // a worker writes this off-loop; the loop-thread done reads it back
+}
+
+// pool_test_work runs OFF the loop thread: a small sleep, then a write into the job.
+// It must not touch the loop — post_async publishes the write when it hands back.
+pool_test_work :: proc(user_data: rawptr) {
+	job := cast(^Pool_Test_Job)user_data
+	time.sleep(5 * time.Millisecond)
+	job.computed = 42
+}
+
+// pool_test_done runs ON the loop thread and records the off-loop result.
+pool_test_done :: proc(loop: ^Loop, user_data: rawptr) {
+	job := cast(^Pool_Test_Job)user_data
+	if job.rec != nil do append(&job.rec.events, job.computed)
+}
+
+@(test)
+threadpool_runs_work_offloop_and_completes_on_loop :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	jobs: [3]Pool_Test_Job
+	for i in 0 ..< len(jobs) {
+		jobs[i] = Pool_Test_Job{rec = &rec}
+		testing.expect(t, pool_submit(&loop, pool_test_work, pool_test_done, &jobs[i]))
+	}
+	// Each submit pins the loop alive (active_async) until its completion posts.
+	testing.expect_value(t, pending_count(&loop), 3)
+
+	testing.expect(t, run_until_idle(&loop))
+	// All three completions ran on the loop thread, each recording the off-loop result.
+	expect_events(t, rec.events[:], []int{42, 42, 42})
+	testing.expect_value(t, loop.active_async, 0)
+	testing.expect_value(t, pending_count(&loop), 0)
+}
+
+@(test)
+threadpool_shutdown_joins_inflight_work :: proc(t: ^testing.T) {
+	// Submitting then destroying without running the loop must not hang or leak: the
+	// worker is joined, the job wrapper is freed, and the dropped completion's task is
+	// never invoked (so the freed wrapper is not dereferenced).
+	loop := init()
+	job := Pool_Test_Job{}
+	testing.expect(t, pool_submit(&loop, pool_test_work, pool_test_done, &job))
+	destroy(&loop) // joins the worker mid-flight; reaching the next line is the assertion
+	testing.expect(t, true)
+}
+
+Pool_Dispose_Job :: struct {
+	disposed: ^int,
+}
+
+pool_test_noop_work :: proc(user_data: rawptr) {}
+
+// pool_test_dispose runs on the loop thread for a job whose `done` will not run.
+pool_test_dispose :: proc(user_data: rawptr) {
+	job := cast(^Pool_Dispose_Job)user_data
+	job.disposed^ += 1
+}
+
+@(test)
+threadpool_shutdown_disposes_undelivered_jobs :: proc(t: ^testing.T) {
+	// A queued backlog (more jobs than workers) torn down before the loop ever runs:
+	// no completion is delivered, so every job's `dispose` must run exactly once (and
+	// its `done` never does), letting a caller release user_data on abnormal teardown.
+	loop := init()
+	disposed := 0
+	N :: 16
+	jobs: [N]Pool_Dispose_Job
+	for i in 0 ..< N {
+		jobs[i] = Pool_Dispose_Job{disposed = &disposed}
+		testing.expect(t, pool_submit(&loop, pool_test_noop_work, nil, &jobs[i], pool_test_dispose))
+	}
+	destroy(&loop) // no loop run → no completion delivered → all N jobs disposed
+	testing.expect_value(t, disposed, N)
+}
+
+@(test)
+threadpool_ring_preserves_fifo_across_grow_and_wrap :: proc(t: ^testing.T) {
+	// Exercise the pending ring directly (no workers, fully deterministic): fill past
+	// capacity (grow), partially drain so the head advances, refill so the live region
+	// wraps past the end, then push past capacity again so growth happens WHILE the
+	// region is wrapped (the unwrap-copy path). Every job must dequeue exactly once in
+	// submit order. (pool_ring_* are pointer-only; no Loop/threads needed.)
+	pool := Thread_Pool{}
+	defer if pool.pending != nil do delete(pool.pending)
+
+	jobs: [20]Pool_Job
+	expect := 0
+	pushed := 0
+
+	// Grow 0 -> 8 and fill.
+	for ; pushed < 8; pushed += 1 do pool_ring_push(&pool, &jobs[pushed], context.allocator)
+	// Drain 6: head advances to 6, two live entries remain.
+	for _ in 0 ..< 6 {
+		testing.expect(t, pool_ring_pop(&pool) == &jobs[expect], "fifo before wrap")
+		expect += 1
+	}
+	// Refill to capacity: the live region now wraps past the end of the 8-slot backing.
+	for ; pushed < 14; pushed += 1 do pool_ring_push(&pool, &jobs[pushed], context.allocator)
+	// Push past capacity: growth happens while the live region is wrapped (8 -> 16).
+	for ; pushed < 20; pushed += 1 do pool_ring_push(&pool, &jobs[pushed], context.allocator)
+	// Drain everything: exactly once, still in submit order.
+	for pool.pending_count > 0 {
+		testing.expect(t, pool_ring_pop(&pool) == &jobs[expect], "fifo after wrap+grow")
+		expect += 1
+	}
+	testing.expect_value(t, expect, 20)
+}
+
 // --- Per-tick temp arena reset ---
 
 record_and_alloc_temp :: proc(loop: ^Loop, user_data: rawptr) {

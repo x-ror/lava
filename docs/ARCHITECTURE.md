@@ -238,22 +238,32 @@ itself notes `fs.readFile`'s "read is synchronous for now."
 DNS pool and the fetch transport. What's missing is a *generic* worker pool that
 sits on top of it.
 
-**Design sketch (`pkg/runtime/eventloop/threadpool.odin`).**
-- A fixed pool (size = `min(CPU, N)`, configurable) of OS threads, each blocking on
-  a shared MPMC work queue.
-- `pool_submit(loop, work_fn, done_cb, user_data)`: `async_begin(loop)`, push the
-  job; a worker runs `work_fn` (off-loop, no JSC access), then `post_async`'s
-  `done_cb` to run on the loop thread (where JSC *is* safe to touch).
-- The invariant that **workers never call into JSC** keeps the single-VM model
-  intact; only the loop-thread completion materializes JS values.
-- Migrate `fs.readFile`/`writeFile` and `crypto.pbkdf2`/`scrypt` async forms onto
-  it. Synchronous `*Sync` APIs stay on the loop thread (Node does the same).
+**Step 1 — the generic pool — done (`pkg/runtime/eventloop/threadpool.odin`).**
+A fixed pool (`THREADPOOL_SIZE`, libuv's default of 4) of OS threads blocking on a
+shared FIFO queue, lazily started on first submit and joined at `destroy()`.
+`pool_submit(loop, work, done, user_data)` does `async_begin(loop)` (keeping the
+loop alive and parked in poll), runs `work` off-loop on a worker, then hands the
+completion back through `post_async`, where `done` runs on the loop thread. The
+invariant that **workers touch only their user_data — never the loop or JSC** keeps
+the single-VM model intact; only the loop-thread `done` materializes JS values. It
+generalizes the DNS pool and shares its teardown discipline (workers joined before
+the async queue is torn down). Covered by deterministic tests in
+`eventloop_test.odin` (off-loop work → on-loop completion; submit-then-destroy joins
+in-flight work without leak/hang).
 
-This single primitive unblocks async `fs.stat`/`readdir`/`mkdir`, `fs.promises`,
-and any future blocking op — and it makes "predictable latency under load" a real
-property rather than an aspiration.
+**Remaining.**
+- **Step 2 — `fs.readFile`/`writeFile`** onto the pool. Subtlety: today the callback
+  is delivered in the **poll phase** (`queue_io_callback`) to preserve Node's
+  I/O-before-`setImmediate` ordering, whereas `post_async` completions drain at the
+  *top* of the tick. So the fs completion must bridge: the pool's loop-thread `done`
+  re-queues via `queue_io_callback` to keep the ordering. Pending fs requests also
+  need teardown tracking (release the GC-protected callback if the loop dies
+  mid-flight), as fetch does.
+- **Step 3 — `crypto.pbkdf2`/`scrypt`** async forms (CPU-bound; ordering is simpler).
 
-*Chosen as a starting direction.*
+Synchronous `*Sync` APIs stay on the loop thread (Node does the same). This primitive
+unblocks async `fs.stat`/`readdir`/`mkdir`, `fs.promises`, and any future blocking op
+— making "predictable latency under load" a real property rather than an aspiration.
 
 ### 5.3 [P1] Make "fast" provable: a benchmark harness with CI gating
 
