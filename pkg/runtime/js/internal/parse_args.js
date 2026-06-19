@@ -89,7 +89,7 @@
     return opt === undefined || opt.type !== 'string';
   }
 
-  function argsToTokens(args, options, allowNegative) {
+  function argsToTokens(args, options) {
     var tokens = [];
     var remaining = ArrayPrototypeSlice(args);
     var index = -1;
@@ -120,10 +120,10 @@
       if (isLoneShortOption(arg)) {
         var sLong = findLongOptionForShort(StringPrototypeCharAt(arg, 1), options);
         var sOpt = objectGetOwn(options, sLong);
-        var sValue;
-        if (sOpt !== undefined && sOpt.type === 'string' && nextArg !== undefined) {
-          sValue = ArrayPrototypeShift(remaining);
-        }
+        // Assign every iteration (a function-scoped `var` would otherwise leak the
+        // previous option's value into the next lone short option, e.g. -n x -f).
+        var sConsumes = sOpt !== undefined && sOpt.type === 'string' && nextArg !== undefined;
+        var sValue = sConsumes ? ArrayPrototypeShift(remaining) : undefined;
         ArrayPrototypePush(tokens, {
           kind: 'option',
           name: sLong,
@@ -132,13 +132,24 @@
           value: sValue,
           inlineValue: sValue !== undefined ? false : undefined,
         });
+        // The consumed value occupies the next argv slot, so advance the index past it.
+        if (sConsumes) index++;
         continue;
       }
 
       if (isShortOptionGroup(arg, options)) {
         var expanded = [];
         for (var g = 1; g < arg.length; g++) {
-          ArrayPrototypePush(expanded, '-' + StringPrototypeCharAt(arg, g));
+          var groupShort = StringPrototypeCharAt(arg, g);
+          var groupOpt = objectGetOwn(options, findLongOptionForShort(groupShort, options));
+          if (groupOpt === undefined || groupOpt.type !== 'string' || g === arg.length - 1) {
+            ArrayPrototypePush(expanded, '-' + groupShort);
+          } else {
+            // A string short option mid-group consumes the rest of the group as its value
+            // (-abVALUE -> -a -bVALUE), matching Node — don't split off its value chars.
+            ArrayPrototypePush(expanded, '-' + StringPrototypeSlice(arg, g));
+            break;
+          }
         }
         for (var e = expanded.length - 1; e >= 0; e--) {
           ArrayPrototypeUnshift(remaining, expanded[e]);
@@ -163,10 +174,8 @@
       if (isLoneLongOption(arg)) {
         var lName = StringPrototypeSlice(arg, 2);
         var lOpt = objectGetOwn(options, lName);
-        var lValue;
-        if (lOpt !== undefined && lOpt.type === 'string' && nextArg !== undefined) {
-          lValue = ArrayPrototypeShift(remaining);
-        }
+        var lConsumes = lOpt !== undefined && lOpt.type === 'string' && nextArg !== undefined;
+        var lValue = lConsumes ? ArrayPrototypeShift(remaining) : undefined;
         ArrayPrototypePush(tokens, {
           kind: 'option',
           name: lName,
@@ -175,6 +184,7 @@
           value: lValue,
           inlineValue: lValue !== undefined ? false : undefined,
         });
+        if (lConsumes) index++;
         continue;
       }
 
@@ -230,8 +240,11 @@
   }
 
   function storeOption(name, value, options, values) {
+    if (name === '__proto__') return; // never write through the prototype
     var spec = objectGetOwn(options, name);
-    var v = spec !== undefined && spec.type === 'string' ? value : true;
+    // A flag (no value) is true; otherwise keep the parsed value — including an inline
+    // value on an unknown option under strict:false (--foo=bar -> 'bar', not true).
+    var v = value === undefined ? true : value;
     if (spec !== undefined && spec.multiple) {
       if (ObjectPrototypeHasOwnProperty(values, name)) ArrayPrototypePush(values[name], v);
       else values[name] = [v];
@@ -250,7 +263,7 @@
     if (strict === undefined) strict = true;
     var allowPositionals = objectGetOwn(config, 'allowPositionals');
     if (allowPositionals === undefined) allowPositionals = !strict;
-    var allowNegative = objectGetOwn(config, 'allowNegative') === true;
+    // NOTE: allowNegative (--no-foo) is not yet implemented — tracked separately.
     var returnTokens = objectGetOwn(config, 'tokens') === true;
     var options = objectGetOwn(config, 'options') || {};
 
@@ -258,7 +271,7 @@
       throw codedError('ERR_INVALID_ARG_TYPE', 'The "options" argument must be of type object');
     }
 
-    var tokens = argsToTokens(args, options, allowNegative);
+    var tokens = argsToTokens(args, options);
 
     var result = { values: { __proto__: null }, positionals: [] };
     if (returnTokens) result.tokens = tokens;

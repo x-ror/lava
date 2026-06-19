@@ -62,4 +62,35 @@ assert.equal(Array.isArray(r.tokens), true);
 assert.equal(r.tokens[0].kind, 'option');
 assert.equal(r.tokens[0].name, 'foo');
 
+// a string short option later in a group keeps its value (-abVALUE -> a:true, b:'VALUE')
+r = parseArgs({
+  args: ['-abVALUE'],
+  options: { a: { type: 'boolean', short: 'a' }, b: { type: 'string', short: 'b' } },
+});
+assert.deepEqual({ ...r.values }, { a: true, b: 'VALUE' });
+
+// a value flag does not leak into the next lone short option (-n x -f)
+r = parseArgs({
+  args: ['-n', 'x', '-f'],
+  options: {
+    name: { type: 'string', short: 'n' },
+    flag: { type: 'boolean', short: 'f' },
+  },
+});
+assert.deepEqual({ ...r.values }, { name: 'x', flag: true });
+
+// an unknown inline option keeps its value under strict:false
+r = parseArgs({ args: ['--foo=bar'], strict: false, options: {} });
+assert.deepEqual({ ...r.values }, { foo: 'bar' });
+
+// a consumed option value advances the token index for following positionals
+r = parseArgs({
+  args: ['--name', 'x', 'pos'],
+  options: { name: { type: 'string' } },
+  allowPositionals: true,
+  tokens: true,
+});
+const positional = r.tokens.find((t) => t.kind === 'positional');
+assert.equal(positional.index, 2);
+
 console.log('ok');
