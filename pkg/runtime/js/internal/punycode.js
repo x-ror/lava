@@ -23,8 +23,15 @@
   var floor = Math.floor;
   var stringFromCharCode = String.fromCharCode;
 
+  // Node-exact error messages (the standalone punycode.js strings).
+  var errors = {
+    overflow: 'Overflow: input needs wider integers to process',
+    'not-basic': 'Illegal input >= 0x80 (not a basic code point)',
+    'invalid-input': 'Invalid input',
+  };
+
   function error(type) {
-    throw new RangeError('punycode: ' + type);
+    throw new RangeError(errors[type]);
   }
 
   function map(array, fn) {
@@ -68,22 +75,20 @@
   }
 
   function ucs2encode(array) {
+    // String.fromCodePoint throws a RangeError on an out-of-range/invalid code point
+    // (matching Node's punycode.ucs2.encode) instead of silently wrapping via
+    // fromCharCode; it also emits the surrogate pair for astral code points.
     return map(array, function (value) {
-      var output = '';
-      if (value > 0xffff) {
-        value -= 0x10000;
-        output += stringFromCharCode(((value >>> 10) & 0x3ff) | 0xd800);
-        value = 0xdc00 | (value & 0x3ff);
-      }
-      output += stringFromCharCode(value);
-      return output;
+      return String.fromCodePoint(value);
     }).join('');
   }
 
   function basicToDigit(codePoint) {
-    if (codePoint - 48 < 10) return codePoint - 22;
-    if (codePoint - 65 < 26) return codePoint - 65;
-    if (codePoint - 97 < 26) return codePoint - 97;
+    // Bounded on BOTH ends so a non-alphanumeric byte (e.g. '$') maps to `base` —
+    // an invalid digit the decoder rejects — rather than a spurious/negative digit.
+    if (codePoint >= 0x30 && codePoint < 0x3a) return codePoint - 0x16; // '0'-'9' -> 26-35
+    if (codePoint >= 0x41 && codePoint < 0x5b) return codePoint - 0x41; // 'A'-'Z' -> 0-25
+    if (codePoint >= 0x61 && codePoint < 0x7b) return codePoint - 0x61; // 'a'-'z' -> 0-25
     return base;
   }
 
