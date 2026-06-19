@@ -420,6 +420,7 @@
     inherits: inherits,
     deprecate: deprecate,
     isDeepStrictEqual: isDeepStrictEqual,
+    parseArgs: require('parse_args').parseArgs,
     // Node exposes the same object via require('node:util').types and
     // require('node:util/types'); many packages use the former.
     types: require('util/types'),
