@@ -40,10 +40,17 @@ Dns_Lookup_Result :: struct {
 // see dns_shutdown_active). The worker thread writes results/ok/err_code;
 // post_async's lock publishes those writes to the loop thread that reads them.
 Dns_Lookup_Request :: struct {
-	ctx:      jsc.JSContextRef,
-	loop:     ^eventloop.Loop,
-	callback: jsc.JSObjectRef, // GC-protected JS callback(errCode|null, addresses|null)
-	hostname: string, // owned clone (the worker reads it off-loop)
+	ctx:       jsc.JSContextRef,
+	loop:      ^eventloop.Loop,
+	callback:  jsc.JSObjectRef, // GC-protected JS callback(errCode|null, addresses|null)
+	// allocator owns `hostname` and the request struct. Captured from the owning
+	// Runtime_State at creation rather than read from the ambient context, because the
+	// clone happens inside a `proc "c"` (context reset to runtime.default_context) but
+	// the free runs from dns_request_free under the loop/teardown context. Routing
+	// alloc+free through this stored allocator keeps the pair matched. (results carries
+	// its own bound allocator, so plain delete() frees it correctly.)
+	allocator: runtime.Allocator,
+	hostname:  string, // owned clone (the worker reads it off-loop)
 	family:   int, // 0 (any) | 4 | 6
 	order:    int, // ORDER_* (which family to prefer / how to concatenate)
 	all:      bool,
@@ -91,14 +98,22 @@ dns_lookup_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
+	// Capture the owning allocator from the Runtime_State (not the ambient proc "c"
+	// context) so the hostname clone and the struct are freed through the same
+	// allocator at teardown. Falls back to context.allocator when there is no state.
+	state := get_state_from_ctx(ctx)
+	alloc := context.allocator
+	if state != nil do alloc = state.allocator
+
 	hostname, host_alloc := jsc_value_to_string_or_default(ctx, args[0])
 	defer if host_alloc do delete(hostname, context.allocator)
 
-	req := new(Dns_Lookup_Request)
+	req := new(Dns_Lookup_Request, alloc)
+	req.allocator = alloc
 	req.ctx = ctx
 	req.loop = loop
 	req.callback = callback
-	req.hostname = strings.clone(hostname) // the worker reads this off-loop
+	req.hostname = strings.clone(hostname, alloc) // the worker reads this off-loop
 	req.family = int(jsc.JSValueToNumber(ctx, args[1], nil))
 	req.order = int(jsc.JSValueToNumber(ctx, args[2], nil))
 	req.all = jsc.JSValueToBoolean(ctx, args[3])
@@ -112,15 +127,15 @@ dns_lookup_cb :: proc "c" (
 	if worker == nil {
 		eventloop.async_cancel(loop)
 		jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)callback)
-		delete(req.hostname)
-		free(req)
+		delete(req.hostname, req.allocator)
+		free(req, req.allocator)
 		if exception != nil do exception^ = make_js_error(ctx, "dns: could not start resolver thread")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	req.worker = worker
 	// Track the in-flight request so eval teardown can join the worker before the
 	// loop/context die, even if a top-level throw skips eventloop.run entirely.
-	dns_track_active(get_state_from_ctx(ctx), req)
+	dns_track_active(state, req)
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
@@ -302,8 +317,8 @@ dns_request_free :: proc(req: ^Dns_Lookup_Request) {
 		req.callback = nil
 	}
 	delete(req.results)
-	delete(req.hostname)
-	free(req)
+	delete(req.hostname, req.allocator)
+	free(req, req.allocator)
 }
 
 // dns_shutdown_active joins and frees every in-flight lookup WITHOUT invoking its

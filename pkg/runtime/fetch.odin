@@ -103,6 +103,16 @@ Fetch_Request :: struct {
 	body_loop_held:    bool, // a loop keep-alive is held for the whole body-write phase
 
 	// Owned copies (the JSC-derived strings they came from do not outlive the call).
+	// allocator owns every heap allocation below (the struct itself, the cloned
+	// strings, and request_bytes). It is captured from the owning Runtime_State at
+	// creation rather than read from the ambient context, because these are cloned
+	// inside a `proc "c"` (where context is reset to runtime.default_context) but
+	// freed by fetch_free_request from TWO contexts — fetch_reclaim_pending (normal
+	// operation) and fetch_destroy_pending (teardown). Routing alloc+free through
+	// this stored allocator keeps the pair matched regardless of the active context.
+	// (The dynamic-array fields response/carry/body_out carry their own bound
+	// allocator, so delete() frees them correctly without help here.)
+	allocator:     runtime.Allocator,
 	url:           string,
 	host:          string,
 	path:          string,
@@ -419,16 +429,25 @@ fetch_request_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
+	// Capture the owning allocator from the Runtime_State (not the ambient proc "c"
+	// context) so every clone below is freed through the same allocator at reclaim
+	// AND at teardown. Falls back to context.allocator when there is no state, which
+	// preserves the historical default-heap behavior.
+	state := get_state_from_ctx(ctx)
+	alloc := context.allocator
+	if state != nil do alloc = state.allocator
+
 	// Reclaim any prior settled requests now that we are safely past the loop
 	// iterations that settled them.
-	if state := get_state_from_ctx(ctx); state != nil do fetch_reclaim_pending(state)
+	if state != nil do fetch_reclaim_pending(state)
 
 	body: []byte
 	if !stream_body {
 		if view, has_body := typed_array_view(ctx, arguments[3]); has_body do body = view
 	}
 
-	req := new(Fetch_Request)
+	req := new(Fetch_Request, alloc)
+	req.allocator = alloc
 	req.ctx = ctx
 	req.loop = loop
 	req.on_response = on_response
@@ -438,10 +457,10 @@ fetch_request_cb :: proc "c" (
 	req.body_streaming = stream_body
 	req.on_body_drain = on_body_drain
 	req.body_len = -1
-	req.method = strings.clone(method)
-	req.url = strings.clone(url)
-	req.host = strings.clone(host)
-	req.path = strings.clone(path)
+	req.method = strings.clone(method, alloc)
+	req.url = strings.clone(url, alloc)
+	req.host = strings.clone(host, alloc)
+	req.path = strings.clone(path, alloc)
 	req.port = port // needed by the deferred connect after async DNS resolves
 	req.is_https = scheme == "https"
 	// Serialize while the JSC-borrowed `body`/`header_lines` are still valid; the
@@ -455,6 +474,7 @@ fetch_request_cb :: proc "c" (
 		body,
 		req.is_https,
 		stream_body,
+		alloc,
 	)
 
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_response)
@@ -486,7 +506,7 @@ fetch_request_cb :: proc "c" (
 		jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)end_fn)
 		req.end_body_fn = end_fn
 	}
-	if state := get_state_from_ctx(ctx); state != nil do fetch_track_active(state, req)
+	if state != nil do fetch_track_active(state, req)
 
 	started, err := fetch_transport_start(req, host, port)
 	if !started {
@@ -645,7 +665,8 @@ fetch_parse_chunk_size :: proc(s: string) -> (size: int, ok: bool) {
 // Content-Length — the body is streamed afterward as chunked frames (see the
 // body-write state machine in fetch_transport.odin); otherwise it emits a
 // Content-Length for a non-empty buffered body. The returned buffer is allocated
-// on context.allocator and owned by the request.
+// on `alloc` (the owning request's allocator) and owned by the request, so it is
+// freed through the same allocator by fetch_free_request.
 build_http_request :: proc(
 	method, host: string,
 	port: int,
@@ -653,8 +674,9 @@ build_http_request :: proc(
 	body: []byte,
 	is_https: bool,
 	chunked: bool,
+	alloc: runtime.Allocator,
 ) -> []byte {
-	b := strings.builder_make(context.allocator)
+	b := strings.builder_make(alloc)
 	strings.write_string(&b, method)
 	strings.write_byte(&b, ' ')
 	// Origin-form request target always begins with '/': a query-only path
@@ -1071,18 +1093,23 @@ fetch_shutdown_active :: proc(state: ^Runtime_State) {
 	fetch_dns_pool_shutdown()
 }
 
-// fetch_free_request releases a settled request's owned allocations.
+// fetch_free_request releases a settled request's owned allocations. The cloned
+// strings, request_bytes, and the struct itself are freed through req.allocator —
+// the allocator they were created with — so the alloc/free pair stays matched
+// whether this runs from fetch_reclaim_pending (normal op) or fetch_destroy_pending
+// (teardown). response/carry/body_out carry their own bound allocator, so plain
+// delete() frees them correctly.
 @(private = "file")
 fetch_free_request :: proc(req: ^Fetch_Request) {
-	delete(req.method)
-	delete(req.url)
-	delete(req.host)
-	delete(req.path)
-	if req.request_bytes != nil do delete(req.request_bytes)
+	delete(req.method, req.allocator)
+	delete(req.url, req.allocator)
+	delete(req.host, req.allocator)
+	delete(req.path, req.allocator)
+	if req.request_bytes != nil do delete(req.request_bytes, req.allocator)
 	delete(req.response)
 	delete(req.carry)
 	delete(req.body_out)
-	free(req)
+	free(req, req.allocator)
 }
 
 // fetch_reclaim_pending frees every settled request awaiting cleanup. Called at the
