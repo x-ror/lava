@@ -963,8 +963,10 @@ is_cancel_requested :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 // --- Timer min-heap (keyed on due_ms, then seq) ---
 
 // timer_less orders the heap: earliest due_ms first, seq breaking ties so equal
-// deadlines fire in scheduling (FIFO) order, matching Node.
-timer_less :: proc(a, b: Timer) -> bool {
+// deadlines fire in scheduling (FIFO) order, matching Node. Takes pointers (the
+// elements are already in loop.timers) to avoid copying a whole Timer per compare —
+// this runs O(log n) times per push/pop in the heap sift loops. Read-only.
+timer_less :: proc(a, b: ^Timer) -> bool {
 	return a.due_ms < b.due_ms || (a.due_ms == b.due_ms && a.seq < b.seq)
 }
 
@@ -974,7 +976,7 @@ timer_heap_push :: proc(loop: ^Loop, timer: Timer) {
 	i := len(loop.timers) - 1
 	for i > 0 {
 		parent := (i - 1) / 2
-		if !timer_less(loop.timers[i], loop.timers[parent]) {
+		if !timer_less(&loop.timers[i], &loop.timers[parent]) {
 			break
 		}
 		loop.timers[i], loop.timers[parent] = loop.timers[parent], loop.timers[i]
@@ -1003,10 +1005,10 @@ timer_heap_sift_down :: proc(loop: ^Loop, start: int) {
 		left := 2 * i + 1
 		right := 2 * i + 2
 		smallest := i
-		if left < n && timer_less(loop.timers[left], loop.timers[smallest]) {
+		if left < n && timer_less(&loop.timers[left], &loop.timers[smallest]) {
 			smallest = left
 		}
-		if right < n && timer_less(loop.timers[right], loop.timers[smallest]) {
+		if right < n && timer_less(&loop.timers[right], &loop.timers[smallest]) {
 			smallest = right
 		}
 		if smallest == i {
