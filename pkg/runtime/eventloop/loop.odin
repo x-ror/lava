@@ -459,14 +459,25 @@ set_immediate :: proc(
 // queue_io_callback registers a poll-phase completion callback (e.g. an async
 // fs.readFile whose result is ready). It runs in the poll phase — after timers,
 // before check (setImmediate) — matching Node's I/O-callback ordering.
-queue_io_callback :: proc(loop: ^Loop, callback: Callback, user_data: rawptr = nil) -> Timer_ID {
+queue_io_callback :: proc(
+	loop: ^Loop,
+	callback: Callback,
+	user_data: rawptr = nil,
+	dispose: Dispose = nil,
+) -> Timer_ID {
 	if callback == nil {
 		return 0
 	}
 	id := next_handle_id(loop)
 	append(
 		&loop.io_callbacks,
-		Task{id = id, callback = callback, user_data = user_data, seq = next_sequence(loop)},
+		Task {
+			id = id,
+			callback = callback,
+			user_data = user_data,
+			dispose = dispose,
+			seq = next_sequence(loop),
+		},
 	)
 	return id
 }
