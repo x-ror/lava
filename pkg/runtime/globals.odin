@@ -897,6 +897,8 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"url", INTERNAL_URL},
 		{"structured_clone", INTERNAL_STRUCTURED_CLONE},
 		{"path", INTERNAL_PATH},
+		{"path/posix", INTERNAL_PATH_POSIX},
+		{"path/win32", INTERNAL_PATH_WIN32},
 		{"sqlite", INTERNAL_SQLITE},
 		{"dns", INTERNAL_DNS},
 		{"dns/promises", INTERNAL_DNS_PROMISES},
@@ -1173,6 +1175,8 @@ INTERNAL_ENCODING :: #load("js/internal/encoding.js", string)
 INTERNAL_URL :: #load("js/internal/url.js", string)
 INTERNAL_STRUCTURED_CLONE :: #load("js/internal/structured_clone.js", string)
 INTERNAL_PATH :: #load("js/internal/path.js", string)
+INTERNAL_PATH_POSIX :: #load("js/internal/path_posix.js", string)
+INTERNAL_PATH_WIN32 :: #load("js/internal/path_win32.js", string)
 INTERNAL_SQLITE :: #load("js/internal/sqlite.js", string)
 INTERNAL_DNS :: #load("js/internal/dns.js", string)
 INTERNAL_DNS_PROMISES :: #load("js/internal/dns_promises.js", string)
