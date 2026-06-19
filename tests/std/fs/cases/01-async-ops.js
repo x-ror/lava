@@ -33,8 +33,19 @@ fs.writeFile(file, payload, (writeErr) => {
         assert.ok(missErr, 'reading a missing file must error');
         assert.equal(missErr.code, 'ENOENT');
         assert.equal(missing, undefined);
-        fs.rmSync(dir, { recursive: true, force: true });
-        console.log('ok');
+
+        // Async WRITE error: writing under a missing parent directory fails. Exercises
+        // fs_write_work's error population + fs_op_complete_cb's error branch end-to-end.
+        // Assert only the shape (a non-empty code string + numeric errno), not an exact
+        // code, so node and lava agree across platforms.
+        fs.writeFile(path.join(dir, 'no-such-dir', 'x.txt'), 'data', (badErr) => {
+          assert.ok(badErr, 'writing under a missing directory must error');
+          assert.equal(typeof badErr.code, 'string');
+          assert.ok(badErr.code.length > 0);
+          assert.equal(typeof badErr.errno, 'number');
+          fs.rmSync(dir, { recursive: true, force: true });
+          console.log('ok');
+        });
       });
     });
   });

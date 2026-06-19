@@ -180,13 +180,16 @@ bad frees).
 
 ### 4.2 Concurrency model
 
-**Single VM, single JS thread, single context.** Off-loop work runs on a per-loop
-worker pool (`threadpool.odin`): the DNS resolver, and now async `fs.readFile`/
-`writeFile` (§5.2). There are still no `worker_threads` and no isolates, and the
-`*Sync` APIs and `crypto` KDFs still run on the loop thread — but blocking file I/O no
-longer does. A worker touches only its own request; all JS-value work stays on the loop
-thread. Lifting the remaining blocking ops (async `fs.stat`/`readdir`, `crypto`) onto
-the same pool is the rest of §5.2.
+**Single VM, single JS thread, single context.** The generic per-loop worker pool
+(`threadpool.odin`) currently backs **async `fs.readFile`/`writeFile` only** (§5.2). DNS
+still runs its own off-loop work — `node:dns` spawns a thread per lookup (`dns.odin`)
+and `fetch` uses a separate process-global resolver pool (`g_fetch_dns_pool`); neither
+has been migrated onto the generic pool yet (the generic pool generalizes the fetch DNS
+pool's design, but nothing was moved over). There are no `worker_threads` and no
+isolates, and the `*Sync` APIs and `crypto` KDFs still run on the loop thread — but
+blocking file I/O no longer does. A worker touches only its own request; all JS-value
+work stays on the loop thread. Migrating DNS/fetch onto the generic pool and lifting the
+remaining blocking ops (async `fs.stat`/`readdir`, `crypto`) onto it is the rest of §5.2.
 
 ### 4.3 The FFI trust boundary — resolved (#159)
 
@@ -274,9 +277,12 @@ in-flight work without leak/hang).
 
 **Remaining.**
 - **Step 2 — `fs.readFile`/`writeFile` — done (`fs.odin`).** The blocking read/write
-  runs off-loop on the pool (`fs_read_work`/`fs_write_work`, touching only the request);
-  `writeFile`'s bytes are marshalled into an owned copy on the loop thread first, since
-  a worker must not read the JS value. The completion bridges the phase gap the doc
+  syscall runs off-loop on the pool (`fs_read_work`/`fs_write_work`, touching only the
+  request). `writeFile` first snapshots its bytes into an owned copy *on the loop thread*
+  (a worker must not read — and JS must not mutate/detach — the live buffer, exactly as
+  Node copies into a Buffer), so for a write only the syscall is off-loop, not the
+  payload copy; that copy is bounded and still strictly better than master, which ran the
+  whole blocking write on-loop. The completion bridges the phase gap the doc
   flagged: `post_async` drains at the *top* of the tick, but the loop-thread `done`
   (`fs_*_pool_done`) re-queues via `queue_io_callback` so the callback still fires in the
   **poll phase** — preserving Node's I/O-before-`setImmediate` ordering (guarded by

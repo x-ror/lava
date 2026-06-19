@@ -62,21 +62,21 @@ fs_read_file_sync_cb :: proc "c" (
 // FS_Read_Request carries an async fs.readFile across three stages: the loop thread
 // builds it, a pool worker reads the file off-loop (fs_read_work — touches ONLY this
 // struct, never JSC/the loop), and the poll-phase completion (fs_read_complete_cb)
-// invokes the JS callback with (err, data). allocator owns path/data/err strings; it
+// invokes the JS callback with (err, data). allocator owns path/data/err_msg; it
 // is the heap allocator (the proc "c" resets context to runtime.default_context), which
 // also matches jsc_buffer_deallocator so a Buffer result handed to JSC frees correctly.
+// The error's `path` property reuses req.path (no separate clone).
 FS_Read_Request :: struct {
 	ctx:       jsc.JSContextRef,
 	callback:  jsc.JSObjectRef, // GC-protected until the completion fires (or dispose at teardown)
-	allocator: runtime.Allocator, // owns path/data/err strings; heap, matches the JSC deallocator
-	path:      string, // owned clone; the worker reads this file off-loop
+	allocator: runtime.Allocator, // owns path/data/err_msg; heap, matches the JSC deallocator
+	path:      string, // owned clone; the worker reads this file off-loop (also the error path)
 	data:      []byte, // file contents on success (ownership handed to JSC for a Buffer result)
 	ok:        bool,
 	as_string: bool, // an encoding was supplied → deliver a string, else a Uint8Array
 	err_msg:   string,
 	err_code:  string, // static literal (not freed)
 	err_errno: int,
-	err_path:  string,
 }
 
 // fs.readFile(path[, options], callback). The blocking read runs OFF the loop on the
@@ -166,7 +166,6 @@ fs_read_work :: proc(user_data: rawptr) {
 	if read_err != os.ERROR_NONE {
 		req.ok = false
 		req.err_code, req.err_errno = fs_os_error_to_code(read_err)
-		req.err_path, _ = strings.clone(req.path, req.allocator)
 		req.err_msg = fmt.aprintf(
 			"%s: %s, open '%s'",
 			req.err_code,
@@ -206,7 +205,6 @@ fs_read_request_free :: proc(req: ^FS_Read_Request) {
 	if req.data != nil do delete(req.data, a)
 	if len(req.path) > 0 do delete(req.path, a)
 	if len(req.err_msg) > 0 do delete(req.err_msg, a)
-	if len(req.err_path) > 0 do delete(req.err_path, a)
 	free(req, a)
 }
 
@@ -238,7 +236,7 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 		if jsc.JSValueIsObject(ctx, err) {
 			err_obj := cast(jsc.JSObjectRef)err
 			set_named(ctx, err_obj, "code", js_string_value(ctx, req.err_code))
-			set_named(ctx, err_obj, "path", js_string_value(ctx, req.err_path))
+			set_named(ctx, err_obj, "path", js_string_value(ctx, req.path))
 			set_named(ctx, err_obj, "syscall", js_string_value(ctx, "open"))
 			if req.err_errno != 0 {
 				set_named(ctx, err_obj, "errno", jsc.JSValueMakeNumber(ctx, f64(-req.err_errno)))
@@ -498,7 +496,6 @@ fs_write_work :: proc(user_data: rawptr) {
 	} else {
 		req.ok = false
 		req.err_code, req.err_errno = fs_os_error_to_code(write_err)
-		req.err_path, _ = strings.clone(req.path, req.allocator)
 	}
 }
 
@@ -521,24 +518,22 @@ fs_op_request_free :: proc(req: ^FS_Op_Request) {
 	a := req.allocator
 	if req.write_data != nil do delete(req.write_data, a)
 	if len(req.path) > 0 do delete(req.path, a)
-	if len(req.err_path) > 0 do delete(req.err_path, a)
 	free(req, a)
 }
 
 // FS_Op_Request backs async fs operations whose callback takes only (err) — today
 // fs.writeFile. The data to write is marshalled into an owned copy (write_data) on the
 // loop thread, since the worker that performs the write must not touch the JS value it
-// came from. allocator (heap) owns path/write_data/err_path.
+// came from. allocator (heap) owns path/write_data; the error path reuses req.path.
 FS_Op_Request :: struct {
 	ctx:        jsc.JSContextRef,
 	callback:   jsc.JSObjectRef,
 	allocator:  runtime.Allocator,
-	path:       string, // owned clone; the worker writes to this path off-loop
+	path:       string, // owned clone; the worker writes to this path off-loop (also the error path)
 	write_data: []byte, // owned copy of the bytes to write (nil = empty file)
 	ok:         bool,
 	err_code:   string, // static literal (not freed)
 	err_errno:  int,
-	err_path:   string,
 	syscall:    string,
 }
 
@@ -552,7 +547,7 @@ fs_op_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	if req.ok {
 		call_args[0] = jsc.JSValueMakeNull(ctx)
 	} else {
-		call_args[0] = fs_make_error(ctx, req.err_code, req.syscall, req.err_path, req.err_errno)
+		call_args[0] = fs_make_error(ctx, req.err_code, req.syscall, req.path, req.err_errno)
 	}
 
 	exception: jsc.JSValueRef
