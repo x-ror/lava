@@ -63,6 +63,13 @@ jobs:
       - name: Fetch transport smoke
         run: make test-fetch-smoke
 
+      # Benchmarks: print the node-vs-Lava ratio table in the job log. Report-only for
+      # now (never fails) because the bench/thresholds.json caps are uncalibrated
+      # starters — once the ratios here are observed and the caps tightened, flip this
+      # to `make bench-gate` to enforce regressions. See bench/README.md.
+      - name: Benchmarks (report-only)
+        run: make bench
+
   macos:
     name: macOS (full build + tests)
     runs-on: macos-latest

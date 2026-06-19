@@ -1,0 +1,16 @@
+{
+  "//": "Per-benchmark gate caps for `make bench-gate` (scripts/run-bench.sh --gate).",
+  "//notes": "Each value is the MAX acceptable lava/node wall-time ratio (lava is allowed to be up to Nx Node's time). A benchmark with no entry here is report-only (never fails the gate). These starters are intentionally generous so they catch only catastrophic regressions and never flake; tighten them toward the real ratios printed by `make bench` once a baseline has been observed on CI. Lower = stricter.",
+  "caps": {
+    "startup": 6.0,
+    "json-parse": 4.0,
+    "json-stringify": 4.0,
+    "buffer-to-hex": 4.0,
+    "buffer-to-base64": 4.0,
+    "buffer-from-utf8": 4.0,
+    "buffer-to-utf8": 4.0,
+    "require-builtin-events": 5.0,
+    "require-builtin-util": 5.0,
+    "fs-write-read-64k": 3.0
+  }
+}
