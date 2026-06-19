@@ -59,25 +59,32 @@ fs_read_file_sync_cb :: proc "c" (
 	return make_uint8_array(ctx, data)
 }
 
-// FS_Read_Request carries an async fs.readFile result from the (synchronous) read
-// to the poll-phase callback that invokes the JS callback with (err, data).
+// FS_Read_Request carries an async fs.readFile across three stages: the loop thread
+// builds it, a pool worker reads the file off-loop (fs_read_work — touches ONLY this
+// struct, never JSC/the loop), and the poll-phase completion (fs_read_complete_cb)
+// invokes the JS callback with (err, data). allocator owns path/data/err_msg; it
+// is the heap allocator (the proc "c" resets context to runtime.default_context), which
+// also matches jsc_buffer_deallocator so a Buffer result handed to JSC frees correctly.
+// The error's `path` property reuses req.path (no separate clone).
 FS_Read_Request :: struct {
 	ctx:       jsc.JSContextRef,
-	callback:  jsc.JSObjectRef, // GC-protected until the completion fires
-	data:      []byte, // file contents on success (ownership handed to JSC for Buffer)
+	callback:  jsc.JSObjectRef, // GC-protected until the completion fires (or dispose at teardown)
+	allocator: runtime.Allocator, // owns path/data/err_msg; heap, matches the JSC deallocator
+	path:      string, // owned clone; the worker reads this file off-loop (also the error path)
+	data:      []byte, // file contents on success (ownership handed to JSC for a Buffer result)
 	ok:        bool,
 	as_string: bool, // an encoding was supplied → deliver a string, else a Uint8Array
 	err_msg:   string,
-	err_code:  string,
+	err_code:  string, // static literal (not freed)
 	err_errno: int,
-	err_path:  string,
 }
 
-// fs.readFile(path[, options], callback). The file is read synchronously and the
-// callback is delivered on the event loop's poll phase (queue_io_callback), so it
-// runs before any setImmediate scheduled in the same turn — matching Node's
-// I/O-callback ordering. (This is not yet threadpool-backed async I/O; the read
-// itself is synchronous, but the callback timing matches.)
+// fs.readFile(path[, options], callback). The blocking read runs OFF the loop on the
+// worker pool (fs_read_work); its completion is delivered on the loop's poll phase
+// (fs_read_complete_cb re-queued via queue_io_callback by fs_read_pool_done), so the
+// callback still runs before any setImmediate scheduled in the same turn — matching
+// Node's I/O-before-check ordering. With no loop bound (bare eval) or if the pool
+// cannot start, it falls back to a synchronous read, preserving the old behavior.
 fs_read_file_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -118,37 +125,87 @@ fs_read_file_cb :: proc "c" (
 		}
 	}
 
-	req := new(FS_Read_Request)
+	// context is runtime.default_context here (proc "c"), so context.allocator is the
+	// heap allocator — capture it so the off-loop worker and the completion agree, and
+	// so a Buffer result freed by jsc_buffer_deallocator (also heap) matches.
+	alloc := context.allocator
+	req := new(FS_Read_Request, alloc)
 	req.ctx = ctx
 	req.callback = callback
+	req.allocator = alloc
 	req.as_string = as_string
+	req.path = strings.clone(path_str, alloc)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)callback)
 
-	data, read_err2 := os.read_entire_file(path_str, context.allocator)
-	if read_err2 != os.ERROR_NONE {
+	loop := get_loop_from_ctx(ctx)
+	// Happy path: read off-loop on the pool. pool_submit keeps the loop alive until the
+	// completion posts; fs_read_pool_done then re-queues onto the poll phase.
+	if loop != nil &&
+	   eventloop.pool_submit(loop, fs_read_work, fs_read_pool_done, req, fs_read_dispose) {
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	// Fallback (no loop, or the pool could not start): read synchronously here, then
+	// deliver on the poll phase if there is a loop, else inline.
+	fs_read_work(req)
+	if loop != nil {
+		eventloop.queue_io_callback(loop, fs_read_complete_cb, req, fs_read_dispose)
+	} else {
+		fs_read_complete_cb(nil, req)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// fs_read_work performs the blocking read. It runs on a pool worker (off the loop) on
+// the happy path, and inline on the fallback path — either way it touches ONLY req
+// (never JSC or the loop), reading through req.allocator so the result is owned
+// independently of any thread's context.
+fs_read_work :: proc(user_data: rawptr) {
+	req := cast(^FS_Read_Request)user_data
+	data, read_err := os.read_entire_file(req.path, req.allocator)
+	if read_err != os.ERROR_NONE {
 		req.ok = false
-		req.err_code, req.err_errno = fs_os_error_to_code(read_err2)
-		req.err_path, _ = strings.clone(path_str, context.allocator)
+		req.err_code, req.err_errno = fs_os_error_to_code(read_err)
 		req.err_msg = fmt.aprintf(
 			"%s: %s, open '%s'",
 			req.err_code,
 			fs_errno_text(req.err_code),
-			path_str,
-			allocator = context.allocator,
+			req.path,
+			allocator = req.allocator,
 		)
 	} else {
 		req.ok = true
 		req.data = data
 	}
+}
 
-	loop := get_loop_from_ctx(ctx)
-	if loop != nil {
-		eventloop.queue_io_callback(loop, fs_read_complete_cb, req)
-	} else {
-		// No loop bound (e.g. bare eval): deliver inline so the callback still runs.
-		fs_read_complete_cb(nil, req)
-	}
-	return jsc.JSValueMakeUndefined(ctx)
+// fs_read_pool_done runs on the loop thread (via post_async) once the worker finishes.
+// It re-queues the completion onto the POLL phase so fs.readFile keeps Node's
+// I/O-before-setImmediate ordering (post_async drains at the top of the tick, not in
+// poll). The dispose hook frees the request if the loop tears down before poll runs it.
+fs_read_pool_done :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	eventloop.queue_io_callback(loop, fs_read_complete_cb, user_data, fs_read_dispose)
+}
+
+// fs_read_dispose releases a request whose completion will never run — the pool job was
+// dropped at teardown, or the re-queued poll callback was discarded when the loop died.
+// Exactly one of {fs_read_complete_cb, fs_read_dispose} runs per request.
+fs_read_dispose :: proc(user_data: rawptr) {
+	context = runtime.default_context()
+	req := cast(^FS_Read_Request)user_data
+	if req == nil do return
+	if req.callback != nil do jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.callback)
+	fs_read_request_free(req)
+}
+
+// fs_read_request_free releases everything the request owns. req.data is freed only when
+// it is still owned here (the Buffer success path hands it to JSC and nils it first).
+fs_read_request_free :: proc(req: ^FS_Read_Request) {
+	a := req.allocator
+	if req.data != nil do delete(req.data, a)
+	if len(req.path) > 0 do delete(req.path, a)
+	if len(req.err_msg) > 0 do delete(req.err_msg, a)
+	free(req, a)
 }
 
 // fs_read_complete_cb runs in the poll phase and invokes the JS callback with the
@@ -164,20 +221,22 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 		call_args[0] = jsc.JSValueMakeNull(ctx)
 		if req.as_string {
 			call_args[1] = js_string_value(ctx, string(req.data))
-			delete(req.data, context.allocator)
+			// req.data is freed by fs_read_request_free below (still owned here).
 		} else {
 			// Async completion runs from the event loop (not a JSC callback), so this
 			// must go through make_uint8_array, which enters the VM around the creation
 			// (see typed_array.odin) — a bare C-API typed-array call here would abort on
-			// a GC. make_uint8_array owns req.data and frees it on collection.
+			// a GC. make_uint8_array takes ownership of req.data, so nil it to keep
+			// fs_read_request_free from double-freeing what JSC now owns.
 			call_args[1] = make_uint8_array(ctx, req.data)
+			req.data = nil
 		}
 	} else {
 		err := make_js_error(ctx, req.err_msg)
 		if jsc.JSValueIsObject(ctx, err) {
 			err_obj := cast(jsc.JSObjectRef)err
 			set_named(ctx, err_obj, "code", js_string_value(ctx, req.err_code))
-			set_named(ctx, err_obj, "path", js_string_value(ctx, req.err_path))
+			set_named(ctx, err_obj, "path", js_string_value(ctx, req.path))
 			set_named(ctx, err_obj, "syscall", js_string_value(ctx, "open"))
 			if req.err_errno != 0 {
 				set_named(ctx, err_obj, "errno", jsc.JSValueMakeNumber(ctx, f64(-req.err_errno)))
@@ -185,8 +244,6 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 		}
 		call_args[0] = err
 		call_args[1] = jsc.JSValueMakeUndefined(ctx)
-		if len(req.err_msg) > 0 do delete(req.err_msg, context.allocator)
-		if len(req.err_path) > 0 do delete(req.err_path, context.allocator)
 	}
 
 	exception: jsc.JSValueRef
@@ -197,7 +254,7 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	}
 
 	jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)req.callback)
-	free(req)
+	fs_read_request_free(req)
 }
 
 // --- node:fs: writes, directories, stat ---
@@ -348,8 +405,11 @@ fs_write_file_sync_cb :: proc "c" (
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
-// fs.writeFile(path, data[, options], callback) — writes synchronously, then
-// delivers callback(err) on the poll phase (same infra as readFile).
+// fs.writeFile(path, data[, options], callback). The data is marshalled into an owned
+// buffer here on the loop thread (the worker must not read the JS value), the blocking
+// write runs off-loop on the pool, and callback(err) is delivered on the poll phase
+// (same ordering infra as readFile). Falls back to a synchronous write with no loop or
+// if the pool cannot start.
 fs_write_file_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -372,38 +432,109 @@ fs_write_file_cb :: proc "c" (
 	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
 	defer if path_alloc do delete(path_str, context.allocator)
 
-	req := new(FS_Op_Request)
+	// context.allocator is the heap allocator here (proc "c"); capture it so the owned
+	// path/data outlive this call and the worker frees through the same allocator.
+	alloc := context.allocator
+	req := new(FS_Op_Request, alloc)
 	req.ctx = ctx
 	req.callback = callback
+	req.allocator = alloc
 	req.syscall = "open"
+	req.path = strings.clone(path_str, alloc)
+	// Marshal the bytes to write into an owned copy NOW (JSC access is loop-thread only;
+	// the worker writes from this buffer, not from the JS value).
+	req.write_data = fs_marshal_write_data(ctx, args[1], alloc)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)callback)
 
-	if write_ok, write_err := fs_write_value(ctx, path_str, args[1]); write_ok {
-		req.ok = true
-	} else {
-		req.ok = false
-		req.err_code, req.err_errno = fs_os_error_to_code(write_err)
-		req.err_path, _ = strings.clone(path_str, context.allocator)
+	loop := get_loop_from_ctx(ctx)
+	if loop != nil &&
+	   eventloop.pool_submit(loop, fs_write_work, fs_write_pool_done, req, fs_write_dispose) {
+		return jsc.JSValueMakeUndefined(ctx)
 	}
 
-	loop := get_loop_from_ctx(ctx)
+	fs_write_work(req)
 	if loop != nil {
-		eventloop.queue_io_callback(loop, fs_op_complete_cb, req)
+		eventloop.queue_io_callback(loop, fs_op_complete_cb, req, fs_write_dispose)
 	} else {
 		fs_op_complete_cb(nil, req)
 	}
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
-// FS_Op_Request backs async fs operations whose callback takes only (err).
+// fs_marshal_write_data copies the bytes to write out of the JS value into an owned
+// buffer (allocated on `alloc`). A typed array's bytes are copied (the view aliases JSC
+// memory that the worker must not touch); any other value is coerced to a string and
+// its UTF-8 bytes copied. An empty result is nil — written as a zero-length file. Must
+// run on the loop thread (it reads JSC).
+fs_marshal_write_data :: proc(
+	ctx: jsc.JSContextRef,
+	value: jsc.JSValueRef,
+	alloc: runtime.Allocator,
+) -> []byte {
+	if jsc.JSValueGetTypedArrayType(ctx, value, nil) != .None {
+		bytes, ok := typed_array_view(ctx, value)
+		if !ok || len(bytes) == 0 do return nil
+		out := make([]byte, len(bytes), alloc)
+		copy(out, bytes)
+		return out
+	}
+	str, salloc := jsc_value_to_string_or_default(ctx, value)
+	defer if salloc do delete(str, context.allocator)
+	if len(str) == 0 do return nil
+	out := make([]byte, len(str), alloc)
+	copy(out, transmute([]byte)str)
+	return out
+}
+
+// fs_write_work performs the blocking write off the loop (or inline on the fallback
+// path), touching ONLY req. Mirrors fs_read_work.
+fs_write_work :: proc(user_data: rawptr) {
+	req := cast(^FS_Op_Request)user_data
+	write_err := os.write_entire_file_from_bytes(req.path, req.write_data)
+	if write_err == nil {
+		req.ok = true
+	} else {
+		req.ok = false
+		req.err_code, req.err_errno = fs_os_error_to_code(write_err)
+	}
+}
+
+// fs_write_pool_done re-queues the completion onto the poll phase (see fs_read_pool_done).
+fs_write_pool_done :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	eventloop.queue_io_callback(loop, fs_op_complete_cb, user_data, fs_write_dispose)
+}
+
+// fs_write_dispose releases a request whose completion will never run (teardown).
+fs_write_dispose :: proc(user_data: rawptr) {
+	context = runtime.default_context()
+	req := cast(^FS_Op_Request)user_data
+	if req == nil do return
+	if req.callback != nil do jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.callback)
+	fs_op_request_free(req)
+}
+
+// fs_op_request_free releases everything an FS_Op_Request owns.
+fs_op_request_free :: proc(req: ^FS_Op_Request) {
+	a := req.allocator
+	if req.write_data != nil do delete(req.write_data, a)
+	if len(req.path) > 0 do delete(req.path, a)
+	free(req, a)
+}
+
+// FS_Op_Request backs async fs operations whose callback takes only (err) — today
+// fs.writeFile. The data to write is marshalled into an owned copy (write_data) on the
+// loop thread, since the worker that performs the write must not touch the JS value it
+// came from. allocator (heap) owns path/write_data; the error path reuses req.path.
 FS_Op_Request :: struct {
-	ctx:       jsc.JSContextRef,
-	callback:  jsc.JSObjectRef,
-	ok:        bool,
-	err_code:  string,
-	err_errno: int,
-	err_path:  string,
-	syscall:   string,
+	ctx:        jsc.JSContextRef,
+	callback:   jsc.JSObjectRef,
+	allocator:  runtime.Allocator,
+	path:       string, // owned clone; the worker writes to this path off-loop (also the error path)
+	write_data: []byte, // owned copy of the bytes to write (nil = empty file)
+	ok:         bool,
+	err_code:   string, // static literal (not freed)
+	err_errno:  int,
+	syscall:    string,
 }
 
 fs_op_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
@@ -416,8 +547,7 @@ fs_op_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	if req.ok {
 		call_args[0] = jsc.JSValueMakeNull(ctx)
 	} else {
-		call_args[0] = fs_make_error(ctx, req.err_code, req.syscall, req.err_path, req.err_errno)
-		if len(req.err_path) > 0 do delete(req.err_path, context.allocator)
+		call_args[0] = fs_make_error(ctx, req.err_code, req.syscall, req.path, req.err_errno)
 	}
 
 	exception: jsc.JSValueRef
@@ -428,7 +558,7 @@ fs_op_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	}
 
 	jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)req.callback)
-	free(req)
+	fs_op_request_free(req)
 }
 
 // fs_options_recursive reads `options.recursive === true` from an options arg.
