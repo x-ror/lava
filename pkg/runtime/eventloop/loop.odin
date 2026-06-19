@@ -167,6 +167,9 @@ init :: proc(allocator := context.allocator, real_time := false) -> Loop {
 	loop.timers = make([dynamic]Timer, allocator)
 	loop.async_queue = make([dynamic]Task, allocator)
 	loop.async_scratch = make([dynamic]Task, allocator)
+	// Bind the worker pool's containers to the loop allocator too (zero capacity —
+	// no backing or threads until the first pool_submit). See threadpool.odin.
+	pool_init(&loop.pool, allocator)
 
 	if real_time {
 		loop.start_tick = time.tick_now()
@@ -239,11 +242,7 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.cancelled_ids)
 	delete(loop.async_queue)
 	delete(loop.async_scratch)
-	// Pool arrays are nil unless the pool was used (pool_shutdown cleared but did not
-	// free their backing); delete is a no-op on a nil dynamic array.
-	delete(loop.pool.pending)
-	delete(loop.pool.threads)
-	delete(loop.pool.outstanding)
+	pool_destroy(&loop.pool, loop.allocator) // frees the pool backings (workers already joined above)
 	loop^ = Loop{}
 }
 

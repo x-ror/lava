@@ -1,5 +1,6 @@
 package eventloop
 
+import "core:mem"
 import "core:sync"
 import "core:thread"
 
@@ -14,8 +15,12 @@ import "core:thread"
 // would race across loops — notably the parallel test runner, where one loop's
 // destroy would join another loop's still-running workers.)
 //
+// Memory: the pool's containers and Pool_Job allocations all use loop.allocator (the
+// same ownership contract the loop's queues follow — see loop.odin init); the loop
+// thread is the only one that allocates or frees them (workers only pop and post).
+//
 // Lifetime / safety mirrors the DNS pool:
-//   - The pool is lazily started on the first submit, so a loop that never offloads
+//   - Workers are lazily started on the first submit, so a loop that never offloads
 //     work spawns no threads.
 //   - pool_submit does async_begin(loop) so the loop stays alive and parked in poll
 //     until the completion is posted; the matching decrement happens in drain_async
@@ -39,35 +44,104 @@ Pool_Work :: proc(user_data: rawptr)
 // post_async), so it may safely touch the loop and the JS engine.
 Pool_Done :: proc(loop: ^Loop, user_data: rawptr)
 
+// Pool_Dispose releases a job's user_data when its `done` will NOT run — i.e. the job
+// was dropped at loop teardown (still queued, or its completion posted but discarded
+// with the async_queue). Exactly one of {done, dispose} runs per job, so a caller can
+// release a protected JS callback / buffer / path here without separately tracking
+// in-flight requests. Runs on the loop thread, inside pool_shutdown. Optional.
+Pool_Dispose :: proc(user_data: rawptr)
+
 // Pool_Job pairs a unit of off-loop work with its on-loop completion. Allocated by
-// pool_submit and freed by its completion (pool_complete) — or by pool_shutdown for
-// a job whose completion is dropped when the loop tears down. user_data is owned by
-// the caller, not the pool.
+// pool_submit and freed by its completion (pool_complete) — or by pool_shutdown for a
+// job whose completion is dropped at teardown. user_data is owned by the caller, not
+// the pool; the pool only ever frees the Pool_Job wrapper (and invokes `dispose` so
+// the caller can free user_data on the dropped path).
 Pool_Job :: struct {
 	work:      Pool_Work,
 	done:      Pool_Done,
+	dispose:   Pool_Dispose,
 	user_data: rawptr,
 	loop:      ^Loop,
 }
 
-// Thread_Pool is embedded in Loop. Its zero value is an unstarted pool (the dynamic
-// arrays are nil until first use), so a loop that never submits work allocates and
-// spawns nothing.
+// Thread_Pool is embedded in Loop. Its containers use loop.allocator; nothing is
+// allocated and no thread is started until the first pool_submit.
+//
+// `pending` is a growable circular buffer (ring): jobs are enqueued at the tail and
+// dequeued from `pending_head`, both O(1) under the mutex — no front-shift, so a large
+// fs/crypto backlog does not turn dequeue into O(n) (and does not hold the mutex while
+// memmoving). The backing grows by doubling and is bounded by the peak queue depth
+// (slots are reused via wraparound), not by the total number of jobs ever submitted.
 Thread_Pool :: struct {
-	mutex:       sync.Mutex,
-	wake:        sync.Cond, // workers sleep here until a job arrives or stop is requested
-	pending:     [dynamic]^Pool_Job, // submitted, not yet picked up (mutex-guarded)
-	threads:     [dynamic]^thread.Thread,
-	outstanding: [dynamic]^Pool_Job, // every live job (loop-thread-only; for teardown free)
-	started:     bool,
-	stopping:    bool,
+	mutex:         sync.Mutex,
+	wake:          sync.Cond, // workers sleep here until a job arrives or stop is requested
+	pending:       []^Pool_Job, // ring backing (cap = len(pending)); mutex-guarded
+	pending_head:  int, // index of the next job to dequeue
+	pending_count: int, // number of live jobs in the ring
+	threads:       [dynamic]^thread.Thread,
+	outstanding:   [dynamic]^Pool_Job, // every live job (loop-thread-only; for teardown dispose/free)
+	started:       bool,
+	stopping:      bool,
+}
+
+// pool_init binds the pool's dynamic containers to the loop allocator at zero
+// capacity. Called once from the loop's init(); the ring backing stays nil and no
+// thread is started until the first pool_submit.
+pool_init :: proc(pool: ^Thread_Pool, allocator: mem.Allocator) {
+	pool.threads = make([dynamic]^thread.Thread, allocator)
+	pool.outstanding = make([dynamic]^Pool_Job, allocator)
+}
+
+// pool_destroy frees the pool's container backings. The workers must already be
+// joined (pool_shutdown) — destroy() calls them in that order.
+pool_destroy :: proc(pool: ^Thread_Pool, allocator: mem.Allocator) {
+	delete(pool.threads)
+	delete(pool.outstanding)
+	if pool.pending != nil do delete(pool.pending, allocator)
+}
+
+// pool_ring_push appends a job at the ring's tail, growing (doubling) when full.
+// Mutex-held, loop thread.
+@(private = "file")
+pool_ring_push :: proc(pool: ^Thread_Pool, job: ^Pool_Job, allocator: mem.Allocator) {
+	if pool.pending_count == len(pool.pending) {
+		new_cap := max(8, len(pool.pending) * 2)
+		ns := make([]^Pool_Job, new_cap, allocator)
+		// Copy the live entries into the front of the new backing, unwrapping the ring.
+		for i in 0 ..< pool.pending_count {
+			ns[i] = pool.pending[(pool.pending_head + i) % len(pool.pending)]
+		}
+		if pool.pending != nil do delete(pool.pending, allocator)
+		pool.pending = ns
+		pool.pending_head = 0
+	}
+	tail := (pool.pending_head + pool.pending_count) % len(pool.pending)
+	pool.pending[tail] = job
+	pool.pending_count += 1
+}
+
+// pool_ring_pop removes and returns the head job. Caller guarantees the ring is
+// non-empty. Mutex-held, worker thread.
+@(private = "file")
+pool_ring_pop :: proc(pool: ^Thread_Pool) -> ^Pool_Job {
+	job := pool.pending[pool.pending_head]
+	pool.pending_head = (pool.pending_head + 1) % len(pool.pending)
+	pool.pending_count -= 1
+	return job
 }
 
 // pool_submit hands a unit of work to the loop's pool. `work` runs off-loop; `done`
-// runs on the loop thread once it finishes. Returns false only if no worker thread
-// could be started (or on a nil loop/work), in which case nothing is scheduled.
+// runs on the loop thread once it finishes; `dispose` (optional) releases user_data if
+// the job is dropped at teardown before `done` runs. Returns false only if no worker
+// thread could be started (or on a nil loop/work), in which case nothing is scheduled.
 // Loop-thread only.
-pool_submit :: proc(loop: ^Loop, work: Pool_Work, done: Pool_Done, user_data: rawptr = nil) -> bool {
+pool_submit :: proc(
+	loop: ^Loop,
+	work: Pool_Work,
+	done: Pool_Done,
+	user_data: rawptr = nil,
+	dispose: Pool_Dispose = nil,
+) -> bool {
 	if loop == nil || work == nil do return false
 	pool := &loop.pool
 
@@ -79,17 +153,18 @@ pool_submit :: proc(loop: ^Loop, work: Pool_Work, done: Pool_Done, user_data: ra
 		return false
 	}
 
-	job := new(Pool_Job)
+	job := new(Pool_Job, loop.allocator)
 	job.work = work
 	job.done = done
+	job.dispose = dispose
 	job.user_data = user_data
 	job.loop = loop
 
 	// outstanding is mutated only on the loop thread (submit, complete, shutdown), so
-	// it needs no lock; pending is shared with the workers.
+	// it needs no lock; the pending ring is shared with the workers.
 	append(&pool.outstanding, job)
 	sync.lock(&pool.mutex)
-	append(&pool.pending, job)
+	pool_ring_push(pool, job, loop.allocator)
 	sync.cond_signal(&pool.wake)
 	sync.unlock(&pool.mutex)
 	return true
@@ -118,16 +193,14 @@ pool_worker :: proc(data: rawptr) {
 	pool := &loop.pool
 	for {
 		sync.lock(&pool.mutex)
-		for len(pool.pending) == 0 && !pool.stopping {
+		for pool.pending_count == 0 && !pool.stopping {
 			sync.cond_wait(&pool.wake, &pool.mutex)
 		}
-		if pool.stopping && len(pool.pending) == 0 {
+		if pool.stopping && pool.pending_count == 0 {
 			sync.unlock(&pool.mutex)
 			return
 		}
-		// FIFO: take the oldest queued job so a burst of submissions cannot starve an
-		// early one behind them (the queue stays small, so pop_front's shift is cheap).
-		job := pop_front(&pool.pending)
+		job := pool_ring_pop(pool) // FIFO from the ring head, O(1)
 		sync.unlock(&pool.mutex)
 
 		if job.work != nil do job.work(job.user_data)
@@ -142,8 +215,9 @@ pool_worker :: proc(data: rawptr) {
 // pool_complete runs on the loop thread once a job's work finishes: it frees the job
 // wrapper, then invokes the caller's `done` with (loop, user_data). The job is
 // released before `done` runs so a `done` that submits more work cannot observe a
-// half-freed wrapper. The async_begin from submit is balanced by drain_async's
-// decrement around this call.
+// half-freed wrapper. `dispose` is NOT called on this path — `done` owns user_data on
+// success. The async_begin from submit is balanced by drain_async's decrement around
+// this call.
 @(private = "file")
 pool_complete :: proc(loop: ^Loop, user_data: rawptr) {
 	job := cast(^Pool_Job)user_data
@@ -162,7 +236,7 @@ pool_release_job :: proc(loop: ^Loop, job: ^Pool_Job) {
 			break
 		}
 	}
-	free(job)
+	free(job, loop.allocator)
 }
 
 // pool_shutdown stops the loop's pool and joins its workers, so no worker can post
@@ -170,19 +244,19 @@ pool_release_job :: proc(loop: ^Loop, job: ^Pool_Job) {
 // stopped, or when never started). Queued-but-unstarted jobs are dropped under the
 // lock before the workers are woken, so the join blocks only on work already in
 // flight — at most THREADPOOL_SIZE units, not the whole backlog. After the join every
-// still-outstanding job is freed (the dropped-queue ones, plus any whose completion
-// was posted but will be discarded when the loop's async_queue is torn down — that
-// task's callback is never invoked, so the freed pointer is not dereferenced).
-//
-// A dropped job's `done` does NOT run, so a caller whose user_data needs releasing on
-// abnormal teardown must track its own in-flight requests (as fetch does) — the pool
-// owns only the Pool_Job wrapper, never the caller's user_data.
+// still-outstanding job has its `dispose` invoked (so the caller can release
+// user_data) and the wrapper freed: these are the jobs whose `done` will never run —
+// the dropped-queue ones, plus any whose completion was posted but is discarded when
+// the loop's async_queue is torn down (that task's callback is never invoked, so the
+// freed pointer is not dereferenced).
 pool_shutdown :: proc(loop: ^Loop) {
 	pool := &loop.pool
 	if !pool.started do return
 	sync.lock(&pool.mutex)
 	pool.stopping = true
-	clear(&pool.pending)
+	// Drop the queued backlog (the jobs stay in `outstanding`, freed/disposed below).
+	pool.pending_count = 0
+	pool.pending_head = 0
 	sync.cond_broadcast(&pool.wake)
 	sync.unlock(&pool.mutex)
 	for th in pool.threads {
@@ -191,7 +265,8 @@ pool_shutdown :: proc(loop: ^Loop) {
 	}
 	clear(&pool.threads)
 	for job in pool.outstanding {
-		free(job)
+		if job.dispose != nil do job.dispose(job.user_data)
+		free(job, loop.allocator)
 	}
 	clear(&pool.outstanding)
 	pool.started = false

@@ -627,6 +627,35 @@ threadpool_shutdown_joins_inflight_work :: proc(t: ^testing.T) {
 	testing.expect(t, true)
 }
 
+Pool_Dispose_Job :: struct {
+	disposed: ^int,
+}
+
+pool_test_noop_work :: proc(user_data: rawptr) {}
+
+// pool_test_dispose runs on the loop thread for a job whose `done` will not run.
+pool_test_dispose :: proc(user_data: rawptr) {
+	job := cast(^Pool_Dispose_Job)user_data
+	job.disposed^ += 1
+}
+
+@(test)
+threadpool_shutdown_disposes_undelivered_jobs :: proc(t: ^testing.T) {
+	// A queued backlog (more jobs than workers) torn down before the loop ever runs:
+	// no completion is delivered, so every job's `dispose` must run exactly once (and
+	// its `done` never does), letting a caller release user_data on abnormal teardown.
+	loop := init()
+	disposed := 0
+	N :: 16
+	jobs: [N]Pool_Dispose_Job
+	for i in 0 ..< N {
+		jobs[i] = Pool_Dispose_Job{disposed = &disposed}
+		testing.expect(t, pool_submit(&loop, pool_test_noop_work, nil, &jobs[i], pool_test_dispose))
+	}
+	destroy(&loop) // no loop run → no completion delivered → all N jobs disposed
+	testing.expect_value(t, disposed, N)
+}
+
 // --- Per-tick temp arena reset ---
 
 record_and_alloc_temp :: proc(loop: ^Loop, user_data: rawptr) {
