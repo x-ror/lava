@@ -1,7 +1,25 @@
 ODIN ?= odin
 ifeq ($(OS),Windows_NT)
+# Native Windows GNU Make defaults to cmd.exe, but every recipe here is POSIX shell
+# (inline VAR=val env, bare ./scripts/*.sh, rm -rf, printf …). Run them through Git Bash
+# so the same recipes work as on Linux/macOS; otherwise `make bench`/`clean`/test-*-lava
+# fail under cmd.exe with errors like "'LAVA_BIN' is not recognized".
+#
+# Point at Git Bash by its full path on purpose: a bare `bash` on the Windows PATH is
+# typically WSL's bash.exe (under WindowsApps), which runs in a Linux VM that cannot see
+# the Windows build tree. Override if Git for Windows lives elsewhere, e.g.
+#   make bench GIT_BASH="D:/Git/bin/bash.exe"
+GIT_BASH ?= C:/Program Files/Git/bin/bash.exe
+SHELL := $(GIT_BASH)
+# SHELL alone isn't enough on Windows: make "direct-executes" simple single-command
+# recipes (a bare ./scripts/x.sh, rm -rf …) without the shell, so they run via the
+# script's shebang and die ("env" isn't on the Windows PATH). Prefix those recipes with
+# $(RUNSCRIPT) to force them through Git Bash. (Empty on Unix — the default shell already
+# runs them and respects each script's own shebang.)
+RUNSCRIPT := "$(GIT_BASH)"
 LAVA ?= build/lava.exe
 else
+RUNSCRIPT :=
 LAVA ?= bin/lava
 endif
 SOURCE ?= console.log('hello from Lava')
@@ -54,7 +72,7 @@ help:
 	@printf '%s\n' '  NODE_BIN=/path/to/node  Override the Node oracle binary'
 
 bootstrap-windows-deps:
-	bash ./scripts/bootstrap-windows-deps.sh
+	$(RUNSCRIPT) ./scripts/bootstrap-windows-deps.sh
 
 ifeq ($(OS),Windows_NT)
 build-sqlite-windows:
@@ -97,10 +115,10 @@ fix-js:
 	vp run js:fix
 
 check-jsc:
-	./scripts/check-jsc.sh
+	$(RUNSCRIPT) ./scripts/check-jsc.sh
 
 check-native:
-	./scripts/check-native-deps.sh
+	$(RUNSCRIPT) ./scripts/check-native-deps.sh
 
 ifeq ($(OS),Windows_NT)
 test: test-odin test-eventloop-odin test-sqlite-odin
@@ -109,22 +127,22 @@ test: test-all
 endif
 
 test-all:
-	sh ./scripts/run-tests.sh
+	$(RUNSCRIPT) ./scripts/run-tests.sh
 
 api-surface: build
-	./scripts/report-api-surface.sh
+	$(RUNSCRIPT) ./scripts/report-api-surface.sh
 
 vendor-bun-report:
-	./scripts/report-vendored-bun.sh
+	$(RUNSCRIPT) ./scripts/report-vendored-bun.sh
 
 bun-buffer-report:
-	./scripts/report-vendored-bun.sh buffer
+	$(RUNSCRIPT) ./scripts/report-vendored-bun.sh buffer
 
 bun-buffer-tests: build
 	LAVA_BIN="$(LAVA)" ./scripts/report-bun-buffer-tests.sh
 
 test-compat:
-	./scripts/run-node-compat-all.sh
+	$(RUNSCRIPT) ./scripts/run-node-compat-all.sh
 
 test-compat-lava: build
 	RUN_LAVA=1 SKIP_KNOWN_LAVA_GAPS=1 LAVA_BIN="$(LAVA)" ./scripts/run-node-compat-all.sh
@@ -147,19 +165,19 @@ test-sqlite-odin:
 endif
 
 test-sqlite-node:
-	./scripts/run-sqlite-oracle.sh
+	$(RUNSCRIPT) ./scripts/run-sqlite-oracle.sh
 
 test-sqlite-lava: build
 	RUN_LAVA=1 LAVA_BIN="$(LAVA)" ./scripts/run-sqlite-oracle.sh
 
 test-fs-node:
-	./scripts/run-fs-oracle.sh
+	$(RUNSCRIPT) ./scripts/run-fs-oracle.sh
 
 test-fs-lava: build
 	RUN_LAVA=1 LAVA_BIN="$(LAVA)" ./scripts/run-fs-oracle.sh
 
 test-eventloop-node:
-	./scripts/run-eventloop-oracle.sh
+	$(RUNSCRIPT) ./scripts/run-eventloop-oracle.sh
 
 test-eventloop-lava: build
 	RUN_LAVA=1 SKIP_KNOWN_LAVA_GAPS=1 LAVA_BIN="$(LAVA)" ./scripts/run-eventloop-oracle.sh
@@ -186,5 +204,8 @@ fmt:
 	$(ODIN) strip-semicolon cmd/lava
 	$(ODIN) strip-semicolon pkg/jsc -no-entry-point
 
+# `rm` isn't a Windows command and can't take the $(RUNSCRIPT) prefix (bash would treat
+# `rm` as a script), so invoke the shell explicitly: $(SHELL) is Git Bash on Windows and
+# /bin/sh on Unix, and the quotes force make to route through it instead of direct-exec.
 clean:
-	rm -rf bin build
+	"$(SHELL)" -c "rm -rf bin build"
