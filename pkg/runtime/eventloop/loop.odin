@@ -628,6 +628,31 @@ drain_microtasks :: proc(loop: ^Loop) {
 	}
 }
 
+// drain_io_callbacks runs ready poll-phase I/O completions (those registered via
+// queue_io_callback, e.g. async fs.readFile/writeFile) whose seq is below `limit`, so
+// callbacks queued *during* the drain defer to a later pass. Returns whether any ran.
+// Shared by run_once's Phase 4a and the post-poll re-drain that keeps a pool completion
+// landing during the poll wait ahead of check.
+drain_io_callbacks :: proc(loop: ^Loop, limit: u64) -> (did_work: bool) {
+	for {
+		index := next_io_callback_index(loop, limit)
+		if index < 0 {
+			break
+		}
+		task := loop.io_callbacks[index]
+		ordered_remove(&loop.io_callbacks, index)
+		if task.cancelled || is_cancel_requested(loop, task.id) {
+			continue
+		}
+		did_work = true
+		loop.running_id = task.id
+		task.callback(loop, task.user_data)
+		drain_microtasks(loop)
+		loop.running_id = 0
+	}
+	return
+}
+
 // --- Main loop tick ---
 //
 // Every tick ends with a free_all(context.temp_allocator): callbacks allocate
@@ -722,24 +747,8 @@ run_once :: proc(loop: ^Loop) -> bool {
 	// queued before this tick. They run after timers and before check, matching
 	// Node's poll-before-check order. The sequence limit defers callbacks queued
 	// *during* this phase to the next iteration.
-	io_phase_sequence_limit := loop.next_sequence
-	for {
-		index := next_io_callback_index(loop, io_phase_sequence_limit)
-		if index < 0 {
-			break
-		}
-
-		task := loop.io_callbacks[index]
-		ordered_remove(&loop.io_callbacks, index)
-		if task.cancelled || is_cancel_requested(loop, task.id) {
-			continue
-		}
-
+	if drain_io_callbacks(loop, loop.next_sequence) {
 		did_work = true
-		loop.running_id = task.id
-		task.callback(loop, task.user_data)
-		drain_microtasks(loop)
-		loop.running_id = 0
 	}
 
 	// Phase 4b: poll — block for I/O only when there is nothing else to do
@@ -795,6 +804,17 @@ run_once :: proc(loop: ^Loop) -> bool {
 	// woken us via the wakeup pipe; drain it now so the work it unblocks (and any
 	// immediate/close it schedules) runs this tick rather than idling out.
 	if drain_async(loop) {
+		did_work = true
+	}
+
+	// A pool completion drained just above (e.g. an async fs.readFile/writeFile that
+	// finished during the poll wait) re-queues its callback onto io_callbacks via
+	// fs_*_pool_done → queue_io_callback. Phase 4a has already run this tick, so drain
+	// these freshly-ready I/O callbacks now — before check — so a poll-ready fs
+	// completion still beats a pending setImmediate, matching Node's poll-before-check.
+	// (Only fs uses io_callbacks; DNS/fetch completions drive watchers, not this queue.
+	// The in-callback ordering in 08-io-before-immediate is unaffected.)
+	if drain_io_callbacks(loop, loop.next_sequence) {
 		did_work = true
 	}
 
