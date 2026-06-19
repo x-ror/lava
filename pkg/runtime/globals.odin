@@ -21,7 +21,9 @@ Runtime_State :: struct {
 	// those two contexts can differ (e.g. an embedder/test using a custom or tracking
 	// allocator), causing a bad free. The map itself carries its own bound allocator.
 	allocator:         runtime.Allocator,
-	module_cache:      map[string]jsc.JSValueRef, // resolved path / specifier -> module.exports
+	// resolved path / specifier -> Cached_Module. The entry carries its own owned key
+	// clone so module_cache_remove frees the key in O(1) (no scan to recover it).
+	module_cache:      map[string]Cached_Module,
 	builtin_require:   jsc.JSValueRef, // JS resolver for internal modules (events/util/assert/buffer); GC-protected
 	esm_transform:     jsc.JSValueRef, // js/internal/esm.js transform(source,url,filename,dirname); GC-protected
 	// Standard JS error constructors (Error/TypeError/RangeError/…) snapshotted and
@@ -108,7 +110,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state.allocator = context.allocator
 	// Bind the map backing to the same allocator explicitly (not implicitly via the
 	// current context), so keys and backing provably share one allocator.
-	state.module_cache = make(map[string]jsc.JSValueRef, 0, state.allocator)
+	state.module_cache = make(map[string]Cached_Module, 0, state.allocator)
 	state.error_intrinsics = make(map[string]jsc.JSValueRef)
 	state.active_fetches = make([dynamic]^Fetch_Request)
 	state.active_dns = make([dynamic]^Dns_Lookup_Request)
@@ -124,9 +126,9 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	fetch_destroy_pending(state)
 	dns_destroy_state(state)
 	sqlite_destroy_state(state)
-	for key, value in state.module_cache {
-		unprotect_before_eval_exit(ctx, value)
-		delete(key, state.allocator)
+	for _, entry in state.module_cache {
+		unprotect_before_eval_exit(ctx, entry.value)
+		delete(entry.key, state.allocator)
 	}
 	delete(state.module_cache)
 	for _, ctor in state.error_intrinsics {
@@ -186,10 +188,18 @@ make_global_class :: proc() -> jsc.JSClassRef {
 
 // --- Module cache ---
 
+// Cached_Module is one module_cache entry. It stores the owned key clone next to the
+// value so module_cache_remove can free the key directly (look the entry up, free
+// entry.key) in O(1), instead of scanning the whole map to recover the stored string.
+Cached_Module :: struct {
+	value: jsc.JSValueRef, // module.exports; GC-protected while cached
+	key:   string, // the owned clone used as this entry's map key; freed on remove/teardown
+}
+
 module_cache_get :: proc(state: ^Runtime_State, key: string) -> (jsc.JSValueRef, bool) {
 	if state == nil do return nil, false
-	value, ok := state.module_cache[key]
-	return value, ok
+	entry, ok := state.module_cache[key]
+	return entry.value, ok
 }
 
 module_cache_put :: proc(
@@ -203,7 +213,7 @@ module_cache_put :: proc(
 	cloned, err := strings.clone(key, state.allocator)
 	if err != nil do return
 	jsc.JSValueProtect(ctx, value)
-	state.module_cache[cloned] = value
+	state.module_cache[cloned] = Cached_Module{value = value, key = cloned}
 }
 
 // module_cache_set inserts or replaces the cached exports for `key`. The
@@ -218,17 +228,18 @@ module_cache_set :: proc(
 	value: jsc.JSValueRef,
 ) {
 	if state == nil do return
-	if existing, ok := state.module_cache[key]; ok {
-		if existing == value do return
+	if entry, ok := state.module_cache[key]; ok {
+		if entry.value == value do return
 		jsc.JSValueProtect(ctx, value) // protect new before unprotecting old
-		jsc.JSValueUnprotect(ctx, existing)
-		state.module_cache[key] = value // reuse the existing (owned) key string
+		jsc.JSValueUnprotect(ctx, entry.value)
+		entry.value = value // keep entry.key (the existing owned key string)
+		state.module_cache[key] = entry
 		return
 	}
 	cloned, err := strings.clone(key, state.allocator)
 	if err != nil do return
 	jsc.JSValueProtect(ctx, value)
-	state.module_cache[cloned] = value
+	state.module_cache[cloned] = Cached_Module{value = value, key = cloned}
 }
 
 // module_cache_remove drops a cached entry, unprotecting its value and freeing
@@ -236,20 +247,13 @@ module_cache_set :: proc(
 // module is not left cached as partial exports (matching Node, which re-loads).
 module_cache_remove :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State, key: string) {
 	if state == nil do return
-	value, ok := state.module_cache[key]
+	entry, ok := state.module_cache[key]
 	if !ok do return
-	jsc.JSValueUnprotect(ctx, value)
-	// The stored key is a clone we own; capture it so we can free it after the
-	// entry is removed (Odin maps do not free string-key backing memory).
-	stored_key: string
-	for k in state.module_cache {
-		if k == key {
-			stored_key = k
-			break
-		}
-	}
+	jsc.JSValueUnprotect(ctx, entry.value)
+	// entry.key is the clone we own and used as the map key (Odin maps do not free
+	// string-key backing memory). Free it after dropping the entry — O(1), no scan.
 	delete_key(&state.module_cache, key)
-	if len(stored_key) > 0 do delete(stored_key, state.allocator)
+	delete(entry.key, state.allocator)
 }
 
 // --- JS callback bridge ---
