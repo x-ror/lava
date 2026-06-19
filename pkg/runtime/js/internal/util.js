@@ -409,6 +409,105 @@
     return deepStrict(a, b, [], []);
   }
 
+  // util.styleText — wrap text in ANSI SGR codes. `format` is a style name or an array
+  // of them (opens applied in order, closes in reverse). Mirrors Node's util.inspect.colors
+  // table. By default the styling is suppressed when the target stream is not a TTY
+  // (options.validateStream, default true; options.stream, default process.stdout) — pass
+  // { validateStream: false } to force it. Null-prototype table so a key like 'constructor'
+  // can't resolve to an inherited value.
+  var styleTextColors = {
+    __proto__: null,
+    reset: [0, 0],
+    bold: [1, 22],
+    dim: [2, 22],
+    italic: [3, 23],
+    underline: [4, 24],
+    blink: [5, 25],
+    inverse: [7, 27],
+    hidden: [8, 28],
+    strikethrough: [9, 29],
+    doubleunderline: [21, 24],
+    black: [30, 39],
+    red: [31, 39],
+    green: [32, 39],
+    yellow: [33, 39],
+    blue: [34, 39],
+    magenta: [35, 39],
+    cyan: [36, 39],
+    white: [37, 39],
+    bgBlack: [40, 49],
+    bgRed: [41, 49],
+    bgGreen: [42, 49],
+    bgYellow: [43, 49],
+    bgBlue: [44, 49],
+    bgMagenta: [45, 49],
+    bgCyan: [46, 49],
+    bgWhite: [47, 49],
+    framed: [51, 54],
+    overlined: [53, 55],
+    gray: [90, 39],
+    grey: [90, 39],
+    redBright: [91, 39],
+    greenBright: [92, 39],
+    yellowBright: [93, 39],
+    blueBright: [94, 39],
+    magentaBright: [95, 39],
+    cyanBright: [96, 39],
+    whiteBright: [97, 39],
+    bgGray: [100, 49],
+    bgGrey: [100, 49],
+    bgRedBright: [101, 49],
+    bgGreenBright: [102, 49],
+    bgYellowBright: [103, 49],
+    bgBlueBright: [104, 49],
+    bgMagentaBright: [105, 49],
+    bgCyanBright: [106, 49],
+    bgWhiteBright: [107, 49],
+  };
+
+  function styleTextError(code, message) {
+    var e = code === 'ERR_INVALID_ARG_TYPE' ? new TypeError(message) : new RangeError(message);
+    e.code = code;
+    return e;
+  }
+
+  function styleText(format, text, options) {
+    if (typeof text !== 'string') {
+      throw styleTextError(
+        'ERR_INVALID_ARG_TYPE',
+        'The "text" argument must be of type string. Received ' + typeof text,
+      );
+    }
+    var formats = Array.isArray(format) ? format : [format];
+    var open = '';
+    var close = '';
+    for (var i = 0; i < formats.length; i++) {
+      var f = formats[i];
+      if (f === 'none') continue;
+      var codes = typeof f === 'string' ? styleTextColors[f] : undefined;
+      if (codes === undefined) {
+        throw styleTextError(
+          'ERR_INVALID_ARG_VALUE',
+          "The argument 'format' must be a valid style. Received " + inspect(f, {}, [], 1),
+        );
+      }
+      open += '\x1b[' + codes[0] + 'm';
+      close = '\x1b[' + codes[1] + 'm' + close; // closes unwind in reverse
+    }
+
+    options = options || {};
+    if (options.validateStream !== false) {
+      var stream =
+        options.stream !== undefined
+          ? options.stream
+          : typeof process !== 'undefined'
+            ? process.stdout
+            : undefined;
+      if (!stream || !stream.isTTY) return text;
+    }
+    return open + text + close;
+  }
+
   module.exports = {
     inspect: function (v, opts) {
       return inspect(v, opts, [], 0);
@@ -421,6 +520,7 @@
     deprecate: deprecate,
     isDeepStrictEqual: isDeepStrictEqual,
     parseArgs: require('parse_args').parseArgs,
+    styleText: styleText,
     // Node exposes the same object via require('node:util').types and
     // require('node:util/types'); many packages use the former.
     types: require('util/types'),
