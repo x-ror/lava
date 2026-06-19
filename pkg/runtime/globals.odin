@@ -911,6 +911,9 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"process", INTERNAL_PROCESS},
 		{"console", INTERNAL_CONSOLE},
 		{"diagnostics_channel", INTERNAL_DIAGNOSTICS_CHANNEL},
+		// Internal helper backing util.parseArgs; hidden from the public resolver
+		// (loader.js publicReq), like primordials — Node has no node:parse_args.
+		{"parse_args", INTERNAL_PARSE_ARGS},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -1190,6 +1193,7 @@ INTERNAL_PUNYCODE :: #load("js/internal/punycode.js", string)
 INTERNAL_PROCESS :: #load("js/internal/process.js", string)
 INTERNAL_CONSOLE :: #load("js/internal/console.js", string)
 INTERNAL_DIAGNOSTICS_CHANNEL :: #load("js/internal/diagnostics_channel.js", string)
+INTERNAL_PARSE_ARGS :: #load("js/internal/parse_args.js", string)
 
 // ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
 // the module resolver (see install_internal_modules); evaluates to a function.

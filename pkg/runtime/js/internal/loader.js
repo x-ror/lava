@@ -60,13 +60,14 @@
   req('structured_clone');
   req('crypto');
 
-  // primordials is internal-only: internal factories require() it through `req`
-  // above, but it must NOT be reachable through the public resolver native
-  // require() consults — Node has no such builtin (require('node:primordials')
-  // is ERR_UNKNOWN_BUILTIN_MODULE), and a user package named "primordials" must
-  // not be shadowed. publicReq hides it; everything else resolves as before.
+  // primordials and parse_args are internal-only: internal factories require() them
+  // through `req` above, but they must NOT be reachable through the public resolver
+  // native require() consults — Node has no such builtins (require('node:primordials')
+  // is ERR_UNKNOWN_BUILTIN_MODULE; util.parseArgs is the public surface for parse_args),
+  // and a user package with either name must not be shadowed. publicReq hides them.
+  var INTERNAL_ONLY = { primordials: true, parse_args: true };
   function publicReq(name) {
-    if (normalize(name) === 'primordials') return undefined;
+    if (INTERNAL_ONLY[normalize(name)]) return undefined;
     return req(name);
   }
 
