@@ -3,11 +3,28 @@
 // boolean, multiple, defaults, -- terminator) and returns { values, positionals[, tokens] }.
 // strict mode (default) validates unknown options and option/value mismatches with Node's
 // error codes. Pure JS; backs require('node:util').parseArgs.
+//
+// Uses primordials throughout (like Node's internals) so a script that mutates a shared
+// prototype — Array.prototype.push, Object.prototype.hasOwnProperty, … — cannot alter the
+// parse.
 (function (require, module) {
   'use strict';
 
+  var P = require('primordials');
+  var TypeError = P.TypeError;
+  var ObjectKeys = P.ObjectKeys;
+  var ObjectPrototypeHasOwnProperty = P.ObjectPrototypeHasOwnProperty;
+  var ArrayPrototypePush = P.ArrayPrototypePush;
+  var ArrayPrototypeShift = P.ArrayPrototypeShift;
+  var ArrayPrototypeUnshift = P.ArrayPrototypeUnshift;
+  var ArrayPrototypeSlice = P.ArrayPrototypeSlice;
+  var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
+  var StringPrototypeCharAt = P.StringPrototypeCharAt;
+  var StringPrototypeIndexOf = P.StringPrototypeIndexOf;
+  var StringPrototypeSlice = P.StringPrototypeSlice;
+
   function objectGetOwn(obj, key) {
-    return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+    return ObjectPrototypeHasOwnProperty(obj, key) ? obj[key] : undefined;
   }
 
   function codedError(code, message) {
@@ -17,7 +34,7 @@
   }
 
   function findLongOptionForShort(shortOption, options) {
-    var keys = Object.keys(options);
+    var keys = ObjectKeys(options);
     for (var i = 0; i < keys.length; i++) {
       if (options[keys[i]].short === shortOption) return keys[i];
     }
@@ -25,53 +42,61 @@
   }
 
   function isOptionLikeValue(value) {
-    return typeof value === 'string' && value.length > 1 && value.charCodeAt(0) === 45;
+    return (
+      typeof value === 'string' && value.length > 1 && StringPrototypeCharCodeAt(value, 0) === 45
+    );
   }
   function isLoneShortOption(arg) {
-    return arg.length === 2 && arg.charCodeAt(0) === 45 && arg.charCodeAt(1) !== 45;
+    return (
+      arg.length === 2 &&
+      StringPrototypeCharCodeAt(arg, 0) === 45 &&
+      StringPrototypeCharCodeAt(arg, 1) !== 45
+    );
   }
   function isLoneLongOption(arg) {
     return (
       arg.length > 2 &&
-      arg.charCodeAt(0) === 45 &&
-      arg.charCodeAt(1) === 45 &&
-      arg.indexOf('=') === -1
+      StringPrototypeCharCodeAt(arg, 0) === 45 &&
+      StringPrototypeCharCodeAt(arg, 1) === 45 &&
+      StringPrototypeIndexOf(arg, '=') === -1
     );
   }
   function isLongOptionAndValue(arg) {
     return (
       arg.length > 2 &&
-      arg.charCodeAt(0) === 45 &&
-      arg.charCodeAt(1) === 45 &&
-      arg.indexOf('=') !== -1
+      StringPrototypeCharCodeAt(arg, 0) === 45 &&
+      StringPrototypeCharCodeAt(arg, 1) === 45 &&
+      StringPrototypeIndexOf(arg, '=') !== -1
     );
   }
   function isShortGroupHead(arg) {
-    return arg.length > 2 && arg.charCodeAt(0) === 45 && arg.charCodeAt(1) !== 45;
+    return (
+      arg.length > 2 &&
+      StringPrototypeCharCodeAt(arg, 0) === 45 &&
+      StringPrototypeCharCodeAt(arg, 1) !== 45
+    );
   }
   function isShortOptionAndValue(arg, options) {
     if (!isShortGroupHead(arg)) return false;
-    var longOption = findLongOptionForShort(arg.charAt(1), options);
-    var opt = objectGetOwn(options, longOption);
+    var opt = objectGetOwn(options, findLongOptionForShort(StringPrototypeCharAt(arg, 1), options));
     return opt !== undefined && opt.type === 'string';
   }
   function isShortOptionGroup(arg, options) {
     if (!isShortGroupHead(arg)) return false;
     // A group only if the first short option is NOT a string option (which would instead
     // consume the rest as its value, handled by isShortOptionAndValue).
-    var longOption = findLongOptionForShort(arg.charAt(1), options);
-    var opt = objectGetOwn(options, longOption);
+    var opt = objectGetOwn(options, findLongOptionForShort(StringPrototypeCharAt(arg, 1), options));
     return opt === undefined || opt.type !== 'string';
   }
 
   function argsToTokens(args, options, allowNegative) {
     var tokens = [];
-    var remaining = args.slice();
+    var remaining = ArrayPrototypeSlice(args);
     var index = -1;
     var groupCount = 0;
 
     while (remaining.length > 0) {
-      var arg = remaining.shift();
+      var arg = ArrayPrototypeShift(remaining);
       var nextArg = remaining[0];
       if (groupCount > 0) {
         groupCount--;
@@ -81,63 +106,68 @@
 
       // '--' terminates option parsing; the rest are positionals.
       if (arg === '--') {
-        tokens.push({ kind: 'option-terminator', index: index });
+        ArrayPrototypePush(tokens, { kind: 'option-terminator', index: index });
         for (var r = 0; r < remaining.length; r++) {
-          tokens.push({ kind: 'positional', index: index + 1 + r, value: remaining[r] });
+          ArrayPrototypePush(tokens, {
+            kind: 'positional',
+            index: index + 1 + r,
+            value: remaining[r],
+          });
         }
         break;
       }
 
       if (isLoneShortOption(arg)) {
-        var sLong = findLongOptionForShort(arg.charAt(1), options);
+        var sLong = findLongOptionForShort(StringPrototypeCharAt(arg, 1), options);
         var sOpt = objectGetOwn(options, sLong);
         var sValue;
-        var sInline = false;
         if (sOpt !== undefined && sOpt.type === 'string' && nextArg !== undefined) {
-          sValue = remaining.shift();
-        } else if (allowNegative && (sOpt === undefined || sOpt.type === 'boolean')) {
-          sValue = undefined;
+          sValue = ArrayPrototypeShift(remaining);
         }
-        tokens.push({
+        ArrayPrototypePush(tokens, {
           kind: 'option',
           name: sLong,
           rawName: arg,
           index: index,
           value: sValue,
-          inlineValue: sValue !== undefined ? sInline : undefined,
+          inlineValue: sValue !== undefined ? false : undefined,
         });
         continue;
       }
 
       if (isShortOptionGroup(arg, options)) {
         var expanded = [];
-        for (var g = 1; g < arg.length; g++) expanded.push('-' + arg.charAt(g));
-        for (var e = expanded.length - 1; e >= 0; e--) remaining.unshift(expanded[e]);
+        for (var g = 1; g < arg.length; g++) {
+          ArrayPrototypePush(expanded, '-' + StringPrototypeCharAt(arg, g));
+        }
+        for (var e = expanded.length - 1; e >= 0; e--) {
+          ArrayPrototypeUnshift(remaining, expanded[e]);
+        }
         groupCount = expanded.length;
         continue;
       }
 
       if (isShortOptionAndValue(arg, options)) {
-        var svLong = findLongOptionForShort(arg.charAt(1), options);
-        tokens.push({
+        var shortChar = StringPrototypeCharAt(arg, 1);
+        ArrayPrototypePush(tokens, {
           kind: 'option',
-          name: svLong,
-          rawName: '-' + arg.charAt(1),
+          name: findLongOptionForShort(shortChar, options),
+          rawName: '-' + shortChar,
           index: index,
-          value: arg.slice(2),
+          value: StringPrototypeSlice(arg, 2),
           inlineValue: true,
         });
         continue;
       }
 
       if (isLoneLongOption(arg)) {
-        var lName = arg.slice(2);
+        var lName = StringPrototypeSlice(arg, 2);
         var lOpt = objectGetOwn(options, lName);
         var lValue;
         if (lOpt !== undefined && lOpt.type === 'string' && nextArg !== undefined) {
-          lValue = remaining.shift();
+          lValue = ArrayPrototypeShift(remaining);
         }
-        tokens.push({
+        ArrayPrototypePush(tokens, {
           kind: 'option',
           name: lName,
           rawName: arg,
@@ -149,26 +179,26 @@
       }
 
       if (isLongOptionAndValue(arg)) {
-        var eq = arg.indexOf('=');
-        var lvName = arg.slice(2, eq);
-        tokens.push({
+        var eq = StringPrototypeIndexOf(arg, '=');
+        var lvName = StringPrototypeSlice(arg, 2, eq);
+        ArrayPrototypePush(tokens, {
           kind: 'option',
           name: lvName,
           rawName: '--' + lvName,
           index: index,
-          value: arg.slice(eq + 1),
+          value: StringPrototypeSlice(arg, eq + 1),
           inlineValue: true,
         });
         continue;
       }
 
-      tokens.push({ kind: 'positional', index: index, value: arg });
+      ArrayPrototypePush(tokens, { kind: 'positional', index: index, value: arg });
     }
     return tokens;
   }
 
-  function checkOptionUsage(token, options, allowNegative) {
-    if (!Object.prototype.hasOwnProperty.call(options, token.name)) {
+  function checkOptionUsage(token, options) {
+    if (!ObjectPrototypeHasOwnProperty(options, token.name)) {
       throw codedError('ERR_PARSE_ARGS_UNKNOWN_OPTION', "Unknown option '" + token.rawName + "'");
     }
     var spec = options[token.name];
@@ -203,7 +233,7 @@
     var spec = objectGetOwn(options, name);
     var v = spec !== undefined && spec.type === 'string' ? value : true;
     if (spec !== undefined && spec.multiple) {
-      if (Object.prototype.hasOwnProperty.call(values, name)) values[name].push(v);
+      if (ObjectPrototypeHasOwnProperty(values, name)) ArrayPrototypePush(values[name], v);
       else values[name] = [v];
     } else {
       values[name] = v;
@@ -212,7 +242,10 @@
 
   function parseArgs(config) {
     config = config || {};
-    var args = objectGetOwn(config, 'args') !== undefined ? config.args : process.argv.slice(2);
+    var args =
+      objectGetOwn(config, 'args') !== undefined
+        ? config.args
+        : ArrayPrototypeSlice(process.argv, 2);
     var strict = objectGetOwn(config, 'strict');
     if (strict === undefined) strict = true;
     var allowPositionals = objectGetOwn(config, 'allowPositionals');
@@ -234,7 +267,7 @@
       var token = tokens[i];
       if (token.kind === 'option') {
         if (strict) {
-          checkOptionUsage(token, options, allowNegative);
+          checkOptionUsage(token, options);
           checkOptionLikeValue(token);
         }
         storeOption(token.name, token.value, options, result.values);
@@ -247,17 +280,17 @@
               "'. This command does not take positional arguments",
           );
         }
-        result.positionals.push(token.value);
+        ArrayPrototypePush(result.positionals, token.value);
       }
     }
 
     // Apply defaults for options never seen.
-    var optionKeys = Object.keys(options);
+    var optionKeys = ObjectKeys(options);
     for (var k = 0; k < optionKeys.length; k++) {
       var name = optionKeys[k];
       if (
         options[name].default !== undefined &&
-        !Object.prototype.hasOwnProperty.call(result.values, name)
+        !ObjectPrototypeHasOwnProperty(result.values, name)
       ) {
         result.values[name] = options[name].default;
       }
