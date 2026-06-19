@@ -910,6 +910,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"punycode", INTERNAL_PUNYCODE},
 		{"process", INTERNAL_PROCESS},
 		{"console", INTERNAL_CONSOLE},
+		{"diagnostics_channel", INTERNAL_DIAGNOSTICS_CHANNEL},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -1188,6 +1189,7 @@ INTERNAL_UTIL_TYPES :: #load("js/internal/util_types.js", string)
 INTERNAL_PUNYCODE :: #load("js/internal/punycode.js", string)
 INTERNAL_PROCESS :: #load("js/internal/process.js", string)
 INTERNAL_CONSOLE :: #load("js/internal/console.js", string)
+INTERNAL_DIAGNOSTICS_CHANNEL :: #load("js/internal/diagnostics_channel.js", string)
 
 // ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
 // the module resolver (see install_internal_modules); evaluates to a function.
