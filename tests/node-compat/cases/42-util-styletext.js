@@ -27,5 +27,22 @@ assert.throws(() => styleText('red', 123, F), { code: 'ERR_INVALID_ARG_TYPE' });
 assert.throws(() => styleText(['red', 'bogus'], 'hi', F), {
   code: 'ERR_INVALID_ARG_VALUE',
 });
+// an invalid format is a TypeError (not just the right code)
+assert.throws(() => styleText('nope', 'hi', F), TypeError);
+
+// alias styles resolve (blackBright === gray codes)
+assert.equal(styleText('blackBright', 'x', F), '\x1b[90mx\x1b[39m');
+assert.equal(styleText('faint', 'x', F), '\x1b[2mx\x1b[22m');
+
+// validateStream: a falsy non-null value forces the codes; a truthy non-boolean throws
+assert.equal(styleText('red', 'hi', { validateStream: 0 }), '\x1b[31mhi\x1b[39m');
+assert.throws(() => styleText('red', 'hi', { validateStream: 1 }), {
+  code: 'ERR_INVALID_ARG_TYPE',
+});
+
+// util.inspect exposes the colors table and the custom-inspection symbol
+const util = require('node:util');
+assert.equal(typeof util.inspect.colors, 'object');
+assert.equal(util.inspect.custom, Symbol.for('nodejs.util.inspect.custom'));
 
 console.log('ok');

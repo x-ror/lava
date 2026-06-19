@@ -409,13 +409,11 @@
     return deepStrict(a, b, [], []);
   }
 
-  // util.styleText — wrap text in ANSI SGR codes. `format` is a style name or an array
-  // of them (opens applied in order, closes in reverse). Mirrors Node's util.inspect.colors
-  // table. By default the styling is suppressed when the target stream is not a TTY
-  // (options.validateStream, default true; options.stream, default process.stdout) — pass
-  // { validateStream: false } to force it. Null-prototype table so a key like 'constructor'
-  // can't resolve to an inherited value.
-  var styleTextColors = {
+  // The live color table backing both util.inspect.colors and util.styleText. Exposed as
+  // util.inspect.colors below, so a caller can add or change a style and have styleText
+  // pick it up (Node parity). Null-prototype, so a key like 'constructor' resolves to
+  // undefined rather than an inherited function. Names map to [openCode, closeCode].
+  var inspectColors = {
     __proto__: null,
     reset: [0, 0],
     bold: [1, 22],
@@ -463,10 +461,21 @@
     bgMagentaBright: [105, 49],
     bgCyanBright: [106, 49],
     bgWhiteBright: [107, 49],
+    // Aliases, as in Node's util.inspect.colors.
+    blackBright: [90, 39],
+    bgBlackBright: [100, 49],
+    faint: [2, 22],
+    conceal: [8, 28],
+    strikeThrough: [9, 29],
+    crossedOut: [9, 29],
+    doubleUnderline: [21, 24],
+    swapColors: [7, 27],
   };
 
+  // ERR_INVALID_ARG_TYPE and ERR_INVALID_ARG_VALUE are both TypeErrors in Node, so
+  // `err instanceof TypeError` works alongside `err.code`.
   function styleTextError(code, message) {
-    var e = code === 'ERR_INVALID_ARG_TYPE' ? new TypeError(message) : new RangeError(message);
+    var e = new TypeError(message);
     e.code = code;
     return e;
   }
@@ -484,7 +493,8 @@
     for (var i = 0; i < formats.length; i++) {
       var f = formats[i];
       if (f === 'none') continue;
-      var codes = typeof f === 'string' ? styleTextColors[f] : undefined;
+      // Read from the live inspectColors so a caller-added/overridden style is honored.
+      var codes = typeof f === 'string' ? inspectColors[f] : undefined;
       if (codes === undefined) {
         throw styleTextError(
           'ERR_INVALID_ARG_VALUE',
@@ -496,7 +506,19 @@
     }
 
     options = options || {};
-    if (options.validateStream !== false) {
+    var validateStream = options.validateStream;
+    // null/undefined default to true (Node uses `?? true`); other falsy values force color.
+    if (validateStream === undefined || validateStream === null) validateStream = true;
+    // A falsy validateStream forces the codes (skips the TTY check); a truthy non-boolean
+    // is rejected — Node only type-checks it on this path.
+    if (validateStream) {
+      if (typeof validateStream !== 'boolean') {
+        throw styleTextError(
+          'ERR_INVALID_ARG_TYPE',
+          'The "options.validateStream" property must be of type boolean. Received ' +
+            typeof validateStream,
+        );
+      }
       var stream =
         options.stream !== undefined
           ? options.stream
@@ -508,10 +530,16 @@
     return open + text + close;
   }
 
+  function inspectPublic(v, opts) {
+    return inspect(v, opts, [], 0);
+  }
+  // util.inspect.colors is the live style table (styleText reads it); util.inspect.custom
+  // is the symbol a value implements to control its own inspection.
+  inspectPublic.colors = inspectColors;
+  if (customInspect) inspectPublic.custom = customInspect;
+
   module.exports = {
-    inspect: function (v, opts) {
-      return inspect(v, opts, [], 0);
-    },
+    inspect: inspectPublic,
     format: format,
     formatWithOptions: formatWithOptions,
     promisify: promisify,
