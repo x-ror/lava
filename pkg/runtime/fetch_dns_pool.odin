@@ -1,6 +1,7 @@
 #+build linux, darwin, windows
 package lava_runtime
 
+import "base:runtime"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -38,6 +39,13 @@ FETCH_DNS_POOL_SIZE :: 4
 // up to one IPv4 then one IPv6 address, tried in turn by the connect path.
 DNS_Job :: struct {
 	host:       string,
+	// allocator owns `host` and the job struct. Captured from the owning request
+	// (req.allocator) at submit, not read from the ambient context, because a job is
+	// freed from two contexts — its completion (loop thread) and fetch_dns_pool_shutdown
+	// (teardown) — and the pool is process-global, so jobs from different runtimes can
+	// be freed together. Freeing each through its own captured allocator keeps the
+	// alloc/free pair matched regardless of which path releases it.
+	allocator:  runtime.Allocator,
 	loop:       ^eventloop.Loop,
 	req:        ^Fetch_Request,
 	addrs:      [2]Fetch_Addr,
@@ -68,8 +76,9 @@ g_fetch_dns_pool: Fetch_DNS_Pool
 fetch_dns_pool_submit :: proc(req: ^Fetch_Request, host: string) -> bool {
 	if !fetch_dns_pool_ensure_started() do return false
 	pool := &g_fetch_dns_pool
-	job := new(DNS_Job)
-	job.host = strings.clone(host)
+	job := new(DNS_Job, req.allocator)
+	job.allocator = req.allocator
+	job.host = strings.clone(host, req.allocator)
 	job.loop = req.loop
 	job.req = req
 	// Back-pointer so an abort before the worker picks this up can cancel it.
@@ -190,8 +199,8 @@ fetch_dns_pool_release_job :: proc(job: ^DNS_Job) {
 			break
 		}
 	}
-	delete(job.host)
-	free(job)
+	delete(job.host, job.allocator)
+	free(job, job.allocator)
 }
 
 // fetch_dns_pool_cancel_job marks a still-queued lookup as cancelled so its worker
@@ -234,8 +243,8 @@ fetch_dns_pool_shutdown :: proc() {
 	// The workers have exited, so nothing can touch a job now — free any whose
 	// completion will never run (dropped with the loop's async queue at teardown).
 	for job in pool.outstanding {
-		delete(job.host)
-		free(job)
+		delete(job.host, job.allocator)
+		free(job, job.allocator)
 	}
 	clear(&pool.outstanding)
 	pool.started = false

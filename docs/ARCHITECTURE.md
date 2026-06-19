@@ -164,15 +164,19 @@ One allocator hazard is the `proc "c"` boundary: a JSC callback resets `context`
 `runtime.default_context()` (the heap allocator), so a long-lived string cloned
 *inside* a callback but freed from a teardown proc running under the caller's context
 mismatches if the caller uses a custom allocator (an embedder, or the test runner's
-tracking allocator). `module_cache` keys are fixed by cloning/freeing them through an
-explicit `Runtime_State.allocator`. **Known, tracked (not yet fixed): the same pattern
-remains in `fetch` (`Fetch_Request` method/url/host/path), `dns`
-(`Dns_Lookup_Request.hostname`), and the fetch DNS pool (`DNS_Job.host`).** These free
-under *multiple* contexts (e.g. `fetch_reclaim_pending` during normal operation vs
-`fetch_destroy_pending` at teardown), so the robust fix is *localized* — store the
-owning allocator on each request/job and clone+free through it (as `module_cache`
-does), rather than context-based. Benign in the shipped CLI (one heap allocator
-everywhere); a follow-up closes it for custom-allocator embedders.
+tracking allocator). The fix is *localized* — each request/job captures the owning
+`Runtime_State.allocator` at creation and clones **and** frees through it, so the
+alloc/free pair stays matched no matter which context is active at either end. This is
+applied to `module_cache` keys, `fetch` (`Fetch_Request` method/url/host/path +
+`request_bytes` + the struct), `dns` (`Dns_Lookup_Request.hostname` + the struct), and
+the fetch DNS pool (`DNS_Job.host` + the struct). It is deliberately *not* context-based:
+those structs free under *multiple* contexts (e.g. `fetch_reclaim_pending` during normal
+operation vs `fetch_destroy_pending` at teardown; a global DNS pool freeing jobs from
+several runtimes), which a "rebind `context.allocator` at the callback entry" approach
+cannot cover. Dynamic-array fields (`response`/`carry`/`body_out`, `results`) carry their
+own bound allocator, so `delete()` already frees them correctly. Guarded by
+`module_cache_alloc_test` and `dns_alloc_test` (eval under a tracking allocator asserts no
+bad frees).
 
 ### 4.2 Concurrency model
 
