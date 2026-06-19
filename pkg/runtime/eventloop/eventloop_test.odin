@@ -656,6 +656,39 @@ threadpool_shutdown_disposes_undelivered_jobs :: proc(t: ^testing.T) {
 	testing.expect_value(t, disposed, N)
 }
 
+@(test)
+threadpool_ring_preserves_fifo_across_grow_and_wrap :: proc(t: ^testing.T) {
+	// Exercise the pending ring directly (no workers, fully deterministic): fill past
+	// capacity (grow), partially drain so the head advances, refill so the live region
+	// wraps past the end, then push past capacity again so growth happens WHILE the
+	// region is wrapped (the unwrap-copy path). Every job must dequeue exactly once in
+	// submit order. (pool_ring_* are pointer-only; no Loop/threads needed.)
+	pool := Thread_Pool{}
+	defer if pool.pending != nil do delete(pool.pending)
+
+	jobs: [20]Pool_Job
+	expect := 0
+	pushed := 0
+
+	// Grow 0 -> 8 and fill.
+	for ; pushed < 8; pushed += 1 do pool_ring_push(&pool, &jobs[pushed], context.allocator)
+	// Drain 6: head advances to 6, two live entries remain.
+	for _ in 0 ..< 6 {
+		testing.expect(t, pool_ring_pop(&pool) == &jobs[expect], "fifo before wrap")
+		expect += 1
+	}
+	// Refill to capacity: the live region now wraps past the end of the 8-slot backing.
+	for ; pushed < 14; pushed += 1 do pool_ring_push(&pool, &jobs[pushed], context.allocator)
+	// Push past capacity: growth happens while the live region is wrapped (8 -> 16).
+	for ; pushed < 20; pushed += 1 do pool_ring_push(&pool, &jobs[pushed], context.allocator)
+	// Drain everything: exactly once, still in submit order.
+	for pool.pending_count > 0 {
+		testing.expect(t, pool_ring_pop(&pool) == &jobs[expect], "fifo after wrap+grow")
+		expect += 1
+	}
+	testing.expect_value(t, expect, 20)
+}
+
 // --- Per-tick temp arena reset ---
 
 record_and_alloc_temp :: proc(loop: ^Loop, user_data: rawptr) {

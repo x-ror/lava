@@ -101,8 +101,8 @@ pool_destroy :: proc(pool: ^Thread_Pool, allocator: mem.Allocator) {
 }
 
 // pool_ring_push appends a job at the ring's tail, growing (doubling) when full.
-// Mutex-held, loop thread.
-@(private = "file")
+// Mutex-held, loop thread. (Package-visible — not file-private — so the ring's
+// FIFO/grow/wrap behavior can be unit-tested directly without spinning up workers.)
 pool_ring_push :: proc(pool: ^Thread_Pool, job: ^Pool_Job, allocator: mem.Allocator) {
 	if pool.pending_count == len(pool.pending) {
 		new_cap := max(8, len(pool.pending) * 2)
@@ -121,8 +121,7 @@ pool_ring_push :: proc(pool: ^Thread_Pool, job: ^Pool_Job, allocator: mem.Alloca
 }
 
 // pool_ring_pop removes and returns the head job. Caller guarantees the ring is
-// non-empty. Mutex-held, worker thread.
-@(private = "file")
+// non-empty. Mutex-held, worker thread. (Package-visible for the ring unit test.)
 pool_ring_pop :: proc(pool: ^Thread_Pool) -> ^Pool_Job {
 	job := pool.pending[pool.pending_head]
 	pool.pending_head = (pool.pending_head + 1) % len(pool.pending)
@@ -240,8 +239,19 @@ pool_release_job :: proc(loop: ^Loop, job: ^Pool_Job) {
 }
 
 // pool_shutdown stops the loop's pool and joins its workers, so no worker can post
-// into a loop about to be destroyed. Loop-thread only; idempotent (a no-op once
-// stopped, or when never started). Queued-but-unstarted jobs are dropped under the
+// into a loop about to be destroyed.
+//
+// CONTRACT: destroy-only. This is NOT a quiesce/restart primitive — it does not
+// balance the per-job async_begin counts (active_async is left as-is) and does not
+// remove the pool completions already posted to async_queue (which, once their jobs
+// are freed here, dangle). That is safe ONLY because destroy() calls this and then
+// immediately tears the whole loop down (async_queue included, with those completion
+// callbacks never invoked). A future "pause the pool but keep the loop running" use
+// would need to also decrement active_async per dropped job and cancel/skip the
+// queued completions. Don't call this outside destroy().
+//
+// Loop-thread only; idempotent (a no-op once stopped, or when never started).
+// Queued-but-unstarted jobs are dropped under the
 // lock before the workers are woken, so the join blocks only on work already in
 // flight — at most THREADPOOL_SIZE units, not the whole backlog. After the join every
 // still-outstanding job has its `dispose` invoked (so the caller can release
