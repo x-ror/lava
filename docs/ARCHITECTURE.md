@@ -160,6 +160,20 @@ the lifecycle documented at every site. Queue buffers are bound to the loop
 allocator up front (`loop.odin:157`) so a worker thread's `post_async` cannot
 accidentally adopt the wrong allocator.
 
+One allocator hazard is the `proc "c"` boundary: a JSC callback resets `context` to
+`runtime.default_context()` (the heap allocator), so a long-lived string cloned
+*inside* a callback but freed from a teardown proc running under the caller's context
+mismatches if the caller uses a custom allocator (an embedder, or the test runner's
+tracking allocator). `module_cache` keys are fixed by cloning/freeing them through an
+explicit `Runtime_State.allocator`. **Known, tracked (not yet fixed): the same pattern
+remains in `fetch` (`Fetch_Request` method/url/host/path), `dns`
+(`Dns_Lookup_Request.hostname`), and the fetch DNS pool (`DNS_Job.host`).** These free
+under *multiple* contexts (e.g. `fetch_reclaim_pending` during normal operation vs
+`fetch_destroy_pending` at teardown), so the robust fix is *localized* — store the
+owning allocator on each request/job and clone+free through it (as `module_cache`
+does), rather than context-based. Benign in the shipped CLI (one heap allocator
+everywhere); a follow-up closes it for custom-allocator embedders.
+
 ### 4.2 Concurrency model
 
 **Single VM, single JS thread, single context.** Off-loop work is limited to the

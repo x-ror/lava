@@ -24,13 +24,17 @@ eval_module_cache_keys_use_consistent_allocator :: proc(t: ^testing.T) {
 	loop := eventloop.init()
 	// require() forces a module_cache key clone inside the native require callback;
 	// eval's teardown then frees it. Both must use the captured state.allocator.
+	// eval CONSUMES the loop — it destroys it on every path (see the OWNERSHIP note in
+	// runtime.odin) — so there is no separate eventloop.destroy here.
 	result := lava.eval("require('node:events'); 0", "<module-cache-alloc-test>", &loop, false)
 	lava.result_destroy(&result)
 
+	// A bad free here is the module_cache key allocator mismatch this fix targets; it
+	// would also catch any other eval-time allocation freed with the wrong allocator.
 	testing.expectf(
 		t,
 		len(track.bad_free_array) == 0,
-		"module_cache freed a key with the wrong allocator: %d bad free(s)",
+		"eval under a tracking allocator recorded %d bad free(s)",
 		len(track.bad_free_array),
 	)
 }

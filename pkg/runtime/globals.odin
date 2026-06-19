@@ -106,7 +106,9 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state.loop = loop
 	// Capture the owning allocator for module_cache keys (see the field comment).
 	state.allocator = context.allocator
-	state.module_cache = make(map[string]jsc.JSValueRef)
+	// Bind the map backing to the same allocator explicitly (not implicitly via the
+	// current context), so keys and backing provably share one allocator.
+	state.module_cache = make(map[string]jsc.JSValueRef, 0, state.allocator)
 	state.error_intrinsics = make(map[string]jsc.JSValueRef)
 	state.active_fetches = make([dynamic]^Fetch_Request)
 	state.active_dns = make([dynamic]^Dns_Lookup_Request)
