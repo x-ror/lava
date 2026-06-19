@@ -409,10 +409,137 @@
     return deepStrict(a, b, [], []);
   }
 
+  // The live color table backing both util.inspect.colors and util.styleText. Exposed as
+  // util.inspect.colors below, so a caller can add or change a style and have styleText
+  // pick it up (Node parity). Null-prototype, so a key like 'constructor' resolves to
+  // undefined rather than an inherited function. Names map to [openCode, closeCode].
+  var inspectColors = {
+    __proto__: null,
+    reset: [0, 0],
+    bold: [1, 22],
+    dim: [2, 22],
+    italic: [3, 23],
+    underline: [4, 24],
+    blink: [5, 25],
+    inverse: [7, 27],
+    hidden: [8, 28],
+    strikethrough: [9, 29],
+    doubleunderline: [21, 24],
+    black: [30, 39],
+    red: [31, 39],
+    green: [32, 39],
+    yellow: [33, 39],
+    blue: [34, 39],
+    magenta: [35, 39],
+    cyan: [36, 39],
+    white: [37, 39],
+    bgBlack: [40, 49],
+    bgRed: [41, 49],
+    bgGreen: [42, 49],
+    bgYellow: [43, 49],
+    bgBlue: [44, 49],
+    bgMagenta: [45, 49],
+    bgCyan: [46, 49],
+    bgWhite: [47, 49],
+    framed: [51, 54],
+    overlined: [53, 55],
+    gray: [90, 39],
+    grey: [90, 39],
+    redBright: [91, 39],
+    greenBright: [92, 39],
+    yellowBright: [93, 39],
+    blueBright: [94, 39],
+    magentaBright: [95, 39],
+    cyanBright: [96, 39],
+    whiteBright: [97, 39],
+    bgGray: [100, 49],
+    bgGrey: [100, 49],
+    bgRedBright: [101, 49],
+    bgGreenBright: [102, 49],
+    bgYellowBright: [103, 49],
+    bgBlueBright: [104, 49],
+    bgMagentaBright: [105, 49],
+    bgCyanBright: [106, 49],
+    bgWhiteBright: [107, 49],
+    // Aliases, as in Node's util.inspect.colors.
+    blackBright: [90, 39],
+    bgBlackBright: [100, 49],
+    faint: [2, 22],
+    conceal: [8, 28],
+    strikeThrough: [9, 29],
+    crossedOut: [9, 29],
+    doubleUnderline: [21, 24],
+    swapColors: [7, 27],
+  };
+
+  // ERR_INVALID_ARG_TYPE and ERR_INVALID_ARG_VALUE are both TypeErrors in Node, so
+  // `err instanceof TypeError` works alongside `err.code`.
+  function styleTextError(code, message) {
+    var e = new TypeError(message);
+    e.code = code;
+    return e;
+  }
+
+  function styleText(format, text, options) {
+    if (typeof text !== 'string') {
+      throw styleTextError(
+        'ERR_INVALID_ARG_TYPE',
+        'The "text" argument must be of type string. Received ' + typeof text,
+      );
+    }
+    var formats = Array.isArray(format) ? format : [format];
+    var open = '';
+    var close = '';
+    for (var i = 0; i < formats.length; i++) {
+      var f = formats[i];
+      if (f === 'none') continue;
+      // Read from the live inspectColors so a caller-added/overridden style is honored.
+      var codes = typeof f === 'string' ? inspectColors[f] : undefined;
+      if (codes === undefined) {
+        throw styleTextError(
+          'ERR_INVALID_ARG_VALUE',
+          "The argument 'format' must be a valid style. Received " + inspect(f, {}, [], 1),
+        );
+      }
+      open += '\x1b[' + codes[0] + 'm';
+      close = '\x1b[' + codes[1] + 'm' + close; // closes unwind in reverse
+    }
+
+    options = options || {};
+    var validateStream = options.validateStream;
+    // null/undefined default to true (Node uses `?? true`); other falsy values force color.
+    if (validateStream === undefined || validateStream === null) validateStream = true;
+    // A falsy validateStream forces the codes (skips the TTY check); a truthy non-boolean
+    // is rejected — Node only type-checks it on this path.
+    if (validateStream) {
+      if (typeof validateStream !== 'boolean') {
+        throw styleTextError(
+          'ERR_INVALID_ARG_TYPE',
+          'The "options.validateStream" property must be of type boolean. Received ' +
+            typeof validateStream,
+        );
+      }
+      var stream =
+        options.stream !== undefined
+          ? options.stream
+          : typeof process !== 'undefined'
+            ? process.stdout
+            : undefined;
+      if (!stream || !stream.isTTY) return text;
+    }
+    return open + text + close;
+  }
+
+  function inspectPublic(v, opts) {
+    return inspect(v, opts, [], 0);
+  }
+  // util.inspect.colors is the live style table (styleText reads it); util.inspect.custom
+  // is the symbol a value implements to control its own inspection.
+  inspectPublic.colors = inspectColors;
+  if (customInspect) inspectPublic.custom = customInspect;
+
   module.exports = {
-    inspect: function (v, opts) {
-      return inspect(v, opts, [], 0);
-    },
+    inspect: inspectPublic,
     format: format,
     formatWithOptions: formatWithOptions,
     promisify: promisify,
@@ -421,6 +548,7 @@
     deprecate: deprecate,
     isDeepStrictEqual: isDeepStrictEqual,
     parseArgs: require('parse_args').parseArgs,
+    styleText: styleText,
     // Node exposes the same object via require('node:util').types and
     // require('node:util/types'); many packages use the former.
     types: require('util/types'),
