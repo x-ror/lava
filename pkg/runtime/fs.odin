@@ -397,12 +397,19 @@ fs_collect_write_bytes :: proc(
 		buffer_val := get_named(ctx, obj, "buffer")
 		if buffer_val != nil && jsc.JSValueGetTypedArrayType(ctx, buffer_val, nil) == .ArrayBuffer {
 			ab := cast(jsc.JSObjectRef)buffer_val
-			base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, ab, nil)
+			// Read the offsets/length FIRST; the ArrayBuffer backing pointer JSC returns
+			// is only valid until the next JSC API call (a GC/realloc can move it), so
+			// fetch it LAST — with no JSC call between it and the copy.
 			ab_len := int(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))
 			off := int(jsc.JSValueToNumber(ctx, get_named(ctx, obj, "byteOffset"), nil))
 			length := int(jsc.JSValueToNumber(ctx, get_named(ctx, obj, "byteLength"), nil))
-			if base == nil || off < 0 || length <= 0 || off + length > ab_len do return nil, true
+			if off < 0 || length <= 0 || off + length > ab_len do return nil, true
 			out = make([]byte, length, alloc)
+			base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, ab, nil)
+			if base == nil {
+				delete(out, alloc)
+				return nil, true
+			}
 			copy(out, (cast([^]byte)base)[off:off + length])
 			return out, true
 		}
@@ -414,19 +421,6 @@ fs_collect_write_bytes :: proc(
 	out = make([]byte, len(str), alloc)
 	copy(out, transmute([]byte)str)
 	return out, true
-}
-
-// fs_make_invalid_data_error builds the ERR_INVALID_ARG_TYPE that writeFile(Sync) throws
-// for a payload Node does not accept (today: a bare ArrayBuffer).
-fs_make_invalid_data_error :: proc(ctx: jsc.JSContextRef) -> jsc.JSValueRef {
-	err := make_js_error(
-		ctx,
-		"The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received an instance of ArrayBuffer",
-	)
-	if jsc.JSValueIsObject(ctx, err) {
-		set_named(ctx, cast(jsc.JSObjectRef)err, "code", js_string_value(ctx, "ERR_INVALID_ARG_TYPE"))
-	}
-	return err
 }
 
 fs_write_file_sync_cb :: proc "c" (
@@ -448,7 +442,7 @@ fs_write_file_sync_cb :: proc "c" (
 
 	write_bytes, data_ok := fs_collect_write_bytes(ctx, args[1], context.allocator)
 	if !data_ok {
-		if exception != nil do exception^ = fs_make_invalid_data_error(ctx)
+		if exception != nil do exception^ = err_invalid_arg_type(ctx, "data", "string or an instance of Buffer, TypedArray, or DataView", args[1])
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	defer delete(write_bytes, context.allocator)
@@ -497,7 +491,7 @@ fs_write_file_cb :: proc "c" (
 	// bare ArrayBuffer) is a synchronous throw, like Node — before anything is allocated.
 	write_bytes, data_ok := fs_collect_write_bytes(ctx, args[1], alloc)
 	if !data_ok {
-		if exception != nil do exception^ = fs_make_invalid_data_error(ctx)
+		if exception != nil do exception^ = err_invalid_arg_type(ctx, "data", "string or an instance of Buffer, TypedArray, or DataView", args[1])
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
