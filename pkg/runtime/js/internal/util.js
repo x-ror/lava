@@ -148,12 +148,125 @@
     return formatWithOptions.apply(null, [{}].concat(Array.prototype.slice.call(arguments)));
   }
 
+  // util.promisify — wrap a (…args, callback(err, value)) function as one returning a
+  // Promise. Honors the util.promisify.custom symbol and copies the original's own
+  // properties / prototype, matching Node (the multi-arg `customArgs` form is omitted).
+  var kCustomPromisify = Symbol.for('nodejs.util.promisify.custom');
+
+  function promisify(original) {
+    if (typeof original !== 'function') {
+      throw new TypeError('The "original" argument must be of type function');
+    }
+    if (original[kCustomPromisify]) {
+      var custom = original[kCustomPromisify];
+      if (typeof custom !== 'function') {
+        throw new TypeError('The "util.promisify.custom" property must be of type function');
+      }
+      return custom;
+    }
+    function fn() {
+      var args = Array.prototype.slice.call(arguments);
+      var self = this;
+      return new Promise(function (resolve, reject) {
+        args.push(function (err, value) {
+          if (err) reject(err);
+          else resolve(value);
+        });
+        Reflect.apply(original, self, args);
+      });
+    }
+    Object.setPrototypeOf(fn, Object.getPrototypeOf(original));
+    Object.defineProperty(fn, kCustomPromisify, {
+      value: fn,
+      enumerable: false,
+      writable: false,
+      configurable: true,
+    });
+    return Object.defineProperties(fn, Object.getOwnPropertyDescriptors(original));
+  }
+  promisify.custom = kCustomPromisify;
+
+  // util.callbackify — the inverse: wrap an async/Promise-returning function as one
+  // taking a Node-style (err, value) callback. Rejections are delivered on a fresh tick;
+  // a falsy rejection reason is wrapped like Node.
+  function callbackify(original) {
+    if (typeof original !== 'function') {
+      throw new TypeError('The "original" argument must be of type function');
+    }
+    function callbackified() {
+      var args = Array.prototype.slice.call(arguments);
+      var cb = args.pop();
+      if (typeof cb !== 'function') {
+        throw new TypeError('The last argument must be of type function');
+      }
+      var self = this;
+      Promise.resolve(Reflect.apply(original, self, args)).then(
+        function (ret) {
+          process.nextTick(cb.bind(self, null, ret));
+        },
+        function (rej) {
+          var reason = rej;
+          if (!reason) {
+            reason = new Error('Promise was rejected with a falsy value');
+            reason.reason = rej;
+          }
+          process.nextTick(cb.bind(self, reason));
+        },
+      );
+    }
+    Object.setPrototypeOf(callbackified, Object.getPrototypeOf(original));
+    Object.defineProperties(callbackified, Object.getOwnPropertyDescriptors(original));
+    return callbackified;
+  }
+
+  // util.inherits — set up classic prototypal inheritance and the `super_` back-link.
+  function inherits(ctor, superCtor) {
+    if (ctor == null || typeof ctor !== 'function') {
+      throw new TypeError('The "ctor" argument must be of type function');
+    }
+    if (superCtor == null || typeof superCtor !== 'function') {
+      throw new TypeError('The "superCtor" argument must be of type function');
+    }
+    if (superCtor.prototype === undefined) {
+      throw new TypeError('The "superCtor.prototype" property must be of type object');
+    }
+    Object.defineProperty(ctor, 'super_', {
+      value: superCtor,
+      writable: true,
+      configurable: true,
+    });
+    Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
+  }
+
+  // util.deprecate — return a wrapper that emits a one-time deprecation warning, then
+  // delegates to fn. Suppressed entirely when process.noDeprecation is set.
+  function deprecate(fn, msg, code) {
+    if (process.noDeprecation === true) return fn;
+    var warned = false;
+    function deprecated() {
+      if (!warned) {
+        warned = true;
+        if (typeof process.emitWarning === 'function') {
+          process.emitWarning(msg, 'DeprecationWarning', code);
+        } else {
+          console.error('DeprecationWarning: ' + msg);
+        }
+      }
+      return Reflect.apply(fn, this, arguments);
+    }
+    return deprecated;
+  }
+
   module.exports = {
     inspect: function (v, opts) {
       return inspect(v, opts, [], 0);
     },
     format: format,
     formatWithOptions: formatWithOptions,
+    promisify: promisify,
+    callbackify: callbackify,
+    inherits: inherits,
+    deprecate: deprecate,
     // Node exposes the same object via require('node:util').types and
     // require('node:util/types'); many packages use the former.
     types: require('util/types'),
