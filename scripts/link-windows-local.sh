@@ -88,6 +88,10 @@ fi
 
 SYSLIBS="Synchronization.lib user32.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib advapi32.lib winmm.lib bcrypt.lib crypt32.lib ws2_32.lib userenv.lib dbghelp.lib iphlpapi.lib version.lib comctl32.lib rpcrt4.lib secur32.lib usp10.lib windowscodecs.lib"
 
-echo "=== odin build (lld) ==="
-odin build cmd/lava -collection:lava=. -out:build/lava.exe -linker:lld \
+# Optimized release build by default (-o:speed). Override for a fast debug/iteration
+# build, e.g. `LAVA_OPT=none scripts/build-windows.ps1`. Levels: none|minimal|size|speed|aggressive.
+OPT="${LAVA_OPT:-speed}"
+
+echo "=== odin build (lld, -o:$OPT) ==="
+odin build cmd/lava -collection:lava=. -out:build/lava.exe -o:"$OPT" -linker:lld \
   -extra-linker-flags:"$RT_OBJS WTF.lib bmalloc.lib sicuuc.lib sicuin.lib sicudt.lib $SYSLIBS"
