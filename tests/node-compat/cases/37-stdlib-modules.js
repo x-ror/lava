@@ -29,6 +29,21 @@ o16 += sd16.write(emoji.subarray(2));
 o16 += sd16.end();
 assert.equal(o16, '😀');
 
+// --- util/types ---
+const types = require('node:util/types');
+assert.equal(types.isDate(new Date()), true);
+assert.equal(types.isRegExp(/x/), true);
+assert.equal(types.isMap(new Map()), true);
+assert.equal(types.isSet(new Set()), true);
+assert.equal(types.isPromise(Promise.resolve(1)), true);
+assert.equal(types.isTypedArray(new Uint8Array(1)), true);
+assert.equal(types.isUint8Array(new Uint8Array(1)), true);
+assert.equal(types.isArrayBufferView(new DataView(new ArrayBuffer(2))), true);
+assert.equal(types.isAnyArrayBuffer(new ArrayBuffer(1)), true);
+assert.equal(types.isNativeError(new TypeError('x')), true);
+assert.equal(types.isTypedArray([]), false);
+assert.equal(types.isDate({}), false);
+
 // --- timers: re-exports the real global timer functions ---
 assert.equal(typeof timers.setTimeout, 'function');
 assert.equal(typeof timers.clearTimeout, 'function');
