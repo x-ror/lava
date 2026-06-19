@@ -82,9 +82,7 @@ const haveLava = (() => {
 })();
 
 console.log(`node: ${NODE_BIN}`);
-console.log(
-  `lava: ${LAVA_BIN}${haveLava ? '' : '  (not runnable — node-only report)'}`,
-);
+console.log(`lava: ${LAVA_BIN}${haveLava ? '' : '  (not runnable — node-only report)'}`);
 
 const noop = join(ROOT, 'bench', 'micro', 'noop.js');
 const nodeResults = collect(NODE_BIN, []);
@@ -106,8 +104,7 @@ if (haveLava) {
 
 const names = [...nodeResults.keys()];
 const thresholds =
-  JSON.parse(readFileSync(join(ROOT, 'bench', 'thresholds.json'), 'utf8'))
-    .caps || {};
+  JSON.parse(readFileSync(join(ROOT, 'bench', 'thresholds.json'), 'utf8')).caps || {};
 
 // Table.
 const pad = (s, n) => String(s).padEnd(n);
@@ -137,22 +134,17 @@ for (const name of names) {
 console.log('');
 
 if (!haveLava) {
-  console.log(
-    'lava not runnable: printed Node baseline only (no ratios, no gate).',
-  );
+  console.log('lava not runnable: printed Node baseline only (no ratios, no gate).');
   process.exit(0);
 }
 
 if (GATE) {
   if (breaches.length > 0) {
     console.error('benchmark gate FAILED — lava/node ratio exceeded cap:');
-    for (const b of breaches)
-      console.error(`  ${b.name}: ${b.ratio.toFixed(2)}x > ${b.cap}x cap`);
+    for (const b of breaches) console.error(`  ${b.name}: ${b.ratio.toFixed(2)}x > ${b.cap}x cap`);
     process.exit(1);
   }
   console.log('benchmark gate passed (all ratios within caps).');
 } else {
-  console.log(
-    'report-only (no gate). Run with --gate to enforce bench/thresholds.json caps.',
-  );
+  console.log('report-only (no gate). Run with --gate to enforce bench/thresholds.json caps.');
 }
