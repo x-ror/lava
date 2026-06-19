@@ -7,7 +7,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke bench bench-gate fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -43,6 +43,8 @@ help:
 	@printf '%s\n' '  make test-eventloop-node Run event-loop ordering tests with Node as oracle'
 	@printf '%s\n' '  make test-eventloop-lava Build and compare event-loop tests through Lava, skipping known gaps'
 	@printf '%s\n' '  make test-fetch-smoke   Compare fetch over a real socket node vs Lava (binds a local port)'
+	@printf '%s\n' '  make bench              Run benchmarks node-vs-Lava, print a ratio table (report-only)'
+	@printf '%s\n' '  make bench-gate         Run benchmarks and fail if any lava/node ratio exceeds its cap'
 	@printf '%s\n' '  make fmt                Strip optional semicolons in Odin sources'
 	@printf '%s\n' '  make clean              Remove build artifacts'
 	@printf '%s\n' ''
@@ -164,6 +166,15 @@ test-eventloop-lava: build
 
 test-fetch-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-fetch-smoke.sh
+
+# bench runs the micro/macro benchmarks node-vs-Lava and prints a ratio table; it never
+# fails on timing (report-only). bench-gate adds --gate, enforcing the per-benchmark
+# lava/node ratio caps in bench/thresholds.json (exit non-zero on a regression).
+bench: build
+	LAVA_BIN="$(LAVA)" ./scripts/run-bench.sh
+
+bench-gate: build
+	LAVA_BIN="$(LAVA)" ./scripts/run-bench.sh --gate
 
 # test-lava runs every oracle suite the platform supports through one entry point
 # (scripts/run-oracles.sh) — the same script the Windows CI job runs against
