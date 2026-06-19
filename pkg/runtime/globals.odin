@@ -905,6 +905,9 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"string_decoder", INTERNAL_STRING_DECODER},
 		{"timers", INTERNAL_TIMERS},
 		{"util/types", INTERNAL_UTIL_TYPES},
+		{"punycode", INTERNAL_PUNYCODE},
+		{"process", INTERNAL_PROCESS},
+		{"console", INTERNAL_CONSOLE},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -1178,6 +1181,9 @@ INTERNAL_QUERYSTRING :: #load("js/internal/querystring.js", string)
 INTERNAL_STRING_DECODER :: #load("js/internal/string_decoder.js", string)
 INTERNAL_TIMERS :: #load("js/internal/timers.js", string)
 INTERNAL_UTIL_TYPES :: #load("js/internal/util_types.js", string)
+INTERNAL_PUNYCODE :: #load("js/internal/punycode.js", string)
+INTERNAL_PROCESS :: #load("js/internal/process.js", string)
+INTERNAL_CONSOLE :: #load("js/internal/console.js", string)
 
 // ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
 // the module resolver (see install_internal_modules); evaluates to a function.
