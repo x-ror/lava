@@ -361,66 +361,81 @@ fs_os_error_to_code :: proc(err: os.Error) -> (code: string, errno_val: int) {
 	}
 }
 
-// fs_collect_write_bytes resolves a writeFile/writeFileSync `data` value into the bytes
-// to write, copied into an owned buffer on `alloc` (so the async worker can write it
-// off-loop, and the sync path frees it after). It mirrors the data types Node accepts:
+// is_data_view reports whether value is a DataView. JSC's C API has no DataView
+// predicate (JSValueGetTypedArrayType returns .None for one), so check the brand via
+// `constructor.name` — the same constructor-name pattern determine_received_type uses.
+// This separates a real DataView from a plain {buffer, byteOffset, byteLength} object,
+// which Node rejects and whose unchecked fields must not be fed to the slice below.
+is_data_view :: proc(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef) -> bool {
+	ctor := get_named(ctx, obj, "constructor")
+	if ctor == nil || !jsc.JSValueIsObject(ctx, ctor) do return false
+	name, allocated := value_to_string(ctx, get_named(ctx, cast(jsc.JSObjectRef)ctor, "name"))
+	defer if allocated do delete(name)
+	return name == "DataView"
+}
+
+// fs_resolve_write_payload resolves a writeFile/writeFileSync `data` value into the
+// bytes to write. The returned slice EITHER borrows JavaScriptCore-owned memory (a
+// TypedArray/DataView window: owned=false — valid only for the current native call,
+// never stored or freed) OR is a heap allocation on context.allocator the caller must
+// free (a coerced string: owned=true). It mirrors the data types Node accepts:
 //   - TypedArray / Buffer: its bytes, honoring byteOffset/byteLength (typed_array_view).
-//   - DataView: its window of the backing buffer. JSC's C API has no DataView byte
-//     accessor, so read the standard `.buffer`/`.byteOffset`/`.byteLength` view
-//     properties and slice the ArrayBuffer — bounds-checked defensively.
-//   - string (and anything non-object, coerced to string): its UTF-8 bytes (unchanged).
-//   - a bare ArrayBuffer: rejected (ok=false) — Node throws ERR_INVALID_ARG_TYPE here,
-//     and the previous code silently wrote an empty file.
-// Returns nil bytes for an empty payload (a zero-length file). Must run on the loop
-// thread — it reads JSC.
-fs_collect_write_bytes :: proc(
+//   - DataView: its window of the backing ArrayBuffer. JSC's C API has no DataView byte
+//     accessor, so confirm the object is a DataView (is_data_view) and read its
+//     `.byteOffset`/`.byteLength` against the `.buffer` backing. The window is validated
+//     in f64 so a non-finite or out-of-range value rejects safely (NaN/Inf fail every
+//     comparison) instead of reaching an undefined float->int conversion.
+//   - string (and anything non-object, coerced to string): its UTF-8 bytes.
+//   - a bare ArrayBuffer (or any non-DataView object that is not coercible): rejected
+//     (ok=false) — Node throws ERR_INVALID_ARG_TYPE, where the previous code silently
+//     wrote an empty file.
+// Returns a nil slice for an empty payload (a zero-length file). Must run on the loop
+// thread (it reads JSC); the caller must consume a borrowed result before its next JSC
+// call (a later call may move the backing store).
+fs_resolve_write_payload :: proc(
 	ctx: jsc.JSContextRef,
 	value: jsc.JSValueRef,
-	alloc: runtime.Allocator,
-) -> (out: []byte, ok: bool) {
+) -> (bytes: []byte, owned: bool, ok: bool) {
 	t := jsc.JSValueGetTypedArrayType(ctx, value, nil)
 	// A bare ArrayBuffer is not a valid fs write payload (Node: ERR_INVALID_ARG_TYPE).
-	if t == .ArrayBuffer do return nil, false
+	if t == .ArrayBuffer do return nil, false, false
 	if t != .None {
 		// A real typed array (Buffer included); typed_array_view is byteOffset-aware, so
-		// a Buffer.subarray(...) writes its window, not the whole backing.
+		// a Buffer.subarray(...) writes its window, not the whole backing. Borrowed.
 		view, view_ok := typed_array_view(ctx, value)
-		if !view_ok || len(view) == 0 do return nil, true
-		out = make([]byte, len(view), alloc)
-		copy(out, view)
-		return out, true
+		if !view_ok do return nil, false, true
+		return view, false, true
 	}
 	// A DataView is an object whose `.buffer` is an ArrayBuffer; read its window directly
 	// from the backing buffer (no C-API DataView accessor exists).
 	if jsc.JSValueIsObject(ctx, value) {
 		obj := cast(jsc.JSObjectRef)value
-		buffer_val := get_named(ctx, obj, "buffer")
-		if buffer_val != nil && jsc.JSValueGetTypedArrayType(ctx, buffer_val, nil) == .ArrayBuffer {
-			ab := cast(jsc.JSObjectRef)buffer_val
-			// Read the offsets/length FIRST; the ArrayBuffer backing pointer JSC returns
-			// is only valid until the next JSC API call (a GC/realloc can move it), so
-			// fetch it LAST — with no JSC call between it and the copy.
-			ab_len := int(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))
-			off := int(jsc.JSValueToNumber(ctx, get_named(ctx, obj, "byteOffset"), nil))
-			length := int(jsc.JSValueToNumber(ctx, get_named(ctx, obj, "byteLength"), nil))
-			if off < 0 || length <= 0 || off + length > ab_len do return nil, true
-			out = make([]byte, length, alloc)
-			base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, ab, nil)
-			if base == nil {
-				delete(out, alloc)
-				return nil, true
+		if is_data_view(ctx, obj) {
+			buffer_val := get_named(ctx, obj, "buffer")
+			if buffer_val != nil && jsc.JSValueGetTypedArrayType(ctx, buffer_val, nil) == .ArrayBuffer {
+				ab := cast(jsc.JSObjectRef)buffer_val
+				// Read offsets/length FIRST and validate them in f64; the ArrayBuffer backing
+				// pointer JSC returns is only valid until the next JSC API call (a GC/realloc
+				// can move it), so fetch it LAST — with no JSC call between it and the return.
+				ab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))
+				off_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, "byteOffset"), nil)
+				len_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, "byteLength"), nil)
+				// NaN/Infinity fail every comparison, so an invalid window rejects to an empty
+				// payload here rather than truncating to an undefined int. len_f > 0 also folds
+				// the zero-length DataView into the empty-file path.
+				if !(off_f >= 0 && len_f > 0 && off_f + len_f <= ab_len) do return nil, false, true
+				base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, ab, nil)
+				if base == nil do return nil, false, true
+				off, length := int(off_f), int(len_f)
+				return (cast([^]byte)base)[off:off + length], false, true
 			}
-			copy(out, (cast([^]byte)base)[off:off + length])
-			return out, true
 		}
 	}
-	// String, or any other value coerced to its string form (unchanged behavior).
+	// String, or any other value coerced to its string form. The string buffer is already
+	// owned on context.allocator, so hand it back as-is (owned=true) — no extra copy.
 	str, salloc := jsc_value_to_string_or_default(ctx, value)
-	defer if salloc do delete(str, context.allocator)
-	if len(str) == 0 do return nil, true
-	out = make([]byte, len(str), alloc)
-	copy(out, transmute([]byte)str)
-	return out, true
+	if !salloc do return nil, false, true // empty/unconvertible -> zero-length file
+	return transmute([]byte)str, true, true
 }
 
 fs_write_file_sync_cb :: proc "c" (
@@ -440,12 +455,15 @@ fs_write_file_sync_cb :: proc "c" (
 	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
 	defer if path_alloc do delete(path_str, context.allocator)
 
-	write_bytes, data_ok := fs_collect_write_bytes(ctx, args[1], context.allocator)
+	// The sync write completes within this native call while a borrowed TypedArray/DataView
+	// window is still valid, so write straight from it — no marshalling copy (only a coerced
+	// string is an owned buffer, freed below).
+	write_bytes, owned, data_ok := fs_resolve_write_payload(ctx, args[1])
 	if !data_ok {
 		if exception != nil do exception^ = err_invalid_arg_type(ctx, "data", "string or an instance of Buffer, TypedArray, or DataView", args[1])
 		return jsc.JSValueMakeUndefined(ctx)
 	}
-	defer delete(write_bytes, context.allocator)
+	defer if owned do delete(write_bytes, context.allocator)
 
 	if write_err := os.write_entire_file_from_bytes(path_str, write_bytes); write_err != nil {
 		if exception != nil {
@@ -486,13 +504,23 @@ fs_write_file_cb :: proc "c" (
 	// context.allocator is the heap allocator here (proc "c"); capture it so the owned
 	// path/data outlive this call and the worker frees through the same allocator.
 	alloc := context.allocator
-	// Marshal the bytes to write into an owned copy NOW (JSC access is loop-thread only;
-	// the worker writes from this buffer, not from the JS value). An invalid payload (a
-	// bare ArrayBuffer) is a synchronous throw, like Node — before anything is allocated.
-	write_bytes, data_ok := fs_collect_write_bytes(ctx, args[1], alloc)
+	// Resolve the payload NOW (JSC access is loop-thread only). An invalid payload (a bare
+	// ArrayBuffer) is a synchronous throw, like Node — before anything is allocated.
+	payload, owned, data_ok := fs_resolve_write_payload(ctx, args[1])
 	if !data_ok {
 		if exception != nil do exception^ = err_invalid_arg_type(ctx, "data", "string or an instance of Buffer, TypedArray, or DataView", args[1])
 		return jsc.JSValueMakeUndefined(ctx)
+	}
+	// The worker writes off-loop, so it must own its bytes. A coerced string is already an
+	// owned heap buffer on `alloc` — take it as-is; a borrowed TypedArray/DataView window
+	// must be copied here (it aliases JSC memory). No JSC call between the resolve and this
+	// copy, per fs_resolve_write_payload's borrowing contract.
+	write_data: []byte
+	if owned {
+		write_data = payload
+	} else if len(payload) > 0 {
+		write_data = make([]byte, len(payload), alloc)
+		copy(write_data, payload)
 	}
 
 	req := new(FS_Op_Request, alloc)
@@ -501,7 +529,7 @@ fs_write_file_cb :: proc "c" (
 	req.allocator = alloc
 	req.syscall = "open"
 	req.path = strings.clone(path_str, alloc)
-	req.write_data = write_bytes
+	req.write_data = write_data
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)callback)
 
 	loop := get_loop_from_ctx(ctx)

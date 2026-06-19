@@ -17,16 +17,32 @@ for (let i = 0; i < 8; i++) fill[i] = i + 1;
 fs.writeFileSync(file, new DataView(ab, 2, 4));
 assert.deepEqual([...fs.readFileSync(file)], [3, 4, 5, 6]);
 
+// DataView spanning the whole backing buffer (no offset/length): writes all 8 bytes.
+fs.writeFileSync(file, new DataView(ab));
+assert.deepEqual([...fs.readFileSync(file)], [1, 2, 3, 4, 5, 6, 7, 8]);
+
+// Zero-length DataView writes an empty file (not a rejection).
+fs.writeFileSync(file, new DataView(ab, 4, 0));
+assert.deepEqual([...fs.readFileSync(file)], []);
+
 // Offset typed-array (Buffer.subarray-style): writes the window, not the whole backing.
 const big = Uint8Array.from([10, 20, 30, 40, 50]);
 fs.writeFileSync(file, big.subarray(1, 4));
 assert.deepEqual([...fs.readFileSync(file)], [20, 30, 40]);
 
 // A bare ArrayBuffer is not a valid payload: both the sync and async forms throw
-// ERR_INVALID_ARG_TYPE synchronously (the async form validates before scheduling).
-assert.throws(() => fs.writeFileSync(file, new ArrayBuffer(4)), {
-  code: 'ERR_INVALID_ARG_TYPE',
-});
+// ERR_INVALID_ARG_TYPE synchronously (the async form validates before scheduling). Print
+// the code+message so the node-vs-lava oracle compares the full message, not just that
+// *some* error was thrown.
+try {
+  fs.writeFileSync(file, new ArrayBuffer(4));
+  assert.fail('writeFileSync(ArrayBuffer) should throw');
+} catch (e) {
+  console.log(e.code, '|', e.message);
+}
+// A rejected write must leave the previous contents untouched (no truncation).
+assert.deepEqual([...fs.readFileSync(file)], [20, 30, 40]);
+
 assert.throws(() => fs.writeFile(file, new ArrayBuffer(4), () => {}), {
   code: 'ERR_INVALID_ARG_TYPE',
 });
