@@ -18,8 +18,11 @@ fs.writeFile(file, payload, (writeErr) => {
 
   fs.readFile(file, (readErr, buf) => {
     assert.equal(readErr, null);
-    assert.ok(Buffer.isBuffer(buf));
-    assert.ok(buf.equals(payload));
+    // Lava's readFile yields a Uint8Array (Node's Buffer is one too), so compare bytes
+    // without relying on Buffer-only methods — keeps node and lava output identical.
+    assert.ok(buf instanceof Uint8Array);
+    assert.equal(buf.length, payload.length);
+    assert.equal(Buffer.from(buf).toString('utf8'), payload.toString('utf8'));
 
     fs.readFile(file, 'utf8', (strErr, text) => {
       assert.equal(strErr, null);
