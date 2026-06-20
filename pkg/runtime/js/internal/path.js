@@ -848,6 +848,177 @@
     return 0;
   }
 
+  // --- matchesGlob (Node 22.5+) ---
+  // A glob matcher with the same surface as Node's path.matchesGlob (which delegates to its
+  // bundled minimatch): `*`/`?` match within one segment and not a leading dot, `**` spans
+  // segments (stopping at a dotfile), `{a,b}` expands, `[abc]`/`[!abc]` are classes, `\`
+  // escapes. `/` is the only separator and runs of it collapse; a trailing `/` is significant
+  // only for a trailing `**`. Matching is case-insensitive on Windows, like Node.
+  var GLOB_NOCASE = typeof process !== 'undefined' && process.platform === 'win32';
+  var GLOB_RE_SPECIAL = /[.*+?^${}()|[\]\\]/;
+
+  function globEscape(ch) {
+    return GLOB_RE_SPECIAL.test(ch) ? '\\' + ch : ch;
+  }
+
+  function globSegToRegex(seg) {
+    var re = '';
+    var i = 0;
+    while (i < seg.length) {
+      var c = seg[i];
+      if (c === '*') {
+        re += '[^/]*';
+        i++;
+      } else if (c === '?') {
+        re += '[^/]';
+        i++;
+      } else if (c === '[') {
+        var j = i + 1;
+        var neg = false;
+        if (seg[j] === '!' || seg[j] === '^') {
+          neg = true;
+          j++;
+        }
+        var cls = '';
+        if (seg[j] === ']') {
+          cls += '\\]';
+          j++;
+        }
+        while (j < seg.length && seg[j] !== ']') {
+          var cc = seg[j];
+          if (cc === '\\') {
+            cls += '\\' + (seg[j + 1] || '');
+            j += 2;
+          } else if (cc === '^' || cc === '[') {
+            cls += '\\' + cc;
+            j++;
+          } else {
+            cls += cc;
+            j++;
+          }
+        }
+        if (j >= seg.length) {
+          re += '\\[';
+          i++;
+        } else {
+          re += '[' + (neg ? '^' : '') + cls + ']';
+          i = j + 1;
+        }
+      } else if (c === '\\') {
+        re += globEscape(seg[i + 1] || '');
+        i += 2;
+      } else {
+        re += globEscape(c);
+        i++;
+      }
+    }
+    // A wildcard at the start of a segment must not match a leading dot (dot:false).
+    if (seg[0] !== '.') re = '(?!\\.)' + re;
+    return new RegExp('^' + re + '$', GLOB_NOCASE ? 'i' : '');
+  }
+
+  function globMatchSegs(patSegs, pathSegs, pi, si, trail) {
+    while (pi < patSegs.length) {
+      if (patSegs[pi] === '**') {
+        if (pi + 1 === patSegs.length) {
+          if (si >= pathSegs.length) return pi === 0 || trail;
+          for (var k = si; k < pathSegs.length; k++) {
+            if (pathSegs[k][0] === '.') return false;
+          }
+          return true;
+        }
+        if (globMatchSegs(patSegs, pathSegs, pi + 1, si, trail)) return true;
+        while (si < pathSegs.length) {
+          if (pathSegs[si][0] === '.') return false;
+          si++;
+          if (globMatchSegs(patSegs, pathSegs, pi + 1, si, trail)) return true;
+        }
+        return false;
+      }
+      if (si >= pathSegs.length) return false;
+      if (!globSegToRegex(patSegs[pi]).test(pathSegs[si])) return false;
+      pi++;
+      si++;
+    }
+    return si === pathSegs.length;
+  }
+
+  function globExpandBraces(pattern) {
+    var open = -1;
+    for (var i = 0; i < pattern.length; i++) {
+      if (pattern[i] === '\\') {
+        i++;
+        continue;
+      }
+      if (pattern[i] === '{') {
+        open = i;
+        break;
+      }
+    }
+    if (open === -1) return [pattern];
+    var depth = 0;
+    var parts = [];
+    var partStart = open + 1;
+    var close = -1;
+    for (var k = open; k < pattern.length; k++) {
+      var ch = pattern[k];
+      if (ch === '\\') {
+        k++;
+        continue;
+      }
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          parts.push(pattern.slice(partStart, k));
+          close = k;
+          break;
+        }
+      } else if (ch === ',' && depth === 1) {
+        parts.push(pattern.slice(partStart, k));
+        partStart = k + 1;
+      }
+    }
+    if (close === -1 || parts.length < 2) return [pattern]; // a brace with no comma is literal
+    var prefix = pattern.slice(0, open);
+    var suffix = pattern.slice(close + 1);
+    var out = [];
+    for (var p = 0; p < parts.length; p++) {
+      var expanded = globExpandBraces(parts[p] + suffix);
+      for (var e = 0; e < expanded.length; e++) out.push(prefix + expanded[e]);
+    }
+    return out;
+  }
+
+  function globSplit(s) {
+    var raw = s.split('/');
+    var out = [];
+    for (var i = 0; i < raw.length; i++) if (raw[i] !== '') out.push(raw[i]);
+    return out;
+  }
+
+  function globArgError(name, value) {
+    var e = new TypeError(
+      'The "' + name + '" argument must be of type string. Received ' + typeof value,
+    );
+    e.code = 'ERR_INVALID_ARG_TYPE';
+    return e;
+  }
+
+  function matchesGlob(path, pattern) {
+    if (typeof path !== 'string') throw globArgError('path', path);
+    if (typeof pattern !== 'string') throw globArgError('pattern', pattern);
+    var trail = path.length > 1 && path[path.length - 1] === '/';
+    var pathSegs = globSplit(path);
+    var patterns = globExpandBraces(pattern);
+    for (var i = 0; i < patterns.length; i++) {
+      if (globMatchSegs(globSplit(patterns[i]), pathSegs, 0, 0, trail)) return true;
+    }
+    return false;
+  }
+  posix.matchesGlob = matchesGlob;
+  win32.matchesGlob = matchesGlob;
+
   posix.posix = win32.posix = posix;
   posix.win32 = win32.win32 = win32;
 
