@@ -861,6 +861,8 @@
     typeof process !== 'undefined' &&
     (process.platform === 'win32' || process.platform === 'darwin');
   var GLOB_RE_SPECIAL = /[.*+?^${}()|[\]\\]/;
+  // The POSIX classes Node's matcher recognizes. Note: `word` and `ascii` are included, but
+  // `print` is NOT — Node does not recognize `[[:print:]]`, so it is left to match literally.
   var GLOB_POSIX_CLASSES = {
     alpha: 'A-Za-z',
     digit: '0-9',
@@ -869,11 +871,14 @@
     lower: 'a-z',
     space: '\\s',
     blank: ' \\t',
+    word: 'A-Za-z0-9_',
+    ascii: '\\x00-\\x7f',
     xdigit: '0-9A-Fa-f',
-    punct: '!-/:-@\\[-`{-~',
-    print: '\\x20-\\x7e',
+    punct: '!-#%-*,:;?@[\\\\\\]_{}-',
     graph: '\\x21-\\x7e',
     cntrl: '\\x00-\\x1f\\x7f',
+    // Node maps `print` to the control set (a minimatch quirk), not the printable range.
+    print: '\\x00-\\x1f\\x7f',
   };
 
   function globEscape(ch) {
