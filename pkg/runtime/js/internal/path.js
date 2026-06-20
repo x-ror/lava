@@ -1077,13 +1077,34 @@
     return globExtglobEnd(seg, 1) === seg.length - 1;
   }
 
+  // A segment is "magic" — and so matched case-insensitively on Windows/macOS, like Node —
+  // when it has a wildcard, an extglob, or a real character class. A purely literal segment
+  // (or a single positive char class like `[a]`, which minimatch treats as a literal) is
+  // matched case-sensitively even there, so `ABC` does not match `abc`.
+  function globSegHasMagic(seg) {
+    for (var i = 0; i < seg.length; i++) {
+      var c = seg[i];
+      if (c === '*' || c === '?') return true;
+      if (globIsExtOp(c) && seg[i + 1] === '(') return true;
+      if (c === '[') {
+        var pc = globParseClass(seg, i);
+        if (pc !== null) {
+          // ranges, negation, POSIX classes and multi-char sets are magic; `[a]` is not.
+          if (!/^[^!^]$/.test(seg.slice(i + 1, pc.next - 1))) return true;
+          i = pc.next - 1;
+        }
+      }
+    }
+    return false;
+  }
+
   function globSegToRegex(seg) {
     var compiled = globCompileBody(seg);
     var re = compiled.body;
     // A wildcard at the start of a segment must not match a leading dot (dot:false).
     if (!compiled.firstDot) re = '(?!\\.)' + re;
     try {
-      return new RegExp('^' + re + '$', GLOB_NOCASE ? 'i' : '');
+      return new RegExp('^' + re + '$', GLOB_NOCASE && globSegHasMagic(seg) ? 'i' : '');
     } catch (e) {
       return /(?!)/; // an invalid range matches nothing, like Node
     }
