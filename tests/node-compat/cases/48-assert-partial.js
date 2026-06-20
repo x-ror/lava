@@ -49,4 +49,43 @@ for (const [a, e] of failing) {
   assert.throws(() => assert.partialDeepStrictEqual(a, e), { operator: 'partialDeepStrictEqual' });
 }
 
+// edge cases matching Node's strict-deep semantics:
+const sym = Symbol.for('k');
+// primitives use Object.is (−0 ≠ 0, NaN = NaN)
+assert.partialDeepStrictEqual({ x: NaN }, { x: NaN });
+assert.throws(() => assert.partialDeepStrictEqual({ x: 0 }, { x: -0 }));
+// Map keys match by partial deep equality (not identity); Errors by name+message+cause
+assert.partialDeepStrictEqual(
+  new Map([
+    [
+      { id: 1, e: 2 },
+      { a: 1, b: 2 },
+    ],
+  ]),
+  new Map([[{ id: 1 }, { a: 1 }]]),
+);
+assert.partialDeepStrictEqual(
+  new Error('boom', { cause: { a: 1, b: 2 } }),
+  new Error('boom', { cause: { a: 1 } }),
+);
+assert.throws(() => assert.partialDeepStrictEqual(new Error('a'), new Error('b')));
+// typed arrays compare element bits (so ±0 differ); ArrayBuffers/DataViews by bytes
+assert.throws(() => assert.partialDeepStrictEqual(Float32Array.of(-0), Float32Array.of(0)));
+assert.partialDeepStrictEqual(Float32Array.of(NaN), Float32Array.of(NaN));
+assert.throws(() =>
+  assert.partialDeepStrictEqual(Uint8Array.of(1).buffer, Uint8Array.of(2).buffer),
+);
+// sparse holes are ignored; expected array's own non-index props are required
+assert.partialDeepStrictEqual([0, 1], [, 1]);
+const earr = [1];
+earr.x = 2;
+assert.throws(() => assert.partialDeepStrictEqual([1], earr));
+assert.partialDeepStrictEqual(Object.assign([1], { x: 2 }), earr);
+// enumerable symbols are honored; a non-enumerable actual prop does not satisfy an expected key
+assert.partialDeepStrictEqual({ [sym]: 1, a: 2 }, { [sym]: 1 });
+assert.throws(() => assert.partialDeepStrictEqual({}, { [sym]: 1 }));
+const nonEnum = {};
+Object.defineProperty(nonEnum, 'h', { value: 1, enumerable: false });
+assert.throws(() => assert.partialDeepStrictEqual(nonEnum, { h: 1 }));
+
 console.log('ok');

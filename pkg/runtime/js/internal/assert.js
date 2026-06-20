@@ -151,24 +151,80 @@
     }
   }
 
+  var hasOwn = Object.prototype.hasOwnProperty;
+  var isEnum = Object.prototype.propertyIsEnumerable;
+
+  // Own enumerable keys, strings then enumerable symbols (matching strict deep equality).
+  function ownEnumKeys(obj) {
+    var keys = Object.keys(obj);
+    var syms = Object.getOwnPropertySymbols(obj);
+    for (var i = 0; i < syms.length; i++) {
+      if (isEnum.call(obj, syms[i])) keys.push(syms[i]);
+    }
+    return keys;
+  }
+
+  function isArrayIndex(key) {
+    return typeof key === 'string' && /^(?:0|[1-9]\d*)$/.test(key) && key <= '4294967294';
+  }
+
+  // Byte-exact comparison of two ArrayBuffer regions.
+  function sameBytes(bufA, offA, lenA, bufB, offB, lenB) {
+    if (lenA !== lenB) return false;
+    var va = new Uint8Array(bufA, offA, lenA);
+    var vb = new Uint8Array(bufB, offB, lenB);
+    for (var i = 0; i < lenA; i++) if (va[i] !== vb[i]) return false;
+    return true;
+  }
+
+  // Match each expected item to a DISTINCT actual item via `pred` (bipartite, backtracking).
+  function bipartiteMatch(actualList, expectedList, pred) {
+    var used = [];
+    var from = function (ei) {
+      if (ei >= expectedList.length) return true;
+      for (var ai = 0; ai < actualList.length; ai++) {
+        if (!used[ai] && pred(actualList[ai], expectedList[ei])) {
+          used[ai] = true;
+          if (from(ei + 1)) return true;
+          used[ai] = false;
+        }
+      }
+      return false;
+    };
+    return from(0);
+  }
+
+  function collect(iterable) {
+    var out = [];
+    iterable.forEach(function () {
+      out.push(arguments.length > 1 ? [arguments[1], arguments[0]] : arguments[0]);
+    });
+    return out;
+  }
+
   // Partial deep-equality: every part of `expected` must appear in `actual`, recursively.
-  // Primitives compare strictly; a plain object's expected keys must each be present and
-  // partially match; an array/typed-array expected must be an ordered subsequence of actual;
-  // a Set's expected elements must each match a distinct actual element (order-independent);
-  // a Map's expected entries must be present with partially-matching values. Dates/RegExps
-  // compare wholly. `actual` may carry extra properties/elements.
+  // Primitives compare with Object.is (so -0 ≠ 0, NaN = NaN); a plain object's own enumerable
+  // keys (strings + symbols) must each be present-and-enumerable on actual and partially match;
+  // an array/typed-array expected must be an ordered subsequence of actual (typed-array
+  // elements compared with Object.is, i.e. by value bits); a Set's elements / a Map's entries
+  // must each match a distinct actual one (keys partially, order-independent); ArrayBuffers and
+  // DataViews compare byte-exact; Errors compare name+message (plus enumerable props);
+  // Dates/RegExps compare wholly. `actual` may carry extra properties/elements.
   function partialMatch(actual, expected, seen) {
     if (Object.is(actual, expected)) return true;
-    // A primitive (or null) expected must strictly equal actual.
-    if (typeof expected !== 'object' || expected === null) return actual === expected;
+    if (typeof expected !== 'object' || expected === null) return Object.is(actual, expected);
     if (typeof actual !== 'object' || actual === null) return false;
 
     if (Object.prototype.toString.call(actual) !== Object.prototype.toString.call(expected)) {
       return false;
     }
-    if (expected instanceof Date) return actual.getTime() === expected.getTime();
+    if (expected instanceof Date) return Object.is(actual.getTime(), expected.getTime());
     if (expected instanceof RegExp) {
-      return actual.source === expected.source && actual.flags === expected.flags;
+      return (
+        actual.source === expected.source &&
+        actual.flags === expected.flags &&
+        actual.lastIndex === expected.lastIndex
+      );
     }
 
     seen = seen || [];
@@ -177,11 +233,24 @@
     }
     seen = seen.concat([[actual, expected]]);
 
-    // TypedArray / Buffer: an ordered subsequence by value.
-    if (ArrayBuffer.isView(actual) && ArrayBuffer.isView(expected)) {
+    if (expected instanceof ArrayBuffer) {
+      return sameBytes(actual, 0, actual.byteLength, expected, 0, expected.byteLength);
+    }
+    if (typeof DataView !== 'undefined' && expected instanceof DataView) {
+      return sameBytes(
+        actual.buffer,
+        actual.byteOffset,
+        actual.byteLength,
+        expected.buffer,
+        expected.byteOffset,
+        expected.byteLength,
+      );
+    }
+    // TypedArray: ordered subsequence; Object.is compares element bits (so ±0 differ).
+    if (ArrayBuffer.isView(expected)) {
       var ti = 0;
       for (var te = 0; te < expected.length; te++) {
-        while (ti < actual.length && actual[ti] !== expected[te]) ti++;
+        while (ti < actual.length && !Object.is(actual[ti], expected[te])) ti++;
         if (ti >= actual.length) return false;
         ti++;
       }
@@ -189,53 +258,36 @@
     }
 
     if (expected instanceof Map) {
-      var mapOk = true;
-      expected.forEach(function (val, key) {
-        if (!actual.has(key) || !partialMatch(actual.get(key), val, seen)) mapOk = false;
+      return bipartiteMatch(collect(actual), collect(expected), function (ae, ee) {
+        return partialMatch(ae[0], ee[0], seen) && partialMatch(ae[1], ee[1], seen);
       });
-      return mapOk;
     }
-
     if (expected instanceof Set) {
-      // Each expected element must match a distinct actual element (bipartite matching).
-      var actualList = [];
-      actual.forEach(function (v) {
-        actualList.push(v);
+      return bipartiteMatch(collect(actual), collect(expected), function (av, ev) {
+        return partialMatch(av, ev, seen);
       });
-      var expectedList = [];
-      expected.forEach(function (v) {
-        expectedList.push(v);
-      });
-      var used = [];
-      var matchFrom = function (ei) {
-        if (ei >= expectedList.length) return true;
-        for (var ai = 0; ai < actualList.length; ai++) {
-          if (!used[ai] && partialMatch(actualList[ai], expectedList[ei], seen)) {
-            used[ai] = true;
-            if (matchFrom(ei + 1)) return true;
-            used[ai] = false;
-          }
-        }
-        return false;
-      };
-      return matchFrom(0);
     }
 
     if (Array.isArray(expected)) {
       if (!Array.isArray(actual)) return false;
       var ai2 = 0;
       for (var ei2 = 0; ei2 < expected.length; ei2++) {
+        if (!(ei2 in expected)) continue; // sparse holes are ignored
         while (ai2 < actual.length && !partialMatch(actual[ai2], expected[ei2], seen)) ai2++;
         if (ai2 >= actual.length) return false;
         ai2++;
       }
-      return true;
+      // fall through to also require expected's own non-index enumerable properties
+    } else if (expected instanceof Error) {
+      if (actual.name !== expected.name || actual.message !== expected.message) return false;
+      // fall through to compare enumerable own props (e.g. cause, custom fields)
     }
 
-    var keysE = Object.keys(expected);
+    var keysE = ownEnumKeys(expected);
     for (var i = 0; i < keysE.length; i++) {
       var key = keysE[i];
-      if (!Object.prototype.hasOwnProperty.call(actual, key)) return false;
+      if (Array.isArray(expected) && isArrayIndex(key)) continue; // matched as a subsequence
+      if (!hasOwn.call(actual, key) || !isEnum.call(actual, key)) return false;
       if (!partialMatch(actual[key], expected[key], seen)) return false;
     }
     return true;
