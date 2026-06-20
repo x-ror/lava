@@ -548,6 +548,7 @@
     deprecate: deprecate,
     isDeepStrictEqual: isDeepStrictEqual,
     parseArgs: require('parse_args').parseArgs,
+    parseEnv: require('parse_env').parseEnv,
     styleText: styleText,
     // Node exposes the same object via require('node:util').types and
     // require('node:util/types'); many packages use the former.
