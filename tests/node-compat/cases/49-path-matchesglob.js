@@ -76,6 +76,20 @@ assert.equal(m('x.css', '!(*.js)'), true);
 assert.equal(m('x.js', '!(*.js)'), false);
 assert.equal(m('ab', '@(a@(b|c))'), true); // nesting
 assert.equal(m('foo.test.js', '*.+(test|spec).js'), true);
+// negation respects following text (the negated part is only what the extglob consumes)
+assert.equal(m('axc', 'a!(b)c'), true);
+assert.equal(m('abc', 'a!(b)c'), false);
+assert.equal(m('file.js', '!(*.js).js'), true);
+assert.equal(m('bb', '!(b)'), true); // whole-segment negation: bb is not b
+// a literal '(' inside an extglob alternative; an invalid alternative is dropped, not fatal
+assert.equal(m('a(b', '@(a(b)'), true);
+assert.equal(m('a', '@([z-a]|a)'), true);
+// a nullable leading extglob lets a following '.' match a dotfile; the empty path matches a
+// zero-length extglob
+assert.equal(m('.b', '?(a).b'), true);
+assert.equal(m('.b', '*.b'), false);
+assert.equal(m('', '?(a)'), true);
+assert.equal(m('', '*(a)'), true);
 
 // non-string arguments throw ERR_INVALID_ARG_TYPE
 assert.throws(() => path.matchesGlob(1, '*'), { code: 'ERR_INVALID_ARG_TYPE' });
