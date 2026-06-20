@@ -261,13 +261,20 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 
 // fs_make_error builds a Node-style fs error: an Error with code/syscall/path.
 fs_make_error :: proc(ctx: jsc.JSContextRef, code, syscall, path: string, errno_val := 0) -> jsc.JSValueRef {
-	msg := fmt.tprintf("%s: %s, %s '%s'", code, fs_errno_text(code), syscall, path)
+	// A path-less syscall (e.g. close, which operates on an fd) gets no "'path'" clause
+	// and no `path` property — matching Node, whose close error reads "EBADF: ..., close".
+	msg: string
+	if len(path) > 0 {
+		msg = fmt.tprintf("%s: %s, %s '%s'", code, fs_errno_text(code), syscall, path)
+	} else {
+		msg = fmt.tprintf("%s: %s, %s", code, fs_errno_text(code), syscall)
+	}
 	err := make_js_error(ctx, msg)
 	if jsc.JSValueIsObject(ctx, err) {
 		obj := cast(jsc.JSObjectRef)err
 		set_named(ctx, obj, "code", js_string_value(ctx, code))
 		set_named(ctx, obj, "syscall", js_string_value(ctx, syscall))
-		set_named(ctx, obj, "path", js_string_value(ctx, path))
+		if len(path) > 0 do set_named(ctx, obj, "path", js_string_value(ctx, path))
 		if errno_val != 0 {
 			set_named(ctx, obj, "errno", jsc.JSValueMakeNumber(ctx, f64(-errno_val)))
 		}
@@ -306,9 +313,55 @@ fs_errno_text :: proc(code: string) -> string {
 	case "EIO":           return "i/o error"
 	case "EROFS":         return "read-only file system"
 	case "ENOSPC":        return "no space left on device"
+	case "EBADF":         return "bad file descriptor"
+	case "EMFILE":        return "too many open files"
+	case "ENFILE":        return "file table overflow"
+	case "ELOOP":         return "too many symbolic links encountered"
+	case "EINVAL":        return "invalid argument"
+	case "ENOSYS":        return "function not implemented"
 	case "ERR_FS_EISDIR": return "Path is a directory"
 	}
 	return "i/o error"
+}
+
+// fs_validate_int_arg validates a JS value as a non-negative integer in [0, max] BEFORE
+// any syscall, mirroring Node's validateInt32/validateUint32: a non-number throws
+// ERR_INVALID_ARG_TYPE; a NaN / negative / non-integer / out-of-range number throws
+// ERR_OUT_OF_RANGE. This is what stops fs.closeSync(3.5) (or a NaN/object) from coercing
+// to a garbage fd and closing an unrelated descriptor (stdin, the loop's epoll fd, …).
+fs_validate_int_arg :: proc(
+	ctx: jsc.JSContextRef,
+	value: jsc.JSValueRef,
+	name: string,
+	max: f64,
+) -> (
+	out: int,
+	err: jsc.JSValueRef,
+	ok: bool,
+) {
+	if !jsc.JSValueIsNumber(ctx, value) {
+		return 0, err_invalid_arg_type(ctx, name, "number", value), false
+	}
+	f := jsc.JSValueToNumber(ctx, value, nil)
+	// The (f >= 0 && f <= max) form rejects NaN (NaN compares false), -inf, and overflow
+	// before the int() cast, so the cast below is always well-defined.
+	if !(f >= 0 && f <= max) {
+		rng := fmt.tprintf(">= 0 && <= %d", int(max))
+		return 0, err_out_of_range(ctx, name, rng, fs_render_number(f)), false
+	}
+	out = int(f)
+	if f != f64(out) {
+		return 0, err_out_of_range(ctx, name, "an integer", fs_render_number(f)), false
+	}
+	return out, nil, true
+}
+
+// fs_render_number renders an offending numeric value for an ERR_OUT_OF_RANGE "Received …"
+// clause: an integer-valued f64 prints without a decimal, NaN as "NaN".
+fs_render_number :: proc(f: f64) -> string {
+	if f != f do return "NaN"
+	if f >= -9.2e18 && f <= 9.2e18 && f == f64(i64(f)) do return fmt.tprintf("%d", i64(f))
+	return fmt.tprintf("%v", f)
 }
 
 // Map an os.Error to a Node-compatible error code string and positive errno number.
@@ -763,6 +816,82 @@ fs_rm_sync_cb :: proc "c" (
 			code, errno_val := fs_os_error_to_code(remove_err)
 			exception^ = fs_make_error(ctx, code, "rm", path_str, errno_val)
 		}
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// fs.openSync(path[, flags='r'][, mode=0o666]) -> fd. Opens the file and returns its
+// integer OS file descriptor (the platform impl lives in fs_fd_posix.odin /
+// fs_fd_windows.odin). A numeric flags argument (Node also accepts one) is not handled
+// yet; the common string forms are. Errors raise a Node-coded fs error.
+fs_open_sync_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 {
+		if exception != nil do exception^ = make_js_error(ctx, "fs.openSync requires a path")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	args := arguments[:int(argument_count)]
+	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
+	defer if path_alloc do delete(path_str, context.allocator)
+
+	flags := "r"
+	flags_alloc := false
+	if argument_count >= 2 && jsc.JSValueIsString(ctx, args[1]) {
+		flags, flags_alloc = jsc_value_to_string_or_default(ctx, args[1])
+	}
+	defer if flags_alloc do delete(flags, context.allocator)
+
+	mode := 0o666
+	if argument_count >= 3 && jsc.JSValueIsNumber(ctx, args[2]) {
+		// A provided numeric mode must be a non-negative 32-bit integer (Node's
+		// validateUint32 via parseFileMode); a fractional/NaN/negative value throws.
+		m, mode_err, mode_ok := fs_validate_int_arg(ctx, args[2], "mode", 0xffffffff)
+		if !mode_ok {
+			if exception != nil do exception^ = mode_err
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		mode = m
+	}
+
+	fd, code, errno_val := fs_platform_open(path_str, flags, mode)
+	if code != "" {
+		if exception != nil do exception^ = fs_make_error(ctx, code, "open", path_str, errno_val)
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	return jsc.JSValueMakeNumber(ctx, f64(fd))
+}
+
+// fs.closeSync(fd) — close an fd previously returned by openSync.
+fs_close_sync_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 {
+		if exception != nil do exception^ = make_js_error(ctx, "fs.closeSync requires a fd")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	// Validate the fd BEFORE the syscall: an unvalidated coercion (3.5 -> 3, NaN/object ->
+	// garbage) would otherwise close an unrelated descriptor (stdin, the loop's epoll fd).
+	fd, fd_err, fd_ok := fs_validate_int_arg(ctx, arguments[0], "fd", 0x7fffffff)
+	if !fd_ok {
+		if exception != nil do exception^ = fd_err
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	code, errno_val := fs_platform_close(fd)
+	if code != "" {
+		if exception != nil do exception^ = fs_make_error(ctx, code, "close", "", errno_val)
 	}
 	return jsc.JSValueMakeUndefined(ctx)
 }
