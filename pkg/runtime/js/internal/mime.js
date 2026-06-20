@@ -23,12 +23,15 @@
       String.fromCharCode(128) +
       String.fromCharCode(45, 255, 93),
   );
-  var LEADING_HTTP_WS = /^[\t\n\f\r ]+/;
-  var TRAILING_HTTP_WS = /[\t\n\f\r ]+$/;
+  // Node's HTTP whitespace is tab, LF, CR and space — NOT form-feed (U+000C), unlike the
+  // looser WHATWG set: a leading/trailing `\f` makes the type invalid rather than being
+  // stripped, and a `\f` in a value keeps it (so the value fails the quoted-string check).
+  var LEADING_HTTP_WS = /^[\t\n\r ]+/;
+  var TRAILING_HTTP_WS = /[\t\n\r ]+$/;
   var ESCAPE_QUOTE_OR_BACKSLASH = /[\\"]/g;
 
   function isHTTPWhitespace(c) {
-    return c === '\t' || c === '\n' || c === '\f' || c === '\r' || c === ' ';
+    return c === '\t' || c === '\n' || c === '\r' || c === ' ';
   }
 
   function mimeError(production, input, index) {
@@ -48,7 +51,10 @@
   }
 
   function parse(str) {
-    str = str.replace(LEADING_HTTP_WS, '').replace(TRAILING_HTTP_WS, '');
+    // Only leading whitespace is trimmed from the whole input; trailing whitespace is
+    // removed per-component (subtype, unquoted value) so it cannot eat characters inside a
+    // quoted value (e.g. an unterminated `a="b\t` keeps the tab).
+    str = str.replace(LEADING_HTTP_WS, '');
     var slash = str.indexOf('/');
     if (slash === -1) throw mimeError('type', str, -1);
     var type = str.slice(0, slash);
@@ -107,13 +113,15 @@
           position++;
         }
         value = buf;
-        while (position < len && str[position] !== ';') position++;
+        // Do not skip the rest of the line to the next ';' here: Node resumes the loop
+        // right after the closing quote (the single advance below steps past the next
+        // char), so parameters that follow a quoted value across whitespace/';' survive.
       } else {
         var valStart = position;
         while (position < len && str[position] !== ';') position++;
         value = str.slice(valStart, position).replace(TRAILING_HTTP_WS, '');
       }
-      if (position < len) position++; // skip the ';'
+      if (position < len) position++; // step past the ';' (or the char after a closing quote)
 
       // Keep only well-formed, non-duplicate parameters (first wins). An empty value is
       // dropped only when it was unquoted; a quoted "" is a valid empty value, matching
@@ -137,7 +145,21 @@
     return value;
   }
 
+  // Serialize a parameter Map to `name=value;name=value`. Shared so MIMEType#toString can
+  // serialize from the internal data directly instead of dispatching through the public
+  // MIMEParams#toString (which user code may override or replace).
+  function serializeParams(data) {
+    var parts = [];
+    data.forEach(function (value, name) {
+      parts.push(name + '=' + encodeValue(value));
+    });
+    return parts.join(';');
+  }
+
   function MIMEParams() {
+    if (new.target === undefined) {
+      throw new TypeError("Class constructor MIMEParams cannot be invoked without 'new'");
+    }
     this[kData] = new Map();
   }
 
@@ -159,7 +181,7 @@
     var badValue = value.search(NotHTTPQuotedStringCodePoint);
     if (badValue !== -1) throw mimeError('parameter value', value, badValue);
     data.set(name, value);
-    return this;
+    // Node's MIMEParams#set returns undefined (like URLSearchParams#set), not `this`.
   };
   MIMEParams.prototype.delete = function del(name) {
     this[kData].delete(`${name}`);
@@ -174,16 +196,15 @@
     return this[kData].values();
   };
   MIMEParams.prototype.toString = function toString() {
-    var parts = [];
-    this[kData].forEach(function (value, name) {
-      parts.push(name + '=' + encodeValue(value));
-    });
-    return parts.join(';');
+    return serializeParams(this[kData]);
   };
   MIMEParams.prototype.toJSON = MIMEParams.prototype.toString;
   MIMEParams.prototype[Symbol.iterator] = MIMEParams.prototype.entries;
 
   function MIMEType(string) {
+    if (new.target === undefined) {
+      throw new TypeError("Class constructor MIMEType cannot be invoked without 'new'");
+    }
     var parsed = parse(`${string}`);
     this[kType] = parsed.type;
     this[kSubtype] = parsed.subtype;
@@ -234,7 +255,9 @@
   });
 
   MIMEType.prototype.toString = function toString() {
-    var paramStr = this[kParams].toString();
+    // Serialize from the internal parameter data, not via this[kParams].toString(), so a
+    // user-overridden MIMEParams#toString cannot change or break MIMEType serialization.
+    var paramStr = serializeParams(this[kParams][kData]);
     return this[kType] + '/' + this[kSubtype] + (paramStr.length > 0 ? ';' + paramStr : '');
   };
   MIMEType.prototype.toJSON = MIMEType.prototype.toString;

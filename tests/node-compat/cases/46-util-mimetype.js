@@ -59,4 +59,27 @@ assert.throws(() => new MIMEType('/plain'), { code: 'ERR_INVALID_MIME_SYNTAX' })
 assert.throws(() => p.set('bad name', 'v'), { code: 'ERR_INVALID_MIME_SYNTAX' });
 assert.throws(() => p.set('a', 'bad\x01'), { code: 'ERR_INVALID_MIME_SYNTAX' });
 
+// form-feed (U+000C) is NOT HTTP whitespace: it is not trimmed and invalidates the type
+const FF = String.fromCharCode(0x0c);
+assert.throws(() => new MIMEType(FF + 'text/plain'), { code: 'ERR_INVALID_MIME_SYNTAX' });
+assert.equal(new MIMEType('\ttext/plain').toString(), 'text/plain'); // tab IS whitespace
+
+// a parameter after a quoted value survives across whitespace/';' (Node resumes parsing)
+assert.equal(new MIMEType('text/x; a="b" c=d').toString(), 'text/x;a=b;c=d');
+assert.equal(new MIMEType('text/x; a="b"xyz;c=d').toString(), 'text/x;a=b;c=d');
+// trailing whitespace inside a (here unterminated) quoted value is preserved
+assert.equal(new MIMEType('text/x;a="b\t').params.get('a'), 'b\t');
+
+// MIMEParams#set returns undefined (like URLSearchParams#set)
+assert.equal(new MIMEType('text/x').params.set('a', 'b'), undefined);
+
+// MIMEType#toString serializes from internal data, ignoring a params.toString override
+const ov = new MIMEType('text/x;a=b');
+ov.params.toString = () => 'HACKED';
+assert.equal(ov.toString(), 'text/x;a=b');
+
+// the constructors require `new`
+assert.throws(() => MIMEType('text/plain'), TypeError);
+assert.throws(() => MIMEParams(), TypeError);
+
 console.log('ok');
