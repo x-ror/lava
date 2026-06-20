@@ -20,6 +20,9 @@ assert.equal(new MIMEType('text/html; x="a;b c"').toString(), 'text/html;x="a;b 
 assert.equal(new MIMEType('text/x; a=1; a=2').params.get('a'), '1');
 assert.equal(new MIMEType('text/x; a=').toString(), 'text/x');
 assert.equal(new MIMEType('text/x; novalue; a=b').toString(), 'text/x;a=b');
+// an empty *quoted* value is kept; only an empty *unquoted* value is dropped (WHATWG)
+assert.equal(new MIMEType('text/x; empty=""').toString(), 'text/x;empty=""');
+assert.equal(new MIMEType('text/x; empty=""').params.get('empty'), '');
 
 // setters lowercase + revalidate
 const s = new MIMEType('text/plain;a=b');

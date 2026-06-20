@@ -82,7 +82,9 @@
       position++; // skip '='
 
       var value;
+      var quoted = false;
       if (position < len && str[position] === '"') {
+        quoted = true;
         position++;
         var buf = '';
         while (position < len) {
@@ -113,10 +115,12 @@
       }
       if (position < len) position++; // skip the ';'
 
-      // Keep only well-formed, non-duplicate parameters (first wins).
+      // Keep only well-formed, non-duplicate parameters (first wins). An empty value is
+      // dropped only when it was unquoted; a quoted "" is a valid empty value, matching
+      // Node/WHATWG (the empty-value skip applies to the unquoted collection only).
       if (
         name.length > 0 &&
-        value.length > 0 &&
+        (quoted || value.length > 0) &&
         !NotHTTPTokenCodePoint.test(name) &&
         !NotHTTPQuotedStringCodePoint.test(value) &&
         !params.has(name)
