@@ -151,6 +151,108 @@
     }
   }
 
+  // Partial deep-equality: every part of `expected` must appear in `actual`, recursively.
+  // Primitives compare strictly; a plain object's expected keys must each be present and
+  // partially match; an array/typed-array expected must be an ordered subsequence of actual;
+  // a Set's expected elements must each match a distinct actual element (order-independent);
+  // a Map's expected entries must be present with partially-matching values. Dates/RegExps
+  // compare wholly. `actual` may carry extra properties/elements.
+  function partialMatch(actual, expected, seen) {
+    if (Object.is(actual, expected)) return true;
+    // A primitive (or null) expected must strictly equal actual.
+    if (typeof expected !== 'object' || expected === null) return actual === expected;
+    if (typeof actual !== 'object' || actual === null) return false;
+
+    if (Object.prototype.toString.call(actual) !== Object.prototype.toString.call(expected)) {
+      return false;
+    }
+    if (expected instanceof Date) return actual.getTime() === expected.getTime();
+    if (expected instanceof RegExp) {
+      return actual.source === expected.source && actual.flags === expected.flags;
+    }
+
+    seen = seen || [];
+    for (var s = 0; s < seen.length; s++) {
+      if (seen[s][0] === actual && seen[s][1] === expected) return true;
+    }
+    seen = seen.concat([[actual, expected]]);
+
+    // TypedArray / Buffer: an ordered subsequence by value.
+    if (ArrayBuffer.isView(actual) && ArrayBuffer.isView(expected)) {
+      var ti = 0;
+      for (var te = 0; te < expected.length; te++) {
+        while (ti < actual.length && actual[ti] !== expected[te]) ti++;
+        if (ti >= actual.length) return false;
+        ti++;
+      }
+      return true;
+    }
+
+    if (expected instanceof Map) {
+      var mapOk = true;
+      expected.forEach(function (val, key) {
+        if (!actual.has(key) || !partialMatch(actual.get(key), val, seen)) mapOk = false;
+      });
+      return mapOk;
+    }
+
+    if (expected instanceof Set) {
+      // Each expected element must match a distinct actual element (bipartite matching).
+      var actualList = [];
+      actual.forEach(function (v) {
+        actualList.push(v);
+      });
+      var expectedList = [];
+      expected.forEach(function (v) {
+        expectedList.push(v);
+      });
+      var used = [];
+      var matchFrom = function (ei) {
+        if (ei >= expectedList.length) return true;
+        for (var ai = 0; ai < actualList.length; ai++) {
+          if (!used[ai] && partialMatch(actualList[ai], expectedList[ei], seen)) {
+            used[ai] = true;
+            if (matchFrom(ei + 1)) return true;
+            used[ai] = false;
+          }
+        }
+        return false;
+      };
+      return matchFrom(0);
+    }
+
+    if (Array.isArray(expected)) {
+      if (!Array.isArray(actual)) return false;
+      var ai2 = 0;
+      for (var ei2 = 0; ei2 < expected.length; ei2++) {
+        while (ai2 < actual.length && !partialMatch(actual[ai2], expected[ei2], seen)) ai2++;
+        if (ai2 >= actual.length) return false;
+        ai2++;
+      }
+      return true;
+    }
+
+    var keysE = Object.keys(expected);
+    for (var i = 0; i < keysE.length; i++) {
+      var key = keysE[i];
+      if (!Object.prototype.hasOwnProperty.call(actual, key)) return false;
+      if (!partialMatch(actual[key], expected[key], seen)) return false;
+    }
+    return true;
+  }
+
+  function partialDeepStrictEqual(actual, expected, message) {
+    if (!partialMatch(actual, expected)) {
+      throw AssertionError({
+        actual: actual,
+        expected: expected,
+        message: message,
+        operator: 'partialDeepStrictEqual',
+        stackStartFn: partialDeepStrictEqual,
+      });
+    }
+  }
+
   function match(value, regexp, message) {
     if (!(regexp instanceof RegExp)) {
       throw new TypeError('The "regexp" argument must be an instance of RegExp');
@@ -322,6 +424,7 @@
   assert.deepStrictEqual = deepEqual;
   assert.notDeepEqual = notDeepEqual;
   assert.notDeepStrictEqual = notDeepEqual;
+  assert.partialDeepStrictEqual = partialDeepStrictEqual;
   assert.match = match;
   assert.doesNotMatch = doesNotMatch;
   assert.throws = throws;
