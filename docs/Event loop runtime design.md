@@ -315,3 +315,92 @@ slow-client defense (backpressure correctness)
 ## The one principle to keep
 
 Measure relentlessly — at this level intuition is often wrong, and most of these levers are workload-specific (io_uring helps when used architecturally; zero-copy helps large transfers and hurts small ones; SQPOLL trades a core for latency). Build `perf`, flamegraphs, and eBPF tracing in from day one and let the profile choose which levers you pull. And remember the thing both analyses agree on: the performance lives in controlling every byte, allocation, queue, timeout, and ownership transition across the whole system — not in the event loop alone.
+
+---
+
+# Part II — Alternatives to the event-loop core itself
+
+Part I assumes an event-loop core and optimizes around it. This part steps back: if we could replace the core of a runtime entirely — drop libuv's event loop and not be bound to any language or technology — what is the actual space of alternatives? This is language- and tech-agnostic by design.
+
+## The core is a scheduling model, and the event loop is one point in a space
+
+A runtime's "core" is really its execution and scheduling model: how a unit of concurrency is represented, who schedules it onto hardware, and how it interacts with I/O and with other units. The event loop is one specific point in that space, and the space is defined by a few axes.
+
+**Cooperative vs preemptive scheduling** is the most important axis and the event loop's biggest weakness. The event loop is cooperative: each callback runs to completion, so one bad callback stalls everything. A preemptive core (OS threads, Go's scheduler, BEAM's reduction counting) guarantees fairness — no task can starve the others.
+
+**Shared memory vs isolation.** Shared mutable memory with locks (threads) versus shared-nothing message passing (actors, processes). This determines whether data races are even possible and how you scale across cores.
+
+**Blocking ergonomics vs explicit async.** The event loop forces non-blocking code or offloading. Fibers and virtual threads let code *look* blocking while staying efficient, removing the "function coloring" problem where `async` infects every signature.
+
+**Readiness vs completion** (reactor vs proactor — epoll vs io_uring/IOCP) and **scheduling topology** (single-thread vs work-stealing vs thread-per-core) round out the space.
+
+Plotting the well-known cores on the two dominant axes:
+
+```text
+                     isolated state
+                           |
+        Seastar  o         |         o  Erlang / BEAM
+   (thread-per-core)       |       (actors + supervision)
+                           |
+   cooperative ------------+------------ preemptive
+    scheduling             |             scheduling
+                           |
+      Node.js o  o Deno    |    o JVM Loom    o Go
+   (libuv event loop)      |   (virtual thr.)  (goroutines)
+                           |
+                     shared memory
+```
+
+The event loop sits in the cooperative + shared-memory corner. The interesting alternatives move you rightward (gain preemptive fairness) and/or upward (gain isolation and fault tolerance). Erlang/BEAM sits in the opposite corner — the most different core from the event loop, and arguably the most robust for connection-heavy systems.
+
+## The families of alternative cores
+
+**Preemptive lightweight-task schedulers** are the most compelling alternative, in two schools. The Go school uses shared memory, channels, a work-stealing scheduler, and asynchronous preemption — cheap goroutines give true multicore parallelism, but data races remain possible because the language doesn't forbid them. The BEAM/Erlang school uses isolated lightweight processes, each with its own heap and garbage collector, preemption by reduction counting, message-passing-only communication, plus supervision and a "let it crash" philosophy. BEAM is probably the most robust core ever built for systems with millions of connections — WhatsApp held roughly two million connections per server on it — at the cost of lower per-core throughput and message-copying overhead.
+
+**Virtual threads, fibers, and effects** give blocking ergonomics without losing efficiency. Java's Loom maps millions of virtual threads onto a few carrier threads, with code written in straight-line blocking style and a poller underneath. OCaml 5 goes further: effect handlers implement lightweight cooperative fibers as a language construct, and domains provide parallelism. For JS this would remove function coloring entirely. The caveat: the engine must be able to suspend and resume an arbitrary call stack, which V8 cannot do today (though WebAssembly stack-switching and JSPI are moving in that direction).
+
+**Thread-per-core, shared-nothing** (Seastar, Glommio) is not a different concurrency model but a different parallelism topology: one executor per physical core, nothing shared between cores, communication via lock-free queues, each core with its own loop. It gives near-linear scaling and zero cross-core synchronization, and it can be combined with any of the models above as the per-core model. Alongside it, the **completion-based async runtime** (Tokio over io_uring) is a work-stealing scheduler of stackless tasks on completion I/O — Deno is the living example, using V8 with Tokio instead of libuv.
+
+At the frontier sit **kernel-bypass run-to-completion** (DPDK — dedicated cores spin-poll and the loop never sleeps), **structured concurrency** as a scheduling discipline (scopes own the lifetime of their child tasks, with cancellation and errors propagating structurally — a principle, not a different engine), and a **distributed actor core** where an actor can be local or remote and the runtime is natively distributed, which is the logical choice if "millions of requests" inherently spans multiple machines.
+
+## Synthesis and the honest meta-point
+
+Choosing a core is choosing a position on these axes, and libuv's event loop is one specific corner: cooperative scheduling, one thread per isolate, shared memory within the isolate, explicit async, reactor I/O. Given the freedom to rewrite a runtime's core, the highest-impact moves are: add preemption (kills "one bad callback stalls everything"); make the unit isolated and supervised (kills shared-state bugs, adds fault tolerance); give blocking ergonomics via virtual threads or effects (kills function coloring); move to thread-per-core (topology); and move to completion I/O.
+
+The honest crux: every real JS runtime still uses an event-loop-shaped core not because better cores don't exist — BEAM, Go, and Loom are arguably better general-purpose concurrency models — but because JavaScript's own semantics (single thread per isolate, shared mutable memory within an isolate, no preemption points, no stack switching) were designed around the event loop. Changing the core therefore means either changing the language's semantics or building a fundamentally different engine. Unbound by language, the real alternatives are exactly that: a JS-like language whose engine supports preemptible, isolated, stack-switching, message-passing tasks — effectively "JS on BEAM" or "JS with virtual threads," not a variation on the same event loop.
+
+---
+
+# Part III — Concretely: these cores as a JS-runtime core
+
+Two of the alternatives above are worth making concrete, because they are the two realistic directions for a JS runtime that wants to move past the event loop: a BEAM-style isolated-actor core and a virtual-thread core. For each: what the execution model looks like, what a server looks like on it, and what would have to change in the engine and in the language.
+
+## A. A BEAM-style isolated-actor core
+
+The idea is to replace "one isolate, one event loop, one shared mutable heap" with many lightweight, isolated JS processes, each with its own tiny heap and GC, scheduled preemptively across a pool of per-core scheduler threads, communicating only by message passing and organized under supervision trees.
+
+**Execution model.** The unit of concurrency is a lightweight process — not an OS thread, not a callback — a cheap object with its own stack and its own small, independently collected heap. Spawning one costs microseconds and kilobytes, so millions are feasible. Processes never share mutable objects; to communicate, a process sends a message to another's mailbox, and the message is copied (or, for large immutable binaries, reference-counted off-heap as BEAM does). This eliminates data races by construction — there is no shared mutable state to race on. A small number of scheduler threads, one pinned per core, run the processes preemptively: each process runs for a bounded budget (BEAM counts reductions, roughly work units) and is then preempted so the scheduler can pick another. One runaway computation therefore cannot starve the rest — precisely the failure mode the cooperative event loop suffers from. Because each process owns a tiny heap, GC is local and short: you collect one process's heap without stopping the world, so there is no global GC pause across all connections — the latency cliff that pushes latency-sensitive services off globally-collected runtimes. I/O still runs through a poller (epoll/io_uring) owned by the scheduler: when a process does a blocking-looking receive, the scheduler parks it and runs others, then marks it runnable when the I/O completes. The event loop becomes an internal detail of the scheduler rather than the programming model; each process is written as straight-line, blocking-looking code. Finally, processes live in supervision trees: when one crashes it dies in isolation (its heap is discarded, and because nothing was shared, no corruption leaks), and its supervisor restarts it per a strategy — fault tolerance as a first-class property, so a crashed handler never takes down the runtime or other requests.
+
+**A server on this core.** Each connection spawns a lightweight process that owns the connection end-to-end, written as straight-line blocking code — read request, await the database, write response — with no async/await coloring. Millions of connections become millions of cheap, preemptively scheduled processes, each with its own tiny heap. This is, almost exactly, the WhatsApp architecture.
+
+**What the engine must change.** V8 is built around one isolate equal to one thread with one shared heap; you can run multiple isolates, but each is heavyweight (its own full heap and compiler state), so you cannot cheaply have millions. A true BEAM-style core needs a JS engine whose "process" is far lighter than a V8 isolate — a cheap-to-create, cheaply-collected heap-plus-stack that still runs JS — which is a fundamental engine redesign, not a libuv swap. It also needs preemption: V8 inserts no safe yield points into arbitrary JS execution, so the VM would have to add reduction-style bounded yielding into its execution loop. And it needs cheap per-process heaps with cheap inter-process copying, plus many tiny independently-collected heaps instead of V8's single per-isolate heap. In short, you are building a BEAM-class VM that happens to execute JS.
+
+**What the language must change.** JS's shared-mutable-memory model (within an isolate) is replaced by share-nothing message passing: no shared globals across processes, communication by explicit messages. That is a real semantic shift — closer to Erlang/Elixir than to JS as it exists. `async`/`await` becomes largely unnecessary at the surface, since code in a process is straight-line blocking and the runtime suspends the whole process on I/O. You gain structured fault tolerance, no data races, no global GC pauses, and preemptive fairness; you give up shared-memory performance tricks and full compatibility with the existing JS ecosystem, which assumes a single shared heap and an event loop. The honest summary: this is Erlang/Elixir semantics with JS syntax — a new VM, not Node with a different loop.
+
+## B. A virtual-thread core
+
+The idea here is more conservative: keep JS's single-shared-heap-per-isolate semantics largely intact, but replace explicit async/await over an event loop with millions of virtual threads over a small pool of carrier OS threads, so JS can be written in straight-line blocking style while the runtime multiplexes it. This is the Loom model applied to JS.
+
+**Execution model.** The unit of concurrency is a virtual thread — a JS execution context with its own suspendable call stack, cheap enough (kilobytes) to have millions. A small pool of carrier OS threads (about one per core) actually runs them. When a virtual thread blocks — reading a socket, awaiting a query, sleeping — the runtime unmounts it from its carrier (saving its stack), runs another, and remounts it when the operation completes, with the poller underneath signaling completion. The event loop is again an internal detail; the programmer writes blocking-looking code. The headline win is eliminating function coloring: no `async`/`await`, no red/blue function split, no Promise plumbing in signatures — a function that does I/O looks identical to one that does not, and `const rows = db.query(...)` blocks the virtual thread rather than the carrier. Whether scheduling is preemptive depends on the design: virtual threads yield at blocking points and ride on OS carriers the kernel can preempt, but a tight compute loop that never blocks can still monopolize a carrier unless the runtime adds safepoints.
+
+**A server on this core.** Each connection runs one virtual thread executing straight-line blocking handler code. Millions of connections become millions of virtual threads on a few carriers — the same scaling as the event loop, but the code reads like synchronous thread-per-request code.
+
+**What the engine must change.** The engine must be able to suspend and resume an arbitrary JS call stack at any blocking point — capture the whole stack, park it, and restore it later, possibly on a different carrier. V8 cannot do this today: its stack is tied to the OS thread and it has no general continuation mechanism for arbitrary JS frames. (Generators and async are stackless coroutines: they suspend only at explicit `yield`/`await` by transforming the function into a state machine, and cannot suspend a deep call stack at an arbitrary point.) The relevant building block is stack switching — and there is active work on WebAssembly stack-switching and on JSPI (JavaScript Promise Integration) that provides a limited form of suspending a call stack across a boundary; a full virtual-thread core would need general, cheap stack-switching for JS frames as an extension of that direction. This is more incremental than the BEAM rewrite — it keeps the heap, GC, and object model — but it still requires a real engine capability V8 lacks, plus a scheduler and poller (the Loom-equivalent of a fork-join pool and NIO) in place of libuv's loop.
+
+**What the language must change.** Far less than the BEAM model. JS keeps its single shared heap per isolate, its GC, and its object model; the main change is that blocking becomes allowed and cheap, suspending only the virtual thread rather than the world, and `async`/`await` becomes optional/legacy while idiomatic code goes straight-line. The one genuine tension is parallelism versus races: if virtual threads run truly in parallel on multiple carriers and share objects, you reintroduce data races — something JS never had to worry about as a single-threaded language. Loom lives with this because Java already has shared-memory threads and a memory model; JS does not. So the cleanest JS-flavored version uses virtual threads for concurrency and ergonomics (no coloring) but keeps execution single-threaded per isolate — only one virtual thread runs at a time — and gets parallelism the way Node already does, through multiple isolates/workers. That preserves JS's no-data-races guarantee and removes async coloring, at the cost of no intra-isolate parallelism.
+
+## Which to pick
+
+The BEAM-style core offers maximum robustness — supervision, no races, no global GC pauses, preemptive fairness — but it is effectively a new VM with new semantics (JS-flavored Erlang) that breaks ecosystem compatibility; it fits when fault tolerance and massive connection counts dominate and leaving the JS ecosystem is acceptable. The virtual-thread core offers maximum compatibility — it keeps JS semantics, removes async coloring, and needs "only" engine-level stack switching — fitting when you want Node-like JS with synchronous-style code and without rewriting the language, the open question being parallelism versus races.
+
+Both share the same deep move, which is the real answer to "an alternative to the event loop": you do not remove the loop, you demote it from the programming surface to the basement and put a better concurrency model — preemptive isolated processes, or virtual threads — on top of it.
