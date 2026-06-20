@@ -65,7 +65,7 @@
   // native require() consults — Node has no such builtins (require('node:primordials')
   // is ERR_UNKNOWN_BUILTIN_MODULE; util.parseArgs is the public surface for parse_args),
   // and a user package with either name must not be shadowed. publicReq hides them.
-  var INTERNAL_ONLY = { primordials: true, parse_args: true, parse_env: true };
+  var INTERNAL_ONLY = { primordials: true, parse_args: true, parse_env: true, mime: true };
   function publicReq(name) {
     if (INTERNAL_ONLY[normalize(name)]) return undefined;
     return req(name);
