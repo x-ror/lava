@@ -924,38 +924,164 @@
     return { re: '[' + (neg ? '^' : '') + cls + ']', next: j + 1, dot: !neg && dot };
   }
 
-  function globSegToRegex(seg) {
+  // Is `ch` an extended-glob operator (introduces a group when followed by '(')?
+  function globIsExtOp(ch) {
+    return ch === '@' || ch === '+' || ch === '!' || ch === '*' || ch === '?';
+  }
+
+  // Index of the ')' closing an extglob group whose '(' is at `open`. Only a '(' that
+  // follows an extglob operator opens a nested group; a bare '(' is a literal character,
+  // and []-class contents are skipped. Returns -1 if unterminated.
+  function globExtglobEnd(seg, open) {
+    var depth = 0;
+    for (var j = open; j < seg.length; j++) {
+      var c = seg[j];
+      if (c === '[') {
+        var pc = globParseClass(seg, j);
+        if (pc !== null) {
+          j = pc.next - 1;
+          continue;
+        }
+      } else if (c === '(' && (j === open || globIsExtOp(seg[j - 1]))) {
+        depth++;
+      } else if (c === ')') {
+        depth--;
+        if (depth <= 0) return j;
+      }
+    }
+    return -1;
+  }
+
+  // Split a group body on top-level '|' (not inside nested groups or classes).
+  function globSplitAlts(body) {
+    var alts = [];
+    var start = 0;
+    var depth = 0;
+    for (var j = 0; j < body.length; j++) {
+      var c = body[j];
+      if (c === '[') {
+        var pc = globParseClass(body, j);
+        if (pc !== null) {
+          j = pc.next - 1;
+          continue;
+        }
+      } else if (c === '(' && j > 0 && globIsExtOp(body[j - 1])) {
+        depth++;
+      } else if (c === ')') {
+        if (depth > 0) depth--;
+      } else if (c === '|' && depth === 0) {
+        alts.push(body.slice(start, j));
+        start = j + 1;
+      }
+    }
+    alts.push(body.slice(start));
+    return alts;
+  }
+
+  // Compile the `|`-separated alternatives of an extglob group. Returns {re, dot} where an
+  // alternative containing an invalid range becomes a never-match (Node keeps the others),
+  // and dot reports whether any alternative can start with a literal '.'.
+  function globCompileAlts(body) {
+    var alts = globSplitAlts(body);
+    var parts = [];
+    var dot = false;
+    var nullable = false;
+    for (var a = 0; a < alts.length; a++) {
+      if (alts[a] === '') nullable = true; // an empty alternative can match nothing
+      var compiled = globCompileBody(alts[a]);
+      var b = compiled.body;
+      try {
+        new RegExp('^(?:' + b + ')$');
+      } catch (e) {
+        b = '(?!)'; // an invalid alternative matches nothing; the others still apply
+      }
+      parts.push(b);
+      if (compiled.firstDot) dot = true;
+    }
+    return { re: parts.join('|'), dot: dot, nullable: nullable };
+  }
+
+  // Compile a segment glob to a regex body (no anchors). Returns {body, firstDot} where
+  // firstDot reports whether the first atom can match a leading '.' — a nullable extglob
+  // (`?(...)`, `*(...)`, or `@()`/`+()` with an empty alternative) lets the following atom
+  // decide, while a plain `*`/`?` fixes "no leading dot".
+  function globCompileBody(seg) {
     var re = '';
     var i = 0;
-    var firstDot = null;
+    var firstDot = false;
+    var firstLocked = false;
+    function lockFirst(dotMatch, seeThrough) {
+      if (firstLocked) return;
+      if (dotMatch) {
+        firstDot = true;
+        firstLocked = true;
+      } else if (!seeThrough) {
+        firstLocked = true;
+      }
+    }
     while (i < seg.length) {
       var c = seg[i];
-      var dot = false;
+      if (globIsExtOp(c) && seg[i + 1] === '(') {
+        var end = globExtglobEnd(seg, i + 1);
+        if (end !== -1) {
+          var alts = globCompileAlts(seg.slice(i + 2, end));
+          if (c === '!') {
+            // `!(...)` negates the whole remainder of the segment: consume the suffix and
+            // forbid (alternatives + suffix) from being the entire remaining text.
+            var suffix = globCompileBody(seg.slice(end + 1));
+            re += '(?!(?:' + alts.re + ')(?:' + suffix.body + ')$)[^/]*?' + suffix.body;
+            lockFirst(false, false);
+            return { body: re, firstDot: firstDot };
+          }
+          var quant = c === '+' ? '+' : c === '*' ? '*' : c === '?' ? '?' : '';
+          re += '(?:' + alts.re + ')' + quant;
+          lockFirst(alts.dot, c === '?' || c === '*' || alts.nullable);
+          i = end + 1;
+          continue;
+        }
+      }
       if (c === '*') {
         re += '[^/]*';
+        lockFirst(false, false);
         i++;
       } else if (c === '?') {
         re += '[^/]';
+        lockFirst(false, false);
         i++;
       } else if (c === '[') {
         var parsed = globParseClass(seg, i);
         if (parsed === null) {
           re += '\\[';
+          lockFirst(false, false);
           i++;
         } else {
           re += parsed.re;
+          lockFirst(parsed.dot, false);
           i = parsed.next;
-          dot = parsed.dot;
         }
       } else {
         re += globEscape(c);
+        lockFirst(c === '.', false);
         i++;
-        dot = c === '.';
       }
-      if (firstDot === null) firstDot = dot;
     }
+    return { body: re, firstDot: firstDot };
+  }
+
+  // Whether a whole segment is a zero-length-capable extglob (`*(...)`, `?(...)`, `!(...)`)
+  // — the segments that match an empty path in Node.
+  function globNullable(seg) {
+    if (seg.length < 3 || (seg[0] !== '*' && seg[0] !== '?' && seg[0] !== '!') || seg[1] !== '(') {
+      return false;
+    }
+    return globExtglobEnd(seg, 1) === seg.length - 1;
+  }
+
+  function globSegToRegex(seg) {
+    var compiled = globCompileBody(seg);
+    var re = compiled.body;
     // A wildcard at the start of a segment must not match a leading dot (dot:false).
-    if (!firstDot) re = '(?!\\.)' + re;
+    if (!compiled.firstDot) re = '(?!\\.)' + re;
     try {
       return new RegExp('^' + re + '$', GLOB_NOCASE ? 'i' : '');
     } catch (e) {
@@ -981,7 +1107,15 @@
         }
         return false;
       }
-      if (si >= pathSegs.length) return false;
+      if (si >= pathSegs.length) {
+        // A trailing slash supplies one empty segment: trailing globstars / zero-length
+        // extglobs (`?(a)`, `*(a)`, `!(a)`) may match it.
+        if (!trail) return false;
+        for (var r = pi; r < patSegs.length; r++) {
+          if (patSegs[r] !== '**' && !globNullable(patSegs[r])) return false;
+        }
+        return true;
+      }
       if (!globSegToRegex(patSegs[pi]).test(pathSegs[si])) return false;
       pi++;
       si++;
@@ -1089,6 +1223,7 @@
       if (typeof pattern !== 'string') throw globArgError('pattern', pattern);
       pattern = pattern.replace(/\\/g, '/'); // windowsPathsNoEscape: '\' is a separator
       if (winSep) path = path.replace(/\\/g, '/');
+      var pathIsEmpty = path === '';
       var pathInfo = globNormalize(path);
       var patterns = globExpandBraces(pattern);
       for (var i = 0; i < patterns.length; i++) {
@@ -1102,6 +1237,21 @@
           continue;
         }
         if (patInfo.trailing && !pathInfo.trailing) continue;
+        if (pathInfo.segs.length === 0) {
+          // A path with no segments ('', '.', '..', './', …). Only the *literal* empty path
+          // matches, and only a pattern whose segments are all globstars or zero-length
+          // extglobs (`?(a)`, `*(a)`, `!(a)`) — which Node lets match nothing.
+          if (
+            pathIsEmpty &&
+            patInfo.segs.length > 0 &&
+            patInfo.segs.every(function (s) {
+              return s === '**' || globNullable(s);
+            })
+          ) {
+            return true;
+          }
+          continue;
+        }
         if (globMatchSegs(patInfo.segs, pathInfo.segs, 0, 0, pathInfo.trailing)) return true;
       }
       return false;
