@@ -45,6 +45,10 @@ assert.equal({}.evil, undefined);
 // an unterminated quote keeps the opening quote and takes the rest of the line literally
 assert.deepEqual({ ...parseEnv('K="unterminated\nA=1') }, { K: '"unterminated', A: '1' });
 
+// CRLF is stripped before parsing (Node removes every carriage return), so a Windows-
+// authored multiline quoted value parses the same as with LF endings
+assert.deepEqual({ ...parseEnv('M="a\r\nb\r\nc"\nN=1') }, { M: 'a\nb\nc', N: '1' });
+
 // non-string input throws ERR_INVALID_ARG_TYPE (Buffers included)
 assert.throws(() => parseEnv(123), { code: 'ERR_INVALID_ARG_TYPE' });
 assert.throws(() => parseEnv(Buffer.from('A=1')), { code: 'ERR_INVALID_ARG_TYPE' });

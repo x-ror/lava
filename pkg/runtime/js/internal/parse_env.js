@@ -64,6 +64,22 @@
     return a < b ? -1 : a > b ? 1 : 0;
   }
 
+  // Node strips every carriage return from the input before parsing (CRLF -> LF, and a
+  // lone CR is dropped), so quoted multiline values and separators normalize the same on
+  // Windows-authored files. Returns the original string when there is no CR to remove.
+  function stripCR(s) {
+    var slen = s.length;
+    var out = '';
+    var seg = 0;
+    for (var k = 0; k < slen; k++) {
+      if (StringPrototypeCharCodeAt(s, k) === CR) {
+        out += StringPrototypeSlice(s, seg, k);
+        seg = k + 1;
+      }
+    }
+    return seg === 0 ? s : out + StringPrototypeSlice(s, seg);
+  }
+
   // Double-quoted values expand only `\n` -> newline; Node does a naive left-to-right
   // substring replace, so `\\n` (backslash then `\n`) keeps the first backslash and
   // expands the second pair.
@@ -97,6 +113,7 @@
         'The "content" argument must be of type string. Received ' + received(content),
       );
     }
+    content = stripCR(content);
     var tmp = { __proto__: null };
     var i = 0;
     // Node rtrims the whole input once, so trailing whitespace never reaches a value —
