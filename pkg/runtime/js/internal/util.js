@@ -746,6 +746,8 @@
     aborted: aborted,
     parseArgs: require('parse_args').parseArgs,
     parseEnv: require('parse_env').parseEnv,
+    MIMEType: require('mime').MIMEType,
+    MIMEParams: require('mime').MIMEParams,
     styleText: styleText,
     stripVTControlCharacters: stripVTControlCharacters,
     toUSVString: toUSVString,
