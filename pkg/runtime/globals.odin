@@ -910,6 +910,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"punycode", INTERNAL_PUNYCODE},
 		{"process", INTERNAL_PROCESS},
 		{"console", INTERNAL_CONSOLE},
+		{"tty", INTERNAL_TTY},
 		{"diagnostics_channel", INTERNAL_DIAGNOSTICS_CHANNEL},
 		// Internal helpers backing util.parseArgs / util.parseEnv / util.MIMEType; hidden
 		// from the public resolver (loader.js publicReq), like primordials — Node has no
@@ -939,6 +940,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "sqlite", cast(jsc.JSValueRef)make_sqlite_bindings(ctx))
 	set_named(ctx, natives, "dns", cast(jsc.JSValueRef)make_dns_bindings(ctx))
 	set_named(ctx, natives, "os", cast(jsc.JSValueRef)make_os_bindings(ctx))
+	set_named(ctx, natives, "tty", cast(jsc.JSValueRef)make_tty_bindings(ctx))
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef
@@ -1195,6 +1197,7 @@ INTERNAL_UTIL_TYPES :: #load("js/internal/util_types.js", string)
 INTERNAL_PUNYCODE :: #load("js/internal/punycode.js", string)
 INTERNAL_PROCESS :: #load("js/internal/process.js", string)
 INTERNAL_CONSOLE :: #load("js/internal/console.js", string)
+INTERNAL_TTY :: #load("js/internal/tty.js", string)
 INTERNAL_DIAGNOSTICS_CHANNEL :: #load("js/internal/diagnostics_channel.js", string)
 INTERNAL_PARSE_ARGS :: #load("js/internal/parse_args.js", string)
 INTERNAL_PARSE_ENV :: #load("js/internal/parse_env.js", string)
