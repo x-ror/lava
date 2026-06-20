@@ -767,6 +767,69 @@ fs_rm_sync_cb :: proc "c" (
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
+// fs.openSync(path[, flags='r'][, mode=0o666]) -> fd. Opens the file and returns its
+// integer OS file descriptor (the platform impl lives in fs_fd_posix.odin /
+// fs_fd_windows.odin). A numeric flags argument (Node also accepts one) is not handled
+// yet; the common string forms are. Errors raise a Node-coded fs error.
+fs_open_sync_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 {
+		if exception != nil do exception^ = make_js_error(ctx, "fs.openSync requires a path")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	args := arguments[:int(argument_count)]
+	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
+	defer if path_alloc do delete(path_str, context.allocator)
+
+	flags := "r"
+	flags_alloc := false
+	if argument_count >= 2 && jsc.JSValueIsString(ctx, args[1]) {
+		flags, flags_alloc = jsc_value_to_string_or_default(ctx, args[1])
+	}
+	defer if flags_alloc do delete(flags, context.allocator)
+
+	mode := 0o666
+	if argument_count >= 3 && jsc.JSValueIsNumber(ctx, args[2]) {
+		mode = int(jsc.JSValueToNumber(ctx, args[2], nil))
+	}
+
+	fd, code, errno_val := fs_platform_open(path_str, flags, mode)
+	if code != "" {
+		if exception != nil do exception^ = fs_make_error(ctx, code, "open", path_str, errno_val)
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	return jsc.JSValueMakeNumber(ctx, f64(fd))
+}
+
+// fs.closeSync(fd) — close an fd previously returned by openSync.
+fs_close_sync_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 {
+		if exception != nil do exception^ = make_js_error(ctx, "fs.closeSync requires a fd")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	fd := int(jsc.JSValueToNumber(ctx, arguments[0], nil))
+	code, errno_val := fs_platform_close(fd)
+	if code != "" {
+		if exception != nil do exception^ = fs_make_error(ctx, code, "close", "", errno_val)
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
 // fs.unlinkSync(path) — remove a file or symlink. Unlike rmSync, unlink never
 // removes a directory; os.remove would happily rmdir an empty one, so classify
 // with lstat first. A symlink — even one pointing at a directory — reports
