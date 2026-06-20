@@ -46,7 +46,9 @@
   };
 
   EventEmitter.prototype.getMaxListeners = function () {
-    return this._maxListeners === undefined ? defaultMaxListeners : this._maxListeners;
+    // Read the live default so events.setMaxListeners(n) (and EventEmitter.defaultMaxListeners = n)
+    // take effect on instances that never set their own limit.
+    return this._maxListeners === undefined ? EventEmitter.defaultMaxListeners : this._maxListeners;
   };
 
   function addListener(target, type, listener, prepend) {
@@ -212,11 +214,207 @@
     });
   }
 
+  // --- static helpers (Node parity) ---
+
+  function typeError(name, expected, actual) {
+    var e = new TypeError(
+      'The "' + name + '" argument must be ' + expected + '. Received ' + typeof actual,
+    );
+    e.code = 'ERR_INVALID_ARG_TYPE';
+    return e;
+  }
+
+  function isAbortSignal(s) {
+    return s != null && typeof s.addEventListener === 'function' && 'aborted' in s;
+  }
+
+  function makeAbortError() {
+    var e = new Error('The operation was aborted');
+    e.name = 'AbortError';
+    e.code = 'ABORT_ERR';
+    return e;
+  }
+
+  // events.getEventListeners(emitter, name) — the listeners for `name`.
+  function getEventListeners(emitterOrTarget, name) {
+    if (typeof emitterOrTarget.listeners === 'function') {
+      return emitterOrTarget.listeners(name);
+    }
+    return []; // a DOM-style EventTarget keeps its listeners private here
+  }
+
+  // events.getMaxListeners(emitter).
+  function getMaxListeners(emitterOrTarget) {
+    if (typeof emitterOrTarget.getMaxListeners === 'function') {
+      return emitterOrTarget.getMaxListeners();
+    }
+    return EventEmitter.defaultMaxListeners;
+  }
+
+  // events.setMaxListeners(n[, ...targets]) — with no targets, sets the global default.
+  function setMaxListeners(n) {
+    n = n === undefined ? EventEmitter.defaultMaxListeners : n;
+    if (typeof n !== 'number' || n < 0 || n !== n) {
+      var e = new RangeError(
+        'The value of "n" is out of range. It must be a non-negative number. Received ' + n,
+      );
+      e.code = 'ERR_OUT_OF_RANGE';
+      throw e;
+    }
+    var targets = P.ArrayPrototypeSlice(arguments, 1);
+    if (targets.length === 0) {
+      EventEmitter.defaultMaxListeners = n;
+    } else {
+      for (var i = 0; i < targets.length; i++) {
+        if (typeof targets[i].setMaxListeners === 'function') targets[i].setMaxListeners(n);
+      }
+    }
+  }
+
+  // events.listenerCount(emitter, name) — the deprecated static form.
+  function staticListenerCount(emitter, type) {
+    return emitter.listenerCount(type);
+  }
+
+  // events.addAbortListener(signal, listener) — once-listener for 'abort' that fires even
+  // if the signal is already aborted; returns a { [Symbol.dispose]() } to remove it.
+  function addAbortListener(signal, listener) {
+    if (!isAbortSignal(signal)) throw typeError('signal', 'an instance of AbortSignal', signal);
+    if (typeof listener !== 'function') throw typeError('listener', 'a function', listener);
+    var removeEventListener;
+    if (signal.aborted) {
+      queueMicrotask(function () {
+        listener();
+      });
+    } else {
+      signal.addEventListener('abort', listener, { once: true });
+      removeEventListener = function () {
+        signal.removeEventListener('abort', listener);
+      };
+    }
+    var disposable = {};
+    if (typeof Symbol !== 'undefined' && Symbol.dispose) {
+      disposable[Symbol.dispose] = function () {
+        if (removeEventListener) removeEventListener();
+      };
+    }
+    return disposable;
+  }
+
+  // events.on(emitter, eventName[, options]) — an async iterator that yields the args of
+  // each matching event. 'error' rejects; options.signal aborts; return()/throw() clean up.
+  function on(emitter, event, options) {
+    options = options || {};
+    var signal = options.signal;
+    if (signal !== undefined && !isAbortSignal(signal)) {
+      throw typeError('options.signal', 'an instance of AbortSignal', signal);
+    }
+    if (signal && signal.aborted) throw makeAbortError();
+
+    var unconsumedEvents = [];
+    var unconsumedPromises = [];
+    var error = null;
+    var finished = false;
+
+    var useEmitter = typeof emitter.on === 'function' && typeof emitter.off === 'function';
+    if (!useEmitter && typeof emitter.addEventListener !== 'function') {
+      throw typeError('emitter', 'an EventEmitter or EventTarget', emitter);
+    }
+    function addListener(name, h) {
+      if (useEmitter) emitter.on(name, h);
+      else emitter.addEventListener(name, h);
+    }
+    function removeListener(name, h) {
+      if (useEmitter) emitter.off(name, h);
+      else emitter.removeEventListener(name, h);
+    }
+
+    function result(value, done) {
+      return { value: value, done: done };
+    }
+    function eventHandler() {
+      var args = P.ArrayPrototypeSlice(arguments);
+      if (unconsumedPromises.length > 0) {
+        P.ArrayPrototypeShift(unconsumedPromises).resolve(result(args, false));
+      } else {
+        P.ArrayPrototypePush(unconsumedEvents, args);
+      }
+    }
+    function errorHandler(err) {
+      if (unconsumedPromises.length > 0) {
+        P.ArrayPrototypeShift(unconsumedPromises).reject(err);
+      } else {
+        error = err;
+      }
+      closeHandler();
+    }
+    function abortHandler() {
+      errorHandler(makeAbortError());
+    }
+    function removeAll() {
+      removeListener(event, eventHandler);
+      if (event !== 'error' && useEmitter) removeListener('error', errorHandler);
+      if (signal) signal.removeEventListener('abort', abortHandler);
+    }
+    function closeHandler() {
+      removeAll();
+      finished = true;
+      while (unconsumedPromises.length > 0) {
+        P.ArrayPrototypeShift(unconsumedPromises).resolve(result(undefined, true));
+      }
+    }
+
+    addListener(event, eventHandler);
+    if (event !== 'error' && useEmitter) addListener('error', errorHandler);
+    if (signal) signal.addEventListener('abort', abortHandler, { once: true });
+
+    var iterator = {
+      next: function () {
+        if (unconsumedEvents.length > 0) {
+          return P.Promise.resolve(result(P.ArrayPrototypeShift(unconsumedEvents), false));
+        }
+        if (error) {
+          var e = error;
+          error = null;
+          return P.Promise.reject(e);
+        }
+        if (finished) return P.Promise.resolve(result(undefined, true));
+        return new P.Promise(function (resolve, reject) {
+          P.ArrayPrototypePush(unconsumedPromises, { resolve: resolve, reject: reject });
+        });
+      },
+      return: function () {
+        closeHandler();
+        return P.Promise.resolve(result(undefined, true));
+      },
+      throw: function (err) {
+        closeHandler();
+        return P.Promise.reject(err);
+      },
+    };
+    iterator[Symbol.asyncIterator] = function () {
+      return this;
+    };
+    return iterator;
+  }
+
   EventEmitter.EventEmitter = EventEmitter;
   EventEmitter.once = once;
+  EventEmitter.on = on;
+  EventEmitter.getEventListeners = getEventListeners;
+  EventEmitter.getMaxListeners = getMaxListeners;
+  EventEmitter.setMaxListeners = setMaxListeners;
+  EventEmitter.listenerCount = staticListenerCount;
+  EventEmitter.addAbortListener = addAbortListener;
   EventEmitter.defaultMaxListeners = defaultMaxListeners;
 
   module.exports = EventEmitter;
   module.exports.EventEmitter = EventEmitter;
   module.exports.once = once;
+  module.exports.on = on;
+  module.exports.getEventListeners = getEventListeners;
+  module.exports.getMaxListeners = getMaxListeners;
+  module.exports.setMaxListeners = setMaxListeners;
+  module.exports.listenerCount = staticListenerCount;
+  module.exports.addAbortListener = addAbortListener;
 });
