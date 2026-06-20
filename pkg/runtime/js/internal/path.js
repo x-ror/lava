@@ -861,19 +861,26 @@
     typeof process !== 'undefined' &&
     (process.platform === 'win32' || process.platform === 'darwin');
   var GLOB_RE_SPECIAL = /[.*+?^${}()|[\]\\]/;
+  // The POSIX classes Node's matcher recognizes, as Unicode-property sets (so they match
+  // non-ASCII letters/punctuation exactly like Node). A `\p{}` escape forces the regex `u`
+  // flag (see globSegToRegex). Notes: `punct` is `\p{P}` (so the math symbols `$+<=>^\`|~`,
+  // which are `\p{S}`, are excluded while `.` and `-` are included), and `print` maps to the
+  // control set like `cntrl` — a minimatch quirk, not the printable range.
   var GLOB_POSIX_CLASSES = {
-    alpha: 'A-Za-z',
-    digit: '0-9',
-    alnum: 'A-Za-z0-9',
-    upper: 'A-Z',
-    lower: 'a-z',
+    alpha: '\\p{L}\\p{Nl}',
+    digit: '\\p{Nd}',
+    alnum: '\\p{L}\\p{Nl}\\p{Nd}',
+    upper: '\\p{Lu}',
+    lower: '\\p{Ll}',
     space: '\\s',
-    blank: ' \\t',
+    blank: '\\p{Zs}\\t',
+    word: '\\p{L}\\p{Nl}\\p{Nd}_',
+    ascii: '\\x00-\\x7f',
     xdigit: '0-9A-Fa-f',
-    punct: '!-/:-@\\[-`{-~',
-    print: '\\x20-\\x7e',
-    graph: '\\x21-\\x7e',
-    cntrl: '\\x00-\\x1f\\x7f',
+    punct: '\\p{P}',
+    graph: '\\p{L}\\p{N}\\p{P}\\p{S}\\p{M}',
+    cntrl: '\\p{Cc}',
+    print: '\\p{Cc}',
   };
 
   function globEscape(ch) {
@@ -1103,8 +1110,11 @@
     var re = compiled.body;
     // A wildcard at the start of a segment must not match a leading dot (dot:false).
     if (!compiled.firstDot) re = '(?!\\.)' + re;
+    var flags = '';
+    if (GLOB_NOCASE && globSegHasMagic(seg)) flags += 'i';
+    if (re.indexOf('\\p{') !== -1) flags += 'u'; // `[[:word:]]` expands to a Unicode property
     try {
-      return new RegExp('^' + re + '$', GLOB_NOCASE && globSegHasMagic(seg) ? 'i' : '');
+      return new RegExp('^' + re + '$', flags);
     } catch (e) {
       return /(?!)/; // an invalid range matches nothing, like Node
     }
