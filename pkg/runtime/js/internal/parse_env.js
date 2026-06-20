@@ -17,6 +17,13 @@
   var StringPrototypeTrim = P.StringPrototypeTrim;
   var ObjectKeys = P.ObjectKeys;
   var ArrayPrototypeSort = P.ArrayPrototypeSort;
+  var TypeError = P.TypeError;
+
+  function codedError(code, message) {
+    var e = new TypeError(message);
+    e.code = code;
+    return e;
+  }
 
   var CR = 13;
   var LF = 10;
@@ -69,8 +76,11 @@
   }
 
   function parseEnv(content) {
+    // Node requires a string and throws ERR_INVALID_ARG_TYPE otherwise (Buffers included).
+    if (typeof content !== 'string') {
+      throw codedError('ERR_INVALID_ARG_TYPE', 'The "content" argument must be of type string.');
+    }
     var tmp = { __proto__: null };
-    if (typeof content !== 'string') return tmp;
     var i = 0;
     // Node rtrims the whole input once, so trailing whitespace never reaches a value —
     // an unterminated quote at end-of-input loses it, but spaces before a newline survive.

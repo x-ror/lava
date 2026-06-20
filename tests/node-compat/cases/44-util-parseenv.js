@@ -45,6 +45,10 @@ assert.equal({}.evil, undefined);
 // an unterminated quote keeps the opening quote and takes the rest of the line literally
 assert.deepEqual({ ...parseEnv('K="unterminated\nA=1') }, { K: '"unterminated', A: '1' });
 
+// non-string input throws ERR_INVALID_ARG_TYPE (Buffers included)
+assert.throws(() => parseEnv(123), { code: 'ERR_INVALID_ARG_TYPE' });
+assert.throws(() => parseEnv(Buffer.from('A=1')), { code: 'ERR_INVALID_ARG_TYPE' });
+
 // keys come out byte-sorted (Node backs the result with a std::map) — printing locks the
 // enumeration order into the oracle (node and lava stdout must match exactly)
 console.log(JSON.stringify(parseEnv('Z=26\nA=1\nM=13\nB=2')));
