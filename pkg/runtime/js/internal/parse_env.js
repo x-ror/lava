@@ -25,6 +25,20 @@
     return e;
   }
 
+  // Node's ERR_INVALID_ARG_TYPE "Received ..." clause for a non-string argument: a
+  // primitive shows `type <typeof> (<value>)`, null/undefined show as-is, and an object
+  // shows `an instance of <constructor>` (e.g. Buffer).
+  function received(v) {
+    if (v === null) return 'null';
+    var t = typeof v;
+    if (t === 'undefined') return 'undefined';
+    if (t === 'object') {
+      var name = v.constructor && v.constructor.name ? v.constructor.name : 'Object';
+      return 'an instance of ' + name;
+    }
+    return 'type ' + t + ' (' + String(v) + ')';
+  }
+
   var CR = 13;
   var LF = 10;
   var SPACE = 32;
@@ -78,7 +92,10 @@
   function parseEnv(content) {
     // Node requires a string and throws ERR_INVALID_ARG_TYPE otherwise (Buffers included).
     if (typeof content !== 'string') {
-      throw codedError('ERR_INVALID_ARG_TYPE', 'The "content" argument must be of type string.');
+      throw codedError(
+        'ERR_INVALID_ARG_TYPE',
+        'The "content" argument must be of type string. Received ' + received(content),
+      );
     }
     var tmp = { __proto__: null };
     var i = 0;
