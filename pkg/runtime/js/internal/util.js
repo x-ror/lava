@@ -530,6 +530,58 @@
     return open + text + close;
   }
 
+  // Node's ANSI/VT escape matcher (lib/internal/util.js): SGR colors, cursor moves, and
+  // OSC sequences such as hyperlinks. An OSC string may be terminated by BEL () or
+  // ST in either form (ESC \ = \, or the C1 byte ) — Node accepts all
+  // three, so we do too. Reproduced so the stripped output is byte-identical to Node's.
+  // Built once; String.prototype.replace with a global regex resets lastIndex per call.
+  var ansiRegex = new RegExp(
+    '[\\u001B\\u009B][[\\]()#;?]*' +
+      '(?:(?:(?:(?:;[-a-zA-Z\\d/#&.:=?%@~_]+)*' +
+      '|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d/#&.:=?%@~_]*)*)?(?:\\u0007|\\u001B\\u005C|\\u009C))' +
+      '|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]))',
+    'g',
+  );
+
+  function stripVTControlCharacters(str) {
+    if (typeof str !== 'string') {
+      throw styleTextError(
+        'ERR_INVALID_ARG_TYPE',
+        'The "str" argument must be of type string. Received ' + typeof str,
+      );
+    }
+    // Short-circuit when there is no ESC (7-bit) or CSI (8-bit) introducer at all.
+    if (str.indexOf('\u001B') === -1 && str.indexOf('\u009B') === -1) return str;
+    return str.replace(ansiRegex, '');
+  }
+
+  // util.toUSVString — coerce to a string of Unicode scalar values, replacing each lone
+  // surrogate with U+FFFD. Matches Node: it coerces (so a non-string is stringified, not
+  // rejected) then well-forms. Symbols throw on coercion, as in Node.
+  function toUSVString(value) {
+    var str = '' + value;
+    if (typeof str.toWellFormed === 'function') return str.toWellFormed();
+    // Fallback for engines without String.prototype.toWellFormed (ES2024).
+    var out = '';
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff) {
+        var next = i + 1 < str.length ? str.charCodeAt(i + 1) : 0;
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          out += str[i] + str[i + 1];
+          i++;
+        } else {
+          out += '\uFFFD';
+        }
+      } else if (c >= 0xdc00 && c <= 0xdfff) {
+        out += '\uFFFD';
+      } else {
+        out += str[i];
+      }
+    }
+    return out;
+  }
+
   function inspectPublic(v, opts) {
     return inspect(v, opts, [], 0);
   }
@@ -550,6 +602,8 @@
     parseArgs: require('parse_args').parseArgs,
     parseEnv: require('parse_env').parseEnv,
     styleText: styleText,
+    stripVTControlCharacters: stripVTControlCharacters,
+    toUSVString: toUSVString,
     // Node exposes the same object via require('node:util').types and
     // require('node:util/types'); many packages use the former.
     types: require('util/types'),
