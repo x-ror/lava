@@ -37,5 +37,7 @@ assert.equal(util.toUSVString('plain'), 'plain');
 assert.equal(util.toUSVString(123), '123');
 assert.equal(util.toUSVString(null), 'null');
 assert.throws(() => util.toUSVString(Symbol('x')), TypeError);
+// string-hint coercion: an object's toString wins over valueOf (Node uses `${input}`)
+assert.equal(util.toUSVString({ valueOf: () => 'bad', toString: () => 'ok' }), 'ok');
 
 console.log('ok');

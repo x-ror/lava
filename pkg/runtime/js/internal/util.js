@@ -556,10 +556,11 @@
   }
 
   // util.toUSVString — coerce to a string of Unicode scalar values, replacing each lone
-  // surrogate with U+FFFD. Matches Node: it coerces (so a non-string is stringified, not
-  // rejected) then well-forms. Symbols throw on coercion, as in Node.
+  // surrogate with U+FFFD. Matches Node: it string-coerces via `${value}` (the string hint,
+  // so an object's toString wins over valueOf — `'' + value` would use the default hint and
+  // diverge) then well-forms. A Symbol throws on coercion, as in Node.
   function toUSVString(value) {
-    var str = '' + value;
+    var str = `${value}`;
     if (typeof str.toWellFormed === 'function') return str.toWellFormed();
     // Fallback for engines without String.prototype.toWellFormed (ES2024).
     var out = '';
