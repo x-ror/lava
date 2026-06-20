@@ -924,13 +924,86 @@
     return { re: '[' + (neg ? '^' : '') + cls + ']', next: j + 1, dot: !neg && dot };
   }
 
-  function globSegToRegex(seg) {
+  // Index of the ')' closing an extglob group whose '(' is at `open`, skipping nested
+  // groups and [...] classes; -1 if unterminated.
+  function globExtglobEnd(seg, open) {
+    var depth = 0;
+    for (var j = open; j < seg.length; j++) {
+      var c = seg[j];
+      if (c === '[') {
+        var pc = globParseClass(seg, j);
+        if (pc !== null) {
+          j = pc.next - 1;
+          continue;
+        }
+      } else if (c === '(') {
+        depth++;
+      } else if (c === ')') {
+        depth--;
+        if (depth === 0) return j;
+      }
+    }
+    return -1;
+  }
+
+  // Split a group body on top-level '|' (not inside nested groups or classes).
+  function globSplitAlts(body) {
+    var alts = [];
+    var start = 0;
+    var depth = 0;
+    for (var j = 0; j < body.length; j++) {
+      var c = body[j];
+      if (c === '[') {
+        var pc = globParseClass(body, j);
+        if (pc !== null) {
+          j = pc.next - 1;
+          continue;
+        }
+      } else if (c === '(') {
+        depth++;
+      } else if (c === ')') {
+        depth--;
+      } else if (c === '|' && depth === 0) {
+        alts.push(body.slice(start, j));
+        start = j + 1;
+      }
+    }
+    alts.push(body.slice(start));
+    return alts;
+  }
+
+  // Translate an extglob `<op>( body )` to a regex fragment. `!(...)` is a negative
+  // lookahead over the whole segment (the common case; mid-segment `!()` is approximate).
+  function globExtglobRegex(op, body) {
+    var alts = globSplitAlts(body);
+    var parts = [];
+    for (var a = 0; a < alts.length; a++) parts.push(globCompileBody(alts[a]).body);
+    var inner = '(?:' + parts.join('|') + ')';
+    if (op === '@') return inner;
+    if (op === '+') return inner + '+';
+    if (op === '*') return inner + '*';
+    if (op === '?') return inner + '?';
+    return '(?!' + inner + '$)[^/]*'; // '!'
+  }
+
+  // Compile a segment glob to a regex body (no anchors). Returns {body, firstDot} where
+  // firstDot reports whether the first atom can match a leading '.'.
+  function globCompileBody(seg) {
     var re = '';
     var i = 0;
     var firstDot = null;
     while (i < seg.length) {
       var c = seg[i];
       var dot = false;
+      if ((c === '@' || c === '+' || c === '!' || c === '*' || c === '?') && seg[i + 1] === '(') {
+        var end = globExtglobEnd(seg, i + 1);
+        if (end !== -1) {
+          re += globExtglobRegex(c, seg.slice(i + 2, end));
+          i = end + 1;
+          if (firstDot === null) firstDot = false;
+          continue;
+        }
+      }
       if (c === '*') {
         re += '[^/]*';
         i++;
@@ -954,8 +1027,14 @@
       }
       if (firstDot === null) firstDot = dot;
     }
+    return { body: re, firstDot: !!firstDot };
+  }
+
+  function globSegToRegex(seg) {
+    var compiled = globCompileBody(seg);
+    var re = compiled.body;
     // A wildcard at the start of a segment must not match a leading dot (dot:false).
-    if (!firstDot) re = '(?!\\.)' + re;
+    if (!compiled.firstDot) re = '(?!\\.)' + re;
     try {
       return new RegExp('^' + re + '$', GLOB_NOCASE ? 'i' : '');
     } catch (e) {
