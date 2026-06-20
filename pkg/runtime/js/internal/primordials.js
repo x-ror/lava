@@ -102,6 +102,7 @@
     ArrayPrototypeJoin: uncurryThis(ArrayProto.join),
     ArrayPrototypeConcat: uncurryThis(ArrayProto.concat),
     ArrayPrototypeReverse: uncurryThis(ArrayProto.reverse),
+    ArrayPrototypeSort: uncurryThis(ArrayProto.sort),
 
     // --- String.prototype.* (uncurried: StringPrototypeSlice(str, ...)) ---
     StringPrototypeSlice: uncurryThis(StringProto.slice),
