@@ -583,6 +583,147 @@
     return out;
   }
 
+  // --- util.debuglog / util.debug ---
+  // NODE_DEBUG is a comma-separated list of sections (no whitespace trimming); `*` is a
+  // wildcard and matching is case-insensitive. Node compiles it once into an anchored regex
+  // (escape regex specials, then `*` -> `.*`, `,` -> alternation) tested against the
+  // upper-cased section name.
+  var debugEnvRegex = /^$/;
+  var debugEnvInitialized = false;
+  function initDebugEnv() {
+    if (debugEnvInitialized) return;
+    debugEnvInitialized = true;
+    var env = typeof process !== 'undefined' && process.env ? process.env.NODE_DEBUG : '';
+    if (env) {
+      env = env
+        .replace(/[|\\{}()[\]^$+?.]/g, '\\$&')
+        .replace(/\*/g, '.*')
+        .replace(/,/g, '$|^')
+        .toUpperCase();
+      debugEnvRegex = new RegExp('^' + env + '$', 'i');
+    }
+  }
+  function testEnabled(section) {
+    initDebugEnv();
+    return debugEnvRegex.exec(section) !== null;
+  }
+
+  var debugImpls = { __proto__: null };
+  function debuglogImpl(enabled, section) {
+    if (debugImpls[section] === undefined) {
+      if (enabled) {
+        debugImpls[section] = function () {
+          var args = [{}];
+          for (var i = 0; i < arguments.length; i++) args[i + 1] = arguments[i];
+          var msg = formatWithOptions.apply(null, args);
+          var pid = typeof process !== 'undefined' && process.pid ? process.pid : 0;
+          process.stderr.write(format('%s %d: %s\n', section, pid, msg));
+        };
+      } else {
+        debugImpls[section] = function () {};
+      }
+    }
+    return debugImpls[section];
+  }
+
+  function debuglog(set, cb) {
+    var enabled;
+    function init() {
+      set = String(set).toUpperCase();
+      enabled = testEnabled(set);
+    }
+    // The heavy impl is built lazily on the first call; the optional callback is invoked then
+    // (once) with the real logger so callers can capture/replace it.
+    var debug = function () {
+      init();
+      debug = debuglogImpl(enabled, set);
+      if (typeof cb === 'function') {
+        Object.defineProperty(debug, 'enabled', {
+          get: function () {
+            return enabled;
+          },
+          configurable: true,
+          enumerable: true,
+        });
+        cb(debug);
+      }
+      return debug.apply(this, arguments);
+    };
+    var test = function () {
+      init();
+      test = function () {
+        return enabled;
+      };
+      return enabled;
+    };
+    var logger = function () {
+      if (enabled === false) return;
+      return debug.apply(this, arguments);
+    };
+    Object.defineProperty(logger, 'enabled', {
+      get: function () {
+        return test();
+      },
+      configurable: true,
+      enumerable: true,
+    });
+    return logger;
+  }
+
+  // Node's ERR_INVALID_ARG_TYPE "Received ..." clause: a primitive shows `type <typeof>
+  // (<value>)`, null/undefined as-is, an object `an instance of <constructor>`.
+  function receivedType(v) {
+    if (v === null) return 'null';
+    var t = typeof v;
+    if (t === 'undefined') return 'undefined';
+    if (t === 'object') {
+      var name = v.constructor && v.constructor.name ? v.constructor.name : 'Object';
+      return 'an instance of ' + name;
+    }
+    return 'type ' + t + ' (' + String(v) + ')';
+  }
+
+  function isAbortSignalLike(s) {
+    return (
+      s !== null &&
+      typeof s === 'object' &&
+      typeof s.addEventListener === 'function' &&
+      typeof s.aborted === 'boolean'
+    );
+  }
+
+  // util.aborted(signal, resource) — like Node, an async function: the returned Promise
+  // fulfills when `signal` aborts (with the abort event) or immediately (with undefined) if it
+  // is already aborted, and a bad argument REJECTS rather than throwing synchronously. The
+  // `resource` must be an object/function — Node holds it weakly so the listener drops when the
+  // resource is GC'd; the weak ref is not observable here, but the type check is.
+  async function aborted(signal, resource) {
+    if (!isAbortSignalLike(signal)) {
+      throw styleTextError(
+        'ERR_INVALID_ARG_TYPE',
+        'The "signal" argument must be an instance of AbortSignal. Received ' +
+          receivedType(signal),
+      );
+    }
+    if (resource === null || (typeof resource !== 'object' && typeof resource !== 'function')) {
+      throw styleTextError(
+        'ERR_INVALID_ARG_TYPE',
+        'The "resource" argument must be of type object. Received ' + receivedType(resource),
+      );
+    }
+    if (signal.aborted) return undefined;
+    return new Promise(function (resolve) {
+      // lava's AbortSignal.addEventListener ignores the options object, so `{ once: true }`
+      // would not auto-remove the listener — wrap the resolver and remove it explicitly so
+      // repeated aborted() calls on a long-lived signal cannot accumulate dead listeners.
+      function onAbort(event) {
+        signal.removeEventListener('abort', onAbort);
+        resolve(event);
+      }
+      signal.addEventListener('abort', onAbort);
+    });
+  }
+
   function inspectPublic(v, opts) {
     return inspect(v, opts, [], 0);
   }
@@ -600,6 +741,9 @@
     inherits: inherits,
     deprecate: deprecate,
     isDeepStrictEqual: isDeepStrictEqual,
+    debuglog: debuglog,
+    debug: debuglog, // Node aliases util.debug to util.debuglog
+    aborted: aborted,
     parseArgs: require('parse_args').parseArgs,
     parseEnv: require('parse_env').parseEnv,
     styleText: styleText,
