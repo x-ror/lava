@@ -16,6 +16,14 @@ package picohttpparser
 
 import "core:c"
 
+// Linux-first: build-native-deps.sh produces libpicohttpparser.a for the Linux/macOS
+// (cc/ar) link. The Windows build path (scripts/link-windows-local.sh) does NOT yet
+// compile picohttpparser, so a Windows link of fetch would fail at this import. That is
+// a known, accepted gap while the Windows/macOS CI jobs are disabled (see the Linux-first
+// note in .github/workflows/ci.yml). When Windows is restored, compile picohttpparser.c
+// with MSVC (cl /c … then lib, as scripts/build-jsc-init-windows.sh does for the JSC
+// shim) into build/picohttpparser.lib on the LIB path, and guard this import to use
+// `system:picohttpparser.lib` under `when ODIN_OS == .Windows`.
 foreign import pico "libpicohttpparser.a"
 
 // Mirror of `struct phr_header` — name/value are pointers INTO the parsed buffer
