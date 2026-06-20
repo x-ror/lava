@@ -53,10 +53,9 @@ Runtime_State :: struct {
 	// Fetches currently owned by this runtime context. Used during abnormal eval
 	// teardown to stop requests and join any DNS worker before the loop/context die.
 	active_fetches:    [dynamic]^Fetch_Request,
-	// In-flight node:dns lookups (see dns.odin). Tracked for the same reason as
-	// active_fetches: abnormal teardown must join the resolver workers before the
-	// loop/context die, or a worker can post_async into freed memory.
-	active_dns:        [dynamic]^Dns_Lookup_Request,
+	// node:dns lookups run off-loop on the loop's shared worker pool (see dns.odin);
+	// the pool's own `outstanding` list is the in-flight tracking, and pool_shutdown
+	// joins + disposes at teardown, so no separate active_dns bag is needed here.
 	// node:sqlite handle registries: opaque id -> ^sqlite.Database / ^sqlite.Statement
 	// (kept as rawptr so this struct need not import pkg/std/sqlite). See sqlite.odin.
 	sqlite_dbs:        map[u64]rawptr,
@@ -113,7 +112,6 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state.module_cache = make(map[string]Cached_Module, 0, state.allocator)
 	state.error_intrinsics = make(map[string]jsc.JSValueRef)
 	state.active_fetches = make([dynamic]^Fetch_Request)
-	state.active_dns = make([dynamic]^Dns_Lookup_Request)
 	state.sqlite_dbs = make(map[u64]rawptr)
 	state.sqlite_stmts = make(map[u64]rawptr)
 	state.next_sqlite_id = 1
@@ -124,7 +122,6 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	if state == nil do return
 	fetch_shutdown_active(state)
 	fetch_destroy_pending(state)
-	dns_destroy_state(state)
 	sqlite_destroy_state(state)
 	for _, entry in state.module_cache {
 		unprotect_before_eval_exit(ctx, entry.value)
