@@ -46,16 +46,20 @@ assert.equal(m('', '*'), false);
 // brace ranges expand like minimatch
 assert.equal(m('file2.js', 'file{1..3}.js'), true);
 assert.equal(m('b', '{a..c}'), true);
-// POSIX character classes; an invalid range matches nothing (does not throw). `word` and
-// `ascii` are supported; `print` maps to the control set (a minimatch quirk) and `punct`
-// excludes the math symbols ($+<=>^`|~), matching Node.
+// POSIX character classes are Unicode-aware, like Node. `word`/`ascii` are supported; `print`
+// maps to the control set (a minimatch quirk); `punct` is \p{P}, so it excludes the math
+// symbols ($+<=>^`|~, which are \p{S}) but includes '.'; classes mid-segment work too.
 assert.equal(m('a', '[[:alpha:]]'), true);
+assert.equal(m('é', '[[:alpha:]]'), true); // Unicode letter
+assert.equal(m('中', '[[:word:]]'), true);
 assert.equal(m('5', '[[:digit:]]'), true);
 assert.equal(m('_', '[[:word:]]'), true);
 assert.equal(m('-', '[[:word:]]'), false);
 assert.equal(m('a', '[[:ascii:]]'), true);
 assert.equal(m('a', '[[:print:]]'), false);
 assert.equal(m('!', '[[:punct:]]'), true);
+assert.equal(m('a.b', 'a[[:punct:]]b'), true); // '.' is punct mid-segment
+assert.equal(m('!', '[[:punct:]a]'), true); // combined with a literal
 assert.equal(m('$', '[[:punct:]]'), false);
 assert.equal(m('x', '[z-a]'), false);
 // an explicit dot character class matches a dotfile
