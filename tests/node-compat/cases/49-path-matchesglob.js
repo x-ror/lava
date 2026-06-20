@@ -4,6 +4,12 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const m = (p, g) => path.matchesGlob(p, g);
 
+// a no-magic (literal) segment is matched case-sensitively even where magic patterns case-
+// fold (Windows/macOS), so a literal never matches across case — true on every platform
+assert.equal(m('ABC', 'abc'), false);
+assert.equal(m('abc', 'abc'), true);
+assert.equal(m('A', '[a]'), false); // a single-char class is treated as a literal
+
 // single-segment wildcards: '*'/'?' do not cross '/' nor match a leading dot
 assert.equal(m('foo.js', '*.js'), true);
 assert.equal(m('foo/bar.js', '*.js'), false);
