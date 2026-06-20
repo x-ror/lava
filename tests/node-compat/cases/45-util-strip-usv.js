@@ -2,8 +2,8 @@
 const assert = require('node:assert/strict');
 const util = require('node:util');
 
-const ESC = String.fromCharCode(27); // 
-const BEL = String.fromCharCode(7); // 
+const ESC = String.fromCharCode(27); //
+const BEL = String.fromCharCode(7); //
 const CSI = String.fromCharCode(155); //  (8-bit CSI)
 const BS = String.fromCharCode(92); // backslash (for the ESC \ string terminator)
 
