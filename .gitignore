@@ -11,6 +11,7 @@ reports/
 *.dll
 *.dylib
 *.exe
+*.a
 *.o
 *.so
 

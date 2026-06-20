@@ -3,6 +3,10 @@ set -eu
 
 mkdir -p bin
 
+# Compile vendored C deps (picohttpparser) that Odin links into the runtime. Idempotent.
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+"$ROOT_DIR/scripts/build-native-deps.sh"
+
 # Optimized release build by default (-o:speed). Override for a fast debug/iteration
 # build, e.g. `LAVA_OPT=none ./scripts/build.sh`. Levels: none|minimal|size|speed|aggressive.
 OPT="${LAVA_OPT:-speed}"

@@ -7,6 +7,7 @@ import "core:strconv"
 import "core:strings"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
+import pico "lava:pkg/runtime/picohttpparser"
 
 // Fetch_Addr is one resolved address in the connect-fallback list (#145). A
 // hostname resolves to up to one IPv4 and one IPv6 address (net.resolve); the
@@ -139,6 +140,10 @@ Fetch_Request :: struct {
 	// fetch_dns_pool_submit, cleared by its completion; loop-thread-only.
 	dns_job:       ^DNS_Job,
 	response:      [dynamic]byte, // accumulates bytes until the header terminator is found
+	// Length of `response` passed to picohttpparser on the previous (incomplete) head
+	// parse — the `last_len` resume hint, so each read re-scans only new bytes for the
+	// CRLFCRLF terminator rather than the whole accumulated head. 0 until the first read.
+	head_last_len: int,
 	watcher:       eventloop.IO_Watcher,
 	fd:            uintptr,
 	has_fd:        bool,
@@ -732,8 +737,17 @@ build_http_request :: proc(
 fetch_on_recv :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, data: []byte) -> (keep: bool) {
 	if !req.headers_done {
 		append(&req.response, ..data)
-		sep := find_header_end(req.response[:])
-		if sep < 0 {
+		// One picohttpparser pass over the whole accumulated head: it both detects
+		// completeness (Partial until the CRLFCRLF is buffered) and parses, resuming
+		// the terminator scan from head_last_len so accumulation stays linear. The
+		// returned strings alias req.response and are consumed inside
+		// fetch_deliver_headers before any further append (none happens here).
+		consumed, status, status_text, headers, is_chunked, content_length, res := parse_http_head(
+			req.response[:],
+			req.head_last_len,
+		)
+		req.head_last_len = len(req.response)
+		if res == .Partial {
 			// A server that never terminates the head must not grow req.response
 			// without bound — reject once it crosses the cap.
 			if len(req.response) > FETCH_MAX_HEADER_BYTES {
@@ -742,14 +756,20 @@ fetch_on_recv :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, data: []byte) 
 			}
 			return true // head still incomplete — read more
 		}
-		if !fetch_deliver_headers(req, sep) do return false // settled with an error
+		if res == .Error {
+			fetch_settle_error(req, "fetch: malformed HTTP response")
+			return false
+		}
+		if !fetch_deliver_headers(req, status, status_text, headers, is_chunked, content_length) {
+			return false // settled with an error
+		}
 		if req.settled do return false // a consumer cancelled inside on_response
 		if req.no_body {
 			fetch_finish_body(req, "") // HEAD / 204 / 304 — settle with a null body
 			return false
 		}
 		// Body bytes that arrived in the same read as the head.
-		return fetch_feed_body(loop, req, req.response[sep + 4:])
+		return fetch_feed_body(loop, req, req.response[consumed:])
 	}
 	return fetch_feed_body(loop, req, data)
 }
@@ -772,20 +792,20 @@ fetch_feed_body :: proc(loop: ^eventloop.Loop, req: ^Fetch_Request, data: []byte
 	return true
 }
 
-// fetch_deliver_headers parses the response head (everything before req.response
-// index `sep`) and fires on_response with { status, statusText, headers, hasBody }.
-// It establishes the body framing (chunked / Content-Length / read-until-EOF) and
-// whether the status permits a body at all. Returns false (after settling an
-// error) on a malformed head.
-fetch_deliver_headers :: proc(req: ^Fetch_Request, sep: int) -> bool {
-	status, status_text, headers, is_chunked, content_length, ok := parse_http_head(
-		req.response[:sep],
-	)
-	if !ok {
-		fetch_settle_error(req, "fetch: malformed HTTP response")
-		return false
-	}
-
+// fetch_deliver_headers fires on_response with { status, statusText, headers, hasBody }
+// from the already-parsed head (see parse_http_head / fetch_on_recv). It establishes
+// the body framing (chunked / Content-Length / read-until-EOF) and whether the status
+// permits a body at all. `status_text` and `headers` alias req.response and are copied
+// into JS values here, so they must not be used after this call. Returns true (the
+// header delivery cannot fail on its own; a malformed head is rejected before this).
+fetch_deliver_headers :: proc(
+	req: ^Fetch_Request,
+	status: int,
+	status_text: string,
+	headers: []string,
+	is_chunked: bool,
+	content_length: int,
+) -> bool {
 	req.headers_done = true
 	req.body_is_chunked = is_chunked
 	req.body_len = content_length
@@ -1158,87 +1178,72 @@ fetch_destroy_pending :: proc(state: ^Runtime_State) {
 	delete(state.active_fetches)
 }
 
-// find_header_end returns the index of the CRLFCRLF that ends the response head,
-// or -1 if the head is not yet fully buffered.
-find_header_end :: proc(data: []byte) -> int {
-	if len(data) < 4 do return -1
-	for i in 0 ..= len(data) - 4 {
-		if data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n' {
-			return i
-		}
-	}
-	return -1
-}
-
-// parse_http_head parses the response head (the bytes before CRLFCRLF) into a
-// status code, status text, an interleaved [name, value, ...] header list, and
-// the body framing signals (chunked transfer-encoding and Content-Length). The
-// returned strings alias `head`/temp storage and must be consumed within the call
-// — fetch_deliver_headers builds the JS values immediately.
+// parse_http_head runs picohttpparser over the accumulated response buffer. It both
+// detects completeness and parses in one pass — no separate header-terminator scan.
+// `last_len` is the length of `buf` on the previous (Partial) call (0 on the first),
+// the picohttpparser resume hint that keeps accumulation linear. On .Complete it
+// returns `consumed` (the head length incl. the CRLFCRLF, i.e. the body offset), the
+// status code/text, an interleaved [name, value, ...] header list, and the body
+// framing (chunked / Content-Length, -1 when absent). Every returned string ALIASES
+// `buf`; the caller (fetch_on_recv -> fetch_deliver_headers) copies them into JS
+// values before `buf` is mutated. .Partial means read more; .Error is a malformed head.
 parse_http_head :: proc(
-	head: []byte,
+	buf: []byte,
+	last_len: int,
 ) -> (
+	consumed: int,
 	status: int,
 	status_text: string,
 	headers: []string,
 	is_chunked: bool,
 	content_length: int,
-	ok: bool,
+	result: pico.Result,
 ) {
 	content_length = -1
-	lines := strings.split(string(head), "\r\n", context.temp_allocator)
-	if len(lines) == 0 do return 0, "", nil, false, -1, false
+	raw: [pico.MAX_HEADERS]pico.Header
+	n_consumed, code, msg, n, res := pico.parse_response(buf, last_len, raw[:])
+	result = res
+	if res != .Complete do return
 
-	// Status line: HTTP/1.1 200 OK
-	status_line := lines[0]
-	sp1 := strings.index_byte(status_line, ' ')
-	if sp1 < 0 do return 0, "", nil, false, -1, false
-	after := status_line[sp1 + 1:]
-	code_str := after
-	if sp2 := strings.index_byte(after, ' '); sp2 >= 0 {
-		code_str = after[:sp2]
-		status_text = after[sp2 + 1:]
-	}
-	code, code_ok := strconv.parse_int(code_str)
-	if !code_ok do return 0, "", nil, false, -1, false
+	consumed = n_consumed
 	status = code
+	status_text = msg
 
-	hdr_list := make([dynamic]string, 0, context.temp_allocator)
+	// Interleaved [name, value, ...] for build_string_array. picohttpparser already
+	// returns name/value as zero-copy slices into buf with leading OWS stripped; we
+	// trim trailing OWS and unfold obs-fold continuations (reported with an empty name).
+	hdr_list := make([dynamic]string, 0, n * 2, context.temp_allocator)
 	last_val_idx := -1
-	for i in 1 ..< len(lines) {
-		line := lines[i]
-		if len(line) == 0 do continue
-		// RFC 7230 obs-fold: a field-value continuation line begins with SP or HT.
-		// It is deprecated, but rather than drop it (silently corrupting the value)
-		// we unfold it — append the trimmed continuation to the previous value with
-		// a single space, the historical HTTP/1.1 interpretation.
-		if (line[0] == ' ' || line[0] == '\t') && last_val_idx >= 0 {
-			cont := strings.trim_space(line)
-			hdr_list[last_val_idx] = strings.concatenate(
-				{hdr_list[last_val_idx], " ", cont},
-				context.temp_allocator,
-			)
+	for i in 0 ..< n {
+		h := raw[i]
+		if h.name == "" {
+			// RFC 7230 obs-fold continuation: append (single space) to the previous
+			// value rather than drop it. Deprecated, but unfolding avoids silent
+			// corruption — the historical HTTP/1.1 interpretation.
+			if last_val_idx >= 0 {
+				cont := strings.trim_space(h.value)
+				hdr_list[last_val_idx] = strings.concatenate(
+					{hdr_list[last_val_idx], " ", cont},
+					context.temp_allocator,
+				)
+			}
 			continue
 		}
-		colon := strings.index_byte(line, ':')
-		if colon < 0 do continue
-		name := strings.trim_space(line[:colon])
-		value := strings.trim_space(line[colon + 1:])
-		append(&hdr_list, name)
+		value := strings.trim_space(h.value)
+		append(&hdr_list, h.name)
 		append(&hdr_list, value)
 		last_val_idx = len(hdr_list) - 1
 
-		lname := strings.to_lower(name, context.temp_allocator)
-		switch lname {
-		case "transfer-encoding":
+		// Case-insensitive name match without lowercasing every header (equal_fold
+		// allocates nothing); only the rare Transfer-Encoding value is lowercased.
+		if strings.equal_fold(h.name, "transfer-encoding") {
 			lvalue := strings.to_lower(value, context.temp_allocator)
 			if strings.contains(lvalue, "chunked") do is_chunked = true
-		case "content-length":
+		} else if strings.equal_fold(h.name, "content-length") {
 			if cl, cl_ok := strconv.parse_int(value); cl_ok do content_length = cl
 		}
 	}
 	headers = hdr_list[:]
-	ok = true
 	return
 }
 

@@ -15,6 +15,9 @@ case "$(uname -s)" in
 esac
 
 printf '%s\n' '== Odin tests =='
+# cmd/lava links the runtime, which links the vendored C deps (picohttpparser). Build
+# them first so the Odin test link succeeds even before `make build` has run.
+"$ROOT_DIR/scripts/build-native-deps.sh"
 "$ODIN" test "$ROOT_DIR/cmd/lava" -collection:lava="$ROOT_DIR"
 "$ODIN" test "$ROOT_DIR/pkg/runtime/eventloop"
 
