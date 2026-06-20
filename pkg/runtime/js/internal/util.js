@@ -713,7 +713,14 @@
     }
     if (signal.aborted) return undefined;
     return new Promise(function (resolve) {
-      signal.addEventListener('abort', resolve, { once: true });
+      // lava's AbortSignal.addEventListener ignores the options object, so `{ once: true }`
+      // would not auto-remove the listener — wrap the resolver and remove it explicitly so
+      // repeated aborted() calls on a long-lived signal cannot accumulate dead listeners.
+      function onAbort(event) {
+        signal.removeEventListener('abort', onAbort);
+        resolve(event);
+      }
+      signal.addEventListener('abort', onAbort);
     });
   }
 
