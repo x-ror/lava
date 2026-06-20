@@ -1,10 +1,13 @@
-// util.parseEnv — parse a .env-format string into an object (Node 21+). Handles the
-// `export ` prefix, `#` comment lines, single/double/backtick quotes (only a double-
-// quoted value expands an escape, and only `\n` -> newline; single/backtick are fully
-// literal; any quote may span lines), inline `#` comments on unquoted values, and
-// last-wins on duplicate keys. Char scanner (quotes can span newlines). Pure JS via
-// primordials; backs require('node:util').parseEnv. Hidden from the public resolver
-// like parse_args.
+// util.parseEnv — parse a .env-format string into an object (Node 21+). Matches Node's
+// C++ dotenv parser (src/node_dotenv.cc): the `export ` prefix, `#` comment lines,
+// single/double/backtick quotes whose matching close may span newlines, double-quote-only
+// `\n` -> newline expansion (every other backslash, incl. one before the closing quote, is
+// literal; single/backtick are fully literal), an *unterminated* quote falling back to a
+// line literal that keeps the opening quote and ignores inline `#`, inline `#` comments on
+// unquoted values, and last-wins on duplicate keys. The `__proto__` key is dropped and the
+// result keys come out byte-sorted (Node stores them in a std::map). Pure JS via
+// primordials; backs require('node:util').parseEnv. Hidden from the public resolver like
+// parse_args.
 (function (require, module) {
   'use strict';
 
@@ -12,6 +15,8 @@
   var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
   var StringPrototypeSlice = P.StringPrototypeSlice;
   var StringPrototypeTrim = P.StringPrototypeTrim;
+  var ObjectKeys = P.ObjectKeys;
+  var ArrayPrototypeSort = P.ArrayPrototypeSort;
 
   var CR = 13;
   var LF = 10;
@@ -32,11 +37,45 @@
     return c === SPACE || c === TAB;
   }
 
+  // std::map key order: compare by UTF-16 code unit, which matches Node's byte order for
+  // the ASCII keys env names use in practice.
+  function byteCompare(a, b) {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
+  // Double-quoted values expand only `\n` -> newline; Node does a naive left-to-right
+  // substring replace, so `\\n` (backslash then `\n`) keeps the first backslash and
+  // expands the second pair.
+  function expandNewlines(s) {
+    var out = '';
+    var slen = s.length;
+    var seg = 0;
+    var j = 0;
+    while (j < slen) {
+      if (
+        StringPrototypeCharCodeAt(s, j) === BACKSLASH &&
+        j + 1 < slen &&
+        StringPrototypeCharCodeAt(s, j + 1) === LOWER_N
+      ) {
+        out += StringPrototypeSlice(s, seg, j) + '\n';
+        j += 2;
+        seg = j;
+      } else {
+        j++;
+      }
+    }
+    out += StringPrototypeSlice(s, seg);
+    return out;
+  }
+
   function parseEnv(content) {
-    var result = { __proto__: null };
-    if (typeof content !== 'string') return result;
+    var tmp = { __proto__: null };
+    if (typeof content !== 'string') return tmp;
     var i = 0;
+    // Node rtrims the whole input once, so trailing whitespace never reaches a value —
+    // an unterminated quote at end-of-input loses it, but spaces before a newline survive.
     var len = content.length;
+    while (len > 0 && isWs(StringPrototypeCharCodeAt(content, len - 1))) len--;
 
     while (i < len) {
       // Skip blank space / newlines between entries.
@@ -74,33 +113,25 @@
       var value;
       var q = i < len ? StringPrototypeCharCodeAt(content, i) : 0;
       if (q === DQUOTE || q === SQUOTE || q === BACKTICK) {
-        // Only a double-quoted value expands an escape, and only `\n` -> newline; every
-        // other backslash (including one before the closing quote) is literal, and single/
-        // backtick values are fully literal. The matching quote always closes the value,
-        // and a quote may span multiple lines.
-        var expandNewline = q === DQUOTE;
-        i++; // skip opening quote
-        var buf = '';
-        var segStart = i;
-        while (i < len && StringPrototypeCharCodeAt(content, i) !== q) {
-          if (
-            expandNewline &&
-            StringPrototypeCharCodeAt(content, i) === BACKSLASH &&
-            i + 1 < len &&
-            StringPrototypeCharCodeAt(content, i + 1) === LOWER_N
-          ) {
-            buf += StringPrototypeSlice(content, segStart, i) + '\n';
-            i += 2;
-            segStart = i;
-          } else {
-            i++;
-          }
+        // Look ahead for the matching close quote, which may be many lines away. A
+        // backslash never escapes it.
+        var close = i + 1;
+        while (close < len && StringPrototypeCharCodeAt(content, close) !== q) close++;
+        if (close >= len) {
+          // Unterminated: keep the opening quote and take the rest of the line literally
+          // (no `#` comment handling, no per-value trim — the whole-input rtrim above is
+          // the only trailing-whitespace removal).
+          var eol = i;
+          while (eol < len && StringPrototypeCharCodeAt(content, eol) !== LF) eol++;
+          value = StringPrototypeSlice(content, i, eol);
+          i = eol;
+        } else {
+          var raw = StringPrototypeSlice(content, i + 1, close);
+          value = q === DQUOTE ? expandNewlines(raw) : raw;
+          i = close + 1;
+          // Ignore the rest of the line after a quoted value.
+          while (i < len && StringPrototypeCharCodeAt(content, i) !== LF) i++;
         }
-        buf += StringPrototypeSlice(content, segStart, i);
-        value = buf;
-        if (i < len) i++; // skip closing quote
-        // Ignore the rest of the line after a quoted value.
-        while (i < len && StringPrototypeCharCodeAt(content, i) !== LF) i++;
       } else {
         // Unquoted: up to a newline or a '#' comment; trimmed.
         var valStart = i;
@@ -115,9 +146,17 @@
         while (i < len && StringPrototypeCharCodeAt(content, i) !== LF) i++;
       }
 
-      if (key.length > 0) result[key] = value;
+      // Node drops a literal `__proto__` key rather than letting it touch the prototype.
+      if (key.length > 0 && key !== '__proto__') tmp[key] = value;
     }
 
+    // Node returns the keys in std::map (byte-sorted) order in a plain object (its proto
+    // is Object.prototype). Rebuild to match; the `__proto__` key was already dropped
+    // above, so assigning onto a plain object cannot pollute the prototype.
+    var keys = ObjectKeys(tmp);
+    ArrayPrototypeSort(keys, byteCompare);
+    var result = {};
+    for (var k = 0; k < keys.length; k++) result[keys[k]] = tmp[keys[k]];
     return result;
   }
 

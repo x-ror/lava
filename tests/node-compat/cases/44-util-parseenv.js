@@ -35,4 +35,17 @@ assert.deepEqual({ ...parseEnv('H=ab#cd') }, { H: 'ab' });
 // unquoted values keep interior spaces, colons, slashes
 assert.deepEqual({ ...parseEnv('URL=http://x:8080/p') }, { URL: 'http://x:8080/p' });
 
+// a literal `__proto__` key is dropped (no prototype pollution); the result is a plain
+// object, like Node's
+const p = parseEnv('__proto__=evil\nSAFE=1');
+assert.deepEqual({ ...p }, { SAFE: '1' });
+assert.equal(Object.getPrototypeOf(p), Object.prototype);
+assert.equal({}.evil, undefined);
+
+// an unterminated quote keeps the opening quote and takes the rest of the line literally
+assert.deepEqual({ ...parseEnv('K="unterminated\nA=1') }, { K: '"unterminated', A: '1' });
+
+// keys come out byte-sorted (Node backs the result with a std::map) — printing locks the
+// enumeration order into the oracle (node and lava stdout must match exactly)
+console.log(JSON.stringify(parseEnv('Z=26\nA=1\nM=13\nB=2')));
 console.log('ok');
