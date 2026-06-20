@@ -37,6 +37,30 @@ assert.equal(m('.hidden', '.*'), true);
 assert.equal(m('', '**'), true);
 assert.equal(m('', '*'), false);
 
+// brace ranges expand like minimatch
+assert.equal(m('file2.js', 'file{1..3}.js'), true);
+assert.equal(m('b', '{a..c}'), true);
+// POSIX character classes; an invalid range matches nothing (does not throw)
+assert.equal(m('a', '[[:alpha:]]'), true);
+assert.equal(m('5', '[[:digit:]]'), true);
+assert.equal(m('x', '[z-a]'), false);
+// an explicit dot character class matches a dotfile
+assert.equal(m('.env', '[.]env'), true);
+// '.'/'..' segments are resolved before matching
+assert.equal(m('a/./b', 'a/b'), true);
+assert.equal(m('b', 'a/../b'), true);
+// '\' is a path separator in patterns (windowsPathsNoEscape), not an escape
+assert.equal(path.posix.matchesGlob('a/b', 'a\\b'), true);
+assert.equal(path.posix.matchesGlob('a*b', 'a\\*b'), false);
+// the win32 variant also treats '\' in the path as a separator; posix does not
+assert.equal(path.win32.matchesGlob('a\\b', 'a/b'), true);
+assert.equal(path.posix.matchesGlob('a\\b', 'a/b'), false);
+// a leading '/' is absolute; a trailing '/' in the pattern marks a directory
+assert.equal(m('foo/bar', '/foo/*'), false);
+assert.equal(m('/foo/bar', '/foo/*'), true);
+assert.equal(m('a', 'a/'), false);
+assert.equal(m('/a/b/c', '**'), true); // a leading '**' absorbs the absolute prefix
+
 // non-string arguments throw ERR_INVALID_ARG_TYPE
 assert.throws(() => path.matchesGlob(1, '*'), { code: 'ERR_INVALID_ARG_TYPE' });
 assert.throws(() => path.matchesGlob('a', 2), { code: 'ERR_INVALID_ARG_TYPE' });

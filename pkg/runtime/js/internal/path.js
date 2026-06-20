@@ -850,22 +850,87 @@
 
   // --- matchesGlob (Node 22.5+) ---
   // A glob matcher with the same surface as Node's path.matchesGlob (which delegates to its
-  // bundled minimatch): `*`/`?` match within one segment and not a leading dot, `**` spans
-  // segments (stopping at a dotfile), `{a,b}` expands, `[abc]`/`[!abc]` are classes, `\`
-  // escapes. `/` is the only separator and runs of it collapse; a trailing `/` is significant
-  // only for a trailing `**`. Matching is case-insensitive on Windows, like Node.
-  var GLOB_NOCASE = typeof process !== 'undefined' && process.platform === 'win32';
+  // bundled minimatch): `*`/`?` match within one segment and not a leading dot; `**` spans
+  // segments (stopping at a dotfile); `{a,b}` and `{1..3}`/`{a..c}` expand; `[abc]`/`[!abc]`
+  // and POSIX `[[:alpha:]]` classes; an invalid range matches nothing; `\` is a path
+  // separator (windowsPathsNoEscape), and on the win32 variant a `\` in the path is one too;
+  // `.`/`..` segments are resolved; a leading `/` is absolute and a trailing `/` marks a
+  // directory. Case-insensitive on Windows and macOS, like Node. Extended-glob operators
+  // (`@(...)`, `+(...)`, etc.) are not yet supported (tracked separately).
+  var GLOB_NOCASE =
+    typeof process !== 'undefined' &&
+    (process.platform === 'win32' || process.platform === 'darwin');
   var GLOB_RE_SPECIAL = /[.*+?^${}()|[\]\\]/;
+  var GLOB_POSIX_CLASSES = {
+    alpha: 'A-Za-z',
+    digit: '0-9',
+    alnum: 'A-Za-z0-9',
+    upper: 'A-Z',
+    lower: 'a-z',
+    space: '\\s',
+    blank: ' \\t',
+    xdigit: '0-9A-Fa-f',
+    punct: '!-/:-@\\[-`{-~',
+    print: '\\x20-\\x7e',
+    graph: '\\x21-\\x7e',
+    cntrl: '\\x00-\\x1f\\x7f',
+  };
 
   function globEscape(ch) {
     return GLOB_RE_SPECIAL.test(ch) ? '\\' + ch : ch;
   }
 
+  // Parse a `[...]` class at `start`; returns {re, next, dot} (dot = matches a literal '.')
+  // or null when unterminated.
+  function globParseClass(seg, start) {
+    var j = start + 1;
+    var neg = false;
+    if (seg[j] === '!' || seg[j] === '^') {
+      neg = true;
+      j++;
+    }
+    var cls = '';
+    var dot = false;
+    if (seg[j] === ']') {
+      cls += '\\]';
+      j++;
+    }
+    while (j < seg.length && seg[j] !== ']') {
+      if (seg[j] === '[' && seg[j + 1] === ':') {
+        var end = seg.indexOf(':]', j + 2);
+        if (end !== -1) {
+          var name = seg.slice(j + 2, end);
+          if (GLOB_POSIX_CLASSES[name]) {
+            cls += GLOB_POSIX_CLASSES[name];
+            j = end + 2;
+            continue;
+          }
+        }
+      }
+      var cc = seg[j];
+      if (cc === '.') dot = true;
+      if (cc === '\\') {
+        cls += '\\' + (seg[j + 1] || '');
+        j += 2;
+      } else if (cc === '^' || cc === '[') {
+        cls += '\\' + cc;
+        j++;
+      } else {
+        cls += cc;
+        j++;
+      }
+    }
+    if (j >= seg.length) return null;
+    return { re: '[' + (neg ? '^' : '') + cls + ']', next: j + 1, dot: !neg && dot };
+  }
+
   function globSegToRegex(seg) {
     var re = '';
     var i = 0;
+    var firstDot = null;
     while (i < seg.length) {
       var c = seg[i];
+      var dot = false;
       if (c === '*') {
         re += '[^/]*';
         i++;
@@ -873,48 +938,29 @@
         re += '[^/]';
         i++;
       } else if (c === '[') {
-        var j = i + 1;
-        var neg = false;
-        if (seg[j] === '!' || seg[j] === '^') {
-          neg = true;
-          j++;
-        }
-        var cls = '';
-        if (seg[j] === ']') {
-          cls += '\\]';
-          j++;
-        }
-        while (j < seg.length && seg[j] !== ']') {
-          var cc = seg[j];
-          if (cc === '\\') {
-            cls += '\\' + (seg[j + 1] || '');
-            j += 2;
-          } else if (cc === '^' || cc === '[') {
-            cls += '\\' + cc;
-            j++;
-          } else {
-            cls += cc;
-            j++;
-          }
-        }
-        if (j >= seg.length) {
+        var parsed = globParseClass(seg, i);
+        if (parsed === null) {
           re += '\\[';
           i++;
         } else {
-          re += '[' + (neg ? '^' : '') + cls + ']';
-          i = j + 1;
+          re += parsed.re;
+          i = parsed.next;
+          dot = parsed.dot;
         }
-      } else if (c === '\\') {
-        re += globEscape(seg[i + 1] || '');
-        i += 2;
       } else {
         re += globEscape(c);
         i++;
+        dot = c === '.';
       }
+      if (firstDot === null) firstDot = dot;
     }
     // A wildcard at the start of a segment must not match a leading dot (dot:false).
-    if (seg[0] !== '.') re = '(?!\\.)' + re;
-    return new RegExp('^' + re + '$', GLOB_NOCASE ? 'i' : '');
+    if (!firstDot) re = '(?!\\.)' + re;
+    try {
+      return new RegExp('^' + re + '$', GLOB_NOCASE ? 'i' : '');
+    } catch (e) {
+      return /(?!)/; // an invalid range matches nothing, like Node
+    }
   }
 
   function globMatchSegs(patSegs, pathSegs, pi, si, trail) {
@@ -943,13 +989,31 @@
     return si === pathSegs.length;
   }
 
+  function globParseRange(inner) {
+    var num = /^(-?\d+)\.\.(-?\d+)$/.exec(inner);
+    if (num) {
+      var a = parseInt(num[1], 10);
+      var b = parseInt(num[2], 10);
+      var out = [];
+      if (a <= b) for (var i = a; i <= b; i++) out.push(String(i));
+      else for (var d = a; d >= b; d--) out.push(String(d));
+      return out;
+    }
+    var ch = /^([A-Za-z])\.\.([A-Za-z])$/.exec(inner);
+    if (ch) {
+      var x = ch[1].charCodeAt(0);
+      var y = ch[2].charCodeAt(0);
+      var r = [];
+      if (x <= y) for (var p = x; p <= y; p++) r.push(String.fromCharCode(p));
+      else for (var q = x; q >= y; q--) r.push(String.fromCharCode(q));
+      return r;
+    }
+    return null;
+  }
+
   function globExpandBraces(pattern) {
     var open = -1;
     for (var i = 0; i < pattern.length; i++) {
-      if (pattern[i] === '\\') {
-        i++;
-        continue;
-      }
       if (pattern[i] === '{') {
         open = i;
         break;
@@ -961,40 +1025,54 @@
     var partStart = open + 1;
     var close = -1;
     for (var k = open; k < pattern.length; k++) {
-      var ch = pattern[k];
-      if (ch === '\\') {
-        k++;
-        continue;
-      }
-      if (ch === '{') depth++;
-      else if (ch === '}') {
+      var c = pattern[k];
+      if (c === '{') depth++;
+      else if (c === '}') {
         depth--;
         if (depth === 0) {
           parts.push(pattern.slice(partStart, k));
           close = k;
           break;
         }
-      } else if (ch === ',' && depth === 1) {
+      } else if (c === ',' && depth === 1) {
         parts.push(pattern.slice(partStart, k));
         partStart = k + 1;
       }
     }
-    if (close === -1 || parts.length < 2) return [pattern]; // a brace with no comma is literal
+    if (close === -1) return [pattern];
+    var alts = parts;
+    if (parts.length < 2) {
+      var range = globParseRange(pattern.slice(open + 1, close));
+      if (!range) return [pattern]; // a brace with no comma or range is literal
+      alts = range;
+    }
     var prefix = pattern.slice(0, open);
     var suffix = pattern.slice(close + 1);
     var out = [];
-    for (var p = 0; p < parts.length; p++) {
-      var expanded = globExpandBraces(parts[p] + suffix);
+    for (var a = 0; a < alts.length; a++) {
+      var expanded = globExpandBraces(alts[a] + suffix);
       for (var e = 0; e < expanded.length; e++) out.push(prefix + expanded[e]);
     }
     return out;
   }
 
-  function globSplit(s) {
+  // Collapse `//`, resolve `.`/`..`, and report whether the path is absolute / directory.
+  function globNormalize(s) {
+    var absolute = s.length > 0 && s[0] === '/';
+    var trailing = s.length > 1 && s[s.length - 1] === '/';
     var raw = s.split('/');
-    var out = [];
-    for (var i = 0; i < raw.length; i++) if (raw[i] !== '') out.push(raw[i]);
-    return out;
+    var segs = [];
+    for (var i = 0; i < raw.length; i++) {
+      var seg = raw[i];
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') {
+        if (segs.length && segs[segs.length - 1] !== '..') segs.pop();
+        else if (!absolute) segs.push('..');
+        continue;
+      }
+      segs.push(seg);
+    }
+    return { segs: segs, absolute: absolute, trailing: trailing };
   }
 
   function globArgError(name, value) {
@@ -1005,19 +1083,32 @@
     return e;
   }
 
-  function matchesGlob(path, pattern) {
-    if (typeof path !== 'string') throw globArgError('path', path);
-    if (typeof pattern !== 'string') throw globArgError('pattern', pattern);
-    var trail = path.length > 1 && path[path.length - 1] === '/';
-    var pathSegs = globSplit(path);
-    var patterns = globExpandBraces(pattern);
-    for (var i = 0; i < patterns.length; i++) {
-      if (globMatchSegs(globSplit(patterns[i]), pathSegs, 0, 0, trail)) return true;
-    }
-    return false;
+  function makeMatchesGlob(winSep) {
+    return function matchesGlob(path, pattern) {
+      if (typeof path !== 'string') throw globArgError('path', path);
+      if (typeof pattern !== 'string') throw globArgError('pattern', pattern);
+      pattern = pattern.replace(/\\/g, '/'); // windowsPathsNoEscape: '\' is a separator
+      if (winSep) path = path.replace(/\\/g, '/');
+      var pathInfo = globNormalize(path);
+      var patterns = globExpandBraces(pattern);
+      for (var i = 0; i < patterns.length; i++) {
+        var patInfo = globNormalize(patterns[i]);
+        // Absolute/relative-ness must agree, except a pattern beginning with `**` (which
+        // absorbs leading segments) may match an absolute path.
+        if (
+          patInfo.absolute !== pathInfo.absolute &&
+          !(!patInfo.absolute && pathInfo.absolute && patInfo.segs[0] === '**')
+        ) {
+          continue;
+        }
+        if (patInfo.trailing && !pathInfo.trailing) continue;
+        if (globMatchSegs(patInfo.segs, pathInfo.segs, 0, 0, pathInfo.trailing)) return true;
+      }
+      return false;
+    };
   }
-  posix.matchesGlob = matchesGlob;
-  win32.matchesGlob = matchesGlob;
+  posix.matchesGlob = makeMatchesGlob(false);
+  win32.matchesGlob = makeMatchesGlob(true);
 
   posix.posix = win32.posix = posix;
   posix.win32 = win32.win32 = win32;
