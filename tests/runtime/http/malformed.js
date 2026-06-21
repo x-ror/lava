@@ -110,6 +110,28 @@ function check(name, cond, detail) {
   r = await raw('GET / HTTP/1.1\r\nHost: x\r\nX-Probe: \xe9\r\nConnection: close\r\n\r\n');
   check('latin1-header', /P=233\b/.test(r), r.slice(0, 80));
 
+  // 11. Streamed response must be chunk-framed on the wire: Transfer-Encoding: chunked
+  //     header, a "6\r\npart1-\r\n" chunk, and the "0\r\n\r\n" terminator — and NO
+  //     Content-Length.
+  r = await raw('GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+  check(
+    'chunked-response-framing',
+    /transfer-encoding:\s*chunked/i.test(r) &&
+      /\r\n6\r\npart1-\r\n/.test(r) &&
+      r.endsWith('0\r\n\r\n') &&
+      !/content-length/i.test(r),
+    r.slice(0, 60),
+  );
+
+  // 12. HTTP/1.0 streamed response must NOT be chunked (1.0 has no Transfer-Encoding) —
+  //     raw, close-delimited body. The chunk markers must be absent and the body intact.
+  r = await raw('GET /stream HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n');
+  check(
+    'http10-no-chunked',
+    !/transfer-encoding/i.test(r) && bodyOf(r) === 'part1-part2-part3',
+    JSON.stringify(bodyOf(r)),
+  );
+
   console.log(failures === 0 ? 'HTTP MALFORMED OK' : 'HTTP MALFORMED FAILURES ' + failures);
   process.exit(failures === 0 ? 0 : 1);
 })();

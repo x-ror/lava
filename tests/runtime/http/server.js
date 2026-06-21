@@ -18,6 +18,16 @@ const server = http.createServer((req, res) => {
     }
     return;
   }
+  // /stream writes the body in pieces via write()+end() with no Content-Length, so the
+  // runtime must frame it with Transfer-Encoding: chunked. The parity client checks the
+  // assembled body; phase 2 checks the chunk framing on the wire.
+  if (req.url === '/stream') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.write('part1-');
+    res.write('part2-');
+    res.end('part3');
+    return;
+  }
   // /status/<code> writes a status derived from the (decoded) URL — the status-line
   // injection sink + no-body-status check (run-http-smoke.sh phase 2).
   if (req.url.indexOf('/status/') === 0) {
