@@ -80,11 +80,31 @@ http_parse_request_cb :: proc "c" (
 		last_val_idx = len(hdr_list) - 1
 	}
 
+	// Build the headers array (and method/url) as LATIN-1 strings: HTTP/1 header bytes are
+	// binary (obs-text 0x80-0xFF), and Node exposes them as latin1. Routing through the
+	// UTF-8 helpers would mis-decode/corrupt non-ASCII bytes.
+	n := len(hdr_list)
+	header_vals := make([]jsc.JSValueRef, n, context.temp_allocator)
+	for i in 0 ..< n do header_vals[i] = http_latin1_string(ctx, hdr_list[i])
+	headers_arr := jsc.JSObjectMakeArray(ctx, c.size_t(n), n > 0 ? raw_data(header_vals) : nil, nil)
+
 	set_named(ctx, result, "state", js_string_value(ctx, "complete"))
 	set_named(ctx, result, "consumed", jsc.JSValueMakeNumber(ctx, f64(consumed)))
-	set_named(ctx, result, "method", js_string_value(ctx, method))
-	set_named(ctx, result, "url", js_string_value(ctx, path))
+	set_named(ctx, result, "method", http_latin1_string(ctx, method))
+	set_named(ctx, result, "url", http_latin1_string(ctx, path))
 	set_named(ctx, result, "minor", jsc.JSValueMakeNumber(ctx, f64(minor)))
-	set_named(ctx, result, "headers", cast(jsc.JSValueRef)build_string_array(ctx, hdr_list[:]))
+	set_named(ctx, result, "headers", cast(jsc.JSValueRef)headers_arr)
 	return cast(jsc.JSValueRef)result
+}
+
+// http_latin1_string builds a JS string by mapping each input BYTE to one UTF-16 code
+// unit (latin1 / ISO-8859-1), matching how Node decodes HTTP/1 request bytes — preserving
+// raw 0x80-0xFF obs-text instead of mis-interpreting it as UTF-8.
+http_latin1_string :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef {
+	if len(value) == 0 do return js_string_value(ctx, "")
+	units := make([]jsc.JSChar, len(value), context.temp_allocator)
+	for i in 0 ..< len(value) do units[i] = jsc.JSChar(value[i])
+	js_str := jsc.JSStringCreateWithCharacters(raw_data(units), c.size_t(len(value)))
+	defer jsc.JSStringRelease(js_str)
+	return jsc.JSValueMakeString(ctx, js_str)
 }

@@ -18,6 +18,18 @@ const server = http.createServer((req, res) => {
     }
     return;
   }
+  // /status/<code> writes a status derived from the (decoded) URL — the status-line
+  // injection sink + no-body-status check (run-http-smoke.sh phase 2).
+  if (req.url.indexOf('/status/') === 0) {
+    try {
+      res.writeHead(decodeURIComponent(req.url.slice('/status/'.length)));
+      res.end('body');
+    } catch (e) {
+      res.writeHead(500);
+      res.end('BADSTATUS ' + e.code);
+    }
+    return;
+  }
   const chunks = [];
   req.on('data', (d) => chunks.push(d));
   req.on('end', () => {
@@ -26,7 +38,12 @@ const server = http.createServer((req, res) => {
       'Content-Type': 'text/plain; charset=utf-8',
       'X-Echo-Method': req.method,
     });
-    res.end('M=' + req.method + ' U=' + req.url + ' L=' + body.length + ' B=' + body);
+    // P= echoes back a probe request header (its decoded char codes) when present — used
+    // by the latin1 round-trip check. Absent for the parity client, so its output is
+    // unchanged.
+    var probe = req.headers['x-probe'];
+    var p = probe === undefined ? '' : ' P=' + Array.from(probe).map((c) => c.charCodeAt(0)).join(',');
+    res.end('M=' + req.method + ' U=' + req.url + ' L=' + body.length + ' B=' + body + p);
   });
 });
 

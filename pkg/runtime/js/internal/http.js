@@ -46,7 +46,9 @@
   // array the parser returns. Duplicates join with ', ' (Node's behavior for most
   // headers; set-cookie's array form is out of M2 scope).
   function buildHeaders(arr) {
-    var headers = {};
+    // Null prototype: a header literally named "constructor"/"hasOwnProperty"/etc. must
+    // not collide with Object.prototype (which would corrupt the duplicate-merge check).
+    var headers = Object.create(null);
     for (var i = 0; i + 1 < arr.length; i += 2) {
       var k = arr[i].toLowerCase();
       var v = arr[i + 1];
@@ -60,6 +62,12 @@
   // reason. Reject invalid input rather than concatenating it into the response head —
   // a value containing CRLF would otherwise split the response (header injection).
   var TOKEN_RE = /^[\^_`a-zA-Z0-9!#$%&'*+\-.|~]+$/;
+  // A field-value/reason char outside this set is rejected. Crucially this also bans code
+  // points > 0xFF: _flushHead serializes with Buffer.from(head, 'latin1'), which masks
+  // each char to one byte, so e.g. č/Ċ would become CR/LF and reintroduce
+  // response splitting past a naive /[\r\n]/ check. Mirrors Node's checkInvalidHeaderChar
+  // (allow HT, printable ASCII, and the latin1 high range 0x80-0xFF).
+  var INVALID_HEADER_CHAR_RE = /[^\t\x20-\x7e\x80-\xff]/;
   function checkHeaderName(name) {
     if (typeof name !== 'string' || name.length === 0 || !TOKEN_RE.test(name)) {
       var e = new TypeError(
@@ -70,11 +78,26 @@
     }
   }
   function checkInvalidChar(value, what) {
-    if (/[\r\n]/.test(value)) {
+    if (INVALID_HEADER_CHAR_RE.test(value)) {
       var e = new TypeError('Invalid character in ' + what);
       e.code = 'ERR_INVALID_CHAR';
       throw e;
     }
+  }
+
+  // 204/304 and 1xx carry no message body (RFC 7230 §3.3.2); HEAD responses also omit
+  // the body (but keep Content-Length).
+  function statusHasNoBody(code) {
+    return code === 204 || code === 304 || (code >= 100 && code < 200);
+  }
+  function validateStatusCode(code) {
+    var n = Number(code);
+    if (!Number.isInteger(n) || n < 100 || n > 999) {
+      var e = new RangeError('Invalid status code: ' + JSON.stringify(code));
+      e.code = 'ERR_HTTP_INVALID_STATUS_CODE';
+      throw e;
+    }
+    return n;
   }
 
   function IncomingMessage(socket, parsed) {
@@ -131,7 +154,7 @@
       headers = statusMessage;
       statusMessage = undefined;
     }
-    this.statusCode = statusCode;
+    this.statusCode = validateStatusCode(statusCode);
     if (statusMessage) this.statusMessage = statusMessage;
     if (headers)
       for (var k in headers)
@@ -141,10 +164,14 @@
 
   ServerResponse.prototype._flushHead = function () {
     if (this.headersSent) return;
+    // Validate the status code at the single serialization chokepoint — it may have been
+    // set via writeHead OR assigned directly (res.statusCode = ...). Rejects a non-integer
+    // / out-of-range / CRLF-bearing status that would otherwise inject into the status line.
+    var code = validateStatusCode(this.statusCode);
     this.headersSent = true;
-    var reason = this.statusMessage || STATUS_CODES[this.statusCode] || '';
+    var reason = this.statusMessage || STATUS_CODES[code] || '';
     checkInvalidChar(String(reason), 'statusMessage'); // no CRLF in the status line
-    var head = 'HTTP/1.1 ' + this.statusCode + ' ' + reason + '\r\n';
+    var head = 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
     // M2: no keep-alive — the response is delimited by the connection close.
     if (!this.hasHeader('connection')) head += 'Connection: close\r\n';
     for (var key in this._headers) {
@@ -162,7 +189,8 @@
       encoding = undefined;
     }
     if (!this.headersSent) this._flushHead();
-    if (!this._isHead && chunk && chunk.length) {
+    var noBody = this._isHead || statusHasNoBody(this.statusCode);
+    if (!noBody && chunk && chunk.length) {
       this.socket.write(typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk);
     }
     if (typeof cb === 'function') process.nextTick(cb);
@@ -183,14 +211,16 @@
     if (chunk !== undefined && chunk !== null) {
       body = typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk;
     }
+    // 204/304/1xx carry no body and no Content-Length; HEAD keeps Content-Length but
+    // sends no body; everything else frames by the body length.
+    var noBody = this._isHead || statusHasNoBody(this.statusCode);
     if (!this.headersSent) {
-      // Known full body and no explicit length → set Content-Length (clean framing).
-      if (!this.hasHeader('content-length')) {
+      if (!this.hasHeader('content-length') && !statusHasNoBody(this.statusCode)) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
       this._flushHead();
     }
-    if (!this._isHead && body && body.length) this.socket.write(body);
+    if (!noBody && body && body.length) this.socket.write(body);
     this.finished = true;
     if (typeof cb === 'function') process.nextTick(cb);
     this.emit('finish');
@@ -289,7 +319,13 @@
       pending = null;
 
       server.emit('request', req, res);
-      feedBody(bodyStart); // deliver any body bytes already buffered; emits 'end' when done
+      // Deliver body bytes that arrived in the same read as the head on the NEXT tick, so
+      // a handler that attaches its 'data'/'end' listeners in process.nextTick (not just
+      // synchronously) still sees them. Body from later reads arrives via socket 'data' on
+      // its own tick, after this. (Full Readable buffering is a later, streaming milestone.)
+      process.nextTick(function () {
+        feedBody(bodyStart);
+      });
     });
 
     socket.on('end', function () {
