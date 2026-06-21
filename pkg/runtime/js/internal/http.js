@@ -4,9 +4,10 @@
 // parse the head, emit 'request' with method/url/headers and a Content-Length request
 // body, and write a response with writeHead/write/end. A streamed response (write()
 // before end(), unknown length) is sent with Transfer-Encoding: chunked; end(body) with
-// a known length uses Content-Length. No keep-alive yet (every response sets
-// Connection: close and ends the socket), chunked REQUEST bodies are still rejected
-// (501), and there is no client (http.request/get). Those are later milestones.
+// a known length uses Content-Length. Keep-alive is supported: a connection is reused
+// for subsequent requests (HTTP/1.1 default; HTTP/1.0 with Connection: keep-alive) when
+// the response is self-delimiting, and closed otherwise. Chunked request bodies are
+// decoded. There is no client (http.request/get) yet — that is a later milestone.
 (function (require, module, exports, native) {
   'use strict';
 
@@ -112,12 +113,14 @@
   }
 
   // Incremental decoder for a Transfer-Encoding: chunked REQUEST body (untrusted input).
-  // feed(bytes) emits decoded data to req via 'data', fires 'end' after the terminating
-  // zero-length chunk (+ optional trailers), and calls onError() on malformed framing.
-  // Hardened: the chunk-size line is length-bounded, and a non-hex or unsafe size is
-  // rejected — data is sliced out incrementally, so a huge declared size never allocates.
+  // feed(bytes) emits decoded data to req via 'data' and, after the terminating zero-length
+  // chunk (+ optional trailers), calls onEnd(leftover) with any bytes past the body (the
+  // next pipelined request, for keep-alive). onError() is called on malformed framing.
+  // Hardened: the chunk-size line is length-bounded, a non-hex / unsafe / whitespace-laden
+  // size is rejected, and data is sliced out incrementally so a huge declared size never
+  // allocates.
   var MAX_CHUNK_SIZE_LINE = 64 * 1024;
-  function makeChunkedDecoder(req, onError) {
+  function makeChunkedDecoder(req, onError, onEnd) {
     var buf = Buffer.alloc(0);
     var state = 'size'; // 'size' | 'data' | 'dataCRLF' | 'trailer'
     var remaining = 0;
@@ -126,14 +129,6 @@
     function bad() {
       done = true;
       onError();
-    }
-    function finish() {
-      done = true;
-      if (!req._ended) {
-        req._ended = true;
-        req.complete = true;
-        req.emit('end');
-      }
     }
 
     return function feed(incoming) {
@@ -181,7 +176,8 @@
           if (buf.length < 2) return;
           if (buf[0] === 13 && buf[1] === 10) {
             buf = buf.slice(2);
-            return finish();
+            done = true;
+            return onEnd(buf); // body complete; hand back any pipelined leftover
           }
           var tnl = buf.indexOf('\r\n');
           if (tnl < 0) {
@@ -233,6 +229,11 @@
     // close (we already send Connection: close) instead of chunking. Undefined minor
     // (direct construction) defaults to allowing chunked (HTTP/1.1).
     this._allowChunked = httpMinor === undefined || httpMinor >= 1;
+    // Tentative keep-alive (from the request); _flushHead finalizes it once the response
+    // framing is known (a non-self-delimiting response can't keep-alive). The connection
+    // reads the finalized value after 'finish' to decide whether to reuse the socket.
+    this._keepAlive = false;
+    this._onComplete = null; // connection-supplied: called by end() instead of closing
   }
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
@@ -278,8 +279,20 @@
     var reason = this.statusMessage || STATUS_CODES[code] || '';
     checkInvalidChar(String(reason), 'statusMessage'); // no CRLF in the status line
     var head = 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
-    // M2: no keep-alive — the response is delimited by the connection close.
-    if (!this.hasHeader('connection')) head += 'Connection: close\r\n';
+    // Finalize keep-alive: only possible if the response is self-delimiting (Content-Length,
+    // chunked, or a no-body status/HEAD) — otherwise the body ends at connection close, so
+    // we must close. A handler-set "Connection: close" also wins.
+    var selfDelimited =
+      this._chunked ||
+      this.hasHeader('content-length') ||
+      this._isHead ||
+      statusHasNoBody(this.statusCode);
+    if (!selfDelimited) this._keepAlive = false;
+    if (this.hasHeader('connection')) {
+      if (/\bclose\b/i.test(this.getHeader('connection'))) this._keepAlive = false;
+    } else {
+      head += this._keepAlive ? 'Connection: keep-alive\r\n' : 'Connection: close\r\n';
+    }
     for (var key in this._headers) {
       if (!Object.prototype.hasOwnProperty.call(this._headers, key)) continue;
       var h = this._headers[key];
@@ -359,25 +372,42 @@
     this.finished = true;
     if (typeof cb === 'function') process.nextTick(cb);
     this.emit('finish');
-    this.socket.end(); // M2: one request/response per connection
+    // The connection decides what happens next (reuse the socket on keep-alive, or close);
+    // a directly-constructed response with no connection falls back to closing.
+    if (this._onComplete) this._onComplete();
+    else this.socket.end();
     return this;
   };
 
-  // Per-connection request pipeline: accumulate bytes, parse the head with the native
-  // bridge, emit 'request', then feed the Content-Length body to the IncomingMessage.
+  function shouldKeepAlive(req) {
+    var conn = (req.headers['connection'] || '').toLowerCase();
+    // HTTP/1.1 defaults to keep-alive (unless "close"); HTTP/1.0 defaults to close
+    // (unless "keep-alive"). _flushHead further forces close for a non-self-delimiting
+    // response.
+    if (req.httpVersionMinor >= 1) return !/\bclose\b/.test(conn);
+    return /\bkeep-alive\b/.test(conn);
+  }
+
+  // Per-connection request loop: parse a head, emit 'request', feed the body, and — once
+  // BOTH the body is fully consumed and the response is finished — either reuse the socket
+  // for the next request (keep-alive) or close it. Leftover bytes past a body (a pipelined
+  // next request) are carried in `pending`.
   function onConnection(server, socket) {
     var pending = Buffer.alloc(0);
     var lastLen = 0;
     var parsingHead = true;
     var req = null;
     var res = null;
-    var bodyRemaining = 0; // Content-Length bytes still owed to req ('data'); 0 == no body
-    var chunkedDecode = null; // set for a Transfer-Encoding: chunked request body
-    var failed = false; // a fixed error response was sent; ignore further input
+    var bodyRemaining = 0; // Content-Length bytes still owed to req ('data')
+    var chunkedDecode = null; // decoder for a Transfer-Encoding: chunked request body
+    var bodyDone = false; // request body fully received ('end' fired)
+    var resDone = false; // response fully sent ('finish' fired)
+    var peerEnded = false; // peer half-closed (read EOF) — no more requests will arrive
+    var closed = false; // socket is being torn down; ignore further input
 
     function fail(code) {
-      if (failed) return;
-      failed = true;
+      if (closed) return;
+      closed = true;
       var reason = STATUS_CODES[code] || 'Error';
       socket.write(
         Buffer.from(
@@ -388,112 +418,157 @@
       socket.end();
     }
 
-    function feedBody(buf) {
-      if (!req || req._ended) return;
-      if (chunkedDecode) {
-        chunkedDecode(buf);
+    function resetForNext() {
+      parsingHead = true;
+      lastLen = 0;
+      req = null;
+      res = null;
+      bodyRemaining = 0;
+      chunkedDecode = null;
+      bodyDone = false;
+      resDone = false;
+    }
+
+    // Advance only when the request is fully read AND the response is fully sent. Then keep
+    // the socket for the next request (per the finalized res._keepAlive) or close it.
+    function maybeAdvance() {
+      if (closed || !bodyDone || !resDone) return;
+      if (!res._keepAlive) {
+        closed = true;
+        socket.end();
         return;
       }
-      if (bodyRemaining > 0 && buf && buf.length) {
-        var take = buf.length < bodyRemaining ? buf.length : bodyRemaining;
-        req.emit('data', buf.slice(0, take));
-        bodyRemaining -= take;
+      resetForNext();
+      if (pending.length > 0) {
+        processHead(); // a pipelined next request is already buffered
+      } else if (peerEnded) {
+        // Kept alive, nothing buffered, and the peer already half-closed → no further
+        // request can arrive (net no longer auto-closes on EOF), so close now.
+        closed = true;
+        socket.destroy();
       }
-      if (bodyRemaining <= 0) {
+    }
+
+    function onResComplete() {
+      resDone = true;
+      maybeAdvance();
+    }
+
+    // Body fully received: fire req 'end' once, stash any leftover (pipelined) bytes, advance.
+    function onBodyComplete(leftover) {
+      pending = leftover && leftover.length ? leftover : Buffer.alloc(0);
+      if (req && !req._ended) {
         req._ended = true;
         req.complete = true;
         req.emit('end');
       }
+      bodyDone = true;
+      maybeAdvance();
     }
 
-    socket.on('data', function (chunk) {
-      if (failed) return;
-      if (!parsingHead) {
-        feedBody(chunk);
-        return;
+    // Content-Length body feed: emit up to bodyRemaining bytes, keep the rest as leftover.
+    function feedBody(buf) {
+      if (!req || req._ended) return;
+      if (bodyRemaining > 0 && buf && buf.length) {
+        var take = buf.length < bodyRemaining ? buf.length : bodyRemaining;
+        req.emit('data', buf.slice(0, take));
+        bodyRemaining -= take;
+        buf = buf.slice(take);
       }
-      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-      var r = native.parseRequest(pending, lastLen);
-      lastLen = pending.length;
+      if (bodyRemaining <= 0) onBodyComplete(buf);
+    }
 
+    function processHead() {
+      var r = native.parseRequest(pending, lastLen);
       if (r.state === 'partial') {
         if (pending.length > MAX_HEAD) fail(431);
+        else lastLen = pending.length;
         return;
       }
-      if (r.state === 'error') {
-        fail(400);
-        return;
-      }
-      // Enforce the head-size cap on completion too — the partial-branch check alone lets
-      // a complete-but-oversized head through.
-      if (r.consumed > MAX_HEAD) {
-        fail(431);
-        return;
-      }
+      if (r.state === 'error') return fail(400);
+      if (r.consumed > MAX_HEAD) return fail(431);
 
       parsingHead = false;
+      lastLen = 0;
       req = new IncomingMessage(socket, r);
       res = new ServerResponse(socket, req.method, req.httpVersionMinor);
+      res._keepAlive = shouldKeepAlive(req); // finalized in _flushHead
+      res._onComplete = onResComplete;
 
-      // Body framing over untrusted input. Reject the request-smuggling vectors rather
-      // than guessing:
-      //   - Content-Length + Transfer-Encoding together -> 400 (CL.TE desync)
-      //   - Transfer-Encoding present but not exactly "chunked" -> 501 (only chunked is
-      //     supported; other transfer codings aren't)
-      //   - Content-Length not a single all-DIGIT token (duplicate "5, 5", negative,
-      //     "+5", non-numeric) -> 400
-      // A chunked decode error mid-request destroys the connection if the response is
-      // already committed, else sends a clean 400.
+      var bodyStart = pending.slice(r.consumed);
+      pending = Buffer.alloc(0);
+
+      // Body framing over untrusted input (smuggling-resistant): reject CL+TE (400), a TE
+      // that isn't exactly chunked (501), and a non-DIGIT Content-Length (400). A chunked
+      // decode error destroys the socket if the response already started, else sends 400.
       var te = req.headers['transfer-encoding'];
       var clStr = req.headers['content-length'];
       if (te !== undefined) {
-        if (clStr !== undefined) {
-          fail(400);
-          return;
-        }
-        if (!/^\s*chunked\s*$/i.test(te)) {
-          fail(501);
-          return;
-        }
-        chunkedDecode = makeChunkedDecoder(req, function () {
-          if (res.headersSent) socket.destroy();
-          else fail(400);
-        });
+        if (clStr !== undefined) return fail(400);
+        if (!/^\s*chunked\s*$/i.test(te)) return fail(501);
+        chunkedDecode = makeChunkedDecoder(
+          req,
+          function () {
+            if (res.headersSent) socket.destroy();
+            else fail(400);
+          },
+          onBodyComplete,
+        );
       } else if (clStr !== undefined) {
-        if (!/^\d+$/.test(clStr)) {
-          fail(400);
-          return;
-        }
+        if (!/^\d+$/.test(clStr)) return fail(400);
         bodyRemaining = parseInt(clStr, 10);
       }
 
-      var bodyStart = pending.slice(r.consumed);
-      pending = null;
-
       server.emit('request', req, res);
-      // Deliver body bytes that arrived in the same read as the head on the NEXT tick, so
-      // a handler that attaches its 'data'/'end' listeners in process.nextTick (not just
-      // synchronously) still sees them. Body from later reads arrives via socket 'data' on
-      // its own tick, after this. (Full Readable buffering is a later, streaming milestone.)
+      // Deliver body bytes from the head's read on the NEXT tick, so a handler that attaches
+      // 'data'/'end' in process.nextTick (not only synchronously) still sees them. For a
+      // bodyless request this fires 'end' immediately (and surfaces any pipelined leftover).
       process.nextTick(function () {
-        feedBody(bodyStart);
+        if (closed) return;
+        if (chunkedDecode) chunkedDecode(bodyStart);
+        else feedBody(bodyStart);
       });
+    }
+
+    socket.on('data', function (chunk) {
+      if (closed) return;
+      if (parsingHead) {
+        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+        processHead();
+      } else if (bodyDone) {
+        // Body finished but we haven't advanced yet (the response is still being produced):
+        // a pipelined next request must be BUFFERED, not handed to the now-finished body
+        // consumer (which would drop it). It is re-parsed when we advance.
+        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      } else if (chunkedDecode) {
+        chunkedDecode(chunk);
+      } else {
+        feedBody(chunk);
+      }
     });
 
     socket.on('end', function () {
-      // Peer half-closed. If the head or a Content-Length body is still incomplete, the
-      // request can never finish — answer 400 (Node's premature-EOF behavior). A request
-      // already received (req._ended) whose response is in flight is left alone; a bare
-      // idle connection that closes without sending anything just closes.
-      if (failed) return;
-      if (parsingHead) {
-        if (pending && pending.length > 0) fail(400);
-      } else if (req && !req._ended && (bodyRemaining > 0 || chunkedDecode)) {
-        // Incomplete Content-Length body, or a chunked body that never reached its
-        // terminating zero-chunk. If the response already started, drop the socket.
-        if (res && res.headersSent) socket.destroy();
-        else fail(400);
-      }
+      peerEnded = true;
+      // Defer one tick so the scheduled body delivery runs first — a client that writes a
+      // COMPLETE request and immediately half-closes (socket.end(req)) would otherwise race
+      // us into a false 400 before the request is marked complete.
+      process.nextTick(function () {
+        if (closed) return;
+        if (parsingHead) {
+          // A partial head that can no longer complete is a bad request; an idle keep-alive
+          // connection the peer is done with just closes (net no longer auto-closes on EOF).
+          if (pending.length > 0) fail(400);
+          else {
+            closed = true;
+            socket.destroy();
+          }
+        } else if (req && !req._ended) {
+          // Genuinely incomplete body (more bytes were expected) — premature EOF.
+          if (res && res.headersSent) socket.destroy();
+          else fail(400);
+        }
+        // else: request complete, response in flight → res completion drives the close.
+      });
     });
 
     socket.on('error', function () {}); // peer reset — drop quietly
