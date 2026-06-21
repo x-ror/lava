@@ -146,11 +146,17 @@
             if (buf.length > MAX_CHUNK_SIZE_LINE) bad();
             return;
           }
+          if (nl > MAX_CHUNK_SIZE_LINE) return bad(); // over-long size line, even with CRLF
           var line = buf.toString('latin1', 0, nl);
-          var semi = line.indexOf(';'); // chunk extensions — ignored
-          var hex = (semi >= 0 ? line.slice(0, semi) : line).trim();
-          if (!/^[0-9a-fA-F]+$/.test(hex)) return bad();
-          var size = parseInt(hex, 16);
+          // Strict chunk-size grammar: chunk-size = 1*HEXDIG (no surrounding whitespace),
+          // optionally followed by ";" chunk-ext. A lenient parser that accepts "5 ",
+          // " 5", or "5;" (empty ext) could disagree with a frontend proxy on the body
+          // boundary — a smuggling surface — so reject those (Node does too).
+          var semi = line.indexOf(';');
+          var sizePart = semi >= 0 ? line.slice(0, semi) : line;
+          if (!/^[0-9a-fA-F]+$/.test(sizePart)) return bad();
+          if (semi >= 0 && !/^;[^\s;]/.test(line.slice(semi))) return bad(); // ext must start with a token char
+          var size = parseInt(sizePart, 16);
           if (!Number.isSafeInteger(size) || size < 0) return bad();
           buf = buf.slice(nl + 2);
           if (size === 0) state = 'trailer';
@@ -182,7 +188,13 @@
             if (buf.length > MAX_CHUNK_SIZE_LINE) bad();
             return;
           }
-          buf = buf.slice(tnl + 2); // drop a trailer line; loop for the next / the blank line
+          if (tnl > MAX_CHUNK_SIZE_LINE) return bad();
+          // A trailer must be a well-formed header field ("token: value"); reject garbage
+          // like "0\r\nBadTrailer\r\n\r\n" instead of treating it as a valid end-of-body.
+          var tline = buf.toString('latin1', 0, tnl);
+          var tc = tline.indexOf(':');
+          if (tc <= 0 || !TOKEN_RE.test(tline.slice(0, tc))) return bad();
+          buf = buf.slice(tnl + 2); // drop the (valid) trailer line; loop for the next / blank line
         }
       }
     };

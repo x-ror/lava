@@ -155,6 +155,30 @@ function check(name, cond, detail) {
   );
   check('bad-chunk-size-400', statusOf(r) === 400, r.slice(0, 40));
 
+  // Strict chunk grammar (smuggling-resistance): reject whitespace around the size and an
+  // empty/garbage extension, but still accept a valid extension and a valid trailer.
+  var CHUNKED =
+    'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n';
+  // 16. Whitespace in the chunk-size token -> 400.
+  r = await raw(CHUNKED + '5 \r\nhello\r\n0\r\n\r\n');
+  check('chunk-size-whitespace-400', statusOf(r) === 400, r.slice(0, 40));
+  // 17. Empty chunk extension ("5;") -> 400.
+  r = await raw(CHUNKED + '5;\r\nhello\r\n0\r\n\r\n');
+  check('empty-chunk-ext-400', statusOf(r) === 400, r.slice(0, 40));
+  // 18. Garbage trailer line ("BadTrailer", no colon) -> 400.
+  r = await raw(CHUNKED + '0\r\nBadTrailer\r\n\r\n');
+  check('bad-trailer-400', statusOf(r) === 400, r.slice(0, 40));
+  // 19. Over-long chunk-size/extension line (> 64 KiB) even with a CRLF -> 400.
+  r = await raw(CHUNKED + '5;' + 'a'.repeat(70 * 1024) + '\r\nhello\r\n0\r\n\r\n');
+  check('overlong-chunk-line-400', statusOf(r) === 400, r.slice(0, 40));
+  // 20. A valid chunk extension and trailer must still be accepted (no over-rejection).
+  r = await raw(CHUNKED + '5;name=val\r\nhello\r\n0\r\nX-Trailer: ok\r\n\r\n');
+  check(
+    'valid-ext-and-trailer-200',
+    statusOf(r) === 200 && /L=5 B=hello\b/.test(r),
+    r.slice(0, 60),
+  );
+
   console.log(failures === 0 ? 'HTTP MALFORMED OK' : 'HTTP MALFORMED FAILURES ' + failures);
   process.exit(failures === 0 ? 0 : 1);
 })();
