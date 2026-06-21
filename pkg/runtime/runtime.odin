@@ -161,6 +161,7 @@ eval :: proc(
 	// eventloop.run returns.
 	defer if loop != nil {
 		fetch_shutdown_active(state)
+		net_shutdown_active(state)
 		eventloop.destroy(loop)
 	}
 

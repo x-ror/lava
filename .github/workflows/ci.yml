@@ -61,6 +61,12 @@ jobs:
       - name: Fetch transport smoke
         run: make test-fetch-smoke
 
+      # node:net TCP server: run the echo-server fixture under Node and under Lava,
+      # hit each with the same Node client, and require identical client output
+      # (server parity). Binds a local port, so it is its own gate like fetch smoke.
+      - name: Net server smoke
+        run: make test-net-smoke
+
       # Benchmarks: print the node-vs-Lava ratio table in the job log. Report-only for
       # now (never fails) because the bench/thresholds.json caps are uncalibrated
       # starters — once the ratios here are observed and the caps tightened, flip this
