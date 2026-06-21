@@ -61,6 +61,12 @@ Runtime_State :: struct {
 	sqlite_dbs:        map[u64]rawptr,
 	sqlite_stmts:      map[u64]rawptr,
 	next_sqlite_id:    u64,
+	// node:net registries (see net.odin): integer id -> live ^Net_Server / ^Net_Connection.
+	// Each is a watched fd, so the loop stays alive while a server listens or a connection
+	// is open; net_shutdown_active tears them down before the loop/context die.
+	net_servers:       map[u64]^Net_Server,
+	net_conns:         map[u64]^Net_Connection,
+	next_net_id:       u64,
 	// Node-style process.argv: [execPath, scriptPath, ...userArgs]. Built in eval()
 	// and read by install_process. Empty for embedders that don't set it (then
 	// install_process falls back to os.args).
@@ -115,6 +121,9 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state.sqlite_dbs = make(map[u64]rawptr)
 	state.sqlite_stmts = make(map[u64]rawptr)
 	state.next_sqlite_id = 1
+	state.net_servers = make(map[u64]^Net_Server)
+	state.net_conns = make(map[u64]^Net_Connection)
+	state.next_net_id = 1
 	return state
 }
 
@@ -122,6 +131,7 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	if state == nil do return
 	fetch_shutdown_active(state)
 	fetch_destroy_pending(state)
+	net_destroy_state(state)
 	sqlite_destroy_state(state)
 	for _, entry in state.module_cache {
 		unprotect_before_eval_exit(ctx, entry.value)
@@ -899,6 +909,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"sqlite", INTERNAL_SQLITE},
 		{"dns", INTERNAL_DNS},
 		{"dns/promises", INTERNAL_DNS_PROMISES},
+		{"net", INTERNAL_NET},
 		{"os", INTERNAL_OS},
 		{"querystring", INTERNAL_QUERYSTRING},
 		{"string_decoder", INTERNAL_STRING_DECODER},
@@ -936,6 +947,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "fetch", cast(jsc.JSValueRef)make_fetch_bindings(ctx))
 	set_named(ctx, natives, "sqlite", cast(jsc.JSValueRef)make_sqlite_bindings(ctx))
 	set_named(ctx, natives, "dns", cast(jsc.JSValueRef)make_dns_bindings(ctx))
+	set_named(ctx, natives, "net", cast(jsc.JSValueRef)make_net_bindings(ctx))
 	set_named(ctx, natives, "os", cast(jsc.JSValueRef)make_os_bindings(ctx))
 	set_named(ctx, natives, "tty", cast(jsc.JSValueRef)make_tty_bindings(ctx))
 
@@ -1195,6 +1207,7 @@ INTERNAL_PUNYCODE :: #load("js/internal/punycode.js", string)
 INTERNAL_PROCESS :: #load("js/internal/process.js", string)
 INTERNAL_CONSOLE :: #load("js/internal/console.js", string)
 INTERNAL_TTY :: #load("js/internal/tty.js", string)
+INTERNAL_NET :: #load("js/internal/net.js", string)
 INTERNAL_DIAGNOSTICS_CHANNEL :: #load("js/internal/diagnostics_channel.js", string)
 INTERNAL_PARSE_ARGS :: #load("js/internal/parse_args.js", string)
 INTERNAL_PARSE_ENV :: #load("js/internal/parse_env.js", string)

@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke bench bench-gate fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke bench bench-gate fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -190,6 +190,9 @@ test-eventloop-lava: build
 
 test-fetch-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-fetch-smoke.sh
+
+test-net-smoke: build
+	LAVA_BIN="$(LAVA)" ./scripts/run-net-smoke.sh
 
 # bench runs the micro/macro benchmarks node-vs-Lava and prints a ratio table; it never
 # fails on timing (report-only). bench-gate adds --gate, enforcing the per-benchmark
