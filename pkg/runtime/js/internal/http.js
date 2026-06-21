@@ -402,6 +402,7 @@
     var chunkedDecode = null; // decoder for a Transfer-Encoding: chunked request body
     var bodyDone = false; // request body fully received ('end' fired)
     var resDone = false; // response fully sent ('finish' fired)
+    var peerEnded = false; // peer half-closed (read EOF) — no more requests will arrive
     var closed = false; // socket is being torn down; ignore further input
 
     function fail(code) {
@@ -438,7 +439,14 @@
         return;
       }
       resetForNext();
-      if (pending.length > 0) processHead(); // a pipelined next request is already buffered
+      if (pending.length > 0) {
+        processHead(); // a pipelined next request is already buffered
+      } else if (peerEnded) {
+        // Kept alive, nothing buffered, and the peer already half-closed → no further
+        // request can arrive (net no longer auto-closes on EOF), so close now.
+        closed = true;
+        socket.destroy();
+      }
     }
 
     function onResComplete() {
@@ -527,6 +535,11 @@
       if (parsingHead) {
         pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
         processHead();
+      } else if (bodyDone) {
+        // Body finished but we haven't advanced yet (the response is still being produced):
+        // a pipelined next request must be BUFFERED, not handed to the now-finished body
+        // consumer (which would drop it). It is re-parsed when we advance.
+        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
       } else if (chunkedDecode) {
         chunkedDecode(chunk);
       } else {
@@ -535,16 +548,27 @@
     });
 
     socket.on('end', function () {
-      // Peer half-closed. Mid-head (with buffered bytes) or mid-body means the request can
-      // never finish -> 400 (or destroy if a response is already streaming). An idle
-      // keep-alive connection between requests just closes.
-      if (closed) return;
-      if (!parsingHead && req && !req._ended) {
-        if (res && res.headersSent) socket.destroy();
-        else fail(400);
-      } else if (parsingHead && pending.length > 0) {
-        fail(400);
-      }
+      peerEnded = true;
+      // Defer one tick so the scheduled body delivery runs first — a client that writes a
+      // COMPLETE request and immediately half-closes (socket.end(req)) would otherwise race
+      // us into a false 400 before the request is marked complete.
+      process.nextTick(function () {
+        if (closed) return;
+        if (parsingHead) {
+          // A partial head that can no longer complete is a bad request; an idle keep-alive
+          // connection the peer is done with just closes (net no longer auto-closes on EOF).
+          if (pending.length > 0) fail(400);
+          else {
+            closed = true;
+            socket.destroy();
+          }
+        } else if (req && !req._ended) {
+          // Genuinely incomplete body (more bytes were expected) — premature EOF.
+          if (res && res.headersSent) socket.destroy();
+          else fail(400);
+        }
+        // else: request complete, response in flight → res completion drives the close.
+      });
     });
 
     socket.on('error', function () {}); // peer reset — drop quietly

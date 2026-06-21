@@ -275,19 +275,15 @@ conn_read_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			return
 		}
 		if n == 0 { // peer half-closed (read EOF)
-			// Stop the read watcher: EOF is a persistent state, so leaving it armed would
-			// re-fire conn_read_cb forever. Then fire 'end' — the handler may write a
-			// response and call end() (the request/response pattern). With Node's default
-			// allowHalfOpen=false, the writable side then closes once pending writes drain,
-			// so we mark end_after_drain and flush rather than closing inline (which would
-			// truncate a backpressured response).
+			// Stop the read watcher (EOF is persistent — it would re-fire forever) and
+			// fire 'end'. Do NOT close here: this is a true half-close. The peer is done
+			// sending, but the write side stays open so the app can still write (an HTTP
+			// server writing its response after the client's request FIN). The connection
+			// closes only when the app calls socket.end()/destroy() — the 'end' consumer
+			// decides. Any in-flight (backpressured) write keeps draining via conn.writing.
 			conn.read_done = true
 			eventloop.unwatch_fd(conn.loop, &conn.watcher)
-			conn.writing = false
 			net_emit(conn.ctx, conn.on_end, nil, 0)
-			if conn.closing do return // an 'end' handler destroyed the socket
-			conn.end_after_drain = true
-			net_flush(conn)
 			return
 		}
 		// Copy out of the transient stack buffer into a JSC-owned Uint8Array (no-copy
