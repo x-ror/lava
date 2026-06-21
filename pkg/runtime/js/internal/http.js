@@ -664,6 +664,14 @@
     this.keepAliveTimeout = 5000;
     this.headersTimeout = 60000;
     this.requestTimeout = 300000;
+    // Honor timeouts configured at construction (Node's createServer(options) form), not
+    // only post-construction mutation.
+    if (options && typeof options === 'object') {
+      if (typeof options.keepAliveTimeout === 'number')
+        this.keepAliveTimeout = options.keepAliveTimeout;
+      if (typeof options.headersTimeout === 'number') this.headersTimeout = options.headersTimeout;
+      if (typeof options.requestTimeout === 'number') this.requestTimeout = options.requestTimeout;
+    }
     this._net = net.createServer(function (socket) {
       onConnection(self, socket);
     });
