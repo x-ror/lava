@@ -63,6 +63,14 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// Short timeouts for the slowloris phase (run-http-smoke.sh phase 4); off by default so
+// the other phases use Node's normal multi-second timeouts.
+if (process.env.HTTP_SHORT_TIMEOUTS) {
+  server.keepAliveTimeout = 250;
+  server.headersTimeout = 250;
+  server.requestTimeout = 400;
+}
+
 server.on('error', (e) => {
   console.error('server error', e && e.message);
   process.exit(1);
