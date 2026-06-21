@@ -6,7 +6,7 @@
 // Report-only (the "benchmark gate" for the io_uring memory-per-connection thesis). Run
 // under Node: `node bench/http/run-http-bench.mjs`. Env: NODE_BIN, LAVA_BIN, BUN_BIN,
 // HTTP_BENCH_CONNS, HTTP_BENCH_DURATION_MS, HTTP_BENCH_IDLE_CONNS.
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -101,6 +101,42 @@ function loadConn(port, deadline, lat, counter) {
   });
 }
 
+// Preferred throughput driver: autocannon (the standard Node HTTP benchmark — proper
+// warmup and HdrHistogram latency). Run via bunx/npx so it needs no committed dependency;
+// returns null if unavailable so the caller falls back to the built-in generator.
+function autocannonThroughput(port) {
+  const durationSec = Math.max(1, Math.round(DURATION_MS / 1000));
+  const args = [
+    'autocannon',
+    '-c',
+    String(CONNS),
+    '-d',
+    String(durationSec),
+    '-j',
+    `http://127.0.0.1:${port}/`,
+  ];
+  for (const runner of ['bunx', 'npx']) {
+    try {
+      const out = execFileSync(runner, runner === 'npx' ? ['--yes', ...args] : args, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      const r = JSON.parse(out);
+      return {
+        rps: Math.round(r.requests.average),
+        p50: +Number(r.latency.p50).toFixed(3),
+        p99: +Number(r.latency.p99).toFixed(3),
+        errors: (r.errors || 0) + (r.timeouts || 0) + (r.non2xx || 0),
+        tool: 'autocannon',
+      };
+    } catch {
+      // try the next runner, else fall through to the built-in generator
+    }
+  }
+  return null;
+}
+
 async function throughput(port) {
   const lat = [];
   const counter = { n: 0 };
@@ -160,7 +196,8 @@ async function benchRuntime(name, launch) {
   }
   try {
     await sleep(200);
-    tput = await throughput(srv.port);
+    tput = autocannonThroughput(srv.port);
+    if (!tput) tput = { ...(await throughput(srv.port)), tool: 'builtin' };
   } finally {
     srv.child.kill('SIGKILL');
   }
@@ -193,14 +230,16 @@ async function main() {
     rows.push(r);
     if (r.error) console.log(`${t.name.padEnd(6)} — skipped (${r.error})`);
   }
-  console.log('');
-  console.log('runtime    req/s     p50(ms)  p99(ms)   mem/conn   (idle conns)');
-  console.log('-------    -----     -------  -------   --------   ------------');
+  const loadTool = (rows.find((r) => r.tool) || {}).tool || 'builtin';
+  console.log(`\nload generator: ${loadTool}`);
+  console.log('runtime    req/s     p50(ms)  p99(ms)   errors    mem/conn   (idle conns)');
+  console.log('-------    -----     -------  -------   ------    --------   ------------');
   for (const r of rows) {
     if (r.error) continue;
     const perKB = (r.perConn / 1024).toFixed(1) + ' KiB';
+    const errs = r.errors === undefined ? 'n/a' : String(r.errors);
     console.log(
-      `${r.name.padEnd(8)} ${String(r.rps).padStart(8)}  ${String(r.p50).padStart(7)}  ${String(r.p99).padStart(7)}   ${perKB.padStart(8)}   (${r.established})`,
+      `${r.name.padEnd(8)} ${String(r.rps).padStart(8)}  ${String(r.p50).padStart(7)}  ${String(r.p99).padStart(7)}   ${errs.padStart(6)}    ${perKB.padStart(8)}   (${r.established})`,
     );
   }
   // Relative to node, if present.
