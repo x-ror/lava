@@ -40,8 +40,11 @@
       cb = encoding;
       encoding = undefined;
     }
-    if (this.destroyed) {
-      if (typeof cb === 'function') process.nextTick(cb, new Error('socket has been destroyed'));
+    if (this.destroyed || this.writableEnded) {
+      var werr = new Error(this.destroyed ? 'socket has been destroyed' : 'write after end');
+      var self = this;
+      if (typeof cb === 'function') process.nextTick(cb, werr);
+      else process.nextTick(function () { self.emit('error', werr); });
       return false;
     }
     var ok = native.write(this._id, toBytes(data, encoding));
@@ -57,11 +60,16 @@
       cb = encoding;
       encoding = undefined;
     }
-    if (this.destroyed) return this;
+    if (this.destroyed) {
+      if (typeof cb === 'function') process.nextTick(cb);
+      return this;
+    }
+    // Register the callback BEFORE native.end — with no queued data the native side can
+    // flush + close synchronously, emitting 'close' before once() would otherwise run.
+    if (typeof cb === 'function') this.once('close', cb);
     if (data !== undefined && data !== null) native.write(this._id, toBytes(data, encoding));
     this.writableEnded = true;
     native.end(this._id);
-    if (typeof cb === 'function') this.once('close', cb);
     return this;
   };
 
@@ -86,8 +94,11 @@
     EventEmitter.call(this);
     this._id = 0;
     this._listening = false;
+    this._closing = false; // close() called; waiting for live sockets to finish
+    this._closed = false; // 'close' already emitted
     this._port = 0;
     this._host = '0.0.0.0';
+    this._sockets = new Set(); // live accepted connections (for server.close timing)
     if (typeof connectionListener === 'function') this.on('connection', connectionListener);
   }
   Server.prototype = Object.create(EventEmitter.prototype);
@@ -100,7 +111,15 @@
   // Arming first means on_close/on_end ARE registered if a 'connection' handler closes the
   // socket synchronously (socket.destroy()/end()), so its 'close'/'end' still fire.
   Server.prototype._onConnection = function (id) {
+    var self = this;
     var socket = new Socket(id);
+    // Track the socket so server.close() can wait for it (Node fires the server 'close'
+    // event only after the last live connection ends).
+    this._sockets.add(socket);
+    socket.once('close', function () {
+      self._sockets.delete(socket);
+      if (self._closing && self._sockets.size === 0) self._maybeEmitClose();
+    });
     native.startConnection(
       id,
       function (u8) {
@@ -120,7 +139,27 @@
     this.emit('connection', socket);
   };
 
+  Server.prototype._maybeEmitClose = function () {
+    if (this._closed) return;
+    this._closed = true;
+    var self = this;
+    process.nextTick(function () {
+      self.emit('close');
+    });
+  };
+
   Server.prototype.listen = function (port, host, backlog, cb) {
+    // A Server listens once: a second listen() would orphan the first native listener
+    // (its fd stays watched, pinning the loop and the port). Reject, like Node.
+    if (this._listening || this._closing) {
+      var self0 = this;
+      var lerr = new Error('Server is already listening');
+      lerr.code = 'ERR_SERVER_ALREADY_LISTEN';
+      process.nextTick(function () {
+        self0.emit('error', lerr);
+      });
+      return this;
+    }
     // listen(port[, host][, backlog][, cb]) — collapse the optional middle args.
     var args = [host, backlog, cb];
     var rest = [];
@@ -162,17 +201,19 @@
   };
 
   Server.prototype.close = function (cb) {
-    var self = this;
-    if (this._listening) {
-      native.closeServer(this._id);
-      this._listening = false;
-      if (typeof cb === 'function') this.once('close', cb);
-      process.nextTick(function () {
-        self.emit('close');
-      });
-    } else if (typeof cb === 'function') {
-      process.nextTick(cb, new Error('Server is not running'));
+    if (!this._listening && !this._closing) {
+      if (typeof cb === 'function') process.nextTick(cb, new Error('Server is not running'));
+      return this;
     }
+    if (typeof cb === 'function') this.once('close', cb);
+    if (this._listening) {
+      native.closeServer(this._id); // stop accepting; live connections keep running
+      this._listening = false;
+    }
+    this._closing = true;
+    // 'close' fires only once every live connection has ended (Node semantics). If none
+    // remain, emit on the next tick; otherwise the last socket's 'close' triggers it.
+    if (this._sockets.size === 0) this._maybeEmitClose();
     return this;
   };
 

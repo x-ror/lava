@@ -60,7 +60,8 @@ Net_Connection :: struct {
 	// dynamic array carries that allocator, so delete() frees it correctly anywhere.
 	write_queue:     [dynamic]byte,
 	writing:         bool, // watcher currently in .Write mode (draining a blocked write)
-	end_after_drain: bool, // socket.end(): close once write_queue empties
+	end_after_drain: bool, // socket.end() / read EOF: close once write_queue empties
+	read_done:       bool, // peer half-closed (read EOF) — never re-arm the read watcher
 	closing:         bool,
 }
 
@@ -123,13 +124,27 @@ net_listen_cb :: proc "c" (
 	reuse: i32 = 1
 	_ = linux.setsockopt(sfd, linux.SOL_SOCKET, linux.Socket_Option.REUSEADDR, &reuse)
 
+	// Resolve the bind address. An unsupported host must NOT silently fall back to the
+	// 0.0.0.0 wildcard — that would expose a server meant for loopback on every
+	// interface. M1 binds IPv4 only: accept a numeric IPv4 or "localhost"; reject IPv6
+	// literals and anything else (a real resolver is a later milestone).
 	ip4 := net.IP4_Address{0, 0, 0, 0}
-	if len(host) > 0 {
+	if len(host) > 0 && host != "0.0.0.0" {
+		resolved := false
 		if parsed := net.parse_address(host); parsed != nil {
 			#partial switch a in parsed {
 			case net.IP4_Address:
 				ip4 = a
+				resolved = true
 			}
+		} else if host == "localhost" {
+			ip4 = net.IP4_Address{127, 0, 0, 1}
+			resolved = true
+		}
+		if !resolved {
+			linux.close(sfd)
+			if exception != nil do exception^ = make_js_error(ctx, "net.listen: unsupported host (only numeric IPv4 and 'localhost' are supported)")
+			return jsc.JSValueMakeUndefined(ctx)
 		}
 	}
 	addr := linux.Sock_Addr_In {
@@ -252,15 +267,27 @@ conn_read_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	buf: [NET_READ_CHUNK]byte
 	for {
 		n, recv_err := linux.recv(linux.Fd(conn.fd), buf[:], {})
+		if recv_err == .EINTR do continue // interrupted by a signal — retry, not fatal
 		if recv_err == .EAGAIN do return // no more data buffered — wait for the next event
 		if recv_err != .NONE {
 			net_emit_error(conn, "read error")
 			net_close_conn(conn, true)
 			return
 		}
-		if n == 0 { // peer closed (EOF)
+		if n == 0 { // peer half-closed (read EOF)
+			// Stop the read watcher: EOF is a persistent state, so leaving it armed would
+			// re-fire conn_read_cb forever. Then fire 'end' — the handler may write a
+			// response and call end() (the request/response pattern). With Node's default
+			// allowHalfOpen=false, the writable side then closes once pending writes drain,
+			// so we mark end_after_drain and flush rather than closing inline (which would
+			// truncate a backpressured response).
+			conn.read_done = true
+			eventloop.unwatch_fd(conn.loop, &conn.watcher)
+			conn.writing = false
 			net_emit(conn.ctx, conn.on_end, nil, 0)
-			net_close_conn(conn, false)
+			if conn.closing do return // an 'end' handler destroyed the socket
+			conn.end_after_drain = true
+			net_flush(conn)
 			return
 		}
 		// Copy out of the transient stack buffer into a JSC-owned Uint8Array (no-copy
@@ -305,6 +332,7 @@ net_write_cb :: proc "c" (
 net_flush :: proc(conn: ^Net_Connection) -> (backpressured: bool) {
 	for len(conn.write_queue) > 0 {
 		sent, send_err := linux.send(linux.Fd(conn.fd), conn.write_queue[:], {.NOSIGNAL})
+		if send_err == .EINTR do continue // interrupted by a signal — retry, not fatal
 		if send_err == .EAGAIN {
 			net_set_mode(conn, .Write) // wait for writability, then conn_write_cb drains
 			return true
@@ -319,7 +347,9 @@ net_flush :: proc(conn: ^Net_Connection) -> (backpressured: bool) {
 		if remaining > 0 do copy(conn.write_queue[:], conn.write_queue[sent:])
 		resize(&conn.write_queue, remaining)
 	}
-	if conn.writing do net_set_mode(conn, .Read) // drained — stop watching for writability
+	// Drained. Restore read interest only if the read side is still open; after a read
+	// EOF (read_done) the socket is write-only and about to close.
+	if conn.writing && !conn.read_done do net_set_mode(conn, .Read)
 	if conn.end_after_drain do net_close_conn(conn, false)
 	return false
 }
