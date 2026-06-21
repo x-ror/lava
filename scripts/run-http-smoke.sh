@@ -70,8 +70,42 @@ for who in node lava; do
 done
 
 if diff -u "$TMP_DIR/node.out" "$TMP_DIR/lava.out"; then
-	printf '%s\n' 'http smoke passed (lava server matches node server)'
+	printf '%s\n' 'http smoke phase 1 passed (lava server matches node server)'
 else
 	printf '%s\n' 'http smoke FAILED: lava server output differs from node server' >&2
 	exit 1
 fi
+
+# Phase 2 — malformed-request handling against the Lava server. These assert Lava's own
+# rejection behavior (header injection, CL+TE smuggling, oversized head, HEAD body,
+# premature EOF), which intentionally differs from Node on some status codes, so it is a
+# pass/fail assertion suite rather than a node-vs-lava diff.
+MALFORMED="$ROOT_DIR/tests/runtime/http/malformed.js"
+: >"$TMP_DIR/srv.out"
+"$LAVA_BIN" run "$SERVER" >"$TMP_DIR/srv.out" 2>&1 &
+SRV_PID=$!
+port=""
+i=0
+while [ "$i" -lt 100 ]; do
+	port=$(sed -n 's/^READYPORT=//p' "$TMP_DIR/srv.out")
+	[ -n "$port" ] && break
+	kill -0 "$SRV_PID" 2>/dev/null || break
+	i=$((i + 1))
+	sleep 0.05
+done
+if [ -z "$port" ]; then
+	printf '%s\n' 'http smoke FAILED: lava server never came up for the malformed-request checks' >&2
+	cat "$TMP_DIR/srv.out" >&2 || true
+	exit 1
+fi
+HTTP_PORT="$port" "$NODE_BIN" "$MALFORMED" >"$TMP_DIR/malformed.out" 2>&1
+mrc=$?
+kill "$SRV_PID" 2>/dev/null || true
+wait "$SRV_PID" 2>/dev/null || true
+SRV_PID=""
+cat "$TMP_DIR/malformed.out"
+if [ "$mrc" -ne 0 ]; then
+	printf '%s\n' 'http smoke FAILED: malformed-request checks failed' >&2
+	exit 1
+fi
+printf '%s\n' 'http smoke passed (parity + malformed-request handling)'

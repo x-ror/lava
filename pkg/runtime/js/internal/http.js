@@ -41,6 +41,25 @@
     return headers;
   }
 
+  // RFC 7230 token (header field-name) and the CR/LF guard for field-values / the status
+  // reason. Reject invalid input rather than concatenating it into the response head —
+  // a value containing CRLF would otherwise split the response (header injection).
+  var TOKEN_RE = /^[\^_`a-zA-Z0-9!#$%&'*+\-.|~]+$/;
+  function checkHeaderName(name) {
+    if (typeof name !== 'string' || name.length === 0 || !TOKEN_RE.test(name)) {
+      var e = new TypeError('Header name must be a valid HTTP token [' + JSON.stringify(name) + ']');
+      e.code = 'ERR_INVALID_HTTP_TOKEN';
+      throw e;
+    }
+  }
+  function checkInvalidChar(value, what) {
+    if (/[\r\n]/.test(value)) {
+      var e = new TypeError('Invalid character in ' + what);
+      e.code = 'ERR_INVALID_CHAR';
+      throw e;
+    }
+  }
+
   function IncomingMessage(socket, parsed) {
     EventEmitter.call(this);
     this.socket = socket;
@@ -57,7 +76,7 @@
   IncomingMessage.prototype = Object.create(EventEmitter.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
 
-  function ServerResponse(socket) {
+  function ServerResponse(socket, method) {
     EventEmitter.call(this);
     this.socket = socket;
     this.statusCode = 200;
@@ -65,12 +84,18 @@
     this.headersSent = false;
     this.finished = false;
     this._headers = {}; // lowercased key -> { name, value }
+    // A response to a HEAD request carries headers (incl. Content-Length) but NO body
+    // (RFC 7230 §3.3.2). Suppress body writes while keeping the framing.
+    this._isHead = method === 'HEAD';
   }
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
 
   ServerResponse.prototype.setHeader = function (name, value) {
-    this._headers[String(name).toLowerCase()] = { name: String(name), value: String(value) };
+    checkHeaderName(name);
+    var v = String(value);
+    checkInvalidChar(v, 'header content [' + name + ']');
+    this._headers[name.toLowerCase()] = { name: name, value: v };
     return this;
   };
   ServerResponse.prototype.getHeader = function (name) {
@@ -99,6 +124,7 @@
     if (this.headersSent) return;
     this.headersSent = true;
     var reason = this.statusMessage || STATUS_CODES[this.statusCode] || '';
+    checkInvalidChar(String(reason), 'statusMessage'); // no CRLF in the status line
     var head = 'HTTP/1.1 ' + this.statusCode + ' ' + reason + '\r\n';
     // M2: no keep-alive — the response is delimited by the connection close.
     if (!this.hasHeader('connection')) head += 'Connection: close\r\n';
@@ -114,7 +140,7 @@
   ServerResponse.prototype.write = function (chunk, encoding, cb) {
     if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
     if (!this.headersSent) this._flushHead();
-    if (chunk && chunk.length) {
+    if (!this._isHead && chunk && chunk.length) {
       this.socket.write(typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk);
     }
     if (typeof cb === 'function') process.nextTick(cb);
@@ -137,7 +163,7 @@
       }
       this._flushHead();
     }
-    if (body && body.length) this.socket.write(body);
+    if (!this._isHead && body && body.length) this.socket.write(body);
     this.finished = true;
     if (typeof cb === 'function') process.nextTick(cb);
     this.emit('finish');
@@ -153,8 +179,11 @@
     var parsingHead = true;
     var req = null;
     var bodyRemaining = 0; // Content-Length bytes still owed to req ('data'); 0 == no body
+    var failed = false; // a fixed error response was sent; ignore further input
 
     function fail(code) {
+      if (failed) return;
+      failed = true;
       var reason = STATUS_CODES[code] || 'Error';
       socket.write(Buffer.from('HTTP/1.1 ' + code + ' ' + reason + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n', 'latin1'));
       socket.end();
@@ -175,6 +204,7 @@
     }
 
     socket.on('data', function (chunk) {
+      if (failed) return;
       if (!parsingHead) {
         feedBody(chunk);
         return;
@@ -191,20 +221,56 @@
         fail(400);
         return;
       }
+      // Enforce the head-size cap on completion too — the partial-branch check alone lets
+      // a complete-but-oversized head through.
+      if (r.consumed > MAX_HEAD) {
+        fail(431);
+        return;
+      }
 
-      // Head complete.
       parsingHead = false;
       req = new IncomingMessage(socket, r);
-      var res = new ServerResponse(socket);
 
-      var cl = parseInt(req.headers['content-length'], 10);
-      bodyRemaining = cl > 0 ? cl : 0;
+      // Body framing over untrusted input. M2 frames by Content-Length only; reject the
+      // request-smuggling vectors rather than guessing:
+      //   - Transfer-Encoding present  -> 501 (chunked request bodies are a later
+      //     milestone; CL+TE is a desync vector either way)
+      //   - Content-Length not a single all-DIGIT token (duplicate "5, 5", negative,
+      //     "+5", non-numeric) -> 400
+      if (req.headers['transfer-encoding'] !== undefined) {
+        fail(501);
+        return;
+      }
+      var clStr = req.headers['content-length'];
+      if (clStr !== undefined) {
+        if (!/^\d+$/.test(clStr)) {
+          fail(400);
+          return;
+        }
+        bodyRemaining = parseInt(clStr, 10);
+      } else {
+        bodyRemaining = 0;
+      }
 
+      var res = new ServerResponse(socket, req.method);
       var bodyStart = pending.slice(r.consumed);
       pending = null;
 
       server.emit('request', req, res);
       feedBody(bodyStart); // deliver any body bytes already buffered; emits 'end' when done
+    });
+
+    socket.on('end', function () {
+      // Peer half-closed. If the head or a Content-Length body is still incomplete, the
+      // request can never finish — answer 400 (Node's premature-EOF behavior). A request
+      // already received (req._ended) whose response is in flight is left alone; a bare
+      // idle connection that closes without sending anything just closes.
+      if (failed) return;
+      if (parsingHead) {
+        if (pending && pending.length > 0) fail(400);
+      } else if (req && !req._ended && bodyRemaining > 0) {
+        fail(400);
+      }
     });
 
     socket.on('error', function () {}); // peer reset — drop quietly

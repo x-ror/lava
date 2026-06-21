@@ -5,6 +5,19 @@
 const http = require('node:http');
 
 const server = http.createServer((req, res) => {
+  // /redir reflects the (decoded) URL into a Location header — the canonical header-
+  // injection sink, used by the malformed-request checks (run-http-smoke.sh phase 2).
+  if (req.url.indexOf('/redir') === 0) {
+    try {
+      res.setHeader('Location', decodeURIComponent(req.url));
+      res.writeHead(302);
+      res.end('r');
+    } catch (e) {
+      res.writeHead(500);
+      res.end('REJECTED ' + e.code);
+    }
+    return;
+  }
   const chunks = [];
   req.on('data', (d) => chunks.push(d));
   req.on('end', () => {
