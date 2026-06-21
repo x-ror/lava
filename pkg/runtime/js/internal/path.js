@@ -999,7 +999,7 @@
       var b = compiled.body;
       try {
         new RegExp('^(?:' + b + ')$');
-      } catch (e) {
+      } catch {
         b = '(?!)'; // an invalid alternative matches nothing; the others still apply
       }
       parts.push(b);
@@ -1115,7 +1115,7 @@
     if (re.indexOf('\\p{') !== -1) flags += 'u'; // `[[:word:]]` expands to a Unicode property
     try {
       return new RegExp('^' + re + '$', flags);
-    } catch (e) {
+    } catch {
       return /(?!)/; // an invalid range matches nothing, like Node
     }
   }
