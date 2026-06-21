@@ -5,7 +5,10 @@ const http = require('node:http');
 const BODY = Buffer.from('Hello, World!');
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  // Pin Content-Length so all three runtimes frame the response identically (Node otherwise
+  // emits Transfer-Encoding: chunked for writeHead()+end(buffer), which would skew the
+  // comparison and confuse the built-in fallback parser).
+  res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': String(BODY.length) });
   res.end(BODY);
 });
 
