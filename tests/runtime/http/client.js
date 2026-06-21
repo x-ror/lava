@@ -32,6 +32,22 @@ function request(method, path, body) {
   });
 }
 
+// POST a body with no Content-Length so the Node http client frames it with
+// Transfer-Encoding: chunked — exercises the server's chunked-request decoder.
+function requestChunked(path, body) {
+  return new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port: PORT, method: 'POST', path: path }, (res) => {
+      let b = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => (b += d));
+      res.on('end', () => resolve({ status: res.statusCode, body: b }));
+    });
+    r.on('error', reject);
+    r.write(body);
+    r.end();
+  });
+}
+
 (async () => {
   const g = await request('GET', '/path/one');
   console.log('GET', g.status, g.ct, g.xm, JSON.stringify(g.body));
@@ -46,6 +62,11 @@ function request(method, path, body) {
   // transparently, so the assembled body must match between the Node and Lava servers.
   const s = await request('GET', '/stream');
   console.log('STREAM', s.status, JSON.stringify(s.body));
+
+  // Chunked REQUEST: writing a body without setting Content-Length makes the Node http
+  // client send Transfer-Encoding: chunked. Both servers must decode it to the same echo.
+  const ch = await requestChunked('/chunk', 'chunked-body-xyz');
+  console.log('CHUNKEDREQ', ch.status, JSON.stringify(ch.body));
 
   console.log('HTTP SMOKE OK');
 })().catch((e) => {

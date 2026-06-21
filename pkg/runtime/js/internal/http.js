@@ -111,6 +111,83 @@
     return Buffer.concat([Buffer.from(buf.length.toString(16) + '\r\n', 'latin1'), buf, CRLF]);
   }
 
+  // Incremental decoder for a Transfer-Encoding: chunked REQUEST body (untrusted input).
+  // feed(bytes) emits decoded data to req via 'data', fires 'end' after the terminating
+  // zero-length chunk (+ optional trailers), and calls onError() on malformed framing.
+  // Hardened: the chunk-size line is length-bounded, and a non-hex or unsafe size is
+  // rejected — data is sliced out incrementally, so a huge declared size never allocates.
+  var MAX_CHUNK_SIZE_LINE = 64 * 1024;
+  function makeChunkedDecoder(req, onError) {
+    var buf = Buffer.alloc(0);
+    var state = 'size'; // 'size' | 'data' | 'dataCRLF' | 'trailer'
+    var remaining = 0;
+    var done = false;
+
+    function bad() {
+      done = true;
+      onError();
+    }
+    function finish() {
+      done = true;
+      if (!req._ended) {
+        req._ended = true;
+        req.complete = true;
+        req.emit('end');
+      }
+    }
+
+    return function feed(incoming) {
+      if (done) return;
+      if (incoming && incoming.length) buf = buf.length ? Buffer.concat([buf, incoming]) : incoming;
+      for (;;) {
+        if (state === 'size') {
+          var nl = buf.indexOf('\r\n');
+          if (nl < 0) {
+            if (buf.length > MAX_CHUNK_SIZE_LINE) bad();
+            return;
+          }
+          var line = buf.toString('latin1', 0, nl);
+          var semi = line.indexOf(';'); // chunk extensions — ignored
+          var hex = (semi >= 0 ? line.slice(0, semi) : line).trim();
+          if (!/^[0-9a-fA-F]+$/.test(hex)) return bad();
+          var size = parseInt(hex, 16);
+          if (!Number.isSafeInteger(size) || size < 0) return bad();
+          buf = buf.slice(nl + 2);
+          if (size === 0) state = 'trailer';
+          else {
+            remaining = size;
+            state = 'data';
+          }
+        } else if (state === 'data') {
+          if (buf.length === 0) return;
+          var take = buf.length < remaining ? buf.length : remaining;
+          req.emit('data', buf.slice(0, take));
+          buf = buf.slice(take);
+          remaining -= take;
+          if (remaining === 0) state = 'dataCRLF';
+        } else if (state === 'dataCRLF') {
+          if (buf.length < 2) return;
+          if (buf[0] !== 13 || buf[1] !== 10) return bad(); // chunk must end in CRLF
+          buf = buf.slice(2);
+          state = 'size';
+        } else {
+          // 'trailer': optional trailer header lines, then a blank line (CRLF) ends the body.
+          if (buf.length < 2) return;
+          if (buf[0] === 13 && buf[1] === 10) {
+            buf = buf.slice(2);
+            return finish();
+          }
+          var tnl = buf.indexOf('\r\n');
+          if (tnl < 0) {
+            if (buf.length > MAX_CHUNK_SIZE_LINE) bad();
+            return;
+          }
+          buf = buf.slice(tnl + 2); // drop a trailer line; loop for the next / the blank line
+        }
+      }
+    };
+  }
+
   function IncomingMessage(socket, parsed) {
     EventEmitter.call(this);
     this.socket = socket;
@@ -281,7 +358,9 @@
     var lastLen = 0;
     var parsingHead = true;
     var req = null;
+    var res = null;
     var bodyRemaining = 0; // Content-Length bytes still owed to req ('data'); 0 == no body
+    var chunkedDecode = null; // set for a Transfer-Encoding: chunked request body
     var failed = false; // a fixed error response was sent; ignore further input
 
     function fail(code) {
@@ -299,6 +378,10 @@
 
     function feedBody(buf) {
       if (!req || req._ended) return;
+      if (chunkedDecode) {
+        chunkedDecode(buf);
+        return;
+      }
       if (bodyRemaining > 0 && buf && buf.length) {
         var take = buf.length < bodyRemaining ? buf.length : bodyRemaining;
         req.emit('data', buf.slice(0, take));
@@ -338,29 +421,40 @@
 
       parsingHead = false;
       req = new IncomingMessage(socket, r);
+      res = new ServerResponse(socket, req.method, req.httpVersionMinor);
 
-      // Body framing over untrusted input. M2 frames by Content-Length only; reject the
-      // request-smuggling vectors rather than guessing:
-      //   - Transfer-Encoding present  -> 501 (chunked request bodies are a later
-      //     milestone; CL+TE is a desync vector either way)
+      // Body framing over untrusted input. Reject the request-smuggling vectors rather
+      // than guessing:
+      //   - Content-Length + Transfer-Encoding together -> 400 (CL.TE desync)
+      //   - Transfer-Encoding present but not exactly "chunked" -> 501 (only chunked is
+      //     supported; other transfer codings aren't)
       //   - Content-Length not a single all-DIGIT token (duplicate "5, 5", negative,
       //     "+5", non-numeric) -> 400
-      if (req.headers['transfer-encoding'] !== undefined) {
-        fail(501);
-        return;
-      }
+      // A chunked decode error mid-request destroys the connection if the response is
+      // already committed, else sends a clean 400.
+      var te = req.headers['transfer-encoding'];
       var clStr = req.headers['content-length'];
-      if (clStr !== undefined) {
+      if (te !== undefined) {
+        if (clStr !== undefined) {
+          fail(400);
+          return;
+        }
+        if (!/^\s*chunked\s*$/i.test(te)) {
+          fail(501);
+          return;
+        }
+        chunkedDecode = makeChunkedDecoder(req, function () {
+          if (res.headersSent) socket.destroy();
+          else fail(400);
+        });
+      } else if (clStr !== undefined) {
         if (!/^\d+$/.test(clStr)) {
           fail(400);
           return;
         }
         bodyRemaining = parseInt(clStr, 10);
-      } else {
-        bodyRemaining = 0;
       }
 
-      var res = new ServerResponse(socket, req.method, req.httpVersionMinor);
       var bodyStart = pending.slice(r.consumed);
       pending = null;
 
@@ -382,8 +476,11 @@
       if (failed) return;
       if (parsingHead) {
         if (pending && pending.length > 0) fail(400);
-      } else if (req && !req._ended && bodyRemaining > 0) {
-        fail(400);
+      } else if (req && !req._ended && (bodyRemaining > 0 || chunkedDecode)) {
+        // Incomplete Content-Length body, or a chunked body that never reached its
+        // terminating zero-chunk. If the response already started, drop the socket.
+        if (res && res.headersSent) socket.destroy();
+        else fail(400);
       }
     });
 

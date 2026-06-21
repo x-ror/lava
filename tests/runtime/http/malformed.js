@@ -51,11 +51,11 @@ function check(name, cond, detail) {
   check('injection-rejected-500', statusOf(r) === 500, r.slice(0, 40));
   check('injection-no-split-header', !/Injected:/i.test(r));
 
-  // 2. Content-Length + Transfer-Encoding (smuggling vector) -> 501 (no chunked in M2).
+  // 2. Content-Length + Transfer-Encoding together (CL.TE smuggling desync) -> 400.
   r = await raw(
     'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nhello',
   );
-  check('cl-plus-te-501', statusOf(r) === 501, r.slice(0, 40));
+  check('cl-plus-te-400', statusOf(r) === 400, r.slice(0, 40));
 
   // 3. Non-numeric / duplicate / negative Content-Length -> 400.
   r = await raw('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\nConnection: close\r\n\r\n');
@@ -131,6 +131,29 @@ function check(name, cond, detail) {
     !/transfer-encoding/i.test(r) && bodyOf(r) === 'part1-part2-part3',
     JSON.stringify(bodyOf(r)),
   );
+
+  // 13. Chunked REQUEST body is decoded and delivered to the handler (echo reports its
+  //     decoded length + bytes). "5 hello" + "6  world" => 11 bytes "hello world".
+  r = await raw(
+    'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n',
+  );
+  check(
+    'chunked-request-decoded',
+    statusOf(r) === 200 && /L=11 B=hello world\b/.test(r),
+    bodyOf(r).slice(0, 60),
+  );
+
+  // 14. Transfer-Encoding present but not "chunked" (e.g. gzip) -> 501 (unsupported coding).
+  r = await raw(
+    'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n',
+  );
+  check('te-not-chunked-501', statusOf(r) === 501, r.slice(0, 40));
+
+  // 15. Malformed chunk size (non-hex) in a chunked body -> 400.
+  r = await raw(
+    'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nZZ\r\nhello\r\n0\r\n\r\n',
+  );
+  check('bad-chunk-size-400', statusOf(r) === 400, r.slice(0, 40));
 
   console.log(failures === 0 ? 'HTTP MALFORMED OK' : 'HTTP MALFORMED FAILURES ' + failures);
   process.exit(failures === 0 ? 0 : 1);
