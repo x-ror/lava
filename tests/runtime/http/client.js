@@ -42,6 +42,11 @@ function request(method, path, body) {
   const q = await request('GET', '/q?a=1&b=2');
   console.log('QUERY', q.status, JSON.stringify(q.body));
 
+  // Streamed (chunked) response — the http client decodes Transfer-Encoding: chunked
+  // transparently, so the assembled body must match between the Node and Lava servers.
+  const s = await request('GET', '/stream');
+  console.log('STREAM', s.status, JSON.stringify(s.body));
+
   console.log('HTTP SMOKE OK');
 })().catch((e) => {
   console.error('client error', e && e.message);

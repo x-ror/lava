@@ -2,9 +2,11 @@
 // IncomingMessage / ServerResponse. Built on node:net (the TCP layer) with the request
 // HEAD parsed by the native picohttpparser bridge (http.odin parseRequest). M2 scope:
 // parse the head, emit 'request' with method/url/headers and a Content-Length request
-// body, and write a response with writeHead/write/end. No keep-alive (every response
-// sets Connection: close and ends the socket), no chunked request/response bodies, no
-// client (http.request/get). Those are later milestones.
+// body, and write a response with writeHead/write/end. A streamed response (write()
+// before end(), unknown length) is sent with Transfer-Encoding: chunked; end(body) with
+// a known length uses Content-Length. No keep-alive yet (every response sets
+// Connection: close and ends the socket), chunked REQUEST bodies are still rejected
+// (501), and there is no client (http.request/get). Those are later milestones.
 (function (require, module, exports, native) {
   'use strict';
 
@@ -100,6 +102,15 @@
     return n;
   }
 
+  // Frame a body chunk for Transfer-Encoding: chunked — "<hex-length>\r\n<data>\r\n".
+  // A zero-length chunk is never framed (the caller skips empty writes); the terminating
+  // "0\r\n\r\n" is written explicitly by end().
+  var CRLF = Buffer.from('\r\n', 'latin1');
+  var LAST_CHUNK = Buffer.from('0\r\n\r\n', 'latin1');
+  function chunkFrame(buf) {
+    return Buffer.concat([Buffer.from(buf.length.toString(16) + '\r\n', 'latin1'), buf, CRLF]);
+  }
+
   function IncomingMessage(socket, parsed) {
     EventEmitter.call(this);
     this.socket = socket;
@@ -122,6 +133,7 @@
     this.statusCode = 200;
     this.statusMessage = undefined;
     this.headersSent = false;
+    this._chunked = false; // emitting Transfer-Encoding: chunked (streamed, unknown length)
     this.finished = false;
     this._headers = {}; // lowercased key -> { name, value }
     // A response to a HEAD request carries headers (incl. Content-Length) but NO body
@@ -188,10 +200,23 @@
       cb = encoding;
       encoding = undefined;
     }
-    if (!this.headersSent) this._flushHead();
     var noBody = this._isHead || statusHasNoBody(this.statusCode);
+    if (!this.headersSent) {
+      // A write() before end() with no explicit length is a streamed body of unknown
+      // size → frame it with Transfer-Encoding: chunked (self-delimiting; also what
+      // keep-alive will need). end(body) without a prior write still uses Content-Length.
+      // No-body responses (HEAD/204/304/1xx) never get a body or chunked framing.
+      if (!noBody && !this.hasHeader('content-length') && !this.hasHeader('transfer-encoding')) {
+        this._chunked = true;
+        this.setHeader('Transfer-Encoding', 'chunked');
+      } else if (this.hasHeader('transfer-encoding')) {
+        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
+      }
+      this._flushHead();
+    }
     if (!noBody && chunk && chunk.length) {
-      this.socket.write(typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk);
+      var b = typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk;
+      this.socket.write(this._chunked ? chunkFrame(b) : b);
     }
     if (typeof cb === 'function') process.nextTick(cb);
     return true;
@@ -215,12 +240,21 @@
     // sends no body; everything else frames by the body length.
     var noBody = this._isHead || statusHasNoBody(this.statusCode);
     if (!this.headersSent) {
-      if (!this.hasHeader('content-length') && !statusHasNoBody(this.statusCode)) {
+      // No prior write() → we know the full length here, so frame with Content-Length
+      // (unless a no-body status, or the caller already chose Transfer-Encoding).
+      if (!this.hasHeader('content-length') && !this.hasHeader('transfer-encoding') && !noBody) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
+      }
+      if (this.hasHeader('transfer-encoding')) {
+        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
       this._flushHead();
     }
-    if (!noBody && body && body.length) this.socket.write(body);
+    if (!noBody && body && body.length) {
+      this.socket.write(this._chunked ? chunkFrame(body) : body);
+    }
+    // Terminate a chunked body with the zero-length last chunk.
+    if (this._chunked && !noBody) this.socket.write(LAST_CHUNK);
     this.finished = true;
     if (typeof cb === 'function') process.nextTick(cb);
     this.emit('finish');
