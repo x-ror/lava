@@ -80,18 +80,30 @@ function check(name, cond, detail) {
 
   // 7. High-code-point injection: U+010D/U+010A latin1-mask to CR/LF. The reflected value
   //    must be rejected (500), not split into headers. (%C4%8D%C4%8A decodes to čĊ.)
-  r = await raw('GET /redir%C4%8D%C4%8AInjected:%20yes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+  r = await raw(
+    'GET /redir%C4%8D%C4%8AInjected:%20yes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+  );
   check('highcp-injection-rejected', statusOf(r) === 500 && !/Injected:/i.test(r), r.slice(0, 40));
 
   // 8. Status-line injection: writeHead('200\r\nX-Injected: yes') must be rejected (500),
   //    not inject a header. (%0d%0a decodes to CRLF inside the status argument.)
-  r = await raw('GET /status/200%0d%0aX-Injected:%20yes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
-  check('status-injection-rejected', statusOf(r) === 500 && !/X-Injected:/i.test(r), r.slice(0, 40));
+  r = await raw(
+    'GET /status/200%0d%0aX-Injected:%20yes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+  );
+  check(
+    'status-injection-rejected',
+    statusOf(r) === 500 && !/X-Injected:/i.test(r),
+    r.slice(0, 40),
+  );
 
   // 9. No-body status: 204 must carry no body and no Content-Length even when end(chunk)
   //    is called.
   r = await raw('GET /status/204 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
-  check('no-body-204', statusOf(r) === 204 && bodyOf(r) === '' && !/content-length/i.test(r), r.slice(0, 60));
+  check(
+    'no-body-204',
+    statusOf(r) === 204 && bodyOf(r) === '' && !/content-length/i.test(r),
+    r.slice(0, 60),
+  );
 
   // 10. Latin-1 header bytes: a raw 0xE9 in a header value must reach the server as the
   //     single char U+00E9 (Node decodes HTTP/1 headers as latin1), not mangled UTF-8.

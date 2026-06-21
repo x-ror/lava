@@ -42,7 +42,13 @@ const server = http.createServer((req, res) => {
     // by the latin1 round-trip check. Absent for the parity client, so its output is
     // unchanged.
     var probe = req.headers['x-probe'];
-    var p = probe === undefined ? '' : ' P=' + Array.from(probe).map((c) => c.charCodeAt(0)).join(',');
+    var p =
+      probe === undefined
+        ? ''
+        : ' P=' +
+          Array.from(probe)
+            .map((c) => c.charCodeAt(0))
+            .join(',');
     res.end('M=' + req.method + ' U=' + req.url + ' L=' + body.length + ' B=' + body + p);
   });
 });
