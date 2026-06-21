@@ -10,19 +10,22 @@ const PORT = Number(process.env.HTTP_PORT);
 function request(method, path, body) {
   return new Promise((resolve, reject) => {
     const headers = body ? { 'Content-Length': Buffer.byteLength(body) } : {};
-    const r = http.request({ host: '127.0.0.1', port: PORT, method: method, path: path, headers: headers }, (res) => {
-      let b = '';
-      res.setEncoding('utf8');
-      res.on('data', (d) => (b += d));
-      res.on('end', () =>
-        resolve({
-          status: res.statusCode,
-          ct: res.headers['content-type'],
-          xm: res.headers['x-echo-method'],
-          body: b,
-        }),
-      );
-    });
+    const r = http.request(
+      { host: '127.0.0.1', port: PORT, method: method, path: path, headers: headers },
+      (res) => {
+        let b = '';
+        res.setEncoding('utf8');
+        res.on('data', (d) => (b += d));
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode,
+            ct: res.headers['content-type'],
+            xm: res.headers['x-echo-method'],
+            body: b,
+          }),
+        );
+      },
+    );
     r.on('error', reject);
     if (body) r.write(body);
     r.end();

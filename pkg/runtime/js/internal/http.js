@@ -19,12 +19,27 @@
   var MAX_HEAD = 64 * 1024; // reject a request head larger than this (431)
 
   var STATUS_CODES = {
-    200: 'OK', 201: 'Created', 204: 'No Content', 206: 'Partial Content',
-    301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 307: 'Temporary Redirect',
-    400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
-    405: 'Method Not Allowed', 408: 'Request Timeout', 411: 'Length Required',
-    413: 'Payload Too Large', 414: 'URI Too Long', 431: 'Request Header Fields Too Large',
-    500: 'Internal Server Error', 501: 'Not Implemented', 503: 'Service Unavailable',
+    200: 'OK',
+    201: 'Created',
+    204: 'No Content',
+    206: 'Partial Content',
+    301: 'Moved Permanently',
+    302: 'Found',
+    304: 'Not Modified',
+    307: 'Temporary Redirect',
+    400: 'Bad Request',
+    401: 'Unauthorized',
+    403: 'Forbidden',
+    404: 'Not Found',
+    405: 'Method Not Allowed',
+    408: 'Request Timeout',
+    411: 'Length Required',
+    413: 'Payload Too Large',
+    414: 'URI Too Long',
+    431: 'Request Header Fields Too Large',
+    500: 'Internal Server Error',
+    501: 'Not Implemented',
+    503: 'Service Unavailable',
   };
 
   // Build Node's lowercased req.headers object from the interleaved [name, value, ...]
@@ -47,7 +62,9 @@
   var TOKEN_RE = /^[\^_`a-zA-Z0-9!#$%&'*+\-.|~]+$/;
   function checkHeaderName(name) {
     if (typeof name !== 'string' || name.length === 0 || !TOKEN_RE.test(name)) {
-      var e = new TypeError('Header name must be a valid HTTP token [' + JSON.stringify(name) + ']');
+      var e = new TypeError(
+        'Header name must be a valid HTTP token [' + JSON.stringify(name) + ']',
+      );
       e.code = 'ERR_INVALID_HTTP_TOKEN';
       throw e;
     }
@@ -116,7 +133,9 @@
     }
     this.statusCode = statusCode;
     if (statusMessage) this.statusMessage = statusMessage;
-    if (headers) for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k)) this.setHeader(k, headers[k]);
+    if (headers)
+      for (var k in headers)
+        if (Object.prototype.hasOwnProperty.call(headers, k)) this.setHeader(k, headers[k]);
     return this;
   };
 
@@ -138,7 +157,10 @@
   };
 
   ServerResponse.prototype.write = function (chunk, encoding, cb) {
-    if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+    if (typeof encoding === 'function') {
+      cb = encoding;
+      encoding = undefined;
+    }
     if (!this.headersSent) this._flushHead();
     if (!this._isHead && chunk && chunk.length) {
       this.socket.write(typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk);
@@ -148,8 +170,13 @@
   };
 
   ServerResponse.prototype.end = function (chunk, encoding, cb) {
-    if (typeof chunk === 'function') { cb = chunk; chunk = undefined; }
-    else if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+    if (typeof chunk === 'function') {
+      cb = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === 'function') {
+      cb = encoding;
+      encoding = undefined;
+    }
     if (this.finished) return this;
 
     var body = null;
@@ -185,7 +212,12 @@
       if (failed) return;
       failed = true;
       var reason = STATUS_CODES[code] || 'Error';
-      socket.write(Buffer.from('HTTP/1.1 ' + code + ' ' + reason + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n', 'latin1'));
+      socket.write(
+        Buffer.from(
+          'HTTP/1.1 ' + code + ' ' + reason + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+          'latin1',
+        ),
+      );
       socket.end();
     }
 
@@ -286,9 +318,15 @@
     this._net = net.createServer(function (socket) {
       onConnection(self, socket);
     });
-    this._net.on('listening', function () { self.emit('listening'); });
-    this._net.on('close', function () { self.emit('close'); });
-    this._net.on('error', function (e) { self.emit('error', e); });
+    this._net.on('listening', function () {
+      self.emit('listening');
+    });
+    this._net.on('close', function () {
+      self.emit('close');
+    });
+    this._net.on('error', function (e) {
+      self.emit('error', e);
+    });
     if (typeof requestListener === 'function') this.on('request', requestListener);
   }
   Server.prototype = Object.create(EventEmitter.prototype);
@@ -317,4 +355,4 @@
     ServerResponse: ServerResponse,
     STATUS_CODES: STATUS_CODES,
   };
-})
+});

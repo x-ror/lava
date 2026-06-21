@@ -43,12 +43,16 @@ function check(name, cond, detail) {
 
 (async () => {
   // 1. CRLF header injection via a reflected Location must be rejected, not split.
-  let r = await raw('GET /redir%0d%0aInjected:%20yes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+  let r = await raw(
+    'GET /redir%0d%0aInjected:%20yes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+  );
   check('injection-rejected-500', statusOf(r) === 500, r.slice(0, 40));
   check('injection-no-split-header', !/Injected:/i.test(r));
 
   // 2. Content-Length + Transfer-Encoding (smuggling vector) -> 501 (no chunked in M2).
-  r = await raw('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nhello');
+  r = await raw(
+    'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nhello',
+  );
   check('cl-plus-te-501', statusOf(r) === 501, r.slice(0, 40));
 
   // 3. Non-numeric / duplicate / negative Content-Length -> 400.
@@ -56,7 +60,11 @@ function check(name, cond, detail) {
   check('bad-content-length-400', statusOf(r) === 400, r.slice(0, 40));
 
   // 4. Oversized request head -> 431.
-  r = await raw('GET / HTTP/1.1\r\nHost: x\r\nX-Big: ' + 'a'.repeat(70 * 1024) + '\r\nConnection: close\r\n\r\n');
+  r = await raw(
+    'GET / HTTP/1.1\r\nHost: x\r\nX-Big: ' +
+      'a'.repeat(70 * 1024) +
+      '\r\nConnection: close\r\n\r\n',
+  );
   check('oversized-head-431', statusOf(r) === 431, r.slice(0, 40));
 
   // 5. HEAD response: headers (200) but no body.
