@@ -118,3 +118,58 @@ parse_response :: proc(
 	if msg_ptr != nil && msg_len > 0 do msg = string(msg_ptr[:msg_len])
 	return int(ret), int(status_c), msg, num, .Complete
 }
+
+// parse_request is the inbound counterpart for an HTTP/1.x SERVER request head. Same
+// shape and lifetime as parse_response: `last_len` is the resume hint, out[:num] hold
+// the headers aliasing buf, and on .Complete `consumed` is the head length (incl. the
+// terminating CRLFCRLF, i.e. the body offset). `method` and `path` (the request target)
+// also alias buf. Used by the node:http server head parser (http.odin).
+parse_request :: proc(
+	buf: []byte,
+	last_len: int,
+	out: []Header,
+) -> (
+	consumed: int,
+	minor: int,
+	num: int,
+	method: string,
+	path: string,
+	result: Result,
+) {
+	raw: [MAX_HEADERS]phr_header
+	cap := min(len(out), MAX_HEADERS)
+	n := c.size_t(cap)
+	minor_c: c.int
+	method_ptr, path_ptr: [^]u8
+	method_len, path_len: c.size_t
+
+	ret := phr_parse_request(
+		raw_data(buf),
+		c.size_t(len(buf)),
+		&method_ptr,
+		&method_len,
+		&path_ptr,
+		&path_len,
+		&minor_c,
+		&raw[0],
+		&n,
+		c.size_t(last_len),
+	)
+	switch {
+	case ret == -1:
+		return 0, 0, 0, "", "", .Error
+	case ret == -2:
+		return 0, 0, 0, "", "", .Partial
+	}
+
+	num = int(n)
+	for i in 0 ..< num {
+		h := raw[i]
+		name := h.name != nil && h.name_len > 0 ? string(h.name[:h.name_len]) : ""
+		value := h.value != nil && h.value_len > 0 ? string(h.value[:h.value_len]) : ""
+		out[i] = Header{name = name, value = value}
+	}
+	if method_ptr != nil && method_len > 0 do method = string(method_ptr[:method_len])
+	if path_ptr != nil && path_len > 0 do path = string(path_ptr[:path_len])
+	return int(ret), int(minor_c), num, method, path, .Complete
+}

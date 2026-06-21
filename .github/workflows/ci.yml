@@ -67,6 +67,12 @@ jobs:
       - name: Net server smoke
         run: make test-net-smoke
 
+      # node:http server: run the echo HTTP server fixture under Node and under Lava,
+      # hit each with the same Node http client, and require identical deterministic
+      # response fields (server parity). Binds a local port — its own gate.
+      - name: HTTP server smoke
+        run: make test-http-smoke
+
       # Benchmarks: print the node-vs-Lava ratio table in the job log. Report-only for
       # now (never fails) because the bench/thresholds.json caps are uncalibrated
       # starters — once the ratios here are observed and the caps tightened, flip this

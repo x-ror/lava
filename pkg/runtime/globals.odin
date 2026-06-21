@@ -910,6 +910,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"dns", INTERNAL_DNS},
 		{"dns/promises", INTERNAL_DNS_PROMISES},
 		{"net", INTERNAL_NET},
+		{"http", INTERNAL_HTTP},
 		{"os", INTERNAL_OS},
 		{"querystring", INTERNAL_QUERYSTRING},
 		{"string_decoder", INTERNAL_STRING_DECODER},
@@ -948,6 +949,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "sqlite", cast(jsc.JSValueRef)make_sqlite_bindings(ctx))
 	set_named(ctx, natives, "dns", cast(jsc.JSValueRef)make_dns_bindings(ctx))
 	set_named(ctx, natives, "net", cast(jsc.JSValueRef)make_net_bindings(ctx))
+	set_named(ctx, natives, "http", cast(jsc.JSValueRef)make_http_bindings(ctx))
 	set_named(ctx, natives, "os", cast(jsc.JSValueRef)make_os_bindings(ctx))
 	set_named(ctx, natives, "tty", cast(jsc.JSValueRef)make_tty_bindings(ctx))
 
@@ -1208,6 +1210,7 @@ INTERNAL_PROCESS :: #load("js/internal/process.js", string)
 INTERNAL_CONSOLE :: #load("js/internal/console.js", string)
 INTERNAL_TTY :: #load("js/internal/tty.js", string)
 INTERNAL_NET :: #load("js/internal/net.js", string)
+INTERNAL_HTTP :: #load("js/internal/http.js", string)
 INTERNAL_DIAGNOSTICS_CHANNEL :: #load("js/internal/diagnostics_channel.js", string)
 INTERNAL_PARSE_ARGS :: #load("js/internal/parse_args.js", string)
 INTERNAL_PARSE_ENV :: #load("js/internal/parse_env.js", string)
