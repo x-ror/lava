@@ -44,7 +44,10 @@
       var werr = new Error(this.destroyed ? 'socket has been destroyed' : 'write after end');
       var self = this;
       if (typeof cb === 'function') process.nextTick(cb, werr);
-      else process.nextTick(function () { self.emit('error', werr); });
+      else
+        process.nextTick(function () {
+          self.emit('error', werr);
+        });
       return false;
     }
     var ok = native.write(this._id, toBytes(data, encoding));
