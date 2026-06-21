@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke bench bench-gate fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke bench bench-gate fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -106,7 +106,13 @@ check-cli:
 check-runtime:
 	$(ODIN) check pkg/runtime -no-entry-point -collection:lava=.
 	$(ODIN) check pkg/runtime/eventloop -no-entry-point
+	$(ODIN) check pkg/runtime/picohttpparser -no-entry-point
 	$(ODIN) check pkg/std/sqlite -no-entry-point
+
+# Compile vendored C deps (picohttpparser) Odin links into the runtime. Idempotent;
+# `odin check` does not need it, but every link of cmd/lava (build, test-odin) does.
+native-deps:
+	$(RUNSCRIPT) ./scripts/build-native-deps.sh
 
 check-js:
 	vp run js:check
@@ -150,7 +156,7 @@ test-compat-lava: build
 test-compat-lava-strict: build
 	RUN_LAVA=1 LAVA_BIN="$(LAVA)" ./scripts/run-node-compat-all.sh
 
-test-odin:
+test-odin: native-deps
 	$(ODIN) test cmd/lava -collection:lava=.
 
 test-eventloop-odin:
@@ -208,4 +214,4 @@ fmt:
 # `rm` as a script), so invoke the shell explicitly: $(SHELL) is Git Bash on Windows and
 # /bin/sh on Unix, and the quotes force make to route through it instead of direct-exec.
 clean:
-	"$(SHELL)" -c "rm -rf bin build"
+	"$(SHELL)" -c "rm -rf bin build pkg/runtime/picohttpparser/*.a pkg/runtime/picohttpparser/*.o"
