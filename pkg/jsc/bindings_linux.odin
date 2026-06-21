@@ -90,4 +90,19 @@ foreign jsc_lib {
 	JSObjectMakeArrayBufferWithBytesNoCopy :: proc(ctx: JSContextRef, bytes: rawptr, byte_length: c.size_t, byte_deallocator: proc "c" (bytes: rawptr, deallocator_context: rawptr), deallocator_context: rawptr, exception: ^JSValueRef) -> JSObjectRef ---
 	JSObjectGetArrayBufferBytesPtr :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---
 	JSObjectGetArrayBufferByteLength :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
+
+	// JSC::Options::setOption(const char* "name=value", bool verify) — exported by
+	// libjavascriptcoregtk (not the public C API). Lets us set engine options
+	// programmatically before the first VM is created; this build has the JSC_ env-var
+	// override path compiled out, so this is the only way to reach them. See jsc_init.odin
+	// (lava_jsc_init) for why we disable the baseline JIT tier on Linux.
+	@(link_name = "_ZN3JSC7Options9setOptionEPKcb")
+	jsc_options_set :: proc(arg: cstring, verify: bool) -> bool ---
+
+	// JSC::initialize() — the engine's umbrella one-time bring-up (initializes Options,
+	// among other things). The GTK dylib runs it lazily at first VM creation; we call it
+	// early (idempotent, once-guarded) so jsc_options_set below sticks instead of being
+	// overwritten when initialize() later runs with defaults.
+	@(link_name = "_ZN3JSC10initializeEv")
+	jsc_initialize :: proc() ---
 }
