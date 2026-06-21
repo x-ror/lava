@@ -127,7 +127,7 @@
   IncomingMessage.prototype = Object.create(EventEmitter.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
 
-  function ServerResponse(socket, method) {
+  function ServerResponse(socket, method, httpMinor) {
     EventEmitter.call(this);
     this.socket = socket;
     this.statusCode = 200;
@@ -139,6 +139,11 @@
     // A response to a HEAD request carries headers (incl. Content-Length) but NO body
     // (RFC 7230 §3.3.2). Suppress body writes while keeping the framing.
     this._isHead = method === 'HEAD';
+    // HTTP/1.0 has no Transfer-Encoding: chunked — such a client would read the chunk-size
+    // markers as body. For a 1.0 request, stream raw bytes delimited by the connection
+    // close (we already send Connection: close) instead of chunking. Undefined minor
+    // (direct construction) defaults to allowing chunked (HTTP/1.1).
+    this._allowChunked = httpMinor === undefined || httpMinor >= 1;
   }
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
@@ -205,11 +210,18 @@
       // A write() before end() with no explicit length is a streamed body of unknown
       // size → frame it with Transfer-Encoding: chunked (self-delimiting; also what
       // keep-alive will need). end(body) without a prior write still uses Content-Length.
-      // No-body responses (HEAD/204/304/1xx) never get a body or chunked framing.
-      if (!noBody && !this.hasHeader('content-length') && !this.hasHeader('transfer-encoding')) {
+      // No-body responses (HEAD/204/304/1xx) never get a body or chunked framing; neither
+      // does an HTTP/1.0 client (it would mis-read the chunk markers) — it gets raw,
+      // close-delimited bytes.
+      if (
+        !noBody &&
+        this._allowChunked &&
+        !this.hasHeader('content-length') &&
+        !this.hasHeader('transfer-encoding')
+      ) {
         this._chunked = true;
         this.setHeader('Transfer-Encoding', 'chunked');
-      } else if (this.hasHeader('transfer-encoding')) {
+      } else if (this._allowChunked && this.hasHeader('transfer-encoding')) {
         this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
       this._flushHead();
@@ -245,7 +257,7 @@
       if (!this.hasHeader('content-length') && !this.hasHeader('transfer-encoding') && !noBody) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
-      if (this.hasHeader('transfer-encoding')) {
+      if (this._allowChunked && this.hasHeader('transfer-encoding')) {
         this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
       this._flushHead();
@@ -348,7 +360,7 @@
         bodyRemaining = 0;
       }
 
-      var res = new ServerResponse(socket, req.method);
+      var res = new ServerResponse(socket, req.method, req.httpVersionMinor);
       var bodyStart = pending.slice(r.consumed);
       pending = null;
 
