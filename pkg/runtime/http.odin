@@ -83,10 +83,21 @@ http_parse_request_cb :: proc "c" (
 	// Build the headers array (and method/url) as LATIN-1 strings: HTTP/1 header bytes are
 	// binary (obs-text 0x80-0xFF), and Node exposes them as latin1. Routing through the
 	// UTF-8 helpers would mis-decode/corrupt non-ASCII bytes.
+	//
+	// Set each string into the array as it is created, rather than parking N freshly-made
+	// JSValueRefs in an Odin temp_allocator slice and passing them to JSObjectMakeArray in
+	// one shot. That slice lives in Odin heap memory, which JSC's conservative GC does NOT
+	// scan (it scans only the machine stack + registers), so every header string in it was
+	// an unrooted GC cell; a collection triggered while building the next string (certain
+	// under load, deterministic under JSC_collectContinuously) frees them, and the array
+	// build then reads freed cells — heap corruption that surfaces as a SIGABRT in JSC's GC
+	// marker (MarkedBlock::aboutToMarkSlow). Setting into the array immediately keeps each
+	// value rooted (by the array, or on the C stack in-flight), with only one live at a time.
 	n := len(hdr_list)
-	header_vals := make([]jsc.JSValueRef, n, context.temp_allocator)
-	for i in 0 ..< n do header_vals[i] = http_latin1_string(ctx, hdr_list[i])
-	headers_arr := jsc.JSObjectMakeArray(ctx, c.size_t(n), n > 0 ? raw_data(header_vals) : nil, nil)
+	headers_arr := jsc.JSObjectMakeArray(ctx, 0, nil, nil)
+	for i in 0 ..< n {
+		jsc.JSObjectSetPropertyAtIndex(ctx, headers_arr, c.uint(i), http_latin1_string(ctx, hdr_list[i]), nil)
+	}
 
 	set_named(ctx, result, "state", js_string_value(ctx, "complete"))
 	set_named(ctx, result, "consumed", jsc.JSValueMakeNumber(ctx, f64(consumed)))

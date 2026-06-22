@@ -58,12 +58,10 @@ make_uint8_array :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef 
 		ptr = raw_data(pad)
 		n = 0
 	}
-	// Enter the VM (JSLockHolder) around the creation: the C-API typed-array
-	// creators do not self-lock, so when this runs from native code that is not
-	// already inside a JSC callback (e.g. fetch's streaming body, driven from the
-	// event loop), a GC triggered by the allocation would abort on Windows. The
-	// helper is a recursive no-op for callers already holding the lock, and a plain
-	// C-API call on Linux/macOS. See pkg/jsc/jsc_init.odin.
+	// make_uint8_nocopy_locked enters the VM (JSLockHolder) around the creation only on
+	// Windows, where that bun-webkit build's typed-array creator does not self-lock and a
+	// GC during the allocation aborts. Stock JavaScriptCore (Linux/macOS) self-locks the
+	// creator, so it is the plain C-API call there. See pkg/jsc/jsc_init.odin.
 	array := jsc.make_uint8_nocopy_locked(ctx, ptr, c.size_t(n), jsc_buffer_deallocator)
 	return cast(jsc.JSValueRef)array
 }
@@ -99,15 +97,18 @@ make_uint8_array_uninit :: proc(ctx: jsc.JSContextRef, size: int) -> (jsc.JSValu
 	if size <= 0 || size > MAX_UNINIT_ALLOC do return nil, false
 	data, err := mem.alloc_bytes_non_zeroed(size, mem.DEFAULT_ALIGNMENT, context.allocator)
 	if err != nil || len(data) != size do return nil, false
+	// Ownership transfers to JSC the moment we pass the region to the NoCopy creator: JSC
+	// invokes jsc_buffer_deallocator to release it, INCLUDING when creation fails/throws
+	// (JSObjectMakeTypedArrayWithBytesNoCopy calls the bytes deallocator on the failure
+	// path). So we must NOT free it ourselves on a nil return — that double-frees. A nil
+	// here is a rare failure (oversize handled above; otherwise OOM/exception) and the
+	// deallocator has already reclaimed the region.
 	array := jsc.make_uint8_nocopy_locked(
 		ctx,
 		raw_data(data),
 		c.size_t(size),
 		jsc_buffer_deallocator,
 	)
-	if array == nil {
-		free(raw_data(data)) // hand-off failed: free the region ourselves, don't leak it
-		return nil, false
-	}
+	if array == nil do return nil, false
 	return cast(jsc.JSValueRef)array, true
 }

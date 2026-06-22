@@ -245,16 +245,19 @@ dns_lookup_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	code_val, addrs_val: jsc.JSValueRef
 	if req.ok {
 		code_val = jsc.JSValueMakeNull(ctx)
+		// Set each entry into the array as it is built — never park unrooted JSValueRefs in
+		// a temp_allocator slice for JSObjectMakeArray (GC-invisible heap → use-after-free;
+		// see build_string_array / http.odin parseRequest).
 		n := len(req.results)
-		objs := make([]jsc.JSValueRef, n, context.temp_allocator)
+		arr := jsc.JSObjectMakeArray(ctx, 0, nil, nil)
 		for i in 0 ..< n {
 			o := jsc.JSObjectMake(ctx, nil, nil)
 			s := net.address_to_string(req.results[i].addr, context.temp_allocator)
 			set_named(ctx, o, "address", js_string_value(ctx, s))
 			set_named(ctx, o, "family", jsc.JSValueMakeNumber(ctx, f64(req.results[i].family)))
-			objs[i] = cast(jsc.JSValueRef)o
+			jsc.JSObjectSetPropertyAtIndex(ctx, arr, c.uint(i), cast(jsc.JSValueRef)o, nil)
 		}
-		addrs_val = cast(jsc.JSValueRef)jsc.JSObjectMakeArray(ctx, c.size_t(n), raw_data(objs), nil)
+		addrs_val = cast(jsc.JSValueRef)arr
 	} else {
 		code_val = js_string_value(ctx, req.err_code)
 		addrs_val = jsc.JSValueMakeNull(ctx)

@@ -90,11 +90,4 @@ foreign jsc_lib {
 	JSObjectMakeArrayBufferWithBytesNoCopy :: proc(ctx: JSContextRef, bytes: rawptr, byte_length: c.size_t, byte_deallocator: proc "c" (bytes: rawptr, deallocator_context: rawptr), deallocator_context: rawptr, exception: ^JSValueRef) -> JSObjectRef ---
 	JSObjectGetArrayBufferBytesPtr :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---
 	JSObjectGetArrayBufferByteLength :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
-
-	// JSC::initialize() — JavaScriptCore's one-time process bring-up (WTF main thread, JIT
-	// and GC marker threads, executable-memory allocator, Options). Exported by
-	// libjavascriptcoregtk, not part of the public C API. The bare C API never runs this on
-	// its own; see jsc_init.odin (lava_jsc_init) for why we must, on Linux.
-	@(link_name = "_ZN3JSC10initializeEv")
-	jsc_initialize :: proc() ---
 }

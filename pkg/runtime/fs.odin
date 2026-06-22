@@ -1260,14 +1260,12 @@ fs_readdir_sync_cb :: proc "c" (
 	}
 	defer os.file_info_slice_delete(infos, context.allocator)
 
-	if len(infos) == 0 {
-		return cast(jsc.JSValueRef)jsc.JSObjectMakeArray(ctx, 0, nil, nil)
-	}
-	values := make([]jsc.JSValueRef, len(infos), context.temp_allocator)
+	// Set each name as it is created — never park unrooted JSValueRefs in a temp_allocator
+	// slice for JSObjectMakeArray (GC-invisible heap → use-after-free; see build_string_array).
+	arr := jsc.JSObjectMakeArray(ctx, 0, nil, nil)
 	for info, i in infos {
-		values[i] = js_string_value(ctx, info.name)
+		jsc.JSObjectSetPropertyAtIndex(ctx, arr, c.uint(i), js_string_value(ctx, info.name), nil)
 	}
-	arr := jsc.JSObjectMakeArray(ctx, c.size_t(len(values)), raw_data(values), nil)
 	return cast(jsc.JSValueRef)arr
 }
 
