@@ -1308,3 +1308,129 @@ rewatch_within_callback_keeps_watcher_live :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.fired, 3) // fired exactly limit times across re-arms
 	testing.expect_value(t, loop.active_io_count, 0) // final unwatch left nothing armed
 }
+
+// --- timer_index (O(1) clearTimeout) invariant + eager-removal regressions (PR #282) ---
+
+// check_timer_index asserts the id->slot map matches the heap exactly and the heap order
+// holds. A missed index update during a swap would surface here as a wrong slot.
+check_timer_index :: proc(t: ^testing.T, loop: ^Loop) {
+	testing.expect_value(t, len(loop.timer_index), len(loop.timers))
+	for i in 0 ..< len(loop.timers) {
+		idx, ok := loop.timer_index[loop.timers[i].id]
+		testing.expect(t, ok, "live timer id missing from timer_index")
+		testing.expect_value(t, idx, i)
+	}
+	for i in 1 ..< len(loop.timers) {
+		parent := (i - 1) / 2
+		// min-heap: parent must not be strictly greater than child.
+		testing.expect(t, !timer_less(&loop.timers[i], &loop.timers[parent]), "heap order violated")
+	}
+}
+
+@(private = "file")
+test_lcg :: proc(s: ^u64) -> u64 {
+	s^ = s^ * 6364136223846793005 + 1442695040888963407
+	return s^ >> 33
+}
+
+// Sift-up moves earlier timers as smaller ones are inserted; cancelling a moved timer must
+// find it at its current slot (not its insertion slot) and remove it without tombstones.
+@(test)
+timer_index_consistent_after_siftup_and_cancel :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	ids: [8]Timer_ID
+	// Descending delays: each insert is the new minimum, sifting to the root and pushing
+	// the rest down — every insert moves existing entries.
+	for k in 0 ..< 8 do ids[k] = set_timeout(&loop, record, u64((8 - k) * 1000), &rec, count_dispose)
+	check_timer_index(t, &loop)
+	testing.expect_value(t, len(loop.timers), 8)
+
+	testing.expect(t, clear_timeout(&loop, ids[0])) // inserted first, sifted deepest
+	testing.expect(t, clear_timeout(&loop, ids[3]))
+	testing.expect(t, clear_timeout(&loop, ids[5]))
+	check_timer_index(t, &loop)
+	testing.expect_value(t, len(loop.timers), 5) // eager removal: heap shrank, no tombstones
+	testing.expect_value(t, rec.dispose_count, 3)
+	testing.expect(t, !clear_timeout(&loop, ids[0])) // already removed → no-op
+}
+
+// Codex #1: cancellation must not leave tombstones in the heap/index behind a live, not-yet-
+// due root. Arming many far-future timers then cancelling all must drain to empty.
+@(test)
+timer_cancel_removes_eagerly_bounding_memory :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	N :: 200
+	ids: [N]Timer_ID
+	for k in 0 ..< N do ids[k] = set_timeout(&loop, record, 1_000_000, &rec, count_dispose)
+	testing.expect_value(t, len(loop.timers), N)
+	testing.expect_value(t, len(loop.timer_index), N)
+
+	for k in 0 ..< N do testing.expect(t, clear_timeout(&loop, ids[k]))
+	testing.expect_value(t, len(loop.timers), 0) // not N tombstones
+	testing.expect_value(t, len(loop.timer_index), 0)
+	testing.expect_value(t, rec.dispose_count, N)
+	testing.expect_value(t, len(rec.events), 0)
+}
+
+// A re-armed interval lives back in the heap each fire; an external clear must find the
+// re-armed instance via the index and remove it cleanly.
+@(test)
+interval_rearm_then_external_cancel :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	id := set_interval(&loop, record, 0, &rec, count_dispose)
+	for _ in 0 ..< 3 do run_once(&loop) // fire + re-arm a few times
+	testing.expect(t, len(rec.events) >= 1)
+	check_timer_index(t, &loop)
+
+	testing.expect(t, clear_interval(&loop, id))
+	testing.expect_value(t, len(loop.timers), 0)
+	testing.expect_value(t, len(loop.timer_index), 0)
+	testing.expect_value(t, rec.dispose_count, 1)
+	testing.expect(t, !run_until_idle(&loop))
+}
+
+// Randomized arm/cancel churn: the id->slot invariant must hold after every operation.
+@(test)
+timer_index_invariant_under_random_churn :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	rec := Recorder{}
+	defer delete(rec.events)
+
+	live: [dynamic]Timer_ID
+	defer delete(live)
+	seed: u64 = 0x9E3779B97F4A7C15
+
+	for _ in 0 ..< 1500 {
+		r := test_lcg(&seed)
+		if len(live) == 0 || (r & 1) == 0 {
+			id := set_timeout(&loop, record, u64(r % 100000 + 1), &rec, count_dispose)
+			append(&live, id)
+		} else {
+			pick := int((r >> 1) % u64(len(live)))
+			testing.expect(t, clear_timeout(&loop, live[pick]))
+			unordered_remove(&live, pick)
+		}
+		if len(loop.timers) != len(loop.timer_index) {
+			testing.expect_value(t, len(loop.timer_index), len(loop.timers))
+			return
+		}
+	}
+	check_timer_index(t, &loop)
+	testing.expect_value(t, len(loop.timers), len(live))
+	for id in live do clear_timeout(&loop, id)
+	testing.expect_value(t, len(loop.timers), 0)
+	testing.expect_value(t, len(loop.timer_index), 0)
+}

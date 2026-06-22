@@ -503,29 +503,25 @@ queue_close_callback :: proc(loop: ^Loop, callback: Callback, user_data: rawptr 
 	)
 }
 
-// timer_ref marks a timer as ref'd (default). Ref'd timers keep the loop alive.
+// timer_ref marks a timer as ref'd (default). Ref'd timers keep the loop alive. O(1) via
+// timer_index; only heap-resident timers are ref-adjustable (a running handle is not in
+// the heap), matching the prior scan's reachability.
 timer_ref :: proc(loop: ^Loop, id: Timer_ID) {
-	for &timer in loop.timers {
-		if timer.id == id {
-			if timer.unreffed && !timer.cancelled {
-				loop.reffed_timer_count += 1
-			}
-			timer.unreffed = false
-			return
+	if idx, ok := loop.timer_index[id]; ok {
+		if loop.timers[idx].unreffed && !loop.timers[idx].cancelled {
+			loop.reffed_timer_count += 1
 		}
+		loop.timers[idx].unreffed = false
 	}
 }
 
 // timer_unref marks a timer so it no longer keeps the loop alive (Node's timer.unref()).
 timer_unref :: proc(loop: ^Loop, id: Timer_ID) {
-	for &timer in loop.timers {
-		if timer.id == id {
-			if !timer.unreffed && !timer.cancelled {
-				loop.reffed_timer_count -= 1
-			}
-			timer.unreffed = true
-			return
+	if idx, ok := loop.timer_index[id]; ok {
+		if !loop.timers[idx].unreffed && !loop.timers[idx].cancelled {
+			loop.reffed_timer_count -= 1
 		}
+		loop.timers[idx].unreffed = true
 	}
 }
 
@@ -567,19 +563,28 @@ clear_timeout :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 		return false
 	}
 
-	// A handle still queued here is not the one currently executing (the running
-	// timer/immediate was removed from its slice before its callback ran), so it
-	// will never fire — release its binding now. The struct stays in the slice,
-	// flagged cancelled, for discard_cancelled_* to drop; firing is skipped via
-	// the cancelled flag, so nothing touches the freed user_data. dispose is
-	// nulled so no later path can release it twice.
-	if idx, ok := loop.timer_index[id]; ok && !loop.timers[idx].cancelled {
+	// Heap-resident timer: remove it eagerly (O(log n)) — release its binding, drop its
+	// ref, and take it out of the heap and timer_index now. It is not the running handle
+	// (that one was popped from the heap before its callback ran), so freeing its user_data
+	// here is safe. Eager removal (vs leaving a cancelled tombstone until it reaches the
+	// root) keeps the heap and timer_index bounded under timer churn — e.g. per-request
+	// HTTP timeouts armed then cancelled on completion, whose due times are far in the
+	// future.
+	if idx, ok := loop.timer_index[id]; ok {
 		if !loop.timers[idx].unreffed {
 			loop.reffed_timer_count -= 1
 		}
-		loop.timers[idx].cancelled = true
 		run_dispose(loop.timers[idx].dispose, loop.timers[idx].user_data)
-		loop.timers[idx].dispose = nil
+		timer_heap_remove_at(loop, idx)
+		return true
+	}
+
+	// Cancelling the currently-running callback (e.g. clearInterval(self)): it was popped
+	// from the heap before its callback ran, so it is not in timer_index. Its binding
+	// cannot be freed mid-call — run_once's re-arm branch releases a repeating timer once
+	// it decides not to re-arm, and a one-shot frees itself when its callback returns.
+	// Checked before the immediates scan so self-cancellation stays O(1).
+	if loop.running_id == id {
 		append_cancel_request(loop, id)
 		return true
 	}
@@ -592,15 +597,6 @@ clear_timeout :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 			append_cancel_request(loop, id)
 			return true
 		}
-	}
-
-	// Cancelling the currently-running callback (e.g. clearInterval(self)): its
-	// binding cannot be freed mid-call. A one-shot frees itself when the callback
-	// returns; a repeating timer is released in run_once's re-arm branch once it
-	// is decided it will not be re-armed.
-	if loop.running_id == id {
-		append_cancel_request(loop, id)
-		return true
 	}
 
 	return false
@@ -1019,9 +1015,14 @@ timer_heap_swap :: proc(loop: ^Loop, i, j: int) {
 
 timer_heap_push :: proc(loop: ^Loop, timer: Timer) {
 	append(&loop.timers, timer)
-	// sift-up
 	i := len(loop.timers) - 1
 	loop.timer_index[timer.id] = i
+	timer_heap_sift_up(loop, i)
+}
+
+@(private = "file")
+timer_heap_sift_up :: proc(loop: ^Loop, start: int) {
+	i := start
 	for i > 0 {
 		parent := (i - 1) / 2
 		if !timer_less(&loop.timers[i], &loop.timers[parent]) {
@@ -1029,6 +1030,31 @@ timer_heap_push :: proc(loop: ^Loop, timer: Timer) {
 		}
 		timer_heap_swap(loop, i, parent)
 		i = parent
+	}
+}
+
+// timer_heap_remove_at removes the timer at slot `idx` (not necessarily the root) in
+// O(log n), keeping timer_index consistent. Used by timer_cancel to drop a cancelled timer
+// eagerly instead of leaving a tombstone in the heap (and its id in timer_index) until it
+// reaches the root — which, with per-request HTTP timeouts armed-then-cancelled, would let
+// cancelled entries pile up behind a not-yet-due live timer and inflate RSS.
+timer_heap_remove_at :: proc(loop: ^Loop, idx: int) {
+	delete_key(&loop.timer_index, loop.timers[idx].id)
+	last := len(loop.timers) - 1
+	if idx == last {
+		ordered_remove(&loop.timers, last) // removing the tail: nothing to re-heap
+		return
+	}
+	moved := loop.timers[last]
+	ordered_remove(&loop.timers, last)
+	loop.timers[idx] = moved
+	loop.timer_index[moved.id] = idx
+	// The moved tail can violate the heap upward or downward, never both: sift the
+	// direction it needs.
+	if idx > 0 && timer_less(&loop.timers[idx], &loop.timers[(idx - 1) / 2]) {
+		timer_heap_sift_up(loop, idx)
+	} else {
+		timer_heap_sift_down(loop, idx)
 	}
 }
 
