@@ -110,6 +110,10 @@
   // "0\r\n\r\n" is written explicitly by end().
   var CRLF = Buffer.from('\r\n', 'latin1');
   var LAST_CHUNK = Buffer.from('0\r\n\r\n', 'latin1');
+  // Upper bound for coalescing the response head with end()'s body into a single write: a
+  // small body is concatenated to the head (one send() instead of two), but a large one is
+  // written separately so we don't memcpy a big payload just to save one syscall.
+  var HEAD_COALESCE_MAX = 64 * 1024;
   function chunkFrame(buf) {
     return Buffer.concat([Buffer.from(buf.length.toString(16) + '\r\n', 'latin1'), buf, CRLF]);
   }
@@ -271,8 +275,11 @@
     return this;
   };
 
-  ServerResponse.prototype._flushHead = function () {
-    if (this.headersSent) return;
+  // _buildHead serializes the status line + headers (finalizing keep-alive) and marks the
+  // response headersSent. It returns the head as a latin1 string instead of writing it, so
+  // the caller can either write it alone (_flushHead) or coalesce it with the body in one
+  // socket write (end's fast path) — saving a send() syscall per response.
+  ServerResponse.prototype._buildHead = function () {
     // Validate the status code at the single serialization chokepoint — it may have been
     // set via writeHead OR assigned directly (res.statusCode = ...). Rejects a non-integer
     // / out-of-range / CRLF-bearing status that would otherwise inject into the status line.
@@ -301,7 +308,12 @@
       head += h.name + ': ' + h.value + '\r\n';
     }
     head += '\r\n';
-    this.socket.write(Buffer.from(head, 'latin1'));
+    return head;
+  };
+
+  ServerResponse.prototype._flushHead = function () {
+    if (this.headersSent) return;
+    this.socket.write(Buffer.from(this._buildHead(), 'latin1'));
   };
 
   ServerResponse.prototype.write = function (chunk, encoding, cb) {
@@ -364,7 +376,16 @@
       if (this._allowChunked && this.hasHeader('transfer-encoding')) {
         this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
-      this._flushHead();
+      // Fast path: emit the head and a known, non-chunked, small body in ONE socket write
+      // (one send() instead of two — the response write path was ~33% of CPU on a
+      // hello-world server, half of it the extra syscall). Larger bodies fall through to a
+      // separate write to avoid copying the whole payload onto the head.
+      if (!noBody && body && body.length && body.length <= HEAD_COALESCE_MAX && !this._chunked) {
+        this.socket.write(Buffer.concat([Buffer.from(this._buildHead(), 'latin1'), body]));
+        body = null; // written with the head
+      } else {
+        this._flushHead();
+      }
     }
     if (!noBody && body && body.length) {
       this.socket.write(this._chunked ? chunkFrame(body) : body);
