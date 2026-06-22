@@ -7,7 +7,9 @@
 // a known length uses Content-Length. Keep-alive is supported: a connection is reused
 // for subsequent requests (HTTP/1.1 default; HTTP/1.0 with Connection: keep-alive) when
 // the response is self-delimiting, and closed otherwise. Chunked request bodies are
-// decoded. There is no client (http.request/get) yet — that is a later milestone.
+// decoded. Slowloris/idle defenses bound time-to-headers, time-to-full-request, and idle
+// keep-alive gaps (server.headersTimeout / requestTimeout / keepAliveTimeout). There is
+// no client (http.request/get) yet — that is a later milestone.
 (function (require, module, exports, native) {
   'use strict';
 
@@ -405,9 +407,62 @@
     var peerEnded = false; // peer half-closed (read EOF) — no more requests will arrive
     var closed = false; // socket is being torn down; ignore further input
 
+    // Slowloris / idle defenses (see Server). idleTimer guards the gap before a request;
+    // headersTimer/requestTimer bound how long receiving a request's head / whole body may
+    // take once it has started.
+    var keepAliveMs = server.keepAliveTimeout || 0;
+    var headersMs = server.headersTimeout || 0;
+    var requestMs = server.requestTimeout || 0;
+    var idleTimer = null;
+    var headersTimer = null;
+    var requestTimer = null;
+    var requestActive = false; // a request is currently being received (head or body)
+
+    function clearReqTimers() {
+      if (headersTimer) {
+        clearTimeout(headersTimer);
+        headersTimer = null;
+      }
+      if (requestTimer) {
+        clearTimeout(requestTimer);
+        requestTimer = null;
+      }
+    }
+    function clearTimers() {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      clearReqTimers();
+    }
+    function destroyConn() {
+      if (closed) return;
+      closed = true;
+      clearTimers();
+      socket.destroy();
+    }
+    function armIdle() {
+      if (keepAliveMs > 0)
+        idleTimer = setTimeout(function () {
+          destroyConn(); // idle too long between requests — drop it
+        }, keepAliveMs);
+    }
+    function beginRequestTimers() {
+      requestActive = true;
+      if (headersMs > 0) headersTimer = setTimeout(onReqTimeout, headersMs);
+      if (requestMs > 0) requestTimer = setTimeout(onReqTimeout, requestMs);
+    }
+    function onReqTimeout() {
+      // A slow head or body (slowloris): answer 408 if no response has started, then close.
+      if (closed) return;
+      if (res && res.headersSent) destroyConn();
+      else fail(408);
+    }
+
     function fail(code) {
       if (closed) return;
       closed = true;
+      clearTimers();
       var reason = STATUS_CODES[code] || 'Error';
       socket.write(
         Buffer.from(
@@ -427,6 +482,7 @@
       chunkedDecode = null;
       bodyDone = false;
       resDone = false;
+      requestActive = false;
     }
 
     // Advance only when the request is fully read AND the response is fully sent. Then keep
@@ -435,17 +491,20 @@
       if (closed || !bodyDone || !resDone) return;
       if (!res._keepAlive) {
         closed = true;
+        clearTimers();
         socket.end();
         return;
       }
       resetForNext();
       if (pending.length > 0) {
-        processHead(); // a pipelined next request is already buffered
+        beginRequestTimers(); // a pipelined next request is already buffered
+        processHead();
       } else if (peerEnded) {
         // Kept alive, nothing buffered, and the peer already half-closed → no further
         // request can arrive (net no longer auto-closes on EOF), so close now.
-        closed = true;
-        socket.destroy();
+        destroyConn();
+      } else {
+        armIdle(); // wait for the next request, bounded by keepAliveTimeout
       }
     }
 
@@ -457,6 +516,7 @@
     // Body fully received: fire req 'end' once, stash any leftover (pipelined) bytes, advance.
     function onBodyComplete(leftover) {
       pending = leftover && leftover.length ? leftover : Buffer.alloc(0);
+      clearReqTimers(); // the whole request is in; the response is not time-bounded
       if (req && !req._ended) {
         req._ended = true;
         req.complete = true;
@@ -490,6 +550,10 @@
 
       parsingHead = false;
       lastLen = 0;
+      if (headersTimer) {
+        clearTimeout(headersTimer); // head received within headersTimeout
+        headersTimer = null;
+      }
       req = new IncomingMessage(socket, r);
       res = new ServerResponse(socket, req.method, req.httpVersionMinor);
       res._keepAlive = shouldKeepAlive(req); // finalized in _flushHead
@@ -509,7 +573,7 @@
         chunkedDecode = makeChunkedDecoder(
           req,
           function () {
-            if (res.headersSent) socket.destroy();
+            if (res.headersSent) destroyConn();
             else fail(400);
           },
           onBodyComplete,
@@ -532,6 +596,12 @@
 
     socket.on('data', function (chunk) {
       if (closed) return;
+      // First byte of a request: stop the idle timer and start the head/request timers.
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      if (!requestActive) beginRequestTimers();
       if (parsingHead) {
         pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
         processHead();
@@ -558,20 +628,26 @@
           // A partial head that can no longer complete is a bad request; an idle keep-alive
           // connection the peer is done with just closes (net no longer auto-closes on EOF).
           if (pending.length > 0) fail(400);
-          else {
-            closed = true;
-            socket.destroy();
-          }
+          else destroyConn();
         } else if (req && !req._ended) {
           // Genuinely incomplete body (more bytes were expected) — premature EOF.
-          if (res && res.headersSent) socket.destroy();
+          if (res && res.headersSent) destroyConn();
           else fail(400);
         }
         // else: request complete, response in flight → res completion drives the close.
       });
     });
 
-    socket.on('error', function () {}); // peer reset — drop quietly
+    socket.on('error', function () {
+      // peer reset — clear timers and stop processing (the net layer frees the socket)
+      closed = true;
+      clearTimers();
+    });
+
+    // A freshly accepted connection that sends nothing must not pin the socket: bound the
+    // wait for the first request by keepAliveTimeout (the same idle budget reused between
+    // keep-alive requests).
+    armIdle();
   }
 
   function Server(options, requestListener) {
@@ -581,6 +657,21 @@
     }
     EventEmitter.call(this);
     var self = this;
+    // Slowloris / idle-connection defenses (ms; 0 disables). Node's defaults:
+    //   keepAliveTimeout — idle time between requests on a kept-alive connection
+    //   headersTimeout   — time to receive the complete request head
+    //   requestTimeout   — time to receive the entire request (head + body)
+    this.keepAliveTimeout = 5000;
+    this.headersTimeout = 60000;
+    this.requestTimeout = 300000;
+    // Honor timeouts configured at construction (Node's createServer(options) form), not
+    // only post-construction mutation.
+    if (options && typeof options === 'object') {
+      if (typeof options.keepAliveTimeout === 'number')
+        this.keepAliveTimeout = options.keepAliveTimeout;
+      if (typeof options.headersTimeout === 'number') this.headersTimeout = options.headersTimeout;
+      if (typeof options.requestTimeout === 'number') this.requestTimeout = options.requestTimeout;
+    }
     this._net = net.createServer(function (socket) {
       onConnection(self, socket);
     });

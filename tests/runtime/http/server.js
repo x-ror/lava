@@ -4,7 +4,14 @@
 // ephemeral port and prints it as READYPORT=<port>. Echoes method, url, and body.
 const http = require('node:http');
 
-const server = http.createServer((req, res) => {
+// Short timeouts for the slowloris phase (run-http-smoke.sh phase 4), passed via the
+// createServer(options) form so that construction-time config path is exercised too; off
+// by default so the other phases use Node's normal multi-second timeouts.
+const opts = process.env.HTTP_SHORT_TIMEOUTS
+  ? { keepAliveTimeout: 250, headersTimeout: 250, requestTimeout: 400 }
+  : {};
+
+const server = http.createServer(opts, (req, res) => {
   // /redir reflects the (decoded) URL into a Location header — the canonical header-
   // injection sink, used by the malformed-request checks (run-http-smoke.sh phase 2).
   if (req.url.indexOf('/redir') === 0) {

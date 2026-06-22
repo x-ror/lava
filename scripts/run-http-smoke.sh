@@ -83,8 +83,9 @@ fi
 lava_assert() {
 	client=$1
 	label=$2
+	srv_env=${3:-} # optional "VAR=value" exported for the server process
 	: >"$TMP_DIR/srv.out"
-	"$LAVA_BIN" run "$SERVER" >"$TMP_DIR/srv.out" 2>&1 &
+	env ${srv_env:+"$srv_env"} "$LAVA_BIN" run "$SERVER" >"$TMP_DIR/srv.out" 2>&1 &
 	SRV_PID=$!
 	port=""
 	i=0
@@ -116,5 +117,8 @@ lava_assert() {
 lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed
 # Phase 3 — keep-alive: connection reuse, pipelining, Connection: close, HTTP/1.0.
 lava_assert "$ROOT_DIR/tests/runtime/http/keepalive.js" keepalive
+# Phase 4 — timeouts / slowloris: idle, slow-head, slow-body evicted; fast client OK.
+# (HTTP_SHORT_TIMEOUTS makes the fixture use sub-second timeouts.)
+lava_assert "$ROOT_DIR/tests/runtime/http/timeouts.js" timeouts HTTP_SHORT_TIMEOUTS=1
 
-printf '%s\n' 'http smoke passed (parity + malformed + keep-alive)'
+printf '%s\n' 'http smoke passed (parity + malformed + keep-alive + timeouts)'

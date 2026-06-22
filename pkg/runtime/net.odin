@@ -204,6 +204,12 @@ net_accept_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 		cfd, accept_err := linux.accept(linux.Fd(server.fd), &addr, {.NONBLOCK})
 		if accept_err != .NONE do break // EAGAIN (drained) or a transient error — stop this round
 
+		// TCP_NODELAY: disable Nagle so small request/response exchanges aren't stalled by
+		// the ~40 ms Nagle + delayed-ACK interaction (the dominant cost on a keep-alive
+		// hello-world load). Node/Bun set this by default. Best-effort.
+		nodelay: i32 = 1
+		_ = linux.setsockopt(cfd, linux.SOL_TCP, linux.Socket_TCP_Option.NODELAY, &nodelay)
+
 		conn := new(Net_Connection)
 		conn.ctx = server.ctx
 		conn.loop = loop
