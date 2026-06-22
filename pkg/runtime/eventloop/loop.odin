@@ -1236,6 +1236,47 @@ unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 	return true
 }
 
+// --- Completion-mode (proactor) socket I/O (io_uring only) ---------------------
+//
+// Unlike watch_fd (readiness: the loop tells you the fd is ready and you do the recv/send),
+// submit_recv/submit_send hand the transfer itself to the kernel and deliver its result via
+// Op_Completion. This is the io_uring proactor path (see docs/io-uring-proactor.md); it is
+// available only on the Linux io_uring backend — proactor_available reports false elsewhere,
+// and callers fall back to watch_fd. An in-flight op counts as pending work (active_io_count)
+// so the loop stays alive until its completion.
+
+// Op_Completion fires exactly once, on the op's terminal CQE, on the loop thread. `res` is
+// the kernel result: bytes transferred (>= 0), or a negative -errno. The buffer passed to
+// submit_* is the CALLER's and must stay valid until this fires (Slice 1: caller-owned
+// per-connection buffer; teardown must keep it alive until the op completes — see the design).
+Op_Completion :: proc(loop: ^Loop, user_data: rawptr, res: i32)
+
+proactor_available :: proc(loop: ^Loop) -> bool {
+	return platform_proactor_available(loop)
+}
+
+// submit_recv queues a RECV of up to len(buf) bytes from fd into buf; cb fires with the byte
+// count (or -errno). Returns false if the proactor is unavailable or the SQE could not be
+// obtained (caller falls back to the readiness path / retries).
+submit_recv :: proc(loop: ^Loop, fd: uintptr, buf: []byte, cb: Op_Completion, user_data: rawptr) -> bool {
+	if platform_submit_recv(loop, fd, buf, cb, user_data) {
+		loop.active_io_count += 1
+		return true
+	}
+	return false
+}
+
+// submit_send queues a SEND of buf to fd; cb fires with the bytes sent (or -errno). SEND may
+// complete with res < len(buf) (partial), exactly like send(2): the caller re-submits the
+// unsent tail and keeps buf alive until the whole buffer is acknowledged.
+submit_send :: proc(loop: ^Loop, fd: uintptr, buf: []byte, cb: Op_Completion, user_data: rawptr) -> bool {
+	if platform_submit_send(loop, fd, buf, cb, user_data) {
+		loop.active_io_count += 1
+		return true
+	}
+	return false
+}
+
 // wakeup allows background worker threads to instantly kick the loop out of sleep.
 wakeup :: proc(loop: ^Loop) {
 	platform_wakeup(loop)

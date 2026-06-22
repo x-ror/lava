@@ -31,6 +31,24 @@ Uring_Watch_Slot :: struct {
 	in_use:     bool,
 }
 
+// Uring_Op_Slot is the proactor analogue of Uring_Watch_Slot: it holds the completion
+// callback for an in-flight RECV/SEND. The op's user_data token carries (slot index,
+// generation) like a watcher token, but with the op-domain bit set so completions are
+// dispatched to the op path, never the poll-watcher path. The slot is released on the op's
+// own (terminal) CQE.
+Uring_Op_Slot :: struct {
+	callback:   Op_Completion,
+	user_data:  rawptr,
+	generation: u32,
+	in_use:     bool,
+}
+
+// Token domains: bit 63 of an io_uring user_data distinguishes a completion-op token (set)
+// from a poll-watcher token (clear). Watcher generations are capped to 31 bits (see
+// uring_release_slot) so a watcher token never sets bit 63, and the small sentinels
+// (wakeup=1, cancel=2) have it clear too — they are matched by exact value first.
+URING_OP_DOMAIN :: u64(1) << 63
+
 Platform_Loop :: struct {
 	use_uring:   bool,
 	ring:        uring.Ring,
@@ -47,6 +65,11 @@ Platform_Loop :: struct {
 	// Free-list of released watch_slots indices, so alloc/release are O(1) (no scan
 	// for a vacant slot). Holds exactly the indices whose slot is currently !in_use.
 	free_slots:  [dynamic]u32,
+	// Completion-op slot table + free-list (proactor RECV/SEND), same generation-token
+	// scheme as watch_slots but in the op token domain. Sized to the high-water mark of
+	// concurrently in-flight ops.
+	op_slots:    [dynamic]Uring_Op_Slot,
+	op_free:     [dynamic]u32,
 }
 
 platform_name :: proc(loop: ^Loop) -> string {
@@ -73,6 +96,8 @@ platform_init :: proc(loop: ^Loop) -> bool {
 		// it does not adopt the allocator of whatever first appends to it.
 		loop.platform.watch_slots = make([dynamic]Uring_Watch_Slot, loop.allocator)
 		loop.platform.free_slots = make([dynamic]u32, loop.allocator)
+		loop.platform.op_slots = make([dynamic]Uring_Op_Slot, loop.allocator)
+		loop.platform.op_free = make([dynamic]u32, loop.allocator)
 
 		arm_uring_poll(loop, u64(loop.platform.wakeup_pipe[0]), URING_WAKEUP_USER_DATA, {.IN})
 		return true
@@ -100,6 +125,10 @@ platform_destroy :: proc(loop: ^Loop) {
 		loop.platform.watch_slots = nil
 		delete(loop.platform.free_slots)
 		loop.platform.free_slots = nil
+		delete(loop.platform.op_slots)
+		loop.platform.op_slots = nil
+		delete(loop.platform.op_free)
+		loop.platform.op_free = nil
 		uring.destroy(&loop.platform.ring)
 		loop.platform.use_uring = false
 	}
@@ -338,6 +367,26 @@ drain_uring_completions :: proc(loop: ^Loop) {
 				continue
 			}
 
+			// A completion-op (proactor RECV/SEND) token: bit 63 set. Map it back through
+			// the op-slot table, drop the in-flight count, release the slot, and fire the
+			// completion with the kernel result (bytes, or -errno). The slot is copied before
+			// release so the callback may immediately submit_* into the freed slot. A stale
+			// token (generation mismatch) is dropped without calling back.
+			if cqe.user_data & URING_OP_DOMAIN != 0 {
+				index := uring_op_token_index(cqe.user_data)
+				gen := uring_op_token_generation(cqe.user_data)
+				if uring_op_slot_live(loop, index, gen) {
+					slot := loop.platform.op_slots[index]
+					loop.active_io_count = max(0, loop.active_io_count - 1)
+					loop.io_events += 1
+					uring_op_release_slot(loop, index)
+					if slot.callback != nil {
+						slot.callback(loop, slot.user_data, cqe.res)
+					}
+				}
+				continue
+			}
+
 			// A completion from a registered async socket watcher. Map the token back
 			// through the table; a stale token (slot released or its generation bumped
 			// by unwatch_fd) is dropped WITHOUT dereferencing the watcher, which may
@@ -459,7 +508,9 @@ uring_release_slot :: proc(loop: ^Loop, index: u32) {
 	slot.in_use = false
 	slot.watcher = nil
 	slot.generation += 1
-	if slot.generation == 0 do slot.generation = 1
+	// Keep generations within 31 bits so a watcher token (generation << 32 | index) never
+	// sets bit 63 — that bit is the op-token domain marker. Skip 0 on wrap (sentinel range).
+	if slot.generation == 0 || slot.generation >= u32(1) << 31 do slot.generation = 1
 	append(&loop.platform.free_slots, index)
 }
 
@@ -482,4 +533,120 @@ uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) {
 	sqe.addr = target_token // match the POLL_ADD whose user_data == target_token
 	sqe.user_data = URING_CANCEL_USER_DATA
 	uring.submit(&loop.platform.ring, 0, nil)
+}
+
+// --- Proactor completion-op submission (io_uring RECV/SEND) ---
+//
+// These are the platform side of submit_recv/submit_send (loop.odin). Each allocates an
+// op-slot, stages a RECV/SEND SQE under its op-domain token, and flushes it. The op's
+// completion is handled in drain_uring_completions (op-domain branch): release the slot and
+// fire the callback with the kernel result. Buffer lifetime is the caller's — `buf` must stay
+// valid until the completion fires. (Op cancellation on teardown is Slice 1b, where the net
+// connection lifecycle drives it.)
+
+platform_proactor_available :: proc(loop: ^Loop) -> bool {
+	return loop.platform.use_uring
+}
+
+platform_submit_recv :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	buf: []byte,
+	cb: Op_Completion,
+	user_data: rawptr,
+) -> bool {
+	if !loop.platform.use_uring do return false
+	token := uring_op_alloc_slot(loop, cb, user_data)
+	if uring_arm_rw(loop, .RECV, fd, buf, token, {}) do return true
+	uring_op_release_slot(loop, uring_op_token_index(token))
+	return false
+}
+
+platform_submit_send :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	buf: []byte,
+	cb: Op_Completion,
+	user_data: rawptr,
+) -> bool {
+	if !loop.platform.use_uring do return false
+	token := uring_op_alloc_slot(loop, cb, user_data)
+	// NOSIGNAL: a send to a peer that has closed surfaces as -EPIPE in the completion rather
+	// than raising SIGPIPE (which would kill the process).
+	if uring_arm_rw(loop, .SEND, fd, buf, token, {.NOSIGNAL}) do return true
+	uring_op_release_slot(loop, uring_op_token_index(token))
+	return false
+}
+
+// uring_arm_rw stages a RECV/SEND SQE for `buf` under `token` and flushes it, with the same
+// submit-and-retry on a momentarily full SQ ring as arm_uring_poll.
+uring_arm_rw :: proc(
+	loop: ^Loop,
+	opcode: linux.IO_Uring_OP,
+	fd: uintptr,
+	buf: []byte,
+	token: u64,
+	flags: linux.Socket_Msg,
+) -> bool {
+	sqe, ok := uring.get_sqe(&loop.platform.ring)
+	if !ok {
+		uring.submit(&loop.platform.ring, 0, nil)
+		sqe, ok = uring.get_sqe(&loop.platform.ring)
+		if !ok do return false
+	}
+	sqe^ = {}
+	sqe.opcode = opcode
+	sqe.fd = cast(linux.Fd)fd
+	sqe.addr = cast(u64)uintptr(raw_data(buf))
+	sqe.len = u32(len(buf))
+	sqe.msg_flags = flags
+	sqe.user_data = token
+	uring.submit(&loop.platform.ring, 0, nil)
+	return true
+}
+
+// --- op-slot table (op token domain; mirrors the watch-slot table) ---
+
+uring_op_encode_token :: proc(index: u32, generation: u32) -> u64 {
+	return URING_OP_DOMAIN | (u64(generation) << 32) | u64(index)
+}
+uring_op_token_index :: proc(token: u64) -> u32 {
+	return u32(token & 0xFFFF_FFFF)
+}
+uring_op_token_generation :: proc(token: u64) -> u32 {
+	return u32((token >> 32) & 0x7FFF_FFFF) // 31-bit generation (bit 63 is the domain marker)
+}
+
+uring_op_slot_live :: proc(loop: ^Loop, index: u32, generation: u32) -> bool {
+	if int(index) >= len(loop.platform.op_slots) do return false
+	slot := loop.platform.op_slots[index]
+	return slot.in_use && slot.generation == generation
+}
+
+uring_op_alloc_slot :: proc(loop: ^Loop, cb: Op_Completion, user_data: rawptr) -> u64 {
+	if len(loop.platform.op_free) > 0 {
+		index := pop(&loop.platform.op_free)
+		slot := &loop.platform.op_slots[index]
+		slot.callback = cb
+		slot.user_data = user_data
+		slot.in_use = true
+		return uring_op_encode_token(index, slot.generation)
+	}
+	append(
+		&loop.platform.op_slots,
+		Uring_Op_Slot{callback = cb, user_data = user_data, generation = 1, in_use = true},
+	)
+	return uring_op_encode_token(u32(len(loop.platform.op_slots) - 1), 1)
+}
+
+uring_op_release_slot :: proc(loop: ^Loop, index: u32) {
+	if int(index) >= len(loop.platform.op_slots) do return
+	slot := &loop.platform.op_slots[index]
+	if !slot.in_use do return
+	slot.in_use = false
+	slot.callback = nil
+	slot.user_data = nil
+	slot.generation += 1
+	if slot.generation == 0 || slot.generation >= u32(1) << 31 do slot.generation = 1
+	append(&loop.platform.op_free, index)
 }
