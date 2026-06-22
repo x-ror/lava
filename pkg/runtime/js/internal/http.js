@@ -110,6 +110,10 @@
   // "0\r\n\r\n" is written explicitly by end().
   var CRLF = Buffer.from('\r\n', 'latin1');
   var LAST_CHUNK = Buffer.from('0\r\n\r\n', 'latin1');
+  // Upper bound for coalescing the response head with end()'s body into a single write: a
+  // small body is concatenated to the head (one send() instead of two), but a large one is
+  // written separately so we don't memcpy a big payload just to save one syscall.
+  var HEAD_COALESCE_MAX = 64 * 1024;
   function chunkFrame(buf) {
     return Buffer.concat([Buffer.from(buf.length.toString(16) + '\r\n', 'latin1'), buf, CRLF]);
   }
@@ -271,13 +275,16 @@
     return this;
   };
 
-  ServerResponse.prototype._flushHead = function () {
-    if (this.headersSent) return;
+  // _buildHead serializes the status line + headers (finalizing keep-alive) and returns the
+  // head as a latin1 string. It deliberately does NOT set headersSent or write anything:
+  // the caller flips headersSent only immediately before it actually writes, so a throw or
+  // allocation failure between build and write (e.g. coalescing a body) cannot leave the
+  // response falsely marked as sent and poison error recovery / the keep-alive connection.
+  ServerResponse.prototype._buildHead = function () {
     // Validate the status code at the single serialization chokepoint — it may have been
     // set via writeHead OR assigned directly (res.statusCode = ...). Rejects a non-integer
     // / out-of-range / CRLF-bearing status that would otherwise inject into the status line.
     var code = validateStatusCode(this.statusCode);
-    this.headersSent = true;
     var reason = this.statusMessage || STATUS_CODES[code] || '';
     checkInvalidChar(String(reason), 'statusMessage'); // no CRLF in the status line
     var head = 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
@@ -301,6 +308,13 @@
       head += h.name + ': ' + h.value + '\r\n';
     }
     head += '\r\n';
+    return head;
+  };
+
+  ServerResponse.prototype._flushHead = function () {
+    if (this.headersSent) return;
+    var head = this._buildHead();
+    this.headersSent = true; // only after the head is serialized, just before writing it
     this.socket.write(Buffer.from(head, 'latin1'));
   };
 
@@ -364,7 +378,36 @@
       if (this._allowChunked && this.hasHeader('transfer-encoding')) {
         this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
-      this._flushHead();
+      // Fast path: emit the head and a known, non-chunked body in ONE socket write (one
+      // send() instead of two — the response write path was ~33% of CPU on a hello-world
+      // server, half of it the extra syscall). Conditions:
+      //   - body is a Uint8Array/Buffer (so length == byteLength and the copy below is
+      //     byte-exact; anything else takes the separate path unchanged, never the throwing
+      //     concat), and
+      //   - the COMBINED size (head + body) is within the bound — guarding the head too, so
+      //     a large header can't blow up the merged allocation.
+      // headersSent flips only after the buffer is fully built, so a build/alloc failure
+      // can't leave the response falsely marked sent.
+      var head = this._buildHead();
+      var total = head.length + (body ? body.length : 0); // head is latin1: length == bytes
+      if (
+        !noBody &&
+        body &&
+        body.length &&
+        body instanceof Uint8Array &&
+        !this._chunked &&
+        total <= HEAD_COALESCE_MAX
+      ) {
+        var out = Buffer.allocUnsafe(total);
+        out.write(head, 0, 'latin1');
+        out.set(body, head.length);
+        this.headersSent = true;
+        this.socket.write(out);
+        body = null; // written with the head
+      } else {
+        this.headersSent = true;
+        this.socket.write(Buffer.from(head, 'latin1'));
+      }
     }
     if (!noBody && body && body.length) {
       this.socket.write(this._chunked ? chunkFrame(body) : body);

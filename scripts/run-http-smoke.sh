@@ -121,4 +121,18 @@ lava_assert "$ROOT_DIR/tests/runtime/http/keepalive.js" keepalive
 # (HTTP_SHORT_TIMEOUTS makes the fixture use sub-second timeouts.)
 lava_assert "$ROOT_DIR/tests/runtime/http/timeouts.js" timeouts HTTP_SHORT_TIMEOUTS=1
 
-printf '%s\n' 'http smoke passed (parity + malformed + keep-alive + timeouts)'
+# Phase 5 — ServerResponse head/body coalescing unit test. Runs in-process under Lava with a
+# mock socket (no server/client): asserts the single-write fast path, its head+body size
+# bound, the chunked/HEAD/large paths, and that a non-coalescable body never marks the
+# response sent without writing the head.
+unit_out="$TMP_DIR/response-unit.out"
+if "$LAVA_BIN" run "$ROOT_DIR/tests/runtime/http/response-unit.js" >"$unit_out" 2>&1 &&
+	grep -q 'RESPONSE UNIT OK' "$unit_out"; then
+	cat "$unit_out"
+else
+	printf '%s\n' 'http smoke FAILED: ServerResponse coalescing unit test failed' >&2
+	cat "$unit_out" >&2 || true
+	exit 1
+fi
+
+printf '%s\n' 'http smoke passed (parity + malformed + keep-alive + timeouts + response-unit)'
