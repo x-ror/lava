@@ -32,33 +32,30 @@ when ODIN_OS == .Windows {
 		return lava_make_uint8_nocopy(ctx, bytes, length, dealloc)
 	}
 } else when ODIN_OS == .Linux {
-	// Disable JavaScriptCore's baseline JIT tier on Linux — the SAME broken tier the
-	// Windows shim disables (see jsc_init_windows.cpp). In this bun-webkit build the
-	// baseline tier's generated code corrupts the heap under sustained load: the node:http
-	// server at ~50 concurrent connections aborts the process (SIGABRT) intermittently,
-	// surfacing downstream in the GC marker (JSC::MarkedBlock::aboutToMarkSlow) once the
-	// corrupted heap is walked. It is a textbook Heisenbug — only at high concurrency, and
-	// it vanishes under AddressSanitizer (whose slowdown hides it) — and it is the JIT, not
-	// the GC: disabling concurrent/parallel GC does nothing, but disabling this one tier
-	// makes the crash 0/10 reproducible while keeping the optimizing pipeline (LLInt → DFG
-	// → FTL), so throughput is barely affected (unlike useJIT=false). This build has the
-	// JSC_ env-var option overrides compiled out (JSC_dumpOptions prints nothing), so we
-	// set it via the exported JSC::Options::setOption, which the GTK dylib has already
-	// initialized by the time we run — before the first JSGlobalContextCreate, since
-	// lava_jsc_init is called ahead of it in runtime.odin.
+	// Run JavaScriptCore's full process bring-up (WTF main thread, JIT + GC marker threads,
+	// executable-memory allocator, Options finalize) before the first JSGlobalContextCreate.
+	// The bare C API does NOT do this: JSGlobalContextCreate only lazily inits a minimal
+	// subset at first VM touch — the SAME gap the Windows static build hits (see
+	// jsc_init_windows.cpp). The old comment claimed "Linux is unaffected because the dylib
+	// self-initializes"; that is wrong. Without this, under sustained load (the node:http
+	// server at ~50 concurrent connections) the baseline JIT and GC marker threads run on
+	// half-initialized engine state and corrupt the heap, aborting the process (SIGABRT,
+	// surfacing downstream in JSC::MarkedBlock::aboutToMarkSlow on a GC thread). It is a
+	// textbook Heisenbug — only at high concurrency, and it vanishes under AddressSanitizer.
+	// Calling JSC::initialize() fixes it at the root (verified 0/N crashes) while keeping the
+	// FULL JIT pipeline (LLInt -> baseline -> DFG -> FTL) — far better than the blunt
+	// useJIT/useBaselineJIT=false workarounds, which only dodge the half-initialized path.
 	//
 	// Guarded by sync.Once: the Odin test runner calls lava_jsc_init from many parallel
-	// @(test) threads, each then creating its own VM. setOption mutates global Options, so
-	// without the guard those writes would race sibling threads creating/using VMs — a
-	// data race that segfaults on multi-core CI (but not on a quieter local box). The
-	// guard makes it run exactly once and blocks the other callers until it has, mirroring
-	// the std::call_once in the Windows shim.
+	// @(test) threads, each then creating its own VM, so the bring-up must run exactly once
+	// and before any VM — the guard blocks the other callers until it has. Mirrors the
+	// std::call_once in the Windows shim.
 	@(private = "file")
 	jsc_init_once: sync.Once
 
 	lava_jsc_init :: proc() {
 		sync.once_do(&jsc_init_once, proc() {
-			jsc_options_set("useBaselineJIT=false", true)
+			jsc_initialize()
 		})
 	}
 

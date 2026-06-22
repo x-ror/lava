@@ -91,11 +91,10 @@ foreign jsc_lib {
 	JSObjectGetArrayBufferBytesPtr :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> rawptr ---
 	JSObjectGetArrayBufferByteLength :: proc(ctx: JSContextRef, object: JSObjectRef, exception: ^JSValueRef) -> c.size_t ---
 
-	// JSC::Options::setOption(const char* "name=value", bool verify) — exported by
-	// libjavascriptcoregtk (not the public C API). Lets us set engine options
-	// programmatically before the first VM is created; this build has the JSC_ env-var
-	// override path compiled out, so this is the only way to reach them. See jsc_init.odin
-	// (lava_jsc_init) for why we disable the baseline JIT tier on Linux.
-	@(link_name = "_ZN3JSC7Options9setOptionEPKcb")
-	jsc_options_set :: proc(arg: cstring, verify: bool) -> bool ---
+	// JSC::initialize() — JavaScriptCore's one-time process bring-up (WTF main thread, JIT
+	// and GC marker threads, executable-memory allocator, Options). Exported by
+	// libjavascriptcoregtk, not part of the public C API. The bare C API never runs this on
+	// its own; see jsc_init.odin (lava_jsc_init) for why we must, on Linux.
+	@(link_name = "_ZN3JSC10initializeEv")
+	jsc_initialize :: proc() ---
 }
