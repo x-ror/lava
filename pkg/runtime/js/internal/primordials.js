@@ -43,6 +43,7 @@
     Error: Error,
     TypeError: TypeError,
     RangeError: RangeError,
+    Uint8Array: Uint8Array,
 
     // --- Object statics ---
     ObjectCreate: Object.create,
@@ -108,6 +109,7 @@
     StringPrototypeSlice: uncurryThis(StringProto.slice),
     StringPrototypeIndexOf: uncurryThis(StringProto.indexOf),
     StringPrototypeCharCodeAt: uncurryThis(StringProto.charCodeAt),
+    Uint8ArrayPrototypeSet: uncurryThis(Uint8Array.prototype.set),
     StringPrototypeCharAt: uncurryThis(StringProto.charAt),
     StringPrototypeReplace: uncurryThis(StringProto.replace),
     StringPrototypeReplaceAll: uncurryThis(StringProto.replaceAll),
