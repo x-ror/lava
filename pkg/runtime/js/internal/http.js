@@ -20,6 +20,11 @@
   var EventEmitter = require('events');
   var Buffer = require('buffer').Buffer;
   var net = require('net');
+  // Pristine intrinsics (captured before any user code) for serializing the response head:
+  // the hot path must not route bytes through public Buffer/Uint8Array methods, which a
+  // script can override (prototype pollution) to corrupt the head or — via a lying
+  // allocUnsafe — leak uninitialized memory past the body. See writeLatin1Into / headBytes.
+  var P = require('primordials');
 
   var MAX_HEAD = 64 * 1024; // reject a request head larger than this (431)
 
@@ -114,6 +119,24 @@
   // small body is concatenated to the head (one send() instead of two), but a large one is
   // written separately so we don't memcpy a big payload just to save one syscall.
   var HEAD_COALESCE_MAX = 64 * 1024;
+
+  // writeLatin1Into writes `str`'s latin1 bytes into `dst` starting at `offset`, using only
+  // pristine intrinsics: a typed-array index store (a native operation, not a method, so it
+  // can't be overridden) and the captured StringPrototypeCharCodeAt. Masking to a byte
+  // matches Buffer.from(str, 'latin1') for code points > 0xFF.
+  function writeLatin1Into(dst, str, offset) {
+    for (var i = 0; i < str.length; i++) {
+      dst[offset + i] = P.StringPrototypeCharCodeAt(str, i) & 0xff;
+    }
+  }
+  // headBytes serializes a latin1 head string into a fresh, pristine, zero-filled Uint8Array
+  // (the pristine constructor honors the exact length, and the bytes are fully overwritten —
+  // no overridable allocator, no uninitialized-memory disclosure).
+  function headBytes(str) {
+    var out = new P.Uint8Array(str.length);
+    writeLatin1Into(out, str, 0);
+    return out;
+  }
   function chunkFrame(buf) {
     return Buffer.concat([Buffer.from(buf.length.toString(16) + '\r\n', 'latin1'), buf, CRLF]);
   }
@@ -313,9 +336,11 @@
 
   ServerResponse.prototype._flushHead = function () {
     if (this.headersSent) return;
-    var head = this._buildHead();
-    this.headersSent = true; // only after the head is serialized, just before writing it
-    this.socket.write(Buffer.from(head, 'latin1'));
+    // Build the head bytes BEFORE flipping headersSent, so a serialization/allocation failure
+    // can't leave the response marked sent with nothing written.
+    var buf = headBytes(this._buildHead());
+    this.headersSent = true;
+    this.socket.write(buf);
   };
 
   ServerResponse.prototype.write = function (chunk, encoding, cb) {
@@ -394,19 +419,24 @@
         !noBody &&
         body &&
         body.length &&
-        body instanceof Uint8Array &&
+        body instanceof P.Uint8Array &&
         !this._chunked &&
         total <= HEAD_COALESCE_MAX
       ) {
-        var out = Buffer.allocUnsafe(total);
-        out.write(head, 0, 'latin1');
-        out.set(body, head.length);
+        // Build the combined buffer with pristine ops only (zero-filled Uint8Array, captured
+        // charCodeAt, uncurried set) and fully overwrite all `total` bytes, so a polluted
+        // Buffer.allocUnsafe/write/set can neither corrupt the head nor leak uninitialized
+        // bytes past the body. Then flip headersSent immediately before the write.
+        var out = new P.Uint8Array(total);
+        writeLatin1Into(out, head, 0);
+        P.Uint8ArrayPrototypeSet(out, body, head.length);
         this.headersSent = true;
         this.socket.write(out);
         body = null; // written with the head
       } else {
+        var hb = headBytes(head);
         this.headersSent = true;
-        this.socket.write(Buffer.from(head, 'latin1'));
+        this.socket.write(hb);
       }
     }
     if (!noBody && body && body.length) {

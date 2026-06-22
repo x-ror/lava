@@ -102,10 +102,11 @@ function bytes(s) {
   } catch (e) {
     threw = true;
   }
+  check(!threw, '6: non-Uint8Array body takes the separate path, does not throw');
+  check(res.finished === true, '6: response finished');
   check(res.headersSent === true, '6: headersSent set');
   check(s.writes.length >= 1, '6: head was actually written (not falsely marked sent)');
   check(bytes(s).toString('latin1').indexOf('HTTP/1.1 200') === 0, '6: head present');
-  void threw;
 })();
 
 // 7) Streamed (write before end) → chunked framing on its own path, not coalesced.
@@ -118,6 +119,78 @@ function bytes(s) {
   const b = bytes(s).toString('latin1');
   check(b.indexOf('Transfer-Encoding: chunked') !== -1, '7: chunked header');
   check(b.indexOf('0\r\n\r\n') !== -1, '7: last-chunk terminator');
+})();
+
+// 8) A head-serialization failure must NOT mark the response sent (headersSent is flipped
+//    only after the head buffer is built). Force _buildHead to throw via an out-of-range
+//    status assigned directly (bypassing writeHead's own validation).
+(function () {
+  const s = mockSocket();
+  const res = new http.ServerResponse(s, 'GET', 1);
+  res.statusCode = 99999; // invalid; validateStatusCode throws inside _buildHead
+  let threw = false;
+  try {
+    res.end('x');
+  } catch (e) {
+    threw = true;
+  }
+  check(threw, '8: invalid status throws');
+  check(res.headersSent === false, '8: headersSent stays false on a build failure');
+  check(s.writes.length === 0, '8: nothing written on a build failure');
+})();
+
+// 9) Coalesce bound is on the COMBINED size. A body at exactly HEAD_COALESCE_MAX makes
+//    total > the bound (head + body) → separate writes; well under → one write.
+(function () {
+  const MAX = 64 * 1024;
+  const s1 = mockSocket();
+  const r1 = new http.ServerResponse(s1, 'GET', 1);
+  const atMax = Buffer.alloc(MAX, 0x62);
+  r1.writeHead(200, { 'Content-Length': String(atMax.length) });
+  r1.end(atMax);
+  check(s1.writes.length === 2, '9: body == MAX (head pushes total over) → not coalesced');
+  check(bytes(s1).length === s1.writes[0].length + MAX, '9: bytes = head + body');
+
+  const s2 = mockSocket();
+  const r2 = new http.ServerResponse(s2, 'GET', 1);
+  const under = Buffer.alloc(MAX - 1024, 0x63);
+  r2.writeHead(200, { 'Content-Length': String(under.length) });
+  r2.end(under);
+  check(s2.writes.length === 1, '9: body comfortably under bound → coalesced');
+})();
+
+// 10) Prototype pollution of the public Buffer/Uint8Array methods the old path used must not
+//     corrupt the head or leak uninitialized bytes past the body — the head/body are now
+//     serialized with pristine primordials. Reassemble via pristine index reads.
+(function () {
+  const _fromCharCode = String.fromCharCode; // capture before polluting
+  const origAlloc = Buffer.allocUnsafe;
+  const origWrite = Buffer.prototype.write;
+  const origSet = Uint8Array.prototype.set;
+  Buffer.allocUnsafe = function (n) {
+    return origAlloc(n + 8); // oversized: would leak 8 trailing bytes if used
+  };
+  Buffer.prototype.write = function () {
+    return 0; // no-op: would blank the head if used
+  };
+  Uint8Array.prototype.set = function () {}; // no-op: would blank the body if used
+  try {
+    const s = { raw: [], write: (b) => (s.raw.push(b), true), end() {} };
+    const res = new http.ServerResponse(s, 'GET', 1);
+    res.writeHead(200, { 'Content-Length': '5' });
+    // Pre-made Uint8Array body (no Buffer.from(string) conversion) so this isolates the head
+    // serialization + coalesce — the path this fix made pristine — from the separate,
+    // pre-existing string→bytes conversion.
+    res.end(new Uint8Array([0x68, 0x65, 0x6c, 0x6c, 0x6f])); // "hello"
+    let out = '';
+    for (const buf of s.raw) for (let i = 0; i < buf.length; i++) out += _fromCharCode(buf[i]);
+    check(out.indexOf('HTTP/1.1 200') === 0, '10: head intact under pollution');
+    check(out.endsWith('\r\n\r\nhello'), '10: body intact + no trailing leak under pollution');
+  } finally {
+    Buffer.allocUnsafe = origAlloc;
+    Buffer.prototype.write = origWrite;
+    Uint8Array.prototype.set = origSet;
+  }
 })();
 
 if (failures > 0) {
