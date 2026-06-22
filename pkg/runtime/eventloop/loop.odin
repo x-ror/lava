@@ -78,6 +78,12 @@ Loop :: struct {
 	// Push/pop are O(log n); cancelled entries are removed lazily (skipped/popped
 	// when they reach the root) rather than compacted each tick.
 	timers:             [dynamic]Timer,
+	// timer_index maps a live heap timer's id to its slot in `timers`, so timer_cancel
+	// (clearTimeout) is O(1) instead of an O(n) scan. With per-request HTTP header/idle
+	// timeouts the heap holds O(connections) timers and an O(n) cancel made the server
+	// O(n^2) under load — ~43% of CPU in clearTimeout (sampling profiler). Kept in sync by
+	// every site that moves a timer within the heap (the timer_heap_* swaps).
+	timer_index:        map[Timer_ID]int,
 	// reffed_timer_count mirrors the number of heap timers that are ref'd and not
 	// cancelled, so pending_count is O(1) instead of walking the heap every tick.
 	// Maintained at every site a timer enters/leaves the heap or flips ref state.
@@ -165,6 +171,7 @@ init :: proc(allocator := context.allocator, real_time := false) -> Loop {
 	loop.io_callbacks = make([dynamic]Task, allocator)
 	loop.close_callbacks = make([dynamic]Task, allocator)
 	loop.timers = make([dynamic]Timer, allocator)
+	loop.timer_index = make(map[Timer_ID]int, 64, allocator)
 	loop.async_queue = make([dynamic]Task, allocator)
 	loop.async_scratch = make([dynamic]Task, allocator)
 	// Bind the worker pool's containers to the loop allocator too (zero capacity —
@@ -239,6 +246,7 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.io_callbacks)
 	delete(loop.close_callbacks)
 	delete(loop.timers)
+	delete(loop.timer_index)
 	delete(loop.cancelled_ids)
 	delete(loop.async_queue)
 	delete(loop.async_scratch)
@@ -565,17 +573,15 @@ clear_timeout :: proc(loop: ^Loop, id: Timer_ID) -> bool {
 	// flagged cancelled, for discard_cancelled_* to drop; firing is skipped via
 	// the cancelled flag, so nothing touches the freed user_data. dispose is
 	// nulled so no later path can release it twice.
-	for i in 0 ..< len(loop.timers) {
-		if loop.timers[i].id == id && !loop.timers[i].cancelled {
-			if !loop.timers[i].unreffed {
-				loop.reffed_timer_count -= 1
-			}
-			loop.timers[i].cancelled = true
-			run_dispose(loop.timers[i].dispose, loop.timers[i].user_data)
-			loop.timers[i].dispose = nil
-			append_cancel_request(loop, id)
-			return true
+	if idx, ok := loop.timer_index[id]; ok && !loop.timers[idx].cancelled {
+		if !loop.timers[idx].unreffed {
+			loop.reffed_timer_count -= 1
 		}
+		loop.timers[idx].cancelled = true
+		run_dispose(loop.timers[idx].dispose, loop.timers[idx].user_data)
+		loop.timers[idx].dispose = nil
+		append_cancel_request(loop, id)
+		return true
 	}
 
 	for i in 0 ..< len(loop.immediates) {
@@ -1001,16 +1007,27 @@ timer_less :: proc(a, b: ^Timer) -> bool {
 	return a.due_ms < b.due_ms || (a.due_ms == b.due_ms && a.seq < b.seq)
 }
 
+// timer_heap_swap exchanges two heap slots and updates timer_index so each timer's id
+// keeps mapping to its current slot. Every in-heap move must go through here (or set the
+// index directly) to keep timer_cancel's O(1) lookup correct.
+@(private = "file")
+timer_heap_swap :: proc(loop: ^Loop, i, j: int) {
+	loop.timers[i], loop.timers[j] = loop.timers[j], loop.timers[i]
+	loop.timer_index[loop.timers[i].id] = i
+	loop.timer_index[loop.timers[j].id] = j
+}
+
 timer_heap_push :: proc(loop: ^Loop, timer: Timer) {
 	append(&loop.timers, timer)
 	// sift-up
 	i := len(loop.timers) - 1
+	loop.timer_index[timer.id] = i
 	for i > 0 {
 		parent := (i - 1) / 2
 		if !timer_less(&loop.timers[i], &loop.timers[parent]) {
 			break
 		}
-		loop.timers[i], loop.timers[parent] = loop.timers[parent], loop.timers[i]
+		timer_heap_swap(loop, i, parent)
 		i = parent
 	}
 }
@@ -1020,10 +1037,12 @@ timer_heap_push :: proc(loop: ^Loop, timer: Timer) {
 timer_heap_pop_min :: proc(loop: ^Loop) -> Timer {
 	n := len(loop.timers)
 	root := loop.timers[0]
+	delete_key(&loop.timer_index, root.id)
 	last := loop.timers[n - 1]
 	ordered_remove(&loop.timers, n - 1) // pop the tail (O(1) on the last element)
 	if n - 1 > 0 {
 		loop.timers[0] = last
+		loop.timer_index[last.id] = 0
 		timer_heap_sift_down(loop, 0)
 	}
 	return root
@@ -1045,7 +1064,7 @@ timer_heap_sift_down :: proc(loop: ^Loop, start: int) {
 		if smallest == i {
 			break
 		}
-		loop.timers[i], loop.timers[smallest] = loop.timers[smallest], loop.timers[i]
+		timer_heap_swap(loop, i, smallest)
 		i = smallest
 	}
 }
