@@ -275,16 +275,16 @@
     return this;
   };
 
-  // _buildHead serializes the status line + headers (finalizing keep-alive) and marks the
-  // response headersSent. It returns the head as a latin1 string instead of writing it, so
-  // the caller can either write it alone (_flushHead) or coalesce it with the body in one
-  // socket write (end's fast path) — saving a send() syscall per response.
+  // _buildHead serializes the status line + headers (finalizing keep-alive) and returns the
+  // head as a latin1 string. It deliberately does NOT set headersSent or write anything:
+  // the caller flips headersSent only immediately before it actually writes, so a throw or
+  // allocation failure between build and write (e.g. coalescing a body) cannot leave the
+  // response falsely marked as sent and poison error recovery / the keep-alive connection.
   ServerResponse.prototype._buildHead = function () {
     // Validate the status code at the single serialization chokepoint — it may have been
     // set via writeHead OR assigned directly (res.statusCode = ...). Rejects a non-integer
     // / out-of-range / CRLF-bearing status that would otherwise inject into the status line.
     var code = validateStatusCode(this.statusCode);
-    this.headersSent = true;
     var reason = this.statusMessage || STATUS_CODES[code] || '';
     checkInvalidChar(String(reason), 'statusMessage'); // no CRLF in the status line
     var head = 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
@@ -313,7 +313,9 @@
 
   ServerResponse.prototype._flushHead = function () {
     if (this.headersSent) return;
-    this.socket.write(Buffer.from(this._buildHead(), 'latin1'));
+    var head = this._buildHead();
+    this.headersSent = true; // only after the head is serialized, just before writing it
+    this.socket.write(Buffer.from(head, 'latin1'));
   };
 
   ServerResponse.prototype.write = function (chunk, encoding, cb) {
@@ -376,15 +378,35 @@
       if (this._allowChunked && this.hasHeader('transfer-encoding')) {
         this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
-      // Fast path: emit the head and a known, non-chunked, small body in ONE socket write
-      // (one send() instead of two — the response write path was ~33% of CPU on a
-      // hello-world server, half of it the extra syscall). Larger bodies fall through to a
-      // separate write to avoid copying the whole payload onto the head.
-      if (!noBody && body && body.length && body.length <= HEAD_COALESCE_MAX && !this._chunked) {
-        this.socket.write(Buffer.concat([Buffer.from(this._buildHead(), 'latin1'), body]));
+      // Fast path: emit the head and a known, non-chunked body in ONE socket write (one
+      // send() instead of two — the response write path was ~33% of CPU on a hello-world
+      // server, half of it the extra syscall). Conditions:
+      //   - body is a Uint8Array/Buffer (so length == byteLength and the copy below is
+      //     byte-exact; anything else takes the separate path unchanged, never the throwing
+      //     concat), and
+      //   - the COMBINED size (head + body) is within the bound — guarding the head too, so
+      //     a large header can't blow up the merged allocation.
+      // headersSent flips only after the buffer is fully built, so a build/alloc failure
+      // can't leave the response falsely marked sent.
+      var head = this._buildHead();
+      var total = head.length + (body ? body.length : 0); // head is latin1: length == bytes
+      if (
+        !noBody &&
+        body &&
+        body.length &&
+        body instanceof Uint8Array &&
+        !this._chunked &&
+        total <= HEAD_COALESCE_MAX
+      ) {
+        var out = Buffer.allocUnsafe(total);
+        out.write(head, 0, 'latin1');
+        out.set(body, head.length);
+        this.headersSent = true;
+        this.socket.write(out);
         body = null; // written with the head
       } else {
-        this._flushHead();
+        this.headersSent = true;
+        this.socket.write(Buffer.from(head, 'latin1'));
       }
     }
     if (!noBody && body && body.length) {
