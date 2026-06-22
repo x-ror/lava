@@ -51,6 +51,14 @@ URING_OP_DOMAIN :: u64(1) << 63
 
 Platform_Loop :: struct {
 	use_uring:   bool,
+	// Whether the proactor (RECV/SEND completion ops) is usable on this kernel. io_uring_setup
+	// can succeed on kernels predating the single-shot RECV/SEND opcodes (added in 5.6), where
+	// submitting one yields a -EINVAL CQE rather than a synchronous failure. We probe for opcode
+	// support at init (uring_probe_proactor) and gate proactor_available / submit_* on this, so
+	// callers fall back to watch_fd instead of mistaking a healthy socket for a failed one (#286).
+	// Implies use_uring (we only probe when the ring initialized); the readiness/poll path on the
+	// same ring stays available on older kernels regardless.
+	proactor_ok: bool,
 	ring:        uring.Ring,
 	cqes:        [32]linux.IO_Uring_CQE,
 	epoll_fd:    linux.Fd,
@@ -92,6 +100,9 @@ platform_init :: proc(loop: ^Loop) -> bool {
 	uring_err := uring.init(&loop.platform.ring, &params, 256)
 	if uring_err == nil {
 		loop.platform.use_uring = true
+		// Gate the proactor on an actual RECV/SEND opcode probe (see proactor_ok): a successful
+		// ring setup does not imply these ops exist on this kernel.
+		loop.platform.proactor_ok = uring_probe_proactor(loop.platform.ring.fd)
 		// Bind the watcher table to the loop allocator (set before platform_init), so
 		// it does not adopt the allocator of whatever first appends to it.
 		loop.platform.watch_slots = make([dynamic]Uring_Watch_Slot, loop.allocator)
@@ -545,7 +556,57 @@ uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) {
 // connection lifecycle drives it.)
 
 platform_proactor_available :: proc(loop: ^Loop) -> bool {
-	return loop.platform.use_uring
+	return loop.platform.proactor_ok
+}
+
+// --- proactor capability probe (IORING_REGISTER_PROBE) ---
+//
+// io_uring_setup succeeding does not mean the RECV/SEND single-shot opcodes exist: they were
+// added in Linux 5.6, after io_uring itself (5.1). On a 5.1–5.5 kernel the ring works for
+// POLL_ADD (the readiness path) but a RECV/SEND SQE only fails at completion time with -EINVAL,
+// past the submit_* return value the fallback contract keys on. So we ask the kernel, up front,
+// which opcodes it supports via IORING_REGISTER_PROBE and gate the proactor on RECV+SEND (#286).
+
+// IO_URING_OP_SUPPORTED: set in io_uring_probe_op.flags when the kernel implements that opcode.
+URING_OP_SUPPORTED :: u16(1) << 0
+
+// Mirror of the kernel's struct io_uring_probe_op (8 bytes); one per opcode in the probe reply.
+Uring_Probe_Op :: struct {
+	op:    u8,
+	resv:  u8,
+	flags: u16,
+	resv2: u32,
+}
+
+// Mirror of struct io_uring_probe: a 16-byte header followed by `ops_len` Uring_Probe_Op entries.
+// `op` is a u8, so 256 entries is the hard ceiling on what any kernel can report — sizing the
+// array to that lets one fixed-size, stack-allocated buffer cover every opcode. The kernel's
+// IORING_REGISTER_PROBE handler rejects (-EINVAL) any buffer that is not fully zeroed, so this
+// must be zero-initialized before the register call.
+Uring_Probe :: struct {
+	last_op: u8,
+	ops_len: u8,
+	resv:    u16,
+	resv2:   [3]u32,
+	ops:     [256]Uring_Probe_Op,
+}
+
+uring_probe_proactor :: proc(ring_fd: linux.Fd) -> bool {
+	probe := Uring_Probe{} // zero-initialized: the kernel requires the whole buffer to be zero.
+	// nr_args is the number of ops[] slots offered; the kernel caps its fill to the opcodes it
+	// knows. REGISTER_PROBE itself postdates RECV/SEND, so an error here means an old kernel
+	// without the proactor opcodes — report unsupported and let callers use the readiness path.
+	if errno := linux.io_uring_register(ring_fd, .REGISTER_PROBE, &probe, u32(len(probe.ops)));
+	   errno != nil {
+		return false
+	}
+	return uring_probe_supports(&probe, .RECV) && uring_probe_supports(&probe, .SEND)
+}
+
+uring_probe_supports :: proc(probe: ^Uring_Probe, op: linux.IO_Uring_OP) -> bool {
+	idx := u8(op)
+	if idx > probe.last_op do return false // opcode beyond what this kernel reports
+	return (probe.ops[idx].flags & URING_OP_SUPPORTED) != 0
 }
 
 platform_submit_recv :: proc(
@@ -555,7 +616,7 @@ platform_submit_recv :: proc(
 	cb: Op_Completion,
 	user_data: rawptr,
 ) -> bool {
-	if !loop.platform.use_uring do return false
+	if !loop.platform.proactor_ok do return false
 	token := uring_op_alloc_slot(loop, cb, user_data)
 	if uring_arm_rw(loop, .RECV, fd, buf, token, {}) do return true
 	uring_op_release_slot(loop, uring_op_token_index(token))
@@ -569,7 +630,7 @@ platform_submit_send :: proc(
 	cb: Op_Completion,
 	user_data: rawptr,
 ) -> bool {
-	if !loop.platform.use_uring do return false
+	if !loop.platform.proactor_ok do return false
 	token := uring_op_alloc_slot(loop, cb, user_data)
 	// NOSIGNAL: a send to a peer that has closed surfaces as -EPIPE in the completion rather
 	// than raising SIGPIPE (which would kill the process).
