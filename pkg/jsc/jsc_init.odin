@@ -2,22 +2,21 @@ package jsc
 
 import "core:c"
 
-// lava_jsc_init configures JavaScriptCore once before the first
-// JSGlobalContextCreate: on Windows it disables the baseline JIT tier (broken in
-// this bun-webkit build — see the .cpp) and runs JSC's process bring-up
-// (WTF::initializeMainThread + JSC::initialize). Without it, heavy JS corrupts
-// memory mid-execution (0xC0000409). The implementation is in build/jsc_init.lib
-// (scripts/build-jsc-init-windows.sh, from pkg/jsc/jsc_init_windows.cpp) and is
-// idempotent. No-op on Linux/macOS — so callers can invoke it unconditionally.
+// lava_jsc_init runs JavaScriptCore's one-time process bring-up before the first
+// JSGlobalContextCreate. On Windows (statically-linked bun-webkit) the C API does NOT do
+// this on its own, so the shim runs WTF::initializeMainThread + JSC::initialize and
+// disables the baseline JIT tier (broken in that build); without it heavy JS corrupts
+// memory mid-execution (0xC0000409). The implementation is build/jsc_init.lib
+// (scripts/build-jsc-init-windows.sh, from pkg/jsc/jsc_init_windows.cpp) and is once-
+// guarded. No-op elsewhere: the GTK/macOS dynamic JavaScriptCore calls JSC::initialize()
+// itself as the first statement of JSGlobalContextCreate (and JSClassCreate), so the bring-
+// up always happens; callers can still invoke lava_jsc_init unconditionally.
 //
-// make_uint8_nocopy_locked wraps JSObjectMakeTypedArrayWithBytesNoCopy in a
-// JSLockHolder so the VM is entered (correct atom-string table) when a Uint8Array
-// is created from native code that is NOT already inside a JSC callback — e.g. the
-// fetch streaming body, driven straight from the event loop. The C-API typed-array
-// creators do not self-lock, so without this a GC during the allocation aborts
-// (see the .cpp). Use it for any native Uint8Array creation reachable from the
-// loop. On Linux/macOS the dynamic JSC does not hit the abort, so the helper falls
-// back to the plain C-API call.
+// make_uint8_nocopy_locked wraps JSObjectMakeTypedArrayWithBytesNoCopy in a JSLockHolder on
+// Windows, where that bun-webkit build's typed-array creator does not enter the VM and a GC
+// during the allocation aborts (see the .cpp). Stock JavaScriptCore's creator self-locks
+// (JSLockHolder locker(vm) in JSTypedArray.cpp), so on Linux/macOS the plain C-API call is
+// already correct.
 when ODIN_OS == .Windows {
 	foreign import jsc_init_lib "system:jsc_init.lib"
 

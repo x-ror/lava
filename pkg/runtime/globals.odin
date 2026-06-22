@@ -1139,15 +1139,18 @@ set_named :: proc(
 	jsc.JSObjectSetProperty(ctx, object, js_name, value, {}, nil)
 }
 
+// Builds the array by setting each element as it is created. Parking freshly-made
+// JSValueRefs in a temp_allocator slice and passing them to JSObjectMakeArray in one shot
+// is a use-after-free: that slice is in Odin heap memory, which JSC's conservative GC does
+// NOT scan (only the machine stack + registers), so the elements are unrooted GC cells and
+// a collection mid-build frees them. Setting into the array immediately keeps each rooted.
+// See http.odin's parseRequest for the crash this pattern caused.
 build_string_array :: proc(ctx: jsc.JSContextRef, items: []string) -> jsc.JSObjectRef {
-	if len(items) == 0 {
-		return jsc.JSObjectMakeArray(ctx, 0, nil, nil)
-	}
-	values := make([]jsc.JSValueRef, len(items), context.temp_allocator)
+	arr := jsc.JSObjectMakeArray(ctx, 0, nil, nil)
 	for item, i in items {
-		values[i] = js_string_value(ctx, item)
+		jsc.JSObjectSetPropertyAtIndex(ctx, arr, c.uint(i), js_string_value(ctx, item), nil)
 	}
-	return jsc.JSObjectMakeArray(ctx, c.size_t(len(items)), raw_data(values), nil)
+	return arr
 }
 
 // build_env_object snapshots the OS environment into a plain object. NOTE: unlike

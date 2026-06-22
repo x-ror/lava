@@ -246,9 +246,12 @@ os_cpus_cb :: proc "c" (
 	exception: ^jsc.JSValueRef,
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
+	// Set each entry into the array as it is built — never park unrooted JSValueRefs in a
+	// temp_allocator slice for JSObjectMakeArray (GC-invisible heap → use-after-free; see
+	// build_string_array / http.odin parseRequest).
 	cpus := os_cpus()
 	n := len(cpus)
-	objs := make([]jsc.JSValueRef, n, context.temp_allocator)
+	arr := jsc.JSObjectMakeArray(ctx, 0, nil, nil)
 	for i in 0 ..< n {
 		cpu := cpus[i]
 		o := jsc.JSObjectMake(ctx, nil, nil)
@@ -261,9 +264,9 @@ os_cpus_cb :: proc "c" (
 		set_named(ctx, times, "idle", jsc.JSValueMakeNumber(ctx, f64(cpu.idle)))
 		set_named(ctx, times, "irq", jsc.JSValueMakeNumber(ctx, f64(cpu.irq)))
 		set_named(ctx, o, "times", cast(jsc.JSValueRef)times)
-		objs[i] = cast(jsc.JSValueRef)o
+		jsc.JSObjectSetPropertyAtIndex(ctx, arr, c.uint(i), cast(jsc.JSValueRef)o, nil)
 	}
-	return cast(jsc.JSValueRef)jsc.JSObjectMakeArray(ctx, c.size_t(n), raw_data(objs), nil)
+	return cast(jsc.JSValueRef)arr
 }
 
 os_network_interfaces_cb :: proc "c" (
@@ -275,9 +278,12 @@ os_network_interfaces_cb :: proc "c" (
 	exception: ^jsc.JSValueRef,
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
+	// Set each entry into the array as it is built — never park unrooted JSValueRefs in a
+	// temp_allocator slice for JSObjectMakeArray (GC-invisible heap → use-after-free; see
+	// build_string_array / http.odin parseRequest).
 	ifaces := os_network_interfaces()
 	n := len(ifaces)
-	objs := make([]jsc.JSValueRef, n, context.temp_allocator)
+	arr := jsc.JSObjectMakeArray(ctx, 0, nil, nil)
 	for i in 0 ..< n {
 		it := ifaces[i]
 		o := jsc.JSObjectMake(ctx, nil, nil)
@@ -288,9 +294,9 @@ os_network_interfaces_cb :: proc "c" (
 		set_named(ctx, o, "mac", js_string_value(ctx, it.mac))
 		set_named(ctx, o, "internal", jsc.JSValueMakeBoolean(ctx, b32(it.internal)))
 		set_named(ctx, o, "scopeid", jsc.JSValueMakeNumber(ctx, f64(it.scopeid)))
-		objs[i] = cast(jsc.JSValueRef)o
+		jsc.JSObjectSetPropertyAtIndex(ctx, arr, c.uint(i), cast(jsc.JSValueRef)o, nil)
 	}
-	return cast(jsc.JSValueRef)jsc.JSObjectMakeArray(ctx, c.size_t(n), raw_data(objs), nil)
+	return cast(jsc.JSValueRef)arr
 }
 
 os_userinfo_cb :: proc "c" (
