@@ -98,11 +98,4 @@ foreign jsc_lib {
 	// (lava_jsc_init) for why we disable the baseline JIT tier on Linux.
 	@(link_name = "_ZN3JSC7Options9setOptionEPKcb")
 	jsc_options_set :: proc(arg: cstring, verify: bool) -> bool ---
-
-	// JSC::initialize() — the engine's umbrella one-time bring-up (initializes Options,
-	// among other things). The GTK dylib runs it lazily at first VM creation; we call it
-	// early (idempotent, once-guarded) so jsc_options_set below sticks instead of being
-	// overwritten when initialize() later runs with defaults.
-	@(link_name = "_ZN3JSC10initializeEv")
-	jsc_initialize :: proc() ---
 }

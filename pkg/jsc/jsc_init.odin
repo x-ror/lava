@@ -1,6 +1,7 @@
 package jsc
 
 import "core:c"
+import "core:sync"
 
 // lava_jsc_init configures JavaScriptCore once before the first
 // JSGlobalContextCreate: on Windows it disables the baseline JIT tier (broken in
@@ -42,12 +43,23 @@ when ODIN_OS == .Windows {
 	// makes the crash 0/10 reproducible while keeping the optimizing pipeline (LLInt → DFG
 	// → FTL), so throughput is barely affected (unlike useJIT=false). This build has the
 	// JSC_ env-var option overrides compiled out (JSC_dumpOptions prints nothing), so we
-	// set it via the exported JSC::Options::setOption; jsc_initialize() first so Options is
-	// live and the override is not reset, and it all runs before the first
-	// JSGlobalContextCreate (lava_jsc_init is called ahead of it in runtime.odin).
+	// set it via the exported JSC::Options::setOption, which the GTK dylib has already
+	// initialized by the time we run — before the first JSGlobalContextCreate, since
+	// lava_jsc_init is called ahead of it in runtime.odin.
+	//
+	// Guarded by sync.Once: the Odin test runner calls lava_jsc_init from many parallel
+	// @(test) threads, each then creating its own VM. setOption mutates global Options, so
+	// without the guard those writes would race sibling threads creating/using VMs — a
+	// data race that segfaults on multi-core CI (but not on a quieter local box). The
+	// guard makes it run exactly once and blocks the other callers until it has, mirroring
+	// the std::call_once in the Windows shim.
+	@(private = "file")
+	jsc_init_once: sync.Once
+
 	lava_jsc_init :: proc() {
-		jsc_initialize()
-		jsc_options_set("useBaselineJIT=false", true)
+		sync.once_do(&jsc_init_once, proc() {
+			jsc_options_set("useBaselineJIT=false", true)
+		})
 	}
 
 	make_uint8_nocopy_locked :: proc(ctx: JSContextRef, bytes: rawptr, length: c.size_t, dealloc: proc "c" (bytes: rawptr, deallocator_context: rawptr)) -> JSObjectRef {
