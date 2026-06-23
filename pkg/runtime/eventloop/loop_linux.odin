@@ -827,6 +827,9 @@ uring_op_alloc_slot_recv :: proc(
 // core:sys/linux exposes the opcodes/flags/CQE bits + io_uring_register but NOT these structs
 // (as with Uring_Probe in 1a). The kernel OVERLAYS the producer `tail` (u16) on bufs[0]'s `resv`
 // (bytes 14..15), so buf_ring_add writes ONLY the 14 bytes addr/len/bid, never resv.
+//
+// Layout below: types, then consts, then the package API (platform_*, called from loop.odin's
+// eventloop wrappers), then the file-private helpers.
 
 Uring_Buf_Reg :: struct {
 	ring_addr:    u64,
@@ -851,8 +854,55 @@ URING_BUFRING_ENTRIES :: 256 // N — power of two
 URING_BUFRING_BUFSIZE :: 16 * 1024 // M
 URING_BUFRING_MASK :: URING_BUFRING_ENTRIES - 1
 
+// --- package API (called from loop.odin's eventloop wrappers) ---
+
+platform_bufring_ok :: proc(loop: ^Loop) -> bool {return loop.platform.bufring_ok}
+
+// platform_submit_recv_ring stages a single-shot BUFFER_SELECT RECV (no per-conn buffer — the kernel
+// picks one from the ring at completion). Returns the op token, or 0 (caller falls back to 1b).
+platform_submit_recv_ring :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	cb: Op_Recv_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
+	if !loop.platform.bufring_ok do return 0
+	token := uring_op_alloc_slot_recv(loop, cb, dispose, user_data)
+	if uring_arm_recv_ring(loop, fd, token) do return token
+	uring_op_release_slot(loop, uring_op_token_index(token))
+	return 0
+}
+
+// platform_buf_ring_recycle returns buffer `bid` to the ring. The caller MUST have already copied
+// any bytes it needs out of the buffer — once the tail is published the kernel may overwrite it.
+platform_buf_ring_recycle :: proc(loop: ^Loop, bid: u16) {
+	if !loop.platform.bufring_ok || int(bid) >= URING_BUFRING_ENTRIES do return
+	off := int(bid) * URING_BUFRING_BUFSIZE
+	buf_ring_add(
+		loop,
+		u32(loop.platform.bufring_tail) & URING_BUFRING_MASK,
+		u64(uintptr(raw_data(loop.platform.bufring_pool[off:]))),
+		URING_BUFRING_BUFSIZE,
+		bid,
+	)
+	loop.platform.bufring_tail += 1
+	buf_ring_publish_tail(loop)
+}
+
+// platform_buf_ring_buf returns the kernel-selected bytes for `bid` (the caller copies, does NOT retain).
+platform_buf_ring_buf :: proc(loop: ^Loop, bid: u16, n: int) -> []byte {
+	if !loop.platform.bufring_ok || int(bid) >= URING_BUFRING_ENTRIES || n <= 0 do return nil
+	off := int(bid) * URING_BUFRING_BUFSIZE
+	m := min(n, URING_BUFRING_BUFSIZE)
+	return loop.platform.bufring_pool[off:off + m]
+}
+
+// --- file-private helpers ---
+
 // buf_ring_add writes a buffer entry's 14 bytes (addr/len/bid) at ring index `idx`, NEVER the
 // `resv` at bytes 14..15 — those alias the shared producer `tail` for bufs[0]. Used by seed + recycle.
+@(private = "file")
 buf_ring_add :: proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
 	// Field stores (clearer than raw byte offsets, identical codegen) — but DELIBERATELY never
 	// write `resv`: at idx 0 it aliases the shared producer `tail`, published separately with a
@@ -865,18 +915,9 @@ buf_ring_add :: proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
 	entry.bid = bid
 }
 
-// buf_ring_add :: #force_inline proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
-// 	ring := cast([^]Uring_Buf)loop.platform.bufring
-
-// 	entry := &ring[idx]
-// 	entry.addr = addr
-// 	entry.len = length
-// 	entry.bid = bid
-// 	entry.resv = 0
-// }
-
 // buf_ring_publish_tail release-stores our producer index into the overlaid tail (bytes 14..15),
 // so the buffer-entry writes are visible to the kernel before it observes the new tail.
+@(private = "file")
 buf_ring_publish_tail :: proc(loop: ^Loop) {
 	tail_ptr := cast(^u16)(uintptr(loop.platform.bufring) + 14)
 	sync.atomic_store_explicit(tail_ptr, loop.platform.bufring_tail, .Release)
@@ -886,6 +927,7 @@ buf_ring_publish_tail :: proc(loop: ^Loop) {
 // returns false (and cleans up) if the proactor is unavailable, the kernel lacks NODROP (deferred
 // CQ overflow — without it an overflow would silently drop a recv CQE and leak its buffer), the
 // ring mmap fails, or REGISTER_PBUF_RING errors. bufring_ok gates the whole ring-recv path.
+@(private = "file")
 buf_ring_init :: proc(loop: ^Loop) -> bool {
 	if !loop.platform.proactor_ok do return false
 	if .NODROP not_in loop.platform.ring.features do return false
@@ -932,6 +974,7 @@ buf_ring_init :: proc(loop: ^Loop) -> bool {
 
 // buf_ring_destroy frees the ring + pool. MUST run only AFTER the io_uring fd is closed
 // (uring.destroy), which implicitly deregisters the buf_ring so the kernel can no longer touch it.
+@(private = "file")
 buf_ring_destroy :: proc(loop: ^Loop) {
 	if loop.platform.bufring != nil {
 		linux.munmap(loop.platform.bufring, loop.platform.bufring_size)
@@ -944,48 +987,9 @@ buf_ring_destroy :: proc(loop: ^Loop) {
 	loop.platform.bufring_ok = false
 }
 
-// platform_buf_ring_recycle returns buffer `bid` to the ring. The caller MUST have already copied
-// any bytes it needs out of the buffer — once the tail is published the kernel may overwrite it.
-platform_buf_ring_recycle :: proc(loop: ^Loop, bid: u16) {
-	if !loop.platform.bufring_ok || int(bid) >= URING_BUFRING_ENTRIES do return
-	off := int(bid) * URING_BUFRING_BUFSIZE
-	buf_ring_add(
-		loop,
-		u32(loop.platform.bufring_tail) & URING_BUFRING_MASK,
-		u64(uintptr(raw_data(loop.platform.bufring_pool[off:]))),
-		URING_BUFRING_BUFSIZE,
-		bid,
-	)
-	loop.platform.bufring_tail += 1
-	buf_ring_publish_tail(loop)
-}
-
-// platform_buf_ring_buf returns the kernel-selected bytes for `bid` (the caller copies, does NOT retain).
-platform_buf_ring_buf :: proc(loop: ^Loop, bid: u16, n: int) -> []byte {
-	if !loop.platform.bufring_ok || int(bid) >= URING_BUFRING_ENTRIES || n <= 0 do return nil
-	off := int(bid) * URING_BUFRING_BUFSIZE
-	m := min(n, URING_BUFRING_BUFSIZE)
-	return loop.platform.bufring_pool[off:off + m]
-}
-
-platform_bufring_ok :: proc(loop: ^Loop) -> bool {return loop.platform.bufring_ok}
-
-// platform_submit_recv_ring stages a single-shot BUFFER_SELECT RECV (no per-conn buffer — the kernel
-// picks one from the ring at completion). Returns the op token, or 0 (caller falls back to 1b).
-platform_submit_recv_ring :: proc(
-	loop: ^Loop,
-	fd: uintptr,
-	cb: Op_Recv_Completion,
-	dispose: Op_Dispose,
-	user_data: rawptr,
-) -> u64 {
-	if !loop.platform.bufring_ok do return 0
-	token := uring_op_alloc_slot_recv(loop, cb, dispose, user_data)
-	if uring_arm_recv_ring(loop, fd, token) do return token
-	uring_op_release_slot(loop, uring_op_token_index(token))
-	return 0
-}
-
+// uring_arm_recv_ring stages the BUFFER_SELECT RECV SQE (addr/len 0 — the kernel sizes from the
+// chosen buffer). Staged, NOT submitted: platform_poll_uring flushes the batch before it waits/drains.
+@(private = "file")
 uring_arm_recv_ring :: proc(loop: ^Loop, fd: uintptr, token: u64) -> bool {
 	sqe, ok := uring.get_sqe(&loop.platform.ring)
 	if !ok {
@@ -1001,6 +1005,5 @@ uring_arm_recv_ring :: proc(loop: ^Loop, fd: uintptr, token: u64) -> bool {
 	sqe.flags = {.BUFFER_SELECT}
 	sqe.buf_group = URING_BUFRING_BGID
 	sqe.user_data = token
-	// Staged, NOT submitted (platform_poll_uring flushes the batch before it waits/drains).
 	return true
 }
