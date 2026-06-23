@@ -1266,8 +1266,54 @@ Op_Completion :: proc(loop: ^Loop, user_data: rawptr, res: i32)
 // Op_Dispose} runs. May be nil if the caller has nothing to release.
 Op_Dispose :: proc(user_data: rawptr)
 
+// Op_Recv_Completion fires for a provided-buffer-ring RECV (Slice 2a). Unlike Op_Completion it
+// reports the kernel-selected buffer: `has_buf` is whether the kernel picked one, `bid` its id.
+// The callback MUST copy what it needs out of get `recv_ring_buf(loop, bid, res)` and then call
+// `recv_ring_recycle(loop, bid)` — copy BEFORE recycle (recycling republishes the buffer and the
+// kernel may immediately overwrite it), and recycle UNCONDITIONALLY (even when discarding the data),
+// or the shared ring leaks a buffer. Loop thread.
+Op_Recv_Completion :: proc(loop: ^Loop, user_data: rawptr, res: i32, bid: u16, has_buf: bool)
+
 proactor_available :: proc(loop: ^Loop) -> bool {
 	return platform_proactor_available(loop)
+}
+
+// bufring_available reports whether the shared provided-buffer ring is registered (Slice 2a). When
+// false, callers use the 1b per-conn-buffer path (submit_recv).
+bufring_available :: proc(loop: ^Loop) -> bool {
+	return platform_bufring_ok(loop)
+}
+
+// submit_recv_ring queues a single-shot RECV that draws its destination from the shared buffer ring
+// (no per-conn buffer). cb fires with (res, bid, has_buf). Returns OP_ID_INVALID if cb is nil, the
+// ring is unavailable, or no SQE could be obtained (caller falls back to submit_recv). LOOP-THREAD ONLY.
+submit_recv_ring :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	cb: Op_Recv_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> Op_ID {
+	if cb == nil do return OP_ID_INVALID
+	token := platform_submit_recv_ring(loop, fd, cb, dispose, user_data)
+	if token != 0 do loop.active_io_count += 1
+	return Op_ID(token)
+}
+
+// recv_ring_buf returns the kernel-selected bytes for a completed ring RECV (copy, do not retain).
+recv_ring_buf :: proc(loop: ^Loop, bid: u16, n: int) -> []byte {
+	return platform_buf_ring_buf(loop, bid, n)
+}
+
+// recv_ring_recycle returns buffer `bid` to the shared ring (after the caller copied what it needs).
+recv_ring_recycle :: proc(loop: ^Loop, bid: u16) {
+	platform_buf_ring_recycle(loop, bid)
+}
+
+// recv_ring_credit is the number of buffers currently available in the ring — the budget for
+// re-arming connections parked on -ENOBUFS (re-arm at most this many per refill to avoid a storm).
+recv_ring_credit :: proc(loop: ^Loop) -> int {
+	return platform_buf_ring_available(loop)
 }
 
 // submit_recv queues a RECV of up to len(buf) bytes from fd into buf; cb fires with the byte

@@ -66,6 +66,7 @@ Runtime_State :: struct {
 	// is open; net_shutdown_active tears them down before the loop/context die.
 	net_servers:       map[u64]^Net_Server,
 	net_conns:         map[u64]^Net_Connection,
+	net_starved:       [dynamic]^Net_Connection, // ProactorRing conns parked on -ENOBUFS (Slice 2a)
 	next_net_id:       u64,
 	// Node-style process.argv: [execPath, scriptPath, ...userArgs]. Built in eval()
 	// and read by install_process. Empty for embedders that don't set it (then

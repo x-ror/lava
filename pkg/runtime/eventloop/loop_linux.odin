@@ -1,6 +1,7 @@
 #+build linux
 package eventloop
 
+import "core:sync"
 import "core:sys/linux"
 import "core:sys/linux/uring"
 import "core:time"
@@ -38,7 +39,8 @@ Uring_Watch_Slot :: struct {
 // own (terminal) CQE.
 Uring_Op_Slot :: struct {
 	callback:   Op_Completion,
-	dispose:    Op_Dispose, // fires instead of callback if the op is dropped at loop destroy
+	recv_cb:    Op_Recv_Completion, // set instead of callback for a provided-buffer-ring RECV (Slice 2a)
+	dispose:    Op_Dispose, // fires instead of callback/recv_cb if the op is dropped at loop destroy
 	user_data:  rawptr,
 	generation: u32,
 	in_use:     bool,
@@ -85,6 +87,18 @@ Platform_Loop :: struct {
 	// concurrently in-flight ops.
 	op_slots:    [dynamic]Uring_Op_Slot,
 	op_free:     [dynamic]u32,
+	// Provided-buffer ring (Slice 2a; the memory moat). A shared pool of N×M buffers the kernel
+	// picks from for BUFFER_SELECT RECVs, so an idle connection holds no per-conn read buffer.
+	// bufring_ok gates the ring-recv path (else callers use the 1b per-conn buffer). `bufring` is a
+	// page-aligned mmap of N Uring_Buf entries (the kernel overlays the producer `tail` on bufs[0]);
+	// `bufring_tail` is our running producer index; `bufring_avail` is ring occupancy (for the
+	// -ENOBUFS refill budget). See docs/io-uring-proactor.md (Slice 2).
+	bufring_ok:   bool,
+	bufring:      rawptr,
+	bufring_size: uint,
+	bufring_pool: []byte,
+	bufring_tail: u16,
+	bufring_avail: int,
 }
 
 platform_name :: proc(loop: ^Loop) -> string {
@@ -122,6 +136,10 @@ platform_init :: proc(loop: ^Loop) -> bool {
 		loop.platform.op_slots = make([dynamic]Uring_Op_Slot, loop.allocator)
 		loop.platform.op_free = make([dynamic]u32, loop.allocator)
 
+		// Best-effort provided-buffer ring (Slice 2a): bufring_ok gates the ring-recv path; if it
+		// can't be set up (no NODROP, mmap/register failure) callers fall back to the 1b per-conn buffer.
+		buf_ring_init(loop)
+
 		arm_uring_poll(loop, u64(loop.platform.wakeup_pipe[0]), URING_WAKEUP_USER_DATA, {.IN})
 		return true
 	}
@@ -156,6 +174,10 @@ platform_destroy :: proc(loop: ^Loop) {
 			if slot.dispose != nil do slot.dispose(slot.user_data)
 			slot.in_use = false
 		}
+		// The io_uring fd is now closed (uring.destroy), which implicitly deregistered the buf_ring
+		// — the kernel can no longer touch the ring/pool, so free them now (teardown model: close
+		// fd = implicit dereg, THEN unmap/free; never an explicit unregister after the fd is closed).
+		buf_ring_destroy(loop)
 		delete(loop.platform.watch_slots)
 		loop.platform.watch_slots = nil
 		delete(loop.platform.free_slots)
@@ -423,7 +445,15 @@ drain_uring_completions :: proc(loop: ^Loop) {
 					loop.active_io_count = max(0, loop.active_io_count - 1)
 					loop.io_events += 1
 					uring_op_release_slot(loop, index)
-					if slot.callback != nil {
+					if slot.recv_cb != nil {
+						// Provided-buffer-ring RECV: decode the kernel-selected buffer id from the
+						// CQE flags (a bit_set — transmute to u32 before the >>16). A buffer left the
+						// ring (avail--); the callback copies it and recycles it (avail++).
+						has_buf := .BUFFER in cqe.flags
+						bid := u16(transmute(u32)cqe.flags >> 16)
+						if has_buf do loop.platform.bufring_avail -= 1
+						slot.recv_cb(loop, slot.user_data, cqe.res, bid, has_buf)
+					} else if slot.callback != nil {
 						slot.callback(loop, slot.user_data, cqe.res)
 					}
 				}
@@ -770,9 +800,185 @@ uring_op_release_slot :: proc(loop: ^Loop, index: u32) {
 	if !slot.in_use do return
 	slot.in_use = false
 	slot.callback = nil
+	slot.recv_cb = nil
 	slot.dispose = nil
 	slot.user_data = nil
 	slot.generation += 1
 	if slot.generation == 0 || slot.generation >= u32(1) << 31 do slot.generation = 1
 	append(&loop.platform.op_free, index)
+}
+
+uring_op_alloc_slot_recv :: proc(
+	loop: ^Loop,
+	recv_cb: Op_Recv_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
+	token := uring_op_alloc_slot(loop, nil, dispose, user_data)
+	loop.platform.op_slots[uring_op_token_index(token)].recv_cb = recv_cb
+	return token
+}
+
+// --- provided-buffer ring (Slice 2a; the memory moat) ---
+//
+// core:sys/linux exposes the opcodes/flags/CQE bits + io_uring_register but NOT these structs
+// (as with Uring_Probe in 1a). The kernel OVERLAYS the producer `tail` (u16) on bufs[0]'s `resv`
+// (bytes 14..15), so buf_ring_add writes ONLY the 14 bytes addr/len/bid, never resv.
+
+Uring_Buf_Reg :: struct {
+	ring_addr:    u64,
+	ring_entries: u32,
+	bgid:         u16,
+	flags:        u16,
+	resv:         [3]u64,
+}
+#assert(size_of(Uring_Buf_Reg) == 40)
+
+Uring_Buf :: struct {
+	addr: u64,
+	len:  u32,
+	bid:  u16,
+	resv: u16,
+}
+#assert(size_of(Uring_Buf) == 16)
+
+URING_BUFRING_BGID :: 0
+URING_BUFRING_ENTRIES :: 256 // N — power of two
+URING_BUFRING_BUFSIZE :: 16 * 1024 // M
+URING_BUFRING_MASK :: URING_BUFRING_ENTRIES - 1
+
+// buf_ring_add writes a buffer entry's 14 bytes (addr/len/bid) at ring index `idx`, NEVER the
+// `resv` at bytes 14..15 — those alias the shared producer `tail` for bufs[0]. Used by seed + recycle.
+buf_ring_add :: proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
+	base := uintptr(loop.platform.bufring) + uintptr(idx) * size_of(Uring_Buf)
+	(cast(^u64)base)^ = addr // bytes 0..7
+	(cast(^u32)(base + 8))^ = length // bytes 8..11
+	(cast(^u16)(base + 12))^ = bid // bytes 12..13
+}
+
+// buf_ring_publish_tail release-stores our producer index into the overlaid tail (bytes 14..15),
+// so the buffer-entry writes are visible to the kernel before it observes the new tail.
+buf_ring_publish_tail :: proc(loop: ^Loop) {
+	tail_ptr := cast(^u16)(uintptr(loop.platform.bufring) + 14)
+	sync.atomic_store_explicit(tail_ptr, loop.platform.bufring_tail, .Release)
+}
+
+// buf_ring_init allocates the pool + ring, seeds all N buffers, and registers the ring. Best-effort:
+// returns false (and cleans up) if the proactor is unavailable, the kernel lacks NODROP (deferred
+// CQ overflow — without it an overflow would silently drop a recv CQE and leak its buffer), the
+// ring mmap fails, or REGISTER_PBUF_RING errors. bufring_ok gates the whole ring-recv path.
+buf_ring_init :: proc(loop: ^Loop) -> bool {
+	if !loop.platform.proactor_ok do return false
+	if .NODROP not_in loop.platform.ring.features do return false
+	pool := make([]byte, URING_BUFRING_ENTRIES * URING_BUFRING_BUFSIZE, loop.allocator)
+	if pool == nil do return false
+	ring_size := uint(URING_BUFRING_ENTRIES * size_of(Uring_Buf))
+	ring_ptr, mmap_err := linux.mmap(0, ring_size, {.READ, .WRITE}, {.PRIVATE, .ANONYMOUS})
+	if mmap_err != .NONE {
+		delete(pool, loop.allocator)
+		return false
+	}
+	loop.platform.bufring = ring_ptr
+	loop.platform.bufring_size = ring_size
+	loop.platform.bufring_pool = pool
+	loop.platform.bufring_tail = 0
+	for bid in 0 ..< u32(URING_BUFRING_ENTRIES) {
+		off := int(bid) * URING_BUFRING_BUFSIZE
+		buf_ring_add(loop, bid, u64(uintptr(raw_data(pool[off:]))), URING_BUFRING_BUFSIZE, u16(bid))
+	}
+	loop.platform.bufring_tail = u16(URING_BUFRING_ENTRIES)
+	buf_ring_publish_tail(loop)
+	loop.platform.bufring_avail = URING_BUFRING_ENTRIES
+	reg := Uring_Buf_Reg {
+		ring_addr    = u64(uintptr(ring_ptr)),
+		ring_entries = u32(URING_BUFRING_ENTRIES),
+		bgid         = URING_BUFRING_BGID,
+	}
+	if errno := linux.io_uring_register(loop.platform.ring.fd, .REGISTER_PBUF_RING, &reg, 1);
+	   errno != .NONE {
+		linux.munmap(ring_ptr, ring_size)
+		delete(pool, loop.allocator)
+		loop.platform.bufring = nil
+		loop.platform.bufring_pool = nil
+		return false
+	}
+	loop.platform.bufring_ok = true
+	return true
+}
+
+// buf_ring_destroy frees the ring + pool. MUST run only AFTER the io_uring fd is closed
+// (uring.destroy), which implicitly deregisters the buf_ring so the kernel can no longer touch it.
+buf_ring_destroy :: proc(loop: ^Loop) {
+	if loop.platform.bufring != nil {
+		linux.munmap(loop.platform.bufring, loop.platform.bufring_size)
+		loop.platform.bufring = nil
+	}
+	if loop.platform.bufring_pool != nil {
+		delete(loop.platform.bufring_pool, loop.allocator)
+		loop.platform.bufring_pool = nil
+	}
+	loop.platform.bufring_ok = false
+}
+
+// platform_buf_ring_recycle returns buffer `bid` to the ring. The caller MUST have already copied
+// any bytes it needs out of the buffer — once the tail is published the kernel may overwrite it.
+platform_buf_ring_recycle :: proc(loop: ^Loop, bid: u16) {
+	if !loop.platform.bufring_ok || int(bid) >= URING_BUFRING_ENTRIES do return
+	off := int(bid) * URING_BUFRING_BUFSIZE
+	buf_ring_add(
+		loop,
+		u32(loop.platform.bufring_tail) & URING_BUFRING_MASK,
+		u64(uintptr(raw_data(loop.platform.bufring_pool[off:]))),
+		URING_BUFRING_BUFSIZE,
+		bid,
+	)
+	loop.platform.bufring_tail += 1
+	buf_ring_publish_tail(loop)
+	loop.platform.bufring_avail += 1
+}
+
+// platform_buf_ring_buf returns the kernel-selected bytes for `bid` (the caller copies, does NOT retain).
+platform_buf_ring_buf :: proc(loop: ^Loop, bid: u16, n: int) -> []byte {
+	if !loop.platform.bufring_ok || int(bid) >= URING_BUFRING_ENTRIES || n <= 0 do return nil
+	off := int(bid) * URING_BUFRING_BUFSIZE
+	m := min(n, URING_BUFRING_BUFSIZE)
+	return loop.platform.bufring_pool[off:off + m]
+}
+
+platform_buf_ring_available :: proc(loop: ^Loop) -> int {return loop.platform.bufring_avail}
+platform_bufring_ok :: proc(loop: ^Loop) -> bool {return loop.platform.bufring_ok}
+
+// platform_submit_recv_ring stages a single-shot BUFFER_SELECT RECV (no per-conn buffer — the kernel
+// picks one from the ring at completion). Returns the op token, or 0 (caller falls back to 1b).
+platform_submit_recv_ring :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	cb: Op_Recv_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
+	if !loop.platform.bufring_ok do return 0
+	token := uring_op_alloc_slot_recv(loop, cb, dispose, user_data)
+	if uring_arm_recv_ring(loop, fd, token) do return token
+	uring_op_release_slot(loop, uring_op_token_index(token))
+	return 0
+}
+
+uring_arm_recv_ring :: proc(loop: ^Loop, fd: uintptr, token: u64) -> bool {
+	sqe, ok := uring.get_sqe(&loop.platform.ring)
+	if !ok {
+		uring.submit(&loop.platform.ring, 0, nil)
+		sqe, ok = uring.get_sqe(&loop.platform.ring)
+		if !ok do return false
+	}
+	sqe^ = {}
+	sqe.opcode = .RECV
+	sqe.fd = cast(linux.Fd)fd
+	sqe.addr = 0
+	sqe.len = 0
+	sqe.flags = {.BUFFER_SELECT}
+	sqe.buf_group = URING_BUFRING_BGID
+	sqe.user_data = token
+	// Staged, NOT submitted (platform_poll_uring flushes the batch before it waits/drains).
+	return true
 }
