@@ -31,8 +31,41 @@ Uring_Watch_Slot :: struct {
 	in_use:     bool,
 }
 
+// Uring_Op_Slot is the proactor analogue of Uring_Watch_Slot: it holds the completion
+// callback for an in-flight RECV/SEND. The op's user_data token carries (slot index,
+// generation) like a watcher token, but with the op-domain bit set so completions are
+// dispatched to the op path, never the poll-watcher path. The slot is released on the op's
+// own (terminal) CQE.
+Uring_Op_Slot :: struct {
+	callback:   Op_Completion,
+	dispose:    Op_Dispose, // fires instead of callback if the op is dropped at loop destroy
+	user_data:  rawptr,
+	generation: u32,
+	in_use:     bool,
+}
+
+// Max bytes per RECV/SEND SQE. The SQE length is a u32, but Buffer.MAX_LENGTH is 4 GiB and a
+// straight u32(len) would wrap a 4 GiB buffer to 0 (a zero-length recv reads as EOF; a
+// zero-length send spins). Cap each op at max(i32) and let the caller continue from cqe.res
+// (it already handles short reads / partial sends).
+URING_MAX_RW :: int(max(i32))
+
+// Token domains: bit 63 of an io_uring user_data distinguishes a completion-op token (set)
+// from a poll-watcher token (clear). Watcher generations are capped to 31 bits (see
+// uring_release_slot) so a watcher token never sets bit 63, and the small sentinels
+// (wakeup=1, cancel=2) have it clear too — they are matched by exact value first.
+URING_OP_DOMAIN :: u64(1) << 63
+
 Platform_Loop :: struct {
 	use_uring:   bool,
+	// Whether the proactor (RECV/SEND completion ops) is usable on this kernel. io_uring_setup
+	// can succeed on kernels predating the single-shot RECV/SEND opcodes (added in 5.6), where
+	// submitting one yields a -EINVAL CQE rather than a synchronous failure. We probe for opcode
+	// support at init (uring_probe_proactor) and gate proactor_available / submit_* on this, so
+	// callers fall back to watch_fd instead of mistaking a healthy socket for a failed one (#286).
+	// Implies use_uring (we only probe when the ring initialized); the readiness/poll path on the
+	// same ring stays available on older kernels regardless.
+	proactor_ok: bool,
 	ring:        uring.Ring,
 	cqes:        [32]linux.IO_Uring_CQE,
 	epoll_fd:    linux.Fd,
@@ -47,6 +80,11 @@ Platform_Loop :: struct {
 	// Free-list of released watch_slots indices, so alloc/release are O(1) (no scan
 	// for a vacant slot). Holds exactly the indices whose slot is currently !in_use.
 	free_slots:  [dynamic]u32,
+	// Completion-op slot table + free-list (proactor RECV/SEND), same generation-token
+	// scheme as watch_slots but in the op token domain. Sized to the high-water mark of
+	// concurrently in-flight ops.
+	op_slots:    [dynamic]Uring_Op_Slot,
+	op_free:     [dynamic]u32,
 }
 
 platform_name :: proc(loop: ^Loop) -> string {
@@ -69,10 +107,15 @@ platform_init :: proc(loop: ^Loop) -> bool {
 	uring_err := uring.init(&loop.platform.ring, &params, 256)
 	if uring_err == nil {
 		loop.platform.use_uring = true
+		// Gate the proactor on an actual RECV/SEND opcode probe (see proactor_ok): a successful
+		// ring setup does not imply these ops exist on this kernel.
+		loop.platform.proactor_ok = uring_probe_proactor(loop.platform.ring.fd)
 		// Bind the watcher table to the loop allocator (set before platform_init), so
 		// it does not adopt the allocator of whatever first appends to it.
 		loop.platform.watch_slots = make([dynamic]Uring_Watch_Slot, loop.allocator)
 		loop.platform.free_slots = make([dynamic]u32, loop.allocator)
+		loop.platform.op_slots = make([dynamic]Uring_Op_Slot, loop.allocator)
+		loop.platform.op_free = make([dynamic]u32, loop.allocator)
 
 		arm_uring_poll(loop, u64(loop.platform.wakeup_pipe[0]), URING_WAKEUP_USER_DATA, {.IN})
 		return true
@@ -96,12 +139,28 @@ platform_init :: proc(loop: ^Loop) -> bool {
 
 platform_destroy :: proc(loop: ^Loop) {
 	if loop.platform.use_uring {
+		// Tear the ring down FIRST: closing the io_uring fd cancels every in-flight op in the
+		// kernel and guarantees it will not touch the op buffers again. Only then is it safe
+		// to tell callers (via Op_Dispose) that the buffers of any op still in flight — which
+		// therefore never got a drained completion — are reclaimable. Exactly one of
+		// {callback, dispose} runs per op; here it is dispose.
+		uring.destroy(&loop.platform.ring)
+		for &slot in loop.platform.op_slots {
+			if !slot.in_use do continue
+			loop.active_io_count = max(0, loop.active_io_count - 1)
+			if slot.dispose != nil do slot.dispose(slot.user_data)
+			slot.in_use = false
+		}
 		delete(loop.platform.watch_slots)
 		loop.platform.watch_slots = nil
 		delete(loop.platform.free_slots)
 		loop.platform.free_slots = nil
-		uring.destroy(&loop.platform.ring)
+		delete(loop.platform.op_slots)
+		loop.platform.op_slots = nil
+		delete(loop.platform.op_free)
+		loop.platform.op_free = nil
 		loop.platform.use_uring = false
+		loop.platform.proactor_ok = false
 	}
 
 	if loop.platform.epoll_fd >= 0 {
@@ -338,6 +397,26 @@ drain_uring_completions :: proc(loop: ^Loop) {
 				continue
 			}
 
+			// A completion-op (proactor RECV/SEND) token: bit 63 set. Map it back through
+			// the op-slot table, drop the in-flight count, release the slot, and fire the
+			// completion with the kernel result (bytes, or -errno). The slot is copied before
+			// release so the callback may immediately submit_* into the freed slot. A stale
+			// token (generation mismatch) is dropped without calling back.
+			if cqe.user_data & URING_OP_DOMAIN != 0 {
+				index := uring_op_token_index(cqe.user_data)
+				gen := uring_op_token_generation(cqe.user_data)
+				if uring_op_slot_live(loop, index, gen) {
+					slot := loop.platform.op_slots[index]
+					loop.active_io_count = max(0, loop.active_io_count - 1)
+					loop.io_events += 1
+					uring_op_release_slot(loop, index)
+					if slot.callback != nil {
+						slot.callback(loop, slot.user_data, cqe.res)
+					}
+				}
+				continue
+			}
+
 			// A completion from a registered async socket watcher. Map the token back
 			// through the table; a stale token (slot released or its generation bumped
 			// by unwatch_fd) is dropped WITHOUT dereferencing the watcher, which may
@@ -459,7 +538,9 @@ uring_release_slot :: proc(loop: ^Loop, index: u32) {
 	slot.in_use = false
 	slot.watcher = nil
 	slot.generation += 1
-	if slot.generation == 0 do slot.generation = 1
+	// Keep generations within 31 bits so a watcher token (generation << 32 | index) never
+	// sets bit 63 — that bit is the op-token domain marker. Skip 0 on wrap (sentinel range).
+	if slot.generation == 0 || slot.generation >= u32(1) << 31 do slot.generation = 1
 	append(&loop.platform.free_slots, index)
 }
 
@@ -482,4 +563,198 @@ uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) {
 	sqe.addr = target_token // match the POLL_ADD whose user_data == target_token
 	sqe.user_data = URING_CANCEL_USER_DATA
 	uring.submit(&loop.platform.ring, 0, nil)
+}
+
+// --- Proactor completion-op submission (io_uring RECV/SEND) ---
+//
+// These are the platform side of submit_recv/submit_send (loop.odin). Each allocates an
+// op-slot, stages a RECV/SEND SQE under its op-domain token, and flushes it. The op's
+// completion is handled in drain_uring_completions (op-domain branch): release the slot and
+// fire the callback with the kernel result. Buffer lifetime is the caller's — `buf` must stay
+// valid until the completion fires. (Op cancellation on teardown is Slice 1b, where the net
+// connection lifecycle drives it.)
+
+platform_proactor_available :: proc(loop: ^Loop) -> bool {
+	return loop.platform.proactor_ok
+}
+
+// --- proactor capability probe (IORING_REGISTER_PROBE) ---
+//
+// io_uring_setup succeeding does not mean the RECV/SEND single-shot opcodes exist: they were
+// added in Linux 5.6, after io_uring itself (5.1). On a 5.1–5.5 kernel the ring works for
+// POLL_ADD (the readiness path) but a RECV/SEND SQE only fails at completion time with -EINVAL,
+// past the submit_* return value the fallback contract keys on. So we ask the kernel, up front,
+// which opcodes it supports via IORING_REGISTER_PROBE and gate the proactor on RECV+SEND (#286).
+
+// IO_URING_OP_SUPPORTED: set in io_uring_probe_op.flags when the kernel implements that opcode.
+URING_OP_SUPPORTED :: u16(1) << 0
+
+// Mirror of the kernel's struct io_uring_probe_op (8 bytes); one per opcode in the probe reply.
+Uring_Probe_Op :: struct {
+	op:    u8,
+	resv:  u8,
+	flags: u16,
+	resv2: u32,
+}
+
+// Mirror of struct io_uring_probe: a 16-byte header followed by `ops_len` Uring_Probe_Op entries.
+// `op` is a u8, so 256 entries is the hard ceiling on what any kernel can report — sizing the
+// array to that lets one fixed-size, stack-allocated buffer cover every opcode. The kernel's
+// IORING_REGISTER_PROBE handler rejects (-EINVAL) any buffer that is not fully zeroed, so this
+// must be zero-initialized before the register call.
+Uring_Probe :: struct {
+	last_op: u8,
+	ops_len: u8,
+	resv:    u16,
+	resv2:   [3]u32,
+	ops:     [256]Uring_Probe_Op,
+}
+
+uring_probe_proactor :: proc(ring_fd: linux.Fd) -> bool {
+	probe := Uring_Probe{} // zero-initialized: the kernel requires the whole buffer to be zero.
+	// nr_args is the number of ops[] slots offered; the kernel caps its fill to the opcodes it
+	// knows. REGISTER_PROBE itself postdates RECV/SEND, so an error here means an old kernel
+	// without the proactor opcodes — report unsupported and let callers use the readiness path.
+	if errno := linux.io_uring_register(ring_fd, .REGISTER_PROBE, &probe, u32(len(probe.ops)));
+	   errno != nil {
+		return false
+	}
+	return uring_probe_supports(&probe, .RECV) && uring_probe_supports(&probe, .SEND)
+}
+
+uring_probe_supports :: proc(probe: ^Uring_Probe, op: linux.IO_Uring_OP) -> bool {
+	idx := u8(op)
+	if idx > probe.last_op do return false // opcode beyond what this kernel reports
+	return (probe.ops[idx].flags & URING_OP_SUPPORTED) != 0
+}
+
+// platform_submit_recv/send return the op token (a non-zero op-domain user_data) on success,
+// or 0 if the proactor is unavailable or no SQE could be obtained.
+platform_submit_recv :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	buf: []byte,
+	cb: Op_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
+	if !loop.platform.proactor_ok do return 0
+	token := uring_op_alloc_slot(loop, cb, dispose, user_data)
+	if uring_arm_rw(loop, .RECV, fd, buf, token, {}) do return token
+	uring_op_release_slot(loop, uring_op_token_index(token))
+	return 0
+}
+
+platform_submit_send :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	buf: []byte,
+	cb: Op_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
+	if !loop.platform.proactor_ok do return 0
+	token := uring_op_alloc_slot(loop, cb, dispose, user_data)
+	// NOSIGNAL: a send to a peer that has closed surfaces as -EPIPE in the completion rather
+	// than raising SIGPIPE (which would kill the process).
+	if uring_arm_rw(loop, .SEND, fd, buf, token, {.NOSIGNAL}) do return token
+	uring_op_release_slot(loop, uring_op_token_index(token))
+	return 0
+}
+
+// platform_cancel_op asks the kernel to cancel the op identified by `token`. The op still
+// produces a terminal CQE that releases the slot and fires the callback; this just makes a
+// pending op (e.g. a RECV on a fd being closed) tear down promptly instead of lingering. The
+// generation check avoids issuing a cancel against a slot already reused for a new op.
+platform_cancel_op :: proc(loop: ^Loop, token: u64) {
+	if !loop.platform.proactor_ok do return
+	if uring_op_slot_live(loop, uring_op_token_index(token), uring_op_token_generation(token)) {
+		uring_cancel_poll(loop, token) // ASYNC_CANCEL(addr=token); its own CQE is ignored
+	}
+}
+
+// uring_arm_rw stages a RECV/SEND SQE for `buf` under `token` and flushes it, with the same
+// submit-and-retry on a momentarily full SQ ring as arm_uring_poll.
+uring_arm_rw :: proc(
+	loop: ^Loop,
+	opcode: linux.IO_Uring_OP,
+	fd: uintptr,
+	buf: []byte,
+	token: u64,
+	flags: linux.Socket_Msg,
+) -> bool {
+	sqe, ok := uring.get_sqe(&loop.platform.ring)
+	if !ok {
+		uring.submit(&loop.platform.ring, 0, nil)
+		sqe, ok = uring.get_sqe(&loop.platform.ring)
+		if !ok do return false
+	}
+	sqe^ = {}
+	sqe.opcode = opcode
+	sqe.fd = cast(linux.Fd)fd
+	sqe.addr = cast(u64)uintptr(raw_data(buf))
+	sqe.len = u32(min(len(buf), URING_MAX_RW)) // cap so a 4 GiB buffer doesn't wrap to 0
+	sqe.msg_flags = flags
+	sqe.user_data = token
+	uring.submit(&loop.platform.ring, 0, nil)
+	return true
+}
+
+// --- op-slot table (op token domain; mirrors the watch-slot table) ---
+
+uring_op_encode_token :: proc(index: u32, generation: u32) -> u64 {
+	return URING_OP_DOMAIN | (u64(generation) << 32) | u64(index)
+}
+uring_op_token_index :: proc(token: u64) -> u32 {
+	return u32(token & 0xFFFF_FFFF)
+}
+uring_op_token_generation :: proc(token: u64) -> u32 {
+	return u32((token >> 32) & 0x7FFF_FFFF) // 31-bit generation (bit 63 is the domain marker)
+}
+
+uring_op_slot_live :: proc(loop: ^Loop, index: u32, generation: u32) -> bool {
+	if int(index) >= len(loop.platform.op_slots) do return false
+	slot := loop.platform.op_slots[index]
+	return slot.in_use && slot.generation == generation
+}
+
+uring_op_alloc_slot :: proc(
+	loop: ^Loop,
+	cb: Op_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
+	if len(loop.platform.op_free) > 0 {
+		index := pop(&loop.platform.op_free)
+		slot := &loop.platform.op_slots[index]
+		slot.callback = cb
+		slot.dispose = dispose
+		slot.user_data = user_data
+		slot.in_use = true
+		return uring_op_encode_token(index, slot.generation)
+	}
+	append(
+		&loop.platform.op_slots,
+		Uring_Op_Slot {
+			callback = cb,
+			dispose = dispose,
+			user_data = user_data,
+			generation = 1,
+			in_use = true,
+		},
+	)
+	return uring_op_encode_token(u32(len(loop.platform.op_slots) - 1), 1)
+}
+
+uring_op_release_slot :: proc(loop: ^Loop, index: u32) {
+	if int(index) >= len(loop.platform.op_slots) do return
+	slot := &loop.platform.op_slots[index]
+	if !slot.in_use do return
+	slot.in_use = false
+	slot.callback = nil
+	slot.dispose = nil
+	slot.user_data = nil
+	slot.generation += 1
+	if slot.generation == 0 || slot.generation >= u32(1) << 31 do slot.generation = 1
+	append(&loop.platform.op_free, index)
 }

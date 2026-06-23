@@ -157,3 +157,34 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 		}
 	}
 }
+
+// Proactor (completion-mode socket I/O) is io_uring-only; this backend has no equivalent, so
+// proactor_available is false and submit_recv/submit_send never succeed (callers use the
+// readiness path, watch_fd). See docs/io-uring-proactor.md.
+platform_proactor_available :: proc(loop: ^Loop) -> bool {
+	return false
+}
+
+platform_submit_recv :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	buf: []byte,
+	cb: Op_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
+	return 0
+}
+
+platform_submit_send :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	buf: []byte,
+	cb: Op_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
+	return 0
+}
+
+platform_cancel_op :: proc(loop: ^Loop, token: u64) {}
