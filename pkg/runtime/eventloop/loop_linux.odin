@@ -339,6 +339,11 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 
 platform_poll_uring :: proc(loop: ^Loop, timeout_ms: int) {
 	if timeout_ms == 0 {
+		// Non-blocking tick: flush any SQEs staged by uring_arm_rw (op submissions) before
+		// reaping. uring.submit only issues io_uring_enter when SQEs are actually pending
+		// (sq_ring_needs_enter), so this is free when nothing is staged. The timeout>0 path
+		// below flushes via its waiting submit(1, ts), so both paths submit before they sleep.
+		uring.submit(&loop.platform.ring, 0, nil)
 		drain_uring_completions(loop)
 		return
 	}
@@ -696,7 +701,11 @@ uring_arm_rw :: proc(
 	sqe.len = u32(min(len(buf), URING_MAX_RW)) // cap so a 4 GiB buffer doesn't wrap to 0
 	sqe.msg_flags = flags
 	sqe.user_data = token
-	uring.submit(&loop.platform.ring, 0, nil)
+	// Staged, NOT submitted here: platform_poll_uring flushes the whole batch with one
+	// io_uring_enter before it waits/drains, so a burst of per-request arms (a send + a recv
+	// re-arm, ×N connections in one drain) costs ONE enter instead of one enter per op — the
+	// proactor's syscall win (Slice 1a's deferred batching, realized in 1b under load). The
+	// op already counts toward active_io_count, so the loop will reach that flushing poll.
 	return true
 }
 

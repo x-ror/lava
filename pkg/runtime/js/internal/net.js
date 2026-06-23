@@ -138,6 +138,12 @@
       function (msg) {
         socket.emit('error', new Error(String(msg)));
       },
+      // onDrain — the proactor write path fires this when the outbound buffer empties
+      // after write() returned backpressure (false), so a caller honoring it resumes.
+      // The readiness path never invokes it (it restores reads internally).
+      function () {
+        socket.emit('drain');
+      },
     );
     this.emit('connection', socket);
   };
