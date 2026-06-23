@@ -67,6 +67,7 @@ Runtime_State :: struct {
 	net_servers:       map[u64]^Net_Server,
 	net_conns:         map[u64]^Net_Connection,
 	net_starved:       [dynamic]^Net_Connection, // ProactorRing conns parked on -ENOBUFS (Slice 2a)
+	net_recv_credits:  int, // buffers recycled with no parked taker — consumed by a later park (Slice 2a)
 	next_net_id:       u64,
 	// Node-style process.argv: [execPath, scriptPath, ...userArgs]. Built in eval()
 	// and read by install_process. Empty for embedders that don't set it (then

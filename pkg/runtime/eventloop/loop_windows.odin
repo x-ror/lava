@@ -319,4 +319,3 @@ platform_submit_recv_ring :: proc(
 ) -> u64 {return 0}
 platform_buf_ring_buf :: proc(loop: ^Loop, bid: u16, n: int) -> []byte {return nil}
 platform_buf_ring_recycle :: proc(loop: ^Loop, bid: u16) {}
-platform_buf_ring_available :: proc(loop: ^Loop) -> int {return 0}

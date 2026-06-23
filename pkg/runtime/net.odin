@@ -436,39 +436,52 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 	net_op_finished(conn)
 }
 
-// net_park_or_rearm handles a ProactorRing -ENOBUFS: if a buffer is available NOW (a recycle landed
-// since the kernel posted this CQE) re-arm immediately — this closes the lost-wakeup where a data
-// CQE recycled into an empty starved list just before this -ENOBUFS CQE; otherwise park to be
-// re-armed by a future recycle (net_refill_starved). No duplicate insertion.
+// NET_RECV_CREDIT_MAX caps banked refill credits at the ring size (URING_BUFRING_ENTRIES): there can
+// never be more than that many free ring buffers, so a larger bank would over-re-arm a -ENOBUFS burst.
+NET_RECV_CREDIT_MAX :: 256
+
+// net_park_or_rearm handles a ProactorRing -ENOBUFS (no ring buffer was selected). The kernel posted
+// this CQE when the ring was empty, but a buffer may have been recycled since: if a credit is banked
+// (a recycle that found no parked taker — see net_refill_starved) consume it and re-arm NOW, closing
+// the lost-wakeup; otherwise park on the starved list and take a loop-liveness ref (async_begin) so
+// the loop cannot exit with our peer's data unread — a future recycle re-arms us.
 net_park_or_rearm :: proc(conn: ^Net_Connection) {
 	if conn.closing || conn.read_done do return
-	if eventloop.recv_ring_credit(conn.loop) > 0 {
+	state := get_state_from_ctx(conn.ctx)
+	if state == nil do return
+	if state.net_recv_credits > 0 {
+		state.net_recv_credits -= 1
 		net_maybe_arm_recv(conn)
 		return
 	}
-	if conn.recv_starved do return
-	if state := get_state_from_ctx(conn.ctx); state != nil {
-		conn.recv_starved = true
-		append(&state.net_starved, conn)
-	}
+	if conn.recv_starved do return // no duplicate insertion
+	conn.recv_starved = true
+	append(&state.net_starved, conn)
+	eventloop.async_begin(conn.loop)
 }
 
-// net_refill_starved re-arms at MOST one parked conn per recycle (credit-budgeted, FIFO/round-robin),
-// so K conns parked behind N buffers drain linearly, not quadratically (no completion storm).
+// net_refill_starved is called once per recycled buffer. One recycle frees exactly one buffer, so it
+// re-arms exactly ONE parked conn (FIFO/round-robin) — re-arming all would storm (most would re-fault
+// -ENOBUFS). If nobody is parked, the freed buffer is banked as a credit (capped) for a conn that
+// parks before the next recycle.
 net_refill_starved :: proc(state: ^Runtime_State) {
-	if len(state.net_starved) == 0 do return
-	conn := state.net_starved[0]
-	if eventloop.recv_ring_credit(conn.loop) <= 0 do return // no buffer back yet — keep parked
-	ordered_remove(&state.net_starved, 0)
-	conn.recv_starved = false
-	if !conn.closing && !conn.read_done do net_maybe_arm_recv(conn)
+	if len(state.net_starved) > 0 {
+		conn := state.net_starved[0]
+		ordered_remove(&state.net_starved, 0)
+		conn.recv_starved = false
+		eventloop.async_cancel(conn.loop) // drop the parked liveness ref
+		if !conn.closing && !conn.read_done do net_maybe_arm_recv(conn)
+		return
+	}
+	if state.net_recv_credits < NET_RECV_CREDIT_MAX do state.net_recv_credits += 1
 }
 
 // net_unpark removes a conn from the starved list before it is freed (lifetime safety: a later
-// recycle must never walk a freed conn).
+// recycle must never walk a freed conn), releasing its liveness ref.
 net_unpark :: proc(state: ^Runtime_State, conn: ^Net_Connection) {
 	if !conn.recv_starved do return
 	conn.recv_starved = false
+	eventloop.async_cancel(conn.loop)
 	for c, i in state.net_starved {
 		if c == conn {
 			ordered_remove(&state.net_starved, i)
@@ -942,7 +955,10 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 			net_unprotect(conn.ctx, conn.on_error)
 			net_unprotect(conn.ctx, conn.on_drain)
 			conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
-			conn.recv_starved = false // the whole starved list is cleared after this loop
+			if conn.recv_starved {
+				conn.recv_starved = false // the whole starved list is cleared after this loop
+				eventloop.async_cancel(conn.loop) // balance the parked liveness ref
+			}
 			if !conn.closing {
 				// Not yet closing: wake any op pending on an idle peer + cancel for promptness.
 				conn.closing = true

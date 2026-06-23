@@ -1310,12 +1310,6 @@ recv_ring_recycle :: proc(loop: ^Loop, bid: u16) {
 	platform_buf_ring_recycle(loop, bid)
 }
 
-// recv_ring_credit is the number of buffers currently available in the ring — the budget for
-// re-arming connections parked on -ENOBUFS (re-arm at most this many per refill to avoid a storm).
-recv_ring_credit :: proc(loop: ^Loop) -> int {
-	return platform_buf_ring_available(loop)
-}
-
 // submit_recv queues a RECV of up to len(buf) bytes from fd into buf; cb fires with the byte
 // count (or -errno) on completion. Returns OP_ID_INVALID if cb is nil, the proactor is
 // unavailable, or the SQE could not be obtained (caller falls back to the readiness path).

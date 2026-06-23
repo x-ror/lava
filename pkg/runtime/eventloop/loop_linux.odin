@@ -91,14 +91,14 @@ Platform_Loop :: struct {
 	// picks from for BUFFER_SELECT RECVs, so an idle connection holds no per-conn read buffer.
 	// bufring_ok gates the ring-recv path (else callers use the 1b per-conn buffer). `bufring` is a
 	// page-aligned mmap of N Uring_Buf entries (the kernel overlays the producer `tail` on bufs[0]);
-	// `bufring_tail` is our running producer index; `bufring_avail` is ring occupancy (for the
-	// -ENOBUFS refill budget). See docs/io-uring-proactor.md (Slice 2).
+	// `bufring_tail` is our running producer index. The -ENOBUFS refill budget is tracked at the net
+	// layer (a recycle-driven credit), NOT here — a userspace ring-occupancy count can't see the
+	// kernel's consumer head and so can't be a reliable credit. See docs/io-uring-proactor.md (Slice 2).
 	bufring_ok:   bool,
 	bufring:      rawptr,
 	bufring_size: uint,
 	bufring_pool: []byte,
 	bufring_tail: u16,
-	bufring_avail: int,
 }
 
 platform_name :: proc(loop: ^Loop) -> string {
@@ -447,11 +447,10 @@ drain_uring_completions :: proc(loop: ^Loop) {
 					uring_op_release_slot(loop, index)
 					if slot.recv_cb != nil {
 						// Provided-buffer-ring RECV: decode the kernel-selected buffer id from the
-						// CQE flags (a bit_set — transmute to u32 before the >>16). A buffer left the
-						// ring (avail--); the callback copies it and recycles it (avail++).
+						// CQE flags (a bit_set — transmute to u32 before the >>16). The callback copies
+						// the bytes then recycles the buffer.
 						has_buf := .BUFFER in cqe.flags
 						bid := u16(transmute(u32)cqe.flags >> 16)
-						if has_buf do loop.platform.bufring_avail -= 1
 						slot.recv_cb(loop, slot.user_data, cqe.res, bid, has_buf)
 					} else if slot.callback != nil {
 						slot.callback(loop, slot.user_data, cqe.res)
@@ -856,6 +855,16 @@ buf_ring_add :: proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
 	(cast(^u16)(base + 12))^ = bid // bytes 12..13
 }
 
+// buf_ring_add :: #force_inline proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
+// 	ring := cast([^]Uring_Buf)loop.platform.bufring
+
+// 	entry := &ring[idx]
+// 	entry.addr = addr
+// 	entry.len  = length
+// 	entry.bid  = bid
+// 	entry.resv = 0
+// }
+
 // buf_ring_publish_tail release-stores our producer index into the overlaid tail (bytes 14..15),
 // so the buffer-entry writes are visible to the kernel before it observes the new tail.
 buf_ring_publish_tail :: proc(loop: ^Loop) {
@@ -888,7 +897,6 @@ buf_ring_init :: proc(loop: ^Loop) -> bool {
 	}
 	loop.platform.bufring_tail = u16(URING_BUFRING_ENTRIES)
 	buf_ring_publish_tail(loop)
-	loop.platform.bufring_avail = URING_BUFRING_ENTRIES
 	reg := Uring_Buf_Reg {
 		ring_addr    = u64(uintptr(ring_ptr)),
 		ring_entries = u32(URING_BUFRING_ENTRIES),
@@ -934,7 +942,6 @@ platform_buf_ring_recycle :: proc(loop: ^Loop, bid: u16) {
 	)
 	loop.platform.bufring_tail += 1
 	buf_ring_publish_tail(loop)
-	loop.platform.bufring_avail += 1
 }
 
 // platform_buf_ring_buf returns the kernel-selected bytes for `bid` (the caller copies, does NOT retain).
@@ -945,7 +952,6 @@ platform_buf_ring_buf :: proc(loop: ^Loop, bid: u16, n: int) -> []byte {
 	return loop.platform.bufring_pool[off:off + m]
 }
 
-platform_buf_ring_available :: proc(loop: ^Loop) -> int {return loop.platform.bufring_avail}
 platform_bufring_ok :: proc(loop: ^Loop) -> bool {return loop.platform.bufring_ok}
 
 // platform_submit_recv_ring stages a single-shot BUFFER_SELECT RECV (no per-conn buffer — the kernel
