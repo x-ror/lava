@@ -156,7 +156,10 @@ Connections become **full proactor** (recv op + send op, no readiness watcher) w
     per-chunk copy, Critical 2) and call `on_data`. If a handler did not close and reads are not
     paused, re-arm `submit_recv` (count only a valid id; on failure → error-and-close, Major 4).
   - `res == 0` → `on_end` (true half-close; do not re-arm).
-  - `res < 0 && res != -ECANCELED` → `on_error` + `net_close_conn`.
+  - `res < 0`: `-ECANCELED` is teardown (no error — handled by `op_finished`); **`-EINTR`/
+    `-EAGAIN` are transient → re-submit the same recv** (the nonblocking-socket retry the
+    readiness path already does for `EINTR`/`EAGAIN`, count only a valid id); any other negative
+    → `on_error` + `net_close_conn`.
 - **End every completion with `op_finished(conn)`** = `inflight -= 1`; `maybe_free(conn)` — the
   LAST action, after all JS calls and all `conn.*` access (Critical 3). A synchronous
   `socket.destroy()` inside `on_data` sets `closing` and runs `maybe_free` while this op is still
@@ -175,7 +178,8 @@ Connections become **full proactor** (recv op + send op, no readiness watcher) w
     `want_drain` emit **`drain`** (below); if `read_paused` re-arm recv; if `end_after_drain`
     close.
   - `res == 0` on a non-empty submission → no-progress → treat as error + close (Minor 11).
-  - `res < 0 && != -ECANCELED` → `on_error` + close.
+  - `res < 0`: `-ECANCELED` is teardown; **`-EINTR`/`-EAGAIN` → re-submit `active_send[off:]`**
+    (transient retry, same backing); any other negative → `on_error` + close.
 - Trailing `op_finished(conn)` as for reads.
 
 ### Backpressure & drain (Major 8)
@@ -226,7 +230,9 @@ moat is a Slice-2 result. (16 KiB is a measured starting point, tunable.)
 4. Exactly one free per conn; `maybe_free` is idempotent and reached once.
 5. JS handlers fire only while `!closing`, except `on_close`, which fires once at finalization
    after the fd is closed (and is suppressed on silent shutdown).
-6. `-ECANCELED` is never surfaced as a socket error.
+6. `-ECANCELED` is teardown (never a socket error), and transient `-EINTR`/`-EAGAIN`
+   completions are retried (re-submit), not surfaced as fatal — only other negatives close the
+   connection.
 7. Failed submits are not counted (no inflated refcount / stalled conn); they fall back or close.
 8. Teardown always reaches `maybe_free`, and a pending op on an idle peer is woken by
    `shutdown(SHUT_RDWR)` so it cannot pin the conn/loop forever.
