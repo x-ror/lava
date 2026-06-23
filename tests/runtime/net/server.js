@@ -5,7 +5,16 @@
 const net = require('node:net');
 
 const server = net.createServer((socket) => {
-  socket.on('data', (chunk) => socket.write(chunk));
+  socket.on('data', (chunk) => {
+    // Reentrant teardown coverage: destroy() from INSIDE the 'data' handler exercises the
+    // proactor's free-under-completion path (the inflight guard must keep the conn alive until
+    // the completion returns). Marker-driven so the parity output stays deterministic.
+    if (chunk.length >= 7 && chunk.toString('latin1', 0, 7) === 'DESTROY') {
+      socket.destroy();
+      return;
+    }
+    socket.write(chunk);
+  });
   socket.on('end', () => socket.end());
   socket.on('error', () => {}); // ignore peer resets — the client drives teardown
 });

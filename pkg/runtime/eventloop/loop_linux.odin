@@ -108,8 +108,13 @@ platform_init :: proc(loop: ^Loop) -> bool {
 	if uring_err == nil {
 		loop.platform.use_uring = true
 		// Gate the proactor on an actual RECV/SEND opcode probe (see proactor_ok): a successful
-		// ring setup does not imply these ops exist on this kernel.
-		loop.platform.proactor_ok = uring_probe_proactor(loop.platform.ring.fd)
+		// ring setup does not imply these ops exist on this kernel. ALSO require FAST_POLL: without
+		// it a RECV on a nonblocking socket with no data completes immediately with -EAGAIN, and
+		// net.odin's transient-retry would busy-spin. With FAST_POLL the kernel arms its own
+		// internal poll past the initial EAGAIN — the assumption the retry path relies on. Lacking
+		// either, fall back to the readiness path.
+		loop.platform.proactor_ok =
+			uring_probe_proactor(loop.platform.ring.fd) && .FAST_POLL in loop.platform.ring.features
 		// Bind the watcher table to the loop allocator (set before platform_init), so
 		// it does not adopt the allocator of whatever first appends to it.
 		loop.platform.watch_slots = make([dynamic]Uring_Watch_Slot, loop.allocator)
@@ -339,11 +344,14 @@ platform_poll :: proc(loop: ^Loop, timeout_ms: int) {
 
 platform_poll_uring :: proc(loop: ^Loop, timeout_ms: int) {
 	if timeout_ms == 0 {
-		// Non-blocking tick: flush any SQEs staged by uring_arm_rw (op submissions) before
-		// reaping. uring.submit only issues io_uring_enter when SQEs are actually pending
-		// (sq_ring_needs_enter), so this is free when nothing is staged. The timeout>0 path
-		// below flushes via its waiting submit(1, ts), so both paths submit before they sleep.
-		uring.submit(&loop.platform.ring, 0, nil)
+		// Non-blocking tick: flush SQEs staged by uring_arm_rw before reaping. This ring is NOT
+		// SQPOLL, so uring.submit would io_uring_enter even with nothing staged (sq_ring_needs_enter
+		// returns true unconditionally without SQPOLL) — gate on sq_ready so a tick that staged no
+		// socket op pays no extra syscall. (copy_cqes reads the CQ ring directly; it needs no
+		// submit to observe completions.) The timeout>0 path flushes via its waiting submit(1, ts).
+		if uring.sq_ready(&loop.platform.ring) > 0 {
+			uring.submit(&loop.platform.ring, 0, nil)
+		}
 		drain_uring_completions(loop)
 		return
 	}

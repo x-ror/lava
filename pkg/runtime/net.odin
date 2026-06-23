@@ -4,6 +4,7 @@ package lava_runtime
 import "base:runtime"
 import "core:c"
 import "core:net"
+import "core:os"
 import "core:sys/linux"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
@@ -295,7 +296,7 @@ net_start_cb :: proc "c" (
 	// becomes .Proactor ONLY on a successful submit; if the proactor is unavailable or no SQE
 	// can be obtained, free the landing buffer and fall back to the readiness watcher so the
 	// connection still works (Major 4 — never count a failed submit; mode set only on success).
-	if eventloop.proactor_available(conn.loop) {
+	if !net_force_readiness() && eventloop.proactor_available(conn.loop) {
 		conn.recv_buf = make([]byte, NET_PROACTOR_RECV, context.allocator)
 		id := eventloop.submit_recv(conn.loop, conn.fd, conn.recv_buf, on_recv_complete, on_op_dispose, conn)
 		if id != eventloop.OP_ID_INVALID {
@@ -315,8 +316,32 @@ net_start_cb :: proc "c" (
 		callback  = conn_read_cb,
 		user_data = conn,
 	}
-	eventloop.watch_fd(conn.loop, &conn.watcher)
+	// If the watcher can't be registered (loop resource exhaustion), the conn has an open fd and
+	// protected handlers but no I/O — tear it down rather than strand it. (Rare; the handlers are
+	// already registered, so 'close' still reports the failure to a listener attached this tick.)
+	if !eventloop.watch_fd(conn.loop, &conn.watcher) {
+		net_emit_error(conn, "could not register connection with the event loop")
+		net_close_conn(conn, true)
+	}
 	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// net_force_readiness reports whether LAVA_NET_FORCE_READINESS is set — a TEST-ONLY switch that
+// makes every connection take the epoll/readiness fallback instead of the proactor, so CI can
+// exercise both backends on the same (proactor-capable) kernel. Read once and cached.
+@(private = "file")
+net_force_readiness_state: enum u8 {
+	Unknown,
+	No,
+	Yes,
+}
+
+net_force_readiness :: proc() -> bool {
+	if net_force_readiness_state == .Unknown {
+		net_force_readiness_state =
+			os.get_env("LAVA_NET_FORCE_READINESS", context.temp_allocator) != "" ? .Yes : .No
+	}
+	return net_force_readiness_state == .Yes
 }
 
 // --- proactor (io_uring completion) connection I/O ---------------------------
@@ -585,6 +610,7 @@ net_write_cb :: proc "c" (
 		append(&conn.write_queue, ..view)
 	}
 	backpressured := net_flush(conn)
+	if backpressured do conn.want_drain = true // owe a 'drain' once the queue empties
 	return jsc.JSValueMakeBoolean(ctx, b32(!backpressured))
 }
 
@@ -612,6 +638,14 @@ net_flush :: proc(conn: ^Net_Connection) -> (backpressured: bool) {
 	// Drained. Restore read interest only if the read side is still open; after a read
 	// EOF (read_done) the socket is write-only and about to close.
 	if conn.writing && !conn.read_done do net_set_mode(conn, .Read)
+	// Fire the owed 'drain' (readiness parity with the proactor path) so a JS writer that
+	// stopped on write()==false resumes. Reentrancy-safe: clear before emit (the listener may
+	// write again — re-arming want_drain — or destroy()), then bail if it closed us.
+	if conn.want_drain {
+		conn.want_drain = false
+		net_emit(conn.ctx, conn.on_drain, nil, 0)
+		if conn.closing do return false
+	}
 	if conn.end_after_drain do net_close_conn(conn, false)
 	return false
 }
@@ -779,7 +813,7 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 	if state == nil do return
 	context = runtime.default_context() // alloc/free conns + buffers on the default heap (see net_maybe_free)
 	// net_maybe_free deletes a freed proactor conn from net_conns, so iterate a snapshot.
-	conns := make([dynamic]^Net_Connection, 0, len(state.net_conns), context.temp_allocator)
+	conns := make([dynamic]^Net_Connection, 0, len(state.net_conns))
 	defer delete(conns)
 	for _, conn in state.net_conns do append(&conns, conn)
 	for conn in conns {

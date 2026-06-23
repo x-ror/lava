@@ -29,6 +29,7 @@
     EventEmitter.call(this);
     this._id = id;
     this.destroyed = false;
+    this._closeEmitted = false;
     this.writableEnded = false;
     this.readableEnded = false;
   }
@@ -78,13 +79,20 @@
 
   Socket.prototype.destroy = function () {
     if (this.destroyed) return this;
+    // Mark destroyed SYNCHRONOUSLY (Node parity): a write() after destroy() must be rejected
+    // with an error, not silently discarded — the proactor path defers the native 'close'
+    // until its in-flight CQEs drain, so we cannot wait for _onClose to set this.
+    this.destroyed = true;
     native.close(this._id);
     return this;
   };
 
-  // Called by the native onClose handler: mark destroyed and emit 'close' once.
+  // Called by the native onClose handler: emit 'close' EXACTLY once. destroyed may already be
+  // set by a synchronous destroy(), so guard on a separate _closeEmitted flag rather than
+  // destroyed (otherwise a destroy()-initiated close would never emit the event).
   Socket.prototype._onClose = function (hadError) {
-    if (this.destroyed) return;
+    if (this._closeEmitted) return;
+    this._closeEmitted = true;
     this.destroyed = true;
     this.emit('close', !!hadError);
   };

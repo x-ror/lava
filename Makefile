@@ -193,9 +193,11 @@ test-fetch-smoke: build
 
 test-net-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-net-smoke.sh
+	LAVA_BIN="$(LAVA)" LAVA_NET_FORCE_READINESS=1 ./scripts/run-net-smoke.sh
 
 test-http-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-http-smoke.sh
+	LAVA_BIN="$(LAVA)" LAVA_NET_FORCE_READINESS=1 ./scripts/run-http-smoke.sh
 
 # bench runs the micro/macro benchmarks node-vs-Lava and prints a ratio table; it never
 # fails on timing (report-only). bench-gate adds --gate, enforcing the per-benchmark
