@@ -230,6 +230,7 @@ net_listen_cb :: proc "c" (
 // read is armed only once JS registers handlers via startConnection, which closes the
 // window where data could arrive before the Socket exists. Loop thread.
 net_accept_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	context = runtime.default_context() // allocate Net_Connection on the heap net_maybe_free frees with
 	server := cast(^Net_Server)user_data
 	if server == nil || server.closing do return
 	state := get_state_from_ctx(server.ctx)
@@ -469,6 +470,11 @@ on_op_dispose :: proc(user_data: rawptr) {
 // conn is dropped from the registry before any JS runs so a reentrant destroy() can't re-enter.
 net_maybe_free :: proc(conn: ^Net_Connection) {
 	if !conn.closing || conn.inflight > 0 do return
+	// Pin the default heap: recv_buf/active_send/pending_writes are allocated under
+	// runtime.default_context (the proc"c" entry points) and the conn under net_accept_cb's
+	// (also default) context, so free them the same way regardless of the ambient context when
+	// this runs (e.g. net_shutdown_active / an Op_Dispose during eventloop.destroy).
+	context = runtime.default_context()
 	linux.close(linux.Fd(conn.fd))
 	if state := get_state_from_ctx(conn.ctx); state != nil do delete_key(&state.net_conns, conn.id)
 	if !conn.silent_close {
@@ -480,7 +486,7 @@ net_maybe_free :: proc(conn: ^Net_Connection) {
 	net_unprotect(conn.ctx, conn.on_close)
 	net_unprotect(conn.ctx, conn.on_error)
 	net_unprotect(conn.ctx, conn.on_drain)
-	delete(conn.recv_buf, context.allocator)
+	delete(conn.recv_buf)
 	delete(conn.active_send)
 	delete(conn.pending_writes)
 	free(conn)
@@ -731,7 +737,8 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 	net_unprotect(conn.ctx, conn.on_end)
 	net_unprotect(conn.ctx, conn.on_close)
 	net_unprotect(conn.ctx, conn.on_error)
-	conn.on_data, conn.on_end, conn.on_close, conn.on_error = nil, nil, nil, nil
+	net_unprotect(conn.ctx, conn.on_drain) // net.js always registers onDrain, even on readiness
+	conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
 
 	if state := get_state_from_ctx(conn.ctx); state != nil do delete_key(&state.net_conns, conn.id)
 	eventloop.async_begin(conn.loop)
@@ -739,6 +746,7 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 }
 
 net_conn_free_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	context = runtime.default_context() // free with the same heap net_accept_cb/proc"c" allocated under
 	conn := cast(^Net_Connection)user_data
 	delete(conn.write_queue)
 	free(conn)
@@ -769,19 +777,17 @@ net_server_free_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 // dropped with the async_queue at eventloop.destroy (their pointers never dereferenced).
 net_shutdown_active :: proc(state: ^Runtime_State) {
 	if state == nil do return
+	context = runtime.default_context() // alloc/free conns + buffers on the default heap (see net_maybe_free)
 	// net_maybe_free deletes a freed proactor conn from net_conns, so iterate a snapshot.
 	conns := make([dynamic]^Net_Connection, 0, len(state.net_conns), context.temp_allocator)
 	defer delete(conns)
 	for _, conn in state.net_conns do append(&conns, conn)
 	for conn in conns {
-		if conn.closing do continue
 		if conn.io_mode == .Proactor {
-			// Mark + unprotect now (no JS at shutdown), wake any op pending on an idle peer,
-			// cancel, then net_maybe_free: a zero-inflight conn (e.g. after a peer EOF — no op,
-			// hence no disposer) is finalized here; a conn with live ops is freed by its
-			// Op_Dispose during eventloop.destroy, which the deferred teardown runs BEFORE
-			// destroy_runtime_state deletes net_conns (so the disposer's delete_key is valid).
-			conn.closing = true
+			// ALWAYS silence + unprotect the proactor conn (no JS during teardown), whether it is
+			// freshly closing or was ALREADY closing with a live op — otherwise that op's later
+			// Op_Dispose reaches net_maybe_free with silent_close==false and fires the JS 'close'
+			// mid-destroy. Clearing the handlers also makes maybe_free's unprotect a no-op.
 			conn.silent_close = true
 			net_unprotect(conn.ctx, conn.on_data)
 			net_unprotect(conn.ctx, conn.on_end)
@@ -789,12 +795,21 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 			net_unprotect(conn.ctx, conn.on_error)
 			net_unprotect(conn.ctx, conn.on_drain)
 			conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
-			linux.shutdown(linux.Fd(conn.fd), .RDWR)
-			eventloop.cancel_op(conn.loop, conn.recv_op)
-			eventloop.cancel_op(conn.loop, conn.send_op)
+			if !conn.closing {
+				// Not yet closing: wake any op pending on an idle peer + cancel for promptness.
+				conn.closing = true
+				linux.shutdown(linux.Fd(conn.fd), .RDWR)
+				eventloop.cancel_op(conn.loop, conn.recv_op)
+				eventloop.cancel_op(conn.loop, conn.send_op)
+			}
+			// Zero-inflight (e.g. post-EOF, no op/disposer) finalizes now; a live-op conn is a
+			// no-op here and is freed by its Op_Dispose during eventloop.destroy, which the
+			// deferred teardown runs BEFORE destroy_runtime_state deletes net_conns (so the
+			// disposer's delete_key stays valid).
 			net_maybe_free(conn)
 			continue
 		}
+		if conn.closing do continue // readiness: already torn down; its deferred free is dropped at destroy
 		conn.closing = true
 		eventloop.unwatch_fd(conn.loop, &conn.watcher)
 		linux.close(linux.Fd(conn.fd))
@@ -802,6 +817,7 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 		net_unprotect(conn.ctx, conn.on_end)
 		net_unprotect(conn.ctx, conn.on_close)
 		net_unprotect(conn.ctx, conn.on_error)
+		net_unprotect(conn.ctx, conn.on_drain)
 		delete(conn.write_queue)
 		free(conn)
 	}
