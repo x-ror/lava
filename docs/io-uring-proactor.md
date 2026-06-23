@@ -300,3 +300,162 @@ The fallback is **Linux** epoll/io_uring readiness. `node:net` is Linux-only; ma
 have empty bindings (`net_other.odin`) and still report `node:net` unavailable — proactor vs
 readiness is a Linux-internal choice. Non-Linux compile checks are retained to catch shared-type
 regressions.
+
+## Slice 2 — provided-buffer ring + multishot RECV (detailed design, rev. 4)
+
+The memory moat. Slice 1b gave every proactor connection its own 16 KiB `recv_buf` (~160 MiB at
+10k idle keep-alives). Slice 2 draws reads from a **shared** kernel buffer ring, so an idle
+connection holds **no** read buffer. Rev. 4 incorporates three review rounds (self-review: 6C/8M/4m;
+two external: 6 + 3C/7M). The hard-won shape:
+
+- **Slice 2a — provided-buffer ring, SINGLE-SHOT `BUFFER_SELECT` recv.** The moat. One CQE per op
+  (like 1b), so op-slot / `active_io_count` / net `inflight` accounting is UNCHANGED. Ship first.
+- **Slice 2b — multishot recv.** One submission, many CQEs — the remaining submit cut. Needs
+  `F_MORE` threaded through three layers AND a backpressure-disarm; higher risk; separate later PR.
+  Several 2b concerns below (overshoot, capability probe) are settled here but verified at 2b time.
+
+### ABI (define ourselves; `core:sys/linux` exposes opcodes/flags/CQE bits + `io_uring_register`,
+NOT these structs — as with `Uring_Probe` in 1a)
+- `Uring_Buf_Reg` (40 B, `#assert(size_of == 40)`): `ring_addr: u64, ring_entries: u32, bgid: u16,
+  flags: u16, resv: [3]u64` in EXACTLY this order. **Zero-initialize**: `flags = 0` = the
+  user-allocated-ring path (we pass `ring_addr`; NOT `IOU_PBUF_RING_MMAP`); `resv` all-zero (the
+  kernel `-EINVAL`s unknown flags / non-zero resv — the `Uring_Probe` zeroing trap). Any non-`.NONE`
+  errno → fall back (no crash).
+- `Uring_Buf` (16 B, `#assert(size_of == 16)`): `addr: u64, len: u32, bid: u16, resv: u16`.
+- Ring = `ring_entries` × `Uring_Buf`; the kernel **overlays the producer `tail` (u16) on
+  `bufs[0]`'s `resv` (bytes 14..15)**. `ring_entries` power of two; `mask = ring_entries - 1`.
+- SQE `buf_group`/`buf_index` are a `#raw_union`; set `buf_group` only.
+
+### Buffer-id decode
+`cqe.flags` is `bit_set[…; u32]`, not an int. `f := transmute(u32)cqe.flags; has_buf := .BUFFER in
+cqe.flags; bid := u16(f >> 16)`. A `res > 0` CQE WITHOUT `BUFFER` selected no buffer → error (don't
+read `pool[bid]`). Always validate `bid < N`.
+
+### Pool + ring setup (loop init, gated)
+- Pool: `N` × `M` (start `256 × 16 KiB` = 4 MiB, **independent of conn count**; tunable). One
+  contiguous alloc; `bid` → `pool[bid*M : bid*M+M]`.
+- Ring: **page-aligned** (`mmap`/`posix_memalign(PAGE_SIZE, N*16)`) — mandatory; assert
+  `ring_addr % PAGE_SIZE == 0`.
+- `buf_ring_add(idx, addr, len, bid)` writes ONLY 14 bytes (`addr`/`len`/`bid`), never `resv`
+  (bytes 14..15 = the overlaid `tail`). Seed via `buf_ring_add` for all `N`, then publish `tail = N`
+  with a **release** store; recycle uses the same helper — a full 16-byte struct store never occurs.
+- **Require `IORING_FEAT_NODROP`** for ring mode (else fall back): on a NODROP kernel a CQ that
+  fills is DEFERRED (kernel overflow list), not dropped — so a recv CQE (and its provided buffer) is
+  never silently lost. Size CQ generously for the full burst (recv + send + cancel + wakeup + poll),
+  not just `N`; treat CQSIZE as a perf safeguard, and monitor the CQ-overflow counter — CQ depth ≥ N
+  alone is NOT a leak proof (it ignores the other CQE sources).
+
+### Recv submission
+- 2a (single-shot): `IORING_OP_RECV`, `addr = 0`, `len = 0`, `buf_group = BGID`,
+  `IOSQE.BUFFER_SELECT`, token in `user_data`. A NEW arm path, not `uring_arm_rw`.
+- 2b (multishot): same SQE PLUS `sqe.ioprio |= IORING_RECV_MULTISHOT` — the recv-multishot flag is
+  an **`ioprio`** flag, NOT `msg_flags` (which is recv(2) `MSG_*`). The Odin `RECVSEND` set maps to
+  `ioprio`.
+
+### Completion handling (2a) — ORDER IS LOAD-BEARING
+Per CQE, in this exact order:
+1. Decode `has_buf`/`bid`/`res`; validate `bid < N`.
+2. If `has_buf` and `res > 0`: **copy `pool[bid][:res]` into a JSC-owned `Uint8Array` NOW**, while
+   we still own the buffer (never no-copy). If `closing`, skip the copy.
+3. If `has_buf`: **recycle `bid`** (`buf_ring_add` + release-store `tail+1`) — UNCONDITIONALLY,
+   even when `closing`/error/EOF. Recycle is a pure pool op (no JS reentrancy). Then run the wake
+   scheduler (below).
+   > Critical ordering: copy BEFORE recycle. Once `tail+1` is published the kernel may immediately
+   > overwrite `pool[bid]`; recycling first would corrupt the copy and could disclose another
+   > connection's bytes. And recycle must NOT be gated by `closing`, or a data CQE racing
+   > `net_close_conn` leaks its buffer → the ring drains → every conn wedges on `-ENOBUFS`.
+4. If `!conn.closing`: `res > 0` → `on_data(the copy)`; `res == 0` → EOF; `res == -ENOBUFS` → park
+   (below); other `res < 0` (not `-ECANCELED`) → `on_error` + close. Re-arm a fresh single-shot
+   recv unless paused/EOF/closing. One CQE per op → slot/`active_io_count`/`inflight` release as in
+   1b (no accounting change in 2a).
+
+### `-ENOBUFS` refill scheduler — event-driven, lifetime-safe, fair (2a)
+On `-ENOBUFS` no buffer was selected; a ring conn holds none, so it can't self-recycle — the ring
+refills only when OTHER conns' data CQEs recycle. Design:
+- Track `available` (buffers currently in the ring): `++` on recycle, `--` when the kernel selects
+  one (a `has_buf` CQE).
+- **Park** a starved conn on a list with an explicit `recv_starved` flag (**no duplicate insertion**).
+  Before parking, **re-check `available > 0` and re-arm immediately instead of parking** — this
+  closes the lost-wakeup where a data CQE recycled (empty list → no wake) just before the `-ENOBUFS`
+  CQE is processed.
+- **Lifetime:** a parked conn is referenced by the list. `net_close_conn`/`net_shutdown_active`
+  MUST remove it from the list (clear `recv_starved`) before `net_maybe_free`, or a later recycle
+  walks a freed conn (UAF). Parking keeps the conn reachable; the loop stays alive because whoever
+  holds the buffers has live ops.
+- **Fair, budgeted wake:** on recycle, wake at most the **buffer credit** that became available
+  (one recycle → wake one parked conn), not the whole list — else with K readable conns and N≪K,
+  one recycle re-arms all K, most re-`-ENOBUFS`, approaching quadratic CQE work. Round-robin the
+  list. Run the scheduler after BOTH a recycle and a park.
+- Size `N ≥ expected concurrent active conns`; undersizing degrades to latency (parking), not a
+  spin. The stress test asserts **bounded CPU** at large-K/small-N, plus buffer conservation.
+
+### Multishot (2b) — `F_MORE` lifetime + backpressure + capability
+- **Three-layer `F_MORE`:** the op/slot, `active_io_count`, net `recv_op`, net `inflight` are
+  one-per-op and release/clear **exactly once on the `F_MORE`-clear (terminal) CQE**, never per
+  intermediate CQE. Requires: (1) `Op_Completion` carries `more`+`bid`+`has_buf`; (2) the drain
+  op-branch releases slot + drops `active_io_count` only when `!more`; (3) net `on_recv_complete`
+  clears `recv_op`/re-arms/`net_op_finished` only on the terminal CQE. A terminal CQE may STILL
+  carry a buffer → copy(if res>0)+recycle it regardless. `-ENOBUFS`/`-ECANCELED` are terminal.
+- **Backpressure is a BOUNDED OVERSHOOT, not a hard stop.** At `NET_WRITE_HWM`, `cancel_op` the
+  multishot to disarm + re-submit from the drain transition. But CQEs already posted (or racing the
+  cancel) must still be drained and may carry data → some `on_data` fire after HWM. This is a
+  **bounded** overshoot (the in-flight CQEs at cancel time), documented as such — cancellation is
+  not a strict per-byte boundary. (2a has no overshoot: it simply doesn't re-arm while paused.)
+- **Capability probe:** multishot is an `ioprio` flag, not a separately-probeable opcode — an
+  unsupported kernel ACCEPTS the SQE and returns `-EINVAL` via the CQE, after the conn committed to
+  ring mode. So **actively probe at startup** (submit a multishot recv on an `AF_UNIX` socketpair;
+  if its first CQE is `-EINVAL`, multishot is unsupported) and gate 2b on it. Defensively, treat a
+  terminal `-EINVAL` on a multishot recv as a capability failure: disable 2b globally and re-arm
+  that conn via 2a (single-shot ring) rather than closing it.
+
+### Integration with 1b — `net_is_proactor()` (do NOT add a mode that bypasses cleanup)
+Adding `.ProactorRing` to the `io_mode` enum is a HAZARD: `net_write_cb`, `net_end_cb`,
+`net_close_conn`, and `net_shutdown_active` currently test `io_mode == .Proactor` by exact equality,
+so a new value would silently take the READINESS branch and free a conn while a kernel recv is armed
+(UAF). Introduce `net_is_proactor(conn) :: conn.io_mode == .Proactor || conn.io_mode == .ProactorRing`
+and replace every `== .Proactor` send/teardown check with it (the send path + teardown are shared);
+the RECV path branches separately on the exact mode (per-conn buffer vs ring). Every
+`.ProactorRing` write/end/close/shutdown branch is tested.
+
+- Mode decided at **first submit only** (like 1b): a failed first ring recv → allocate a per-conn
+  `recv_buf` and fall back to `.Proactor`, then `.Readiness` — never strand a ring conn with no
+  buffer. A mid-life SQ-full re-arm uses submit-and-retry; only error+close if that also fails.
+- `.ProactorRing` drops `recv_buf`; send (active_send/pending_writes) + teardown unchanged from 1b
+  (the recv op counts as one `inflight` until its terminal CQE; `cancel_op` + `shutdown(SHUT_RDWR)`
+  end it with a terminal CQE), plus the starved-list removal above.
+
+### Teardown (one coherent model)
+At loop destroy, the existing path closes the io_uring fd (`uring.destroy`), which **implicitly
+deregisters** the buf_ring and tears down in-flight ops (their `Op_Dispose` runs). So: dispose op
+slots → close the ring fd (implicit `UNREGISTER_PBUF_RING`) → THEN `munmap` the ring + free the
+pool (after the fd is closed the kernel can no longer touch them). Do NOT attempt an explicit
+`UNREGISTER_PBUF_RING` after the fd is closed (impossible) or before draining live recvs.
+
+### Safety invariants (verification checklist)
+1. Per CQE the order is copy(if delivering, while owned) → recycle(unconditional) → JS; a buffer is
+   never read after its `tail+1` is published, and never handed to JSC no-copy.
+2. Every CQE carrying a buffer recycles its `bid` exactly once regardless of conn state; `bid < N`;
+   a `res>0` CQE without `BUFFER` is an error, not a `pool[bid]` read.
+3. `tail` advances via a release store from the single loop thread; `buf_ring_add` writes 14 bytes,
+   never the overlaid tail (incl. `idx == 0`).
+4. The starved list: no duplicate insertion; park re-checks `available` first (no lost wakeup);
+   `net_close_conn`/shutdown remove a conn before freeing it (no UAF); wake is buffer-credit-budgeted
+   and round-robin (no completion storm); `-ENOBUFS` never drops a conn and never spins.
+5. Ring/pool freed only AFTER the ring fd is closed (implicit dereg); never while registered.
+6. (2b) op slot / `active_io_count` / `recv_op` / `inflight` release exactly once on the terminal
+   CQE; a terminal CQE still recycles+delivers its buffer; backpressure disarms with a documented
+   bounded overshoot; the multishot ioprio flag + the startup capability probe + `-EINVAL` fallback.
+7. `.ProactorRing` takes proactor (not readiness) cleanup everywhere via `net_is_proactor`; all 1b
+   connection invariants still hold; 2a changes only the buffer source.
+8. Ring mode requires `IORING_FEAT_NODROP`; CQ overflow is deferred, not dropped (no buffer loss).
+
+### Gating / tests
+Probe `REGISTER_PBUF_RING` (≈5.19) + `IORING_FEAT_NODROP` + (2b) the active multishot socketpair
+probe; fall back 2b→2a→1b→readiness. `#assert` struct sizes. Deterministic tests: N=1 rapid reuse
+with byte-integrity; close/destroy while parked on the starved list; data-CQE-before-`-ENOBUFS`
+lost-wakeup ordering; large-K/tiny-N bounded-CPU + buffer-conservation (`seeded == in-ring +
+in-flight + held`); unsupported-multishot fallback (2b→2a); CQEs queued before a backpressure
+cancel completes; destroy with live ring ops + register-failure cleanup; every `.ProactorRing`
+write/end/close/shutdown branch; the `LAVA_NET_FORCE_READINESS` dual-mode smokes extended to force
+each read path; the crash guard; and `bench-http` **mem/idle-conn** (the moat — idle memory to ~Bun
+levels). An adversarial multi-lens review as for 1a/1b.

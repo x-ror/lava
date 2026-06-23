@@ -686,8 +686,9 @@ platform_cancel_op :: proc(loop: ^Loop, token: u64) {
 	}
 }
 
-// uring_arm_rw stages a RECV/SEND SQE for `buf` under `token` and flushes it, with the same
-// submit-and-retry on a momentarily full SQ ring as arm_uring_poll.
+// uring_arm_rw STAGES a RECV/SEND SQE for `buf` under `token` (it does NOT submit — platform_poll_uring
+// flushes the batch with one io_uring_enter before it waits/drains). If the SQ ring is momentarily
+// full it submits once to make room and retries get_sqe, like arm_uring_poll.
 uring_arm_rw :: proc(
 	loop: ^Loop,
 	opcode: linux.IO_Uring_OP,
