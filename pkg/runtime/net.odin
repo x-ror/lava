@@ -110,6 +110,8 @@ Net_Connection :: struct {
 	silent_close:    bool, // teardown at loop shutdown: free without firing 'close'
 	had_error:       bool, // sticky: set true by any net_close_conn(.., true)
 	recv_starved:    bool, // ProactorRing: on the state.net_starved_* FIFO after -ENOBUFS (no ring buffer)
+	recv_multishot:  bool, // ProactorRing: the live recv_op was armed multishot (attributes its -EINVAL)
+	recv_cancel_pending: bool, // ProactorRing: a backpressure cancel is queued for recv_op (suppresses dup cancels)
 	starved_next:    ^Net_Connection, // intrusive starved-FIFO links (valid only while recv_starved)
 	starved_prev:    ^Net_Connection,
 }
@@ -388,6 +390,11 @@ net_maybe_arm_recv :: proc(conn: ^Net_Connection) -> bool {
 	if conn.io_mode == .ProactorRing {
 		// Shared ring: no per-conn buffer; the kernel picks one at completion (net_recv_ring_complete).
 		id = eventloop.submit_recv_ring(conn.loop, conn.fd, net_recv_ring_complete, on_op_dispose, conn)
+		// Record THIS op's submission mode so its completion can attribute a -EINVAL correctly: a
+		// multishot op's -EINVAL means "kernel lacks RECV_MULTISHOT" (fall back); a single-shot op's
+		// -EINVAL is a genuine error (close), never a capability signal to re-arm into a loop.
+		conn.recv_multishot = eventloop.recv_ring_multishot(conn.loop)
+		conn.recv_cancel_pending = false // a fresh op has no backpressure cancel outstanding
 	} else {
 		id = eventloop.submit_recv(conn.loop, conn.fd, conn.recv_buf, on_recv_complete, on_op_dispose, conn)
 	}
@@ -411,7 +418,10 @@ net_maybe_arm_recv :: proc(conn: ^Net_Connection) -> bool {
 net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32, bid: u16, has_buf: bool, more: bool) {
 	context = runtime.default_context()
 	conn := cast(^Net_Connection)user_data
-	if !more do conn.recv_op = eventloop.OP_ID_INVALID // terminal: this op is finished
+	if !more {
+		conn.recv_op = eventloop.OP_ID_INVALID // terminal: this op is finished
+		conn.recv_cancel_pending = false // any backpressure cancel for this op is now consumed
+	}
 
 	// (1) copy BEFORE recycle (recycling republishes the buffer; the kernel may overwrite it).
 	arg: jsc.JSValueRef = nil
@@ -435,8 +445,12 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 		} else if res == 0 {
 			conn.read_done = true // EOF (always terminal — F_MORE clear)
 			net_emit(conn.ctx, conn.on_end, nil, 0)
-		} else if res == -i32(linux.Errno.EINVAL) {
-			eventloop.disable_multishot(loop) // kernel has buffer rings but not RECV_MULTISHOT — single-shot from now
+		} else if res == -i32(linux.Errno.EINVAL) && conn.recv_multishot {
+			// This op was submitted MULTISHOT and the kernel rejected it (has buffer rings but not
+			// RECV_MULTISHOT, e.g. Linux 5.19): disable multishot loop-wide; the terminal re-arm below
+			// re-arms this conn single-shot. A single-shot -EINVAL is NOT this — it falls through to the
+			// fatal branch (close), so a genuine error can never re-arm into an -EINVAL loop.
+			eventloop.disable_multishot(loop)
 		} else if res == -i32(linux.Errno.ENOBUFS) || res == -i32(linux.Errno.EINTR) ||
 		   res == -i32(linux.Errno.EAGAIN) || res == -i32(linux.Errno.ECANCELED) {
 			// benign/transient — the terminal re-arm path below handles it
@@ -479,13 +493,18 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 // crossed the high-water mark, so a slow-writing peer can't make the kernel keep reading unboundedly
 // (2a single-shot needs none — it pauses by simply not re-arming). The cancel's terminal -ECANCELED
 // CQE drops the op; the drain transition (net_proactor_on_drained) re-arms a fresh recv once the
-// outbound buffer empties. Idempotent-safe: a redundant cancel before the terminal CQE is a harmless
-// kernel no-op (-EALREADY/-ENOENT).
+// outbound buffer empties. recv_cancel_pending suppresses duplicate cancels: this fires from on_data
+// AND from net_write_cb, and every racing CQE above the HWM would otherwise queue another ASYNC_CANCEL
+// (a syscall + an ignored CQE each). The flag is set only when a cancel was actually queued and is
+// cleared on the op's terminal CQE (net_recv_ring_complete) — and per-op (net_maybe_arm_recv), so a
+// momentarily-full SQ that dropped the cancel is retried on the next crossing.
 net_maybe_pause_multishot :: proc(conn: ^Net_Connection) {
 	if conn.io_mode != .ProactorRing || conn.closing do return
-	if conn.recv_op == eventloop.OP_ID_INVALID do return
+	if conn.recv_op == eventloop.OP_ID_INVALID || conn.recv_cancel_pending do return
 	if !eventloop.recv_ring_multishot(conn.loop) do return
-	if net_proactor_buffered(conn) >= NET_WRITE_HWM do eventloop.cancel_op(conn.loop, conn.recv_op)
+	if net_proactor_buffered(conn) >= NET_WRITE_HWM {
+		conn.recv_cancel_pending = eventloop.cancel_op(conn.loop, conn.recv_op)
+	}
 }
 
 // NET_RECV_CREDIT_MAX caps banked refill credits at the ring size: there can never be more than that

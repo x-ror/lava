@@ -306,7 +306,7 @@ platform_submit_send :: proc(
 	return 0
 }
 
-platform_cancel_op :: proc(loop: ^Loop, token: u64) {}
+platform_cancel_op :: proc(loop: ^Loop, token: u64) -> bool {return false}
 
 // Provided-buffer ring (Slice 2a) — Linux/io_uring only; no-op on windows.
 platform_bufring_ok :: proc(loop: ^Loop) -> bool {return false}

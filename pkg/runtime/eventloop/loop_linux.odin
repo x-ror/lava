@@ -404,10 +404,24 @@ platform_poll_uring :: proc(loop: ^Loop, timeout_ms: int) {
 	drain_uring_completions(loop)
 }
 
+// URING_DRAIN_CAP bounds how many completions a single drain processes. A multishot RECV on a
+// continuously-readable peer replenishes the CQ as fast as we drain it (each completion recycles a
+// ring buffer that feeds the next), so an uncapped drain could never return and would starve
+// timers/immediates/other sockets/shutdown. The cap is generous — far above the per-tick load of a
+// busy server, which drains to empty long before reaching it — so normal throughput is unthrottled;
+// it bites only under true monopolization, where we yield to the rest of run_once and the remaining
+// CQEs wait for the next tick (NODROP defers any CQ overflow — no loss).
+URING_DRAIN_CAP :: 1024
+
 drain_uring_completions :: proc(loop: ^Loop) {
-	for {
+	// Drain to empty (NOT just the entry snapshot): a closed-loop client's next request and our own
+	// send-completions land mid-drain, so picking them up here instead of deferring avoids an extra
+	// poll syscall per generation. URING_DRAIN_CAP keeps a hot multishot socket from looping forever.
+	processed := 0
+	for processed < URING_DRAIN_CAP {
 		n, err := uring.copy_cqes(&loop.platform.ring, loop.platform.cqes[:], 0)
 		if err != nil || n == 0 do return
+		processed += int(n)
 
 		for i in 0 ..< int(n) {
 			cqe := loop.platform.cqes[i]
@@ -605,13 +619,15 @@ uring_release_slot :: proc(loop: ^Loop, index: u32) {
 // the generation bump in uring_release_slot already makes any surviving completion
 // safe to drop — the cancel is the promptness optimization, not the safety net.
 // The cancel op's own completion carries URING_CANCEL_USER_DATA and is ignored.
-uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) {
+// Returns whether the cancel SQE was actually queued (false = SQ momentarily full),
+// so a caller suppressing duplicate cancels knows whether one is genuinely pending.
+uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) -> bool {
 	sqe, ok := uring.get_sqe(&loop.platform.ring)
 	if !ok {
 		// SQ ring momentarily full: submit to free slots, then retry once.
 		uring.submit(&loop.platform.ring, 0, nil)
 		sqe, ok = uring.get_sqe(&loop.platform.ring)
-		if !ok do return
+		if !ok do return false
 	}
 	// Zero the recycled SQE slot — get_sqe does not clear it (mirrors arm_uring_poll).
 	sqe^ = {}
@@ -619,6 +635,7 @@ uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) {
 	sqe.addr = target_token // match the POLL_ADD whose user_data == target_token
 	sqe.user_data = URING_CANCEL_USER_DATA
 	uring.submit(&loop.platform.ring, 0, nil)
+	return true
 }
 
 // --- Proactor completion-op submission (io_uring RECV/SEND) ---
@@ -722,11 +739,12 @@ platform_submit_send :: proc(
 // produces a terminal CQE that releases the slot and fires the callback; this just makes a
 // pending op (e.g. a RECV on a fd being closed) tear down promptly instead of lingering. The
 // generation check avoids issuing a cancel against a slot already reused for a new op.
-platform_cancel_op :: proc(loop: ^Loop, token: u64) {
-	if !loop.platform.proactor_ok do return
+platform_cancel_op :: proc(loop: ^Loop, token: u64) -> bool {
+	if !loop.platform.proactor_ok do return false
 	if uring_op_slot_live(loop, uring_op_token_index(token), uring_op_token_generation(token)) {
-		uring_cancel_poll(loop, token) // ASYNC_CANCEL(addr=token); its own CQE is ignored
+		return uring_cancel_poll(loop, token) // ASYNC_CANCEL(addr=token); its own CQE is ignored
 	}
+	return false
 }
 
 // uring_arm_rw STAGES a RECV/SEND SQE for `buf` under `token` (it does NOT submit — platform_poll_uring

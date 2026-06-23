@@ -293,6 +293,11 @@ proactor_ring_recv_recycle :: proc(t: ^testing.T) {
 	defer linux.close(sv[0])
 	defer linux.close(sv[1])
 
+	// Capability is fixed for the loop's lifetime, so the submission mode is deterministic — the
+	// test REQUIRES it to match (not "accept either"): a regression that dropped RECV_MULTISHOT on a
+	// capable kernel would surface as rec.more being false here, not silently pass as single-shot.
+	multishot := recv_ring_multishot(&loop)
+
 	rec := Ring_Rec{}
 	id := submit_recv_ring(&loop, uintptr(sv[0]), ring_on_recv, nil, &rec)
 	testing.expect(t, id != OP_ID_INVALID, "ring recv submit")
@@ -303,16 +308,18 @@ proactor_ring_recv_recycle :: proc(t: ^testing.T) {
 	testing.expect(t, rec.has_buf, "ring recv must carry a kernel-selected buffer")
 	testing.expect_value(t, rec.res, 5) // NOT 0 — the len=buffer-size guard (Linux 5.19)
 	testing.expect_value(t, string(rec.got[:rec.got_len]), "hello")
+	testing.expect_value(t, rec.more, multishot) // first delivery: intermediate iff multishot engaged
 
-	if rec.more {
+	if multishot {
 		// 2b multishot: the SAME submission delivers the next chunk (no re-arm); the op stays in
 		// flight (active_io_count still 1) across the intermediate CQE.
 		testing.expect_value(t, loop.active_io_count, 1)
 		ring_pump(t, &loop, &rec, sv[1], "world")
 		testing.expect_value(t, string(rec.got[:rec.got_len]), "world")
+		testing.expect(t, rec.more, "multishot op must stay armed (more) across the second chunk")
 		testing.expect_value(t, loop.active_io_count, 1)
 		// Cancel the still-armed multishot; its terminal CQE releases the op → count back to 0.
-		cancel_op(&loop, id)
+		testing.expect(t, cancel_op(&loop, id), "cancel of a live multishot must report a queued cancel")
 		arm_watchdog(&loop)
 		for _ in 0 ..< 64 {
 			if loop.active_io_count == 0 do break
@@ -327,4 +334,109 @@ proactor_ring_recv_recycle :: proc(t: ^testing.T) {
 		testing.expect_value(t, string(rec.got[:rec.got_len]), "world")
 	}
 	testing.expect_value(t, loop.active_io_count, 0)
+}
+
+// 10) Forced single-shot: disable_multishot (what net.odin's -EINVAL fallback calls) makes
+//     submit_recv_ring arm a SINGLE-shot ring recv even on a multishot-capable kernel. One
+//     submission then delivers exactly one chunk — a terminal CQE (more=false) that releases the op
+//     — and the len=buffer-size guard still gives the real byte count (not a false EOF). This is the
+//     path a kernel with buffer rings but no RECV_MULTISHOT (Linux 5.19) always takes.
+@(test)
+proactor_ring_forced_single_shot :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	if !bufring_available(&loop) do return
+
+	sv, sp_ok := make_socketpair(t)
+	if !sp_ok do return
+	defer linux.close(sv[0])
+	defer linux.close(sv[1])
+
+	disable_multishot(&loop)
+	testing.expect(t, !recv_ring_multishot(&loop), "disable_multishot must clear the capability")
+
+	rec := Ring_Rec{}
+	id := submit_recv_ring(&loop, uintptr(sv[0]), ring_on_recv, nil, &rec)
+	testing.expect(t, id != OP_ID_INVALID, "single-shot ring submit")
+	testing.expect_value(t, loop.active_io_count, 1)
+
+	ring_pump(t, &loop, &rec, sv[1], "hello")
+	testing.expect_value(t, rec.res, 5) // len=buffer-size guard applies to the single-shot path too
+	testing.expect_value(t, string(rec.got[:rec.got_len]), "hello")
+	testing.expect(t, !rec.more, "single-shot delivery must be terminal (more=false)")
+	testing.expect_value(t, loop.active_io_count, 0) // op released on the terminal CQE
+}
+
+// 11) CQ-drain fairness (2b): a readable multishot socket must not starve other loop work.
+//     drain_uring_completions bounds itself to the CQEs ready at entry, so a due timer still fires.
+//     (A single-threaded test can't reproduce true monopolization — that needs a peer producing
+//     CQEs *during* the drain, which the integration stress covers — but this guards the co-progress
+//     property and that the bounded drain still drains.)
+@(private = "file")
+ring_fairness_timer :: proc(loop: ^Loop, ud: rawptr) {(cast(^bool)ud)^ = true}
+
+@(test)
+proactor_ring_drain_fairness :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	if !bufring_available(&loop) do return
+	if !recv_ring_multishot(&loop) do return // the monopolization concern is multishot-specific
+
+	sv, sp_ok := make_socketpair(t)
+	if !sp_ok do return
+	defer linux.close(sv[0])
+	defer linux.close(sv[1])
+
+	rec := Ring_Rec{}
+	id := submit_recv_ring(&loop, uintptr(sv[0]), ring_on_recv, nil, &rec)
+	testing.expect(t, id != OP_ID_INVALID, "ring recv submit")
+
+	fired := false
+	set_timeout(&loop, ring_fairness_timer, 0, &fired) // already due
+	for _ in 0 ..< 8 do _, _ = linux.send(sv[1], transmute([]u8)string("ping"), {})
+
+	arm_watchdog(&loop)
+	for _ in 0 ..< 64 {
+		if fired && rec.done do break
+		run_once(&loop)
+	}
+	testing.expect(t, rec.done, "multishot recv must deliver under the bounded drain")
+	testing.expect(t, fired, "a due timer must fire even while a multishot socket is readable")
+
+	cancel_op(&loop, id)
+	arm_watchdog(&loop)
+	for _ in 0 ..< 64 {
+		if loop.active_io_count == 0 do break
+		run_once(&loop)
+	}
+	testing.expect_value(t, loop.active_io_count, 0)
+}
+
+// 12) cancel_op reports whether it actually queued a cancel: true for a live op, false for
+//     OP_ID_INVALID and for a slot that already completed. net.odin's duplicate-cancel suppression
+//     (recv_cancel_pending) relies on this to distinguish a real cancel from a no-op.
+@(test)
+proactor_cancel_reports_queued :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	if !proactor_available(&loop) do return
+
+	testing.expect(t, !cancel_op(&loop, OP_ID_INVALID), "cancel of OP_ID_INVALID must report no-op")
+
+	sv, sp_ok := make_socketpair(t)
+	if !sp_ok do return
+	defer linux.close(sv[0])
+	defer linux.close(sv[1])
+
+	rec := Proactor_Rec{}
+	id := submit_recv(&loop, uintptr(sv[0]), rec.recv_buf[:], proactor_on_recv, nil, &rec) // pending: no peer send
+	testing.expect(t, id != OP_ID_INVALID, "recv submit")
+	testing.expect(t, cancel_op(&loop, id), "cancel of a live op must report a queued cancel")
+
+	arm_watchdog(&loop) // drain the terminal -ECANCELED so the slot releases
+	for _ in 0 ..< 64 {
+		if rec.recv_done do break
+		run_once(&loop)
+	}
+	testing.expect(t, !cancel_op(&loop, id), "cancel of an already-completed op must report no-op")
 }

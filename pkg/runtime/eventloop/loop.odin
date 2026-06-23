@@ -1372,11 +1372,13 @@ submit_send :: proc(
 // closed — io_uring holds its own file reference, so closing the fd alone does NOT tear the
 // op down). Best-effort: the op still produces a terminal CQE (its own -ECANCELED, or a real
 // result that beat the cancel), which fires Op_Completion and reclaims the slot. The buffer
-// must stay valid until that terminal completion — the cancel CQE alone is not it. No-op for
-// OP_ID_INVALID or when the proactor is unavailable. LOOP-THREAD ONLY.
-cancel_op :: proc(loop: ^Loop, id: Op_ID) {
-	if id == OP_ID_INVALID do return
-	platform_cancel_op(loop, u64(id))
+// must stay valid until that terminal completion — the cancel CQE alone is not it. LOOP-THREAD
+// ONLY. Returns whether a cancel SQE was actually queued (false = OP_ID_INVALID, proactor
+// unavailable, the slot already completed, or the SQ was momentarily full), so a caller
+// suppressing duplicate cancels can distinguish a real cancel from a no-op.
+cancel_op :: proc(loop: ^Loop, id: Op_ID) -> bool {
+	if id == OP_ID_INVALID do return false
+	return platform_cancel_op(loop, u64(id))
 }
 
 // wakeup allows background worker threads to instantly kick the loop out of sleep.
