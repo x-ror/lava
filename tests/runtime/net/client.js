@@ -37,6 +37,17 @@ function once(payload) {
   }
   console.log('echo-seq', seqOk);
 
+  // Reentrant destroy: the server destroy()s from inside its 'data' handler, so the connection
+  // closes with no echo. Exercises teardown-from-callback identically on both server backends.
+  const destroyedLen = await new Promise((resolve) => {
+    const c = net.connect(PORT, '127.0.0.1', () => c.write('DESTROY-now'));
+    const chunks = [];
+    c.on('data', (d) => chunks.push(d));
+    c.on('close', () => resolve(Buffer.concat(chunks).length));
+    c.on('error', () => {}); // a server destroy() may surface as ECONNRESET; 'close' still fires
+  });
+  console.log('destroy-noecho', destroyedLen === 0);
+
   console.log('NET SMOKE OK');
 })().catch((e) => {
   console.error('client error', e && e.message);

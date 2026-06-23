@@ -4,6 +4,7 @@ package lava_runtime
 import "base:runtime"
 import "core:c"
 import "core:net"
+import "core:os"
 import "core:sys/linux"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
@@ -27,6 +28,23 @@ import eventloop "lava:pkg/runtime/eventloop"
 
 NET_READ_CHUNK :: 64 * 1024
 NET_DEFAULT_BACKLOG :: 511
+
+// Proactor (io_uring completion-mode) tunables — see docs/io-uring-proactor.md (Slice 1b).
+// A per-conn recv landing buffer is a real idle-memory cost vs the readiness path's transient
+// stack buffer (Slice 2's provided-buffer ring reclaims it), so it is smaller than NET_READ_CHUNK.
+NET_PROACTOR_RECV :: 16 * 1024
+// Outbound high-water mark: write() reports backpressure (and reads pause) only when this many
+// bytes are buffered, NOT merely because a send op is in flight (every io_uring send is async).
+NET_WRITE_HWM :: 16 * 1024
+
+// A connection's I/O backend, chosen ONCE at start: .Proactor only after a successful first
+// submit_recv, else .Readiness (the epoll-style watcher path). close/write/end/shutdown branch
+// on this, never on proactor_available or op-ID liveness (both IDs are invalid after EOF on a
+// live proactor conn).
+Net_IO_Mode :: enum u8 {
+	Readiness = 0,
+	Proactor,
+}
 
 // Net_Server owns a listening socket. on_connection is a GC-protected JS callback
 // invoked as on_connection(connId) for each accepted connection.
@@ -54,6 +72,7 @@ Net_Connection :: struct {
 	on_end:          jsc.JSObjectRef,
 	on_close:        jsc.JSObjectRef,
 	on_error:        jsc.JSObjectRef,
+	on_drain:        jsc.JSObjectRef, // proactor: fired when the outbound buffer empties
 	handlers_set:    bool,
 	// Pending outbound bytes not yet accepted by the kernel send buffer. Bound to the
 	// default heap on first append (a proc "c" runs under runtime.default_context); the
@@ -63,6 +82,23 @@ Net_Connection :: struct {
 	end_after_drain: bool, // socket.end() / read EOF: close once write_queue empties
 	read_done:       bool, // peer half-closed (read EOF) — never re-arm the read watcher
 	closing:         bool,
+	// --- proactor (io_uring completion) state; io_mode == .Proactor ---------------
+	io_mode:         Net_IO_Mode,
+	recv_buf:        []byte, // reused kernel landing zone (copied per chunk; never JSC no-copy)
+	recv_op:         eventloop.Op_ID, // live RECV (OP_ID_INVALID == none in flight)
+	send_op:         eventloop.Op_ID, // live SEND
+	// active_send is the IMMUTABLE buffer currently submitted to send_op (the op submits
+	// active_send[active_send_off:]); pending_writes is the mutable queue appends land in.
+	// Both stay [dynamic]byte (a []byte would drop the allocator/capacity) and are ROTATED
+	// (swapped + cleared), never reallocated, so a backing the kernel is reading never moves.
+	active_send:     [dynamic]byte,
+	active_send_off: int,
+	pending_writes:  [dynamic]byte,
+	inflight:        int, // submitted-but-not-completed ops; the conn outlives its ops
+	read_paused:     bool, // reads not re-armed while buffered >= NET_WRITE_HWM
+	want_drain:      bool, // write() returned backpressure; a 'drain' is owed
+	silent_close:    bool, // teardown at loop shutdown: free without firing 'close'
+	had_error:       bool, // sticky: set true by any net_close_conn(.., true)
 }
 
 // make_net_bindings builds the `native` object passed to js/internal/net.js.
@@ -195,6 +231,7 @@ net_listen_cb :: proc "c" (
 // read is armed only once JS registers handlers via startConnection, which closes the
 // window where data could arrive before the Socket exists. Loop thread.
 net_accept_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	context = runtime.default_context() // allocate Net_Connection on the heap net_maybe_free frees with
 	server := cast(^Net_Server)user_data
 	if server == nil || server.closing do return
 	state := get_state_from_ctx(server.ctx)
@@ -247,20 +284,250 @@ net_start_cb :: proc "c" (
 	conn.on_end = callback_arg(ctx, args[2])
 	conn.on_close = callback_arg(ctx, args[3])
 	conn.on_error = callback_arg(ctx, args[4])
+	if argument_count >= 6 do conn.on_drain = callback_arg(ctx, args[5])
 	net_protect(ctx, conn.on_data)
 	net_protect(ctx, conn.on_end)
 	net_protect(ctx, conn.on_close)
 	net_protect(ctx, conn.on_error)
+	net_protect(ctx, conn.on_drain)
 	conn.handlers_set = true
 
+	// Prefer the proactor: submit the first RECV directly (completion mode). The connection
+	// becomes .Proactor ONLY on a successful submit; if the proactor is unavailable or no SQE
+	// can be obtained, free the landing buffer and fall back to the readiness watcher so the
+	// connection still works (Major 4 — never count a failed submit; mode set only on success).
+	if !net_force_readiness() && eventloop.proactor_available(conn.loop) {
+		conn.recv_buf = make([]byte, NET_PROACTOR_RECV, context.allocator)
+		id := eventloop.submit_recv(conn.loop, conn.fd, conn.recv_buf, on_recv_complete, on_op_dispose, conn)
+		if id != eventloop.OP_ID_INVALID {
+			conn.io_mode = .Proactor
+			conn.recv_op = id
+			conn.inflight += 1
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+		delete(conn.recv_buf, context.allocator)
+		conn.recv_buf = nil
+	}
+
+	conn.io_mode = .Readiness
 	conn.watcher = eventloop.IO_Watcher {
 		fd        = conn.fd,
 		mode      = .Read,
 		callback  = conn_read_cb,
 		user_data = conn,
 	}
-	eventloop.watch_fd(conn.loop, &conn.watcher)
+	// If the watcher can't be registered (loop resource exhaustion), the conn has an open fd and
+	// protected handlers but no I/O — tear it down rather than strand it. (Rare; the handlers are
+	// already registered, so 'close' still reports the failure to a listener attached this tick.)
+	if !eventloop.watch_fd(conn.loop, &conn.watcher) {
+		net_emit_error(conn, "could not register connection with the event loop")
+		net_close_conn(conn, true)
+	}
 	return jsc.JSValueMakeUndefined(ctx)
+}
+
+// net_force_readiness reports whether LAVA_NET_FORCE_READINESS is set — a TEST-ONLY switch that
+// makes every connection take the epoll/readiness fallback instead of the proactor, so CI can
+// exercise both backends on the same (proactor-capable) kernel. Read once and cached.
+@(private = "file")
+net_force_readiness_state: enum u8 {
+	Unknown,
+	No,
+	Yes,
+}
+
+net_force_readiness :: proc() -> bool {
+	if net_force_readiness_state == .Unknown {
+		net_force_readiness_state =
+			os.get_env("LAVA_NET_FORCE_READINESS", context.temp_allocator) != "" ? .Yes : .No
+	}
+	return net_force_readiness_state == .Yes
+}
+
+// --- proactor (io_uring completion) connection I/O ---------------------------
+//
+// See docs/io-uring-proactor.md (Slice 1b). The connection holds an `inflight` op refcount so
+// it OUTLIVES its in-flight recv/send ops; the single free site (net_maybe_free) runs only when
+// closing && inflight == 0, so the kernel never touches a freed buffer and {callback XOR dispose}
+// fires exactly once per op. All of these run on the loop thread (op completions / disposers).
+
+// net_maybe_arm_recv is the SOLE place a RECV is submitted: at most one is ever in flight (two
+// kernel ops writing the one recv_buf would corrupt it), and never after EOF, while reads are
+// paused by backpressure, or during teardown. read_paused is recomputed here so it can't go stale.
+net_maybe_arm_recv :: proc(conn: ^Net_Connection) {
+	if conn.closing || conn.read_done do return
+	if conn.recv_op != eventloop.OP_ID_INVALID do return // a recv is already in flight
+	conn.read_paused = net_proactor_buffered(conn) >= NET_WRITE_HWM
+	if conn.read_paused do return
+	id := eventloop.submit_recv(conn.loop, conn.fd, conn.recv_buf, on_recv_complete, on_op_dispose, conn)
+	if id == eventloop.OP_ID_INVALID {
+		net_emit_error(conn, "read submit failed")
+		net_close_conn(conn, true)
+		return
+	}
+	conn.recv_op = id
+	conn.inflight += 1
+}
+
+// on_recv_complete: a RECV terminal CQE. Decrement+maybe-free is the LAST act (op_finished),
+// after all JS and conn access, so a synchronous destroy() inside on_data cannot free the conn
+// out from under this callback (the inflight count is the callback's lifetime reference).
+on_recv_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32) {
+	context = runtime.default_context()
+	conn := cast(^Net_Connection)user_data
+	conn.recv_op = eventloop.OP_ID_INVALID
+	if !conn.closing {
+		if res > 0 {
+			// Copy out of the reused landing buffer into a JSC-owned Uint8Array (no-copy handoff
+			// frees copy_buf on GC). The landing buffer must NOT be handed to JSC — it is reused.
+			n := int(res)
+			copy_buf := make([]byte, n, context.allocator)
+			copy(copy_buf, conn.recv_buf[:n])
+			arg := make_uint8_array(conn.ctx, copy_buf)
+			net_emit(conn.ctx, conn.on_data, &arg, 1)
+			net_maybe_arm_recv(conn) // its guards handle a handler that closed/paused
+		} else if res == 0 {
+			conn.read_done = true // half-close: never re-arm
+			net_emit(conn.ctx, conn.on_end, nil, 0)
+		} else if res == -i32(linux.Errno.EINTR) || res == -i32(linux.Errno.EAGAIN) {
+			net_maybe_arm_recv(conn) // transient — a fresh submit (kernel re-polls), not a spin
+		} else if res != -i32(linux.Errno.ECANCELED) {
+			net_emit_error(conn, "read error")
+			net_close_conn(conn, true)
+		}
+		// -ECANCELED: our own teardown cancel; no error, just let op_finished reclaim.
+	}
+	net_op_finished(conn)
+}
+
+// net_proactor_buffered: outbound bytes not yet handed to the kernel (unsent active tail + queue).
+net_proactor_buffered :: proc(conn: ^Net_Connection) -> int {
+	return (len(conn.active_send) - conn.active_send_off) + len(conn.pending_writes)
+}
+
+// net_proactor_submit_send submits active_send[off:] (the tail not yet sent). Loop thread.
+net_proactor_submit_send :: proc(conn: ^Net_Connection) {
+	id := eventloop.submit_send(conn.loop, conn.fd, conn.active_send[conn.active_send_off:], on_send_complete, on_op_dispose, conn)
+	if id == eventloop.OP_ID_INVALID {
+		net_emit_error(conn, "write submit failed")
+		net_close_conn(conn, true)
+		return
+	}
+	conn.send_op = id
+	conn.inflight += 1
+}
+
+// net_proactor_kick_send rotates pending_writes into active_send and submits, if no send is in
+// flight and there is data. Rotation (swap + clear) preserves each backing's allocator/capacity.
+net_proactor_kick_send :: proc(conn: ^Net_Connection) {
+	if conn.closing do return
+	if conn.send_op != eventloop.OP_ID_INVALID do return // a send is already in flight
+	if len(conn.pending_writes) == 0 do return
+	conn.active_send, conn.pending_writes = conn.pending_writes, conn.active_send
+	clear(&conn.pending_writes)
+	conn.active_send_off = 0
+	net_proactor_submit_send(conn)
+}
+
+// on_send_complete: a SEND terminal CQE. Advances the offset, re-submits a partial tail, rotates
+// the next queued chunk, or runs the drain transition when fully drained.
+on_send_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32) {
+	context = runtime.default_context()
+	conn := cast(^Net_Connection)user_data
+	conn.send_op = eventloop.OP_ID_INVALID
+	if !conn.closing {
+		if res > 0 {
+			conn.active_send_off += int(res)
+			if conn.active_send_off < len(conn.active_send) {
+				net_proactor_submit_send(conn) // partial send — re-submit the unsent tail
+			} else if len(conn.pending_writes) > 0 {
+				net_proactor_kick_send(conn) // active drained; send the queued chunk next
+			} else {
+				clear(&conn.active_send) // fully drained (keep the backing for reuse)
+				conn.active_send_off = 0
+				net_proactor_on_drained(conn)
+			}
+		} else if res == 0 {
+			net_emit_error(conn, "write stalled") // zero-progress on a non-empty send
+			net_close_conn(conn, true)
+		} else if res == -i32(linux.Errno.EINTR) || res == -i32(linux.Errno.EAGAIN) {
+			net_proactor_submit_send(conn) // transient — re-submit the tail (a fresh op)
+		} else if res != -i32(linux.Errno.ECANCELED) {
+			net_emit_error(conn, "write error")
+			net_close_conn(conn, true)
+		}
+	}
+	net_op_finished(conn)
+}
+
+// net_proactor_on_drained runs the reentrancy-safe drain transition: clear want_drain BEFORE
+// emitting 'drain' (the listener may write >= HWM again or destroy()), then re-check state and
+// re-arm reads / close only against the FRESH state.
+net_proactor_on_drained :: proc(conn: ^Net_Connection) {
+	if conn.want_drain {
+		conn.want_drain = false
+		net_emit(conn.ctx, conn.on_drain, nil, 0)
+	}
+	if conn.closing do return // a 'drain' listener destroyed the socket
+	net_maybe_arm_recv(conn) // recomputes read_paused from the (possibly new) buffered count
+	if conn.end_after_drain && conn.send_op == eventloop.OP_ID_INVALID && len(conn.pending_writes) == 0 {
+		net_close_conn(conn, false)
+	}
+}
+
+// net_op_finished is every completion's LAST act: drop the op's lifetime reference, then free
+// the conn iff it is closing and no op remains.
+net_op_finished :: proc(conn: ^Net_Connection) {
+	conn.inflight -= 1
+	net_maybe_free(conn)
+}
+
+// on_op_dispose: an op dropped without a terminal CQE (only at loop destruction). No JS reentry
+// here, so it decrements immediately. Both ops carry the same conn; the last one frees it.
+on_op_dispose :: proc(user_data: rawptr) {
+	context = runtime.default_context()
+	net_op_finished(cast(^Net_Connection)user_data)
+}
+
+// net_maybe_free is the SINGLE free site for a proactor conn. It finalizes only on the inflight
+// 1->0 transition while closing (NOT idempotent — a call after free would be a UAF; but inflight
+// == 0 means no op remains to call it again). The fd is closed BEFORE 'close' is emitted, and the
+// conn is dropped from the registry before any JS runs so a reentrant destroy() can't re-enter.
+net_maybe_free :: proc(conn: ^Net_Connection) {
+	if !conn.closing || conn.inflight > 0 do return
+	// Pin the default heap: recv_buf/active_send/pending_writes are allocated under
+	// runtime.default_context (the proc"c" entry points) and the conn under net_accept_cb's
+	// (also default) context, so free them the same way regardless of the ambient context when
+	// this runs (e.g. net_shutdown_active / an Op_Dispose during eventloop.destroy).
+	context = runtime.default_context()
+	linux.close(linux.Fd(conn.fd))
+	if state := get_state_from_ctx(conn.ctx); state != nil do delete_key(&state.net_conns, conn.id)
+	if !conn.silent_close {
+		had := jsc.JSValueMakeBoolean(conn.ctx, b32(conn.had_error))
+		net_emit(conn.ctx, conn.on_close, &had, 1)
+	}
+	net_unprotect(conn.ctx, conn.on_data)
+	net_unprotect(conn.ctx, conn.on_end)
+	net_unprotect(conn.ctx, conn.on_close)
+	net_unprotect(conn.ctx, conn.on_error)
+	net_unprotect(conn.ctx, conn.on_drain)
+	delete(conn.recv_buf)
+	delete(conn.active_send)
+	delete(conn.pending_writes)
+	free(conn)
+}
+
+// net_close_conn_proactor: mark closing once, wake any op pending on an idle peer via
+// shutdown(SHUT_RDWR) (cancel_op alone is best-effort), cancel for promptness, then maybe_free
+// (finalizes immediately if no op is in flight — e.g. after a peer EOF). had_error is sticky.
+net_close_conn_proactor :: proc(conn: ^Net_Connection, had_error: bool) {
+	if had_error do conn.had_error = true // sticky, BEFORE the idempotency guard
+	if conn.closing do return
+	conn.closing = true
+	linux.shutdown(linux.Fd(conn.fd), .RDWR)
+	eventloop.cancel_op(conn.loop, conn.recv_op)
+	eventloop.cancel_op(conn.loop, conn.send_op)
+	net_maybe_free(conn)
 }
 
 // conn_read_cb drains the socket (edge-triggered: read until EAGAIN), delivering each
@@ -321,10 +588,29 @@ net_write_cb :: proc "c" (
 	conn := net_get_conn(ctx, args[0])
 	if conn == nil || conn.closing do return jsc.JSValueMakeBoolean(ctx, false)
 
+	if conn.io_mode == .Proactor {
+		// Hold a lifetime reference for the call: net_proactor_kick_send can fail a submit and
+		// synchronously close — and, if no op were in flight, free — the conn; the guard keeps it
+		// alive until we have read its state and computed the return (mirrors a completion's ref).
+		conn.inflight += 1
+		defer net_op_finished(conn)
+		if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
+			append(&conn.pending_writes, ..view)
+		}
+		net_proactor_kick_send(conn)
+		if conn.closing do return jsc.JSValueMakeBoolean(ctx, false)
+		if net_proactor_buffered(conn) >= NET_WRITE_HWM {
+			conn.want_drain = true // backpressure (Node's write()==false); a 'drain' is owed
+			return jsc.JSValueMakeBoolean(ctx, false)
+		}
+		return jsc.JSValueMakeBoolean(ctx, true)
+	}
+
 	if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
 		append(&conn.write_queue, ..view)
 	}
 	backpressured := net_flush(conn)
+	if backpressured do conn.want_drain = true // owe a 'drain' once the queue empties
 	return jsc.JSValueMakeBoolean(ctx, b32(!backpressured))
 }
 
@@ -352,6 +638,14 @@ net_flush :: proc(conn: ^Net_Connection) -> (backpressured: bool) {
 	// Drained. Restore read interest only if the read side is still open; after a read
 	// EOF (read_done) the socket is write-only and about to close.
 	if conn.writing && !conn.read_done do net_set_mode(conn, .Read)
+	// Fire the owed 'drain' (readiness parity with the proactor path) so a JS writer that
+	// stopped on write()==false resumes. Reentrancy-safe: clear before emit (the listener may
+	// write again — re-arming want_drain — or destroy()), then bail if it closed us.
+	if conn.want_drain {
+		conn.want_drain = false
+		net_emit(conn.ctx, conn.on_drain, nil, 0)
+		if conn.closing do return false
+	}
 	if conn.end_after_drain do net_close_conn(conn, false)
 	return false
 }
@@ -390,6 +684,17 @@ net_end_cb :: proc "c" (
 	conn := net_get_conn(ctx, arguments[0])
 	if conn == nil || conn.closing do return jsc.JSValueMakeUndefined(ctx)
 	conn.end_after_drain = true
+	if conn.io_mode == .Proactor {
+		// Guarded like net_write_cb: kick / close below may free the conn otherwise.
+		conn.inflight += 1
+		defer net_op_finished(conn)
+		net_proactor_kick_send(conn)
+		// Nothing left to drain → close now; otherwise on_send_complete closes once drained.
+		if !conn.closing && conn.send_op == eventloop.OP_ID_INVALID && len(conn.pending_writes) == 0 {
+			net_close_conn(conn, false)
+		}
+		return jsc.JSValueMakeUndefined(ctx)
+	}
 	net_flush(conn)
 	return jsc.JSValueMakeUndefined(ctx)
 }
@@ -450,7 +755,12 @@ net_server_port_cb :: proc "c" (
 // next tick (so an in-flight read/write callback can still read conn.closing safely).
 // Idempotent. Loop thread.
 net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
-	if conn == nil || conn.closing do return
+	if conn == nil do return
+	if conn.io_mode == .Proactor {
+		net_close_conn_proactor(conn, had_error)
+		return
+	}
+	if conn.closing do return
 	conn.closing = true
 	eventloop.unwatch_fd(conn.loop, &conn.watcher) // idempotent if never armed
 	linux.close(linux.Fd(conn.fd))
@@ -461,7 +771,8 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 	net_unprotect(conn.ctx, conn.on_end)
 	net_unprotect(conn.ctx, conn.on_close)
 	net_unprotect(conn.ctx, conn.on_error)
-	conn.on_data, conn.on_end, conn.on_close, conn.on_error = nil, nil, nil, nil
+	net_unprotect(conn.ctx, conn.on_drain) // net.js always registers onDrain, even on readiness
+	conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
 
 	if state := get_state_from_ctx(conn.ctx); state != nil do delete_key(&state.net_conns, conn.id)
 	eventloop.async_begin(conn.loop)
@@ -469,6 +780,7 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 }
 
 net_conn_free_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	context = runtime.default_context() // free with the same heap net_accept_cb/proc"c" allocated under
 	conn := cast(^Net_Connection)user_data
 	delete(conn.write_queue)
 	free(conn)
@@ -499,8 +811,39 @@ net_server_free_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 // dropped with the async_queue at eventloop.destroy (their pointers never dereferenced).
 net_shutdown_active :: proc(state: ^Runtime_State) {
 	if state == nil do return
-	for _, conn in state.net_conns {
-		if conn.closing do continue
+	context = runtime.default_context() // alloc/free conns + buffers on the default heap (see net_maybe_free)
+	// net_maybe_free deletes a freed proactor conn from net_conns, so iterate a snapshot.
+	conns := make([dynamic]^Net_Connection, 0, len(state.net_conns))
+	defer delete(conns)
+	for _, conn in state.net_conns do append(&conns, conn)
+	for conn in conns {
+		if conn.io_mode == .Proactor {
+			// ALWAYS silence + unprotect the proactor conn (no JS during teardown), whether it is
+			// freshly closing or was ALREADY closing with a live op — otherwise that op's later
+			// Op_Dispose reaches net_maybe_free with silent_close==false and fires the JS 'close'
+			// mid-destroy. Clearing the handlers also makes maybe_free's unprotect a no-op.
+			conn.silent_close = true
+			net_unprotect(conn.ctx, conn.on_data)
+			net_unprotect(conn.ctx, conn.on_end)
+			net_unprotect(conn.ctx, conn.on_close)
+			net_unprotect(conn.ctx, conn.on_error)
+			net_unprotect(conn.ctx, conn.on_drain)
+			conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
+			if !conn.closing {
+				// Not yet closing: wake any op pending on an idle peer + cancel for promptness.
+				conn.closing = true
+				linux.shutdown(linux.Fd(conn.fd), .RDWR)
+				eventloop.cancel_op(conn.loop, conn.recv_op)
+				eventloop.cancel_op(conn.loop, conn.send_op)
+			}
+			// Zero-inflight (e.g. post-EOF, no op/disposer) finalizes now; a live-op conn is a
+			// no-op here and is freed by its Op_Dispose during eventloop.destroy, which the
+			// deferred teardown runs BEFORE destroy_runtime_state deletes net_conns (so the
+			// disposer's delete_key stays valid).
+			net_maybe_free(conn)
+			continue
+		}
+		if conn.closing do continue // readiness: already torn down; its deferred free is dropped at destroy
 		conn.closing = true
 		eventloop.unwatch_fd(conn.loop, &conn.watcher)
 		linux.close(linux.Fd(conn.fd))
@@ -508,10 +851,11 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 		net_unprotect(conn.ctx, conn.on_end)
 		net_unprotect(conn.ctx, conn.on_close)
 		net_unprotect(conn.ctx, conn.on_error)
+		net_unprotect(conn.ctx, conn.on_drain)
 		delete(conn.write_queue)
 		free(conn)
 	}
-	clear(&state.net_conns)
+	clear(&state.net_conns) // live-op proactor conns (if any) are freed by their Op_Dispose
 	for _, server in state.net_servers {
 		if server.closing do continue
 		server.closing = true
