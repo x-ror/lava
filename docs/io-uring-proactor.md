@@ -125,3 +125,83 @@ mirroring the existing `bench --gate`), not rely on the report.
 
 Windows/macOS proactor (Linux-first; those stay on their current backends). Replacing the
 readiness path for fetch/file fds — the proactor is opt-in per connection-class.
+
+## Slice 1b — wiring net connections onto the proactor (detailed design)
+
+Slice 1a landed the eventloop primitive (`submit_recv`/`submit_send`/`cancel_op`, op-slot
+table, `Op_Dispose`). Slice 1b makes `node:net` connections USE it: a connection becomes a
+**full proactor** connection (recv op + send op, no readiness watcher) when
+`proactor_available`, else stays on the current readiness path (`watch_fd` + `linux.recv`/
+`net_flush`). Gating is per-connection so the two models never mix on one fd.
+
+### Connection state (proactor mode)
+Added to `Net_Connection`: `proactor: bool`, `recv_buf: []byte` (one `NET_READ_CHUNK` buffer,
+allocated at start, freed at conn free), `recv_op`/`send_op: eventloop.Op_ID`, `inflight: int`
+(submitted-but-not-completed ops), `read_paused: bool`. Existing `write_queue`,
+`end_after_drain`, `closing` are reused; the readiness-only `watcher`/`writing` are unused in
+proactor mode.
+
+### Read lifecycle
+- `net_start_cb` (proactor): allocate `recv_buf`; `recv_op = submit_recv(fd, recv_buf, on_recv_complete, on_op_dispose, conn)`; `inflight += 1`.
+- `on_recv_complete(loop, conn, res)`: `inflight -= 1`; `recv_op = invalid`. Then:
+  - if `conn.closing` → `maybe_free(conn)` (free when `inflight == 0`); deliver nothing.
+  - `res > 0` → `on_data(recv_buf[:res])`; if a data handler closed the conn, stop; else re-arm
+    `submit_recv` UNLESS a send op is in flight (write-backpressured) — then set `read_paused`
+    (flow control: don't read faster than we can write, matching the readiness model's
+    pause-reads-while-writing).
+  - `res == 0` → peer half-close: `on_end`; do NOT re-arm (true half-close; write side stays
+    open until the app closes).
+  - `res < 0` and not `-ECANCELED` → `on_error` + `net_close_conn`. (`-ECANCELED` is our own
+    teardown; just let `maybe_free` run.)
+
+### Write lifecycle
+- `net_write_cb` (proactor): append to `write_queue`; if no send op in flight, `send_op =
+  submit_send(write_queue[:], on_send_complete, on_op_dispose, conn)`, `inflight += 1`.
+  Backpressure signalled to JS = a send op already in flight (bytes still queued).
+- `on_send_complete(loop, conn, res)`: `inflight -= 1`; `send_op = invalid`. Then:
+  - if `conn.closing` → `maybe_free(conn)`.
+  - `res > 0` → drop `res` bytes from the front of `write_queue`; if more remain, submit the
+    remainder (`inflight += 1`); else drained → if `read_paused`, re-arm recv and clear it; if
+    `end_after_drain`, `net_close_conn`.
+  - `res < 0` (not `-ECANCELED`) → `on_error` + `net_close_conn`.
+  Partial sends are thus handled by re-submitting `write_queue[res:]` — never freeing it early.
+
+### Teardown (the safety-critical part)
+- `net_close_conn` (proactor): set `closing`; fire `on_close` + unprotect the four handlers
+  ONCE (so later cancelled completions, which run with `closing` set, never call JS); remove
+  from the registry; `cancel_op(recv_op)` and `cancel_op(send_op)`. Do NOT close the fd or free
+  the conn yet.
+- Each cancelled op still produces a terminal CQE (`-ECANCELED`) that runs `on_recv_complete`/
+  `on_send_complete` with `closing` set → `inflight -= 1` → `maybe_free`.
+- `maybe_free(conn)`: when `closing && inflight == 0`, close the fd, `delete(write_queue)`,
+  `delete(recv_buf)`, drop from the registry, `free(conn)`. This is the single free site; the
+  kernel has produced terminal CQEs for both ops, so it will never touch `recv_buf`/the send
+  bytes again. (Replaces the current `async_begin`+`post_async` deferred free, which existed
+  because an in-flight readiness callback might still read `conn.closing`; the proactor's
+  refcount subsumes that — the conn outlives its ops by construction.)
+
+### Loop destruction with live proactor connections
+`net_shutdown_active` runs in eval's pre-destroy teardown, BEFORE `eventloop.destroy`. For a
+proactor conn it must NOT free directly (an in-flight op still references it): it sets
+`closing`, unprotects handlers, and leaves the conn. Then `eventloop.destroy` →
+`platform_destroy` closes the ring (kernel cancels+drains the ops) and runs each op's
+`Op_Dispose` = `on_op_dispose(conn)`, which does `inflight -= 1` + `maybe_free`. So proactor
+conns are freed by the dispose path; readiness conns keep the current direct free. Exactly one
+free per conn.
+
+### Safety invariants (to verify)
+1. `recv_buf` and `write_queue` outlive every op that references them — both freed only in
+   `maybe_free`, which runs only at `inflight == 0`.
+2. The conn outlives its ops (the `inflight` refcount); no completion ever dereferences a freed
+   conn.
+3. Exactly one free per conn (`maybe_free` guarded by `closing && inflight == 0`, idempotent).
+4. JS handlers (`on_data`/`on_end`/`on_error`/`on_close`) fire only while `!closing`.
+5. `-ECANCELED` is distinguished from a real socket error (no spurious `on_error`).
+6. Flow control: reads pause while a send is backpressured (`read_paused`), matching the
+   readiness model, so a slow reader can't make the server buffer unboundedly.
+
+### Gates
+`make bench-http` (throughput + mem/conn — the read-side win lands here) reported before/after;
+the `JSC_scribbleFreeCells=1 JSC_collectContinuously=1` crash guard; net + http smokes pass
+with the proactor path active (they will, since io_uring is present in CI); plus an
+adversarial multi-lens review of the teardown/refcount, as for 1a.
