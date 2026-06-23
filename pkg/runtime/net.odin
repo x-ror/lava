@@ -459,6 +459,15 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 	if !fatal && !conn.closing && !conn.read_done {
 		if res == -i32(linux.Errno.ENOBUFS) {
 			net_park_or_rearm(conn)
+		} else if res == -i32(linux.Errno.ECANCELED) {
+			// This terminal came from net_maybe_pause_multishot disarming for backpressure (a
+			// teardown cancel is filtered by !conn.closing above). Re-arm ONLY if no drain is still
+			// owed: a partial send can drop buffered below NET_WRITE_HWM while want_drain is set, and
+			// re-arming on that would resume reads before 'drain' (the caller saw write()==false).
+			// While want_drain holds, leave reads disarmed — net_proactor_on_drained re-arms on the
+			// full drain. (The drain may have completed already but couldn't re-arm while this op's
+			// recv_op was still set, so the !want_drain case must re-arm here.)
+			if !conn.want_drain do net_maybe_arm_recv(conn)
 		} else {
 			net_maybe_arm_recv(conn)
 		}

@@ -1024,16 +1024,22 @@ uring_arm_recv_ring :: proc(loop: ^Loop, fd: uintptr, token: u64) -> bool {
 	sqe.opcode = .RECV
 	sqe.fd = cast(linux.Fd)fd
 	sqe.addr = 0
-	// len MUST be the buffer size, not 0: Linux 5.19 (the oldest kernel with buffer rings, which
-	// our gate accepts) takes len literally for a BUFFER_SELECT recv, so len=0 reads 0 bytes and
-	// completes as a false EOF; only 6.1+ treats 0 as "use the selected buffer's size". The kernel
-	// still reports the actual bytes received in cqe.res (<= this cap).
-	sqe.len = u32(URING_BUFRING_BUFSIZE)
 	sqe.flags = {.BUFFER_SELECT}
 	sqe.buf_group = URING_BUFRING_BGID
-	// Multishot (2b): the RECV_MULTISHOT flag lives in ioprio (aliased here as sq_send_recv_flags),
-	// NOT msg_flags. One submission then yields many CQEs (each F_MORE-set until it ends).
-	if loop.platform.multishot_ok do sqe.sq_send_recv_flags = {.RECV_MULTISHOT}
+	if loop.platform.multishot_ok {
+		// Multishot (2b): RECV_MULTISHOT lives in ioprio (aliased here as sq_send_recv_flags), NOT
+		// msg_flags; one submission then yields many CQEs (each F_MORE-set until it ends). The
+		// multishot+BUFFER_SELECT API REQUIRES len == 0 (the kernel sizes from the chosen buffer);
+		// a non-zero len is rejected with -EINVAL (which would silently disable multishot).
+		sqe.sq_send_recv_flags = {.RECV_MULTISHOT}
+		sqe.len = 0
+	} else {
+		// Single-shot: len MUST be the buffer size, not 0 — Linux 5.19 (the oldest kernel with
+		// buffer rings, which the gate accepts) takes len literally for a BUFFER_SELECT recv, so
+		// len=0 reads 0 bytes = a false EOF; only 6.1+ treats 0 as "use the buffer's size". The
+		// kernel reports the actual bytes in cqe.res (<= this cap).
+		sqe.len = u32(URING_BUFRING_BUFSIZE)
+	}
 	sqe.user_data = token
 	return true
 }
