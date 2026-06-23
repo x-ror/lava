@@ -188,3 +188,15 @@ platform_submit_send :: proc(
 }
 
 platform_cancel_op :: proc(loop: ^Loop, token: u64) {}
+
+// Provided-buffer ring (Slice 2a) — Linux/io_uring only; no-op on darwin.
+platform_bufring_ok :: proc(loop: ^Loop) -> bool {return false}
+platform_submit_recv_ring :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	cb: Op_Recv_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {return 0}
+platform_buf_ring_buf :: proc(loop: ^Loop, bid: u16, n: int) -> []byte {return nil}
+platform_buf_ring_recycle :: proc(loop: ^Loop, bid: u16) {}

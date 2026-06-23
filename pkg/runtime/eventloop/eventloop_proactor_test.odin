@@ -245,3 +245,66 @@ proactor_slot_reuse :: proc(t: ^testing.T) {
 	testing.expect(t, uring_op_token_generation(b) != uring_op_token_generation(a), "reused slot must bump generation")
 	uring_op_release_slot(&loop, uring_op_token_index(b))
 }
+
+// 9) Provided-buffer ring (Slice 2a): submit_recv_ring delivers the kernel-selected buffer with the
+//    correct bytes (not a false zero-byte EOF — the len-must-be-buffer-size guard), recycle returns
+//    it, and a second recv reuses the ring. Skips when the ring is unavailable (older kernel / no
+//    NODROP); on a capable kernel it exercises the lazy buf_ring_init + decode + recycle + reuse.
+Ring_Rec :: struct {
+	res:     i32,
+	has_buf: bool,
+	got:     [64]u8,
+	got_len: int,
+	done:    bool,
+}
+
+ring_on_recv :: proc(loop: ^Loop, ud: rawptr, res: i32, bid: u16, has_buf: bool) {
+	rec := cast(^Ring_Rec)ud
+	rec.res = res
+	rec.has_buf = has_buf
+	if has_buf && res > 0 {
+		rec.got_len = copy(rec.got[:], recv_ring_buf(loop, bid, int(res))) // copy BEFORE recycle
+	}
+	if has_buf do recv_ring_recycle(loop, bid)
+	rec.done = true
+}
+
+@(private = "file")
+ring_roundtrip :: proc(t: ^testing.T, loop: ^Loop, fd: linux.Fd, peer: linux.Fd, msg: string) -> (Ring_Rec, bool) {
+	rec := Ring_Rec{}
+	id := submit_recv_ring(loop, uintptr(fd), ring_on_recv, nil, &rec)
+	if !testing.expect(t, id != OP_ID_INVALID, "ring recv submit") do return rec, false
+	_, _ = linux.send(peer, transmute([]u8)msg, {})
+	arm_watchdog(loop)
+	for _ in 0 ..< 5 {
+		if rec.done do break
+		run_once(loop)
+	}
+	return rec, true
+}
+
+@(test)
+proactor_ring_recv_recycle :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	if !bufring_available(&loop) do return // ring unsupported on this kernel — skip
+
+	sv, sp_ok := make_socketpair(t)
+	if !sp_ok do return
+	defer linux.close(sv[0])
+	defer linux.close(sv[1])
+
+	rec, ok1 := ring_roundtrip(t, &loop, sv[0], sv[1], "hello")
+	if !ok1 do return
+	testing.expect(t, rec.done, "ring recv did not complete")
+	testing.expect(t, rec.has_buf, "ring recv must carry a kernel-selected buffer")
+	testing.expect_value(t, rec.res, 5) // NOT 0 — the len=buffer-size guard (Linux 5.19)
+	testing.expect_value(t, string(rec.got[:rec.got_len]), "hello")
+
+	// Second recv must reuse the recycled buffer and deliver correctly.
+	rec2, ok2 := ring_roundtrip(t, &loop, sv[0], sv[1], "world")
+	if !ok2 do return
+	testing.expect(t, rec2.done, "second ring recv did not complete")
+	testing.expect_value(t, string(rec2.got[:rec2.got_len]), "world")
+	testing.expect_value(t, loop.active_io_count, 0)
+}
