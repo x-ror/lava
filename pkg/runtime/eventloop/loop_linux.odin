@@ -59,7 +59,7 @@ URING_MAX_RW :: int(max(i32))
 URING_OP_DOMAIN :: u64(1) << 63
 
 Platform_Loop :: struct {
-	use_uring:   bool,
+	use_uring:    bool,
 	// Whether the proactor (RECV/SEND completion ops) is usable on this kernel. io_uring_setup
 	// can succeed on kernels predating the single-shot RECV/SEND opcodes (added in 5.6), where
 	// submitting one yields a -EINVAL CQE rather than a synchronous failure. We probe for opcode
@@ -67,26 +67,26 @@ Platform_Loop :: struct {
 	// callers fall back to watch_fd instead of mistaking a healthy socket for a failed one (#286).
 	// Implies use_uring (we only probe when the ring initialized); the readiness/poll path on the
 	// same ring stays available on older kernels regardless.
-	proactor_ok: bool,
-	ring:        uring.Ring,
-	cqes:        [32]linux.IO_Uring_CQE,
-	epoll_fd:    linux.Fd,
+	proactor_ok:  bool,
+	ring:         uring.Ring,
+	cqes:         [32]linux.IO_Uring_CQE,
+	epoll_fd:     linux.Fd,
 	// Self-pipe used by wakeup() to kick the loop out of poll from another thread.
 	// A pipe (not an eventfd): io_uring POLL_ADD reliably completes on a pipe fd
 	// but not on an eventfd in our kernels (#74). [0] = read end, [1] = write end.
-	wakeup_pipe: [2]linux.Fd,
+	wakeup_pipe:  [2]linux.Fd,
 	// Watcher table backing the generation-token scheme (io_uring only). Slots are
 	// reused across watchers; the array only grows to the high-water mark of
 	// concurrently watched fds, so retention stays bounded to the in-flight set.
-	watch_slots: [dynamic]Uring_Watch_Slot,
+	watch_slots:  [dynamic]Uring_Watch_Slot,
 	// Free-list of released watch_slots indices, so alloc/release are O(1) (no scan
 	// for a vacant slot). Holds exactly the indices whose slot is currently !in_use.
-	free_slots:  [dynamic]u32,
+	free_slots:   [dynamic]u32,
 	// Completion-op slot table + free-list (proactor RECV/SEND), same generation-token
 	// scheme as watch_slots but in the op token domain. Sized to the high-water mark of
 	// concurrently in-flight ops.
-	op_slots:    [dynamic]Uring_Op_Slot,
-	op_free:     [dynamic]u32,
+	op_slots:     [dynamic]Uring_Op_Slot,
+	op_free:      [dynamic]u32,
 	// Provided-buffer ring (Slice 2a; the memory moat). A shared pool of N×M buffers the kernel
 	// picks from for BUFFER_SELECT RECVs, so an idle connection holds no per-conn read buffer.
 	// bufring_ok gates the ring-recv path (else callers use the 1b per-conn buffer). `bufring` is a
@@ -128,7 +128,8 @@ platform_init :: proc(loop: ^Loop) -> bool {
 		// internal poll past the initial EAGAIN — the assumption the retry path relies on. Lacking
 		// either, fall back to the readiness path.
 		loop.platform.proactor_ok =
-			uring_probe_proactor(loop.platform.ring.fd) && .FAST_POLL in loop.platform.ring.features
+			uring_probe_proactor(loop.platform.ring.fd) &&
+			.FAST_POLL in loop.platform.ring.features
 		// Bind the watcher table to the loop allocator (set before platform_init), so
 		// it does not adopt the allocator of whatever first appends to it.
 		loop.platform.watch_slots = make([dynamic]Uring_Watch_Slot, loop.allocator)
@@ -564,7 +565,10 @@ uring_alloc_slot :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> u64 {
 		slot.in_use = true
 		return uring_encode_token(index, slot.generation)
 	}
-	append(&loop.platform.watch_slots, Uring_Watch_Slot{watcher = watcher, generation = 1, in_use = true})
+	append(
+		&loop.platform.watch_slots,
+		Uring_Watch_Slot{watcher = watcher, generation = 1, in_use = true},
+	)
 	return uring_encode_token(u32(len(loop.platform.watch_slots) - 1), 1)
 }
 
@@ -837,9 +841,10 @@ Uring_Buf :: struct {
 	addr: u64,
 	len:  u32,
 	bid:  u16,
-	resv: u16,
+	resv: u16, // overlaid by the producer `tail` at bufs[0]; buf_ring_add never writes it
 }
 #assert(size_of(Uring_Buf) == 16)
+#assert(align_of(Uring_Buf) == 8)
 
 URING_BUFRING_BGID :: 0
 URING_BUFRING_ENTRIES :: 256 // N — power of two
@@ -849,10 +854,15 @@ URING_BUFRING_MASK :: URING_BUFRING_ENTRIES - 1
 // buf_ring_add writes a buffer entry's 14 bytes (addr/len/bid) at ring index `idx`, NEVER the
 // `resv` at bytes 14..15 — those alias the shared producer `tail` for bufs[0]. Used by seed + recycle.
 buf_ring_add :: proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
-	base := uintptr(loop.platform.bufring) + uintptr(idx) * size_of(Uring_Buf)
-	(cast(^u64)base)^ = addr // bytes 0..7
-	(cast(^u32)(base + 8))^ = length // bytes 8..11
-	(cast(^u16)(base + 12))^ = bid // bytes 12..13
+	// Field stores (clearer than raw byte offsets, identical codegen) — but DELIBERATELY never
+	// write `resv`: at idx 0 it aliases the shared producer `tail`, published separately with a
+	// release store in buf_ring_publish_tail. (Matches liburing's io_uring_buf_ring_add, which
+	// also leaves resv untouched.) `ring` is 8-aligned (page-aligned mmap), so the stores align.
+	ring := cast([^]Uring_Buf)loop.platform.bufring
+	entry := &ring[idx]
+	entry.addr = addr
+	entry.len = length
+	entry.bid = bid
 }
 
 // buf_ring_add :: #force_inline proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
@@ -860,8 +870,8 @@ buf_ring_add :: proc(loop: ^Loop, idx: u32, addr: u64, length: u32, bid: u16) {
 
 // 	entry := &ring[idx]
 // 	entry.addr = addr
-// 	entry.len  = length
-// 	entry.bid  = bid
+// 	entry.len = length
+// 	entry.bid = bid
 // 	entry.resv = 0
 // }
 
@@ -893,7 +903,13 @@ buf_ring_init :: proc(loop: ^Loop) -> bool {
 	loop.platform.bufring_tail = 0
 	for bid in 0 ..< u32(URING_BUFRING_ENTRIES) {
 		off := int(bid) * URING_BUFRING_BUFSIZE
-		buf_ring_add(loop, bid, u64(uintptr(raw_data(pool[off:]))), URING_BUFRING_BUFSIZE, u16(bid))
+		buf_ring_add(
+			loop,
+			bid,
+			u64(uintptr(raw_data(pool[off:]))),
+			URING_BUFRING_BUFSIZE,
+			u16(bid),
+		)
 	}
 	loop.platform.bufring_tail = u16(URING_BUFRING_ENTRIES)
 	buf_ring_publish_tail(loop)
