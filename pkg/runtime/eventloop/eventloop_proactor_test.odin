@@ -246,22 +246,24 @@ proactor_slot_reuse :: proc(t: ^testing.T) {
 	uring_op_release_slot(&loop, uring_op_token_index(b))
 }
 
-// 9) Provided-buffer ring (Slice 2a): submit_recv_ring delivers the kernel-selected buffer with the
-//    correct bytes (not a false zero-byte EOF — the len-must-be-buffer-size guard), recycle returns
-//    it, and a second recv reuses the ring. Skips when the ring is unavailable (older kernel / no
-//    NODROP); on a capable kernel it exercises the lazy buf_ring_init + decode + recycle + reuse.
+// 9) Provided-buffer ring (Slice 2a/2b): a ring recv delivers the kernel-selected buffer with the
+//    correct bytes (NOT a false zero-byte EOF — the len=buffer-size guard for Linux 5.19), recycles
+//    it, and — under multishot (2b) — delivers a SECOND chunk from the SAME submission (more=true,
+//    no re-arm). Verifies the F_MORE accounting: active_io_count stays at 1 across the intermediate
+//    CQEs and returns to 0 only after the op's terminal (cancel) CQE. Skips if the ring is
+//    unavailable (older kernel / no NODROP); single-shot kernels take the re-arm fallback.
 Ring_Rec :: struct {
 	res:     i32,
 	has_buf: bool,
+	more:    bool,
 	got:     [64]u8,
 	got_len: int,
 	done:    bool,
 }
 
-ring_on_recv :: proc(loop: ^Loop, ud: rawptr, res: i32, bid: u16, has_buf: bool) {
+ring_on_recv :: proc(loop: ^Loop, ud: rawptr, res: i32, bid: u16, has_buf: bool, more: bool) {
 	rec := cast(^Ring_Rec)ud
-	rec.res = res
-	rec.has_buf = has_buf
+	rec.res, rec.has_buf, rec.more = res, has_buf, more
 	if has_buf && res > 0 {
 		rec.got_len = copy(rec.got[:], recv_ring_buf(loop, bid, int(res))) // copy BEFORE recycle
 	}
@@ -270,17 +272,14 @@ ring_on_recv :: proc(loop: ^Loop, ud: rawptr, res: i32, bid: u16, has_buf: bool)
 }
 
 @(private = "file")
-ring_roundtrip :: proc(t: ^testing.T, loop: ^Loop, fd: linux.Fd, peer: linux.Fd, msg: string) -> (Ring_Rec, bool) {
-	rec := Ring_Rec{}
-	id := submit_recv_ring(loop, uintptr(fd), ring_on_recv, nil, &rec)
-	if !testing.expect(t, id != OP_ID_INVALID, "ring recv submit") do return rec, false
+ring_pump :: proc(t: ^testing.T, loop: ^Loop, rec: ^Ring_Rec, peer: linux.Fd, msg: string) {
+	rec.done = false
 	_, _ = linux.send(peer, transmute([]u8)msg, {})
 	arm_watchdog(loop)
-	for _ in 0 ..< 5 {
+	for _ in 0 ..< 64 {
 		if rec.done do break
 		run_once(loop)
 	}
-	return rec, true
 }
 
 @(test)
@@ -294,17 +293,38 @@ proactor_ring_recv_recycle :: proc(t: ^testing.T) {
 	defer linux.close(sv[0])
 	defer linux.close(sv[1])
 
-	rec, ok1 := ring_roundtrip(t, &loop, sv[0], sv[1], "hello")
-	if !ok1 do return
-	testing.expect(t, rec.done, "ring recv did not complete")
+	rec := Ring_Rec{}
+	id := submit_recv_ring(&loop, uintptr(sv[0]), ring_on_recv, nil, &rec)
+	testing.expect(t, id != OP_ID_INVALID, "ring recv submit")
+	testing.expect_value(t, loop.active_io_count, 1)
+
+	ring_pump(t, &loop, &rec, sv[1], "hello")
+	testing.expect(t, rec.done, "ring recv did not deliver")
 	testing.expect(t, rec.has_buf, "ring recv must carry a kernel-selected buffer")
 	testing.expect_value(t, rec.res, 5) // NOT 0 — the len=buffer-size guard (Linux 5.19)
 	testing.expect_value(t, string(rec.got[:rec.got_len]), "hello")
 
-	// Second recv must reuse the recycled buffer and deliver correctly.
-	rec2, ok2 := ring_roundtrip(t, &loop, sv[0], sv[1], "world")
-	if !ok2 do return
-	testing.expect(t, rec2.done, "second ring recv did not complete")
-	testing.expect_value(t, string(rec2.got[:rec2.got_len]), "world")
+	if rec.more {
+		// 2b multishot: the SAME submission delivers the next chunk (no re-arm); the op stays in
+		// flight (active_io_count still 1) across the intermediate CQE.
+		testing.expect_value(t, loop.active_io_count, 1)
+		ring_pump(t, &loop, &rec, sv[1], "world")
+		testing.expect_value(t, string(rec.got[:rec.got_len]), "world")
+		testing.expect_value(t, loop.active_io_count, 1)
+		// Cancel the still-armed multishot; its terminal CQE releases the op → count back to 0.
+		cancel_op(&loop, id)
+		arm_watchdog(&loop)
+		for _ in 0 ..< 64 {
+			if loop.active_io_count == 0 do break
+			run_once(&loop)
+		}
+	} else {
+		// 2a single-shot: terminal already (op released); re-arm explicitly for the next chunk.
+		testing.expect_value(t, loop.active_io_count, 0)
+		id2 := submit_recv_ring(&loop, uintptr(sv[0]), ring_on_recv, nil, &rec)
+		testing.expect(t, id2 != OP_ID_INVALID, "second single-shot ring submit")
+		ring_pump(t, &loop, &rec, sv[1], "world")
+		testing.expect_value(t, string(rec.got[:rec.got_len]), "world")
+	}
 	testing.expect_value(t, loop.active_io_count, 0)
 }

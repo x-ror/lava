@@ -95,6 +95,7 @@ Platform_Loop :: struct {
 	// layer (a recycle-driven credit), NOT here — a userspace ring-occupancy count can't see the
 	// kernel's consumer head and so can't be a reliable credit. See docs/io-uring-proactor.md (Slice 2).
 	bufring_ok:    bool,
+	multishot_ok:  bool, // submit ring recvs as MULTISHOT (2b); cleared on a -EINVAL (kernel lacks it)
 	bufring_tried: bool, // buf_ring_init attempted (lazy: on the first ring-recv check, not loop init)
 	bufring:       rawptr,
 	bufring_size:  uint,
@@ -444,16 +445,24 @@ drain_uring_completions :: proc(loop: ^Loop) {
 				gen := uring_op_token_generation(cqe.user_data)
 				if uring_op_slot_live(loop, index, gen) {
 					slot := loop.platform.op_slots[index]
-					loop.active_io_count = max(0, loop.active_io_count - 1)
 					loop.io_events += 1
-					uring_op_release_slot(loop, index)
+					// A multishot RECV (2b) stays armed across many CQEs: IORING_CQE_F_MORE set means
+					// this is an INTERMEDIATE completion (the op is still live under the same token) —
+					// fire the callback but keep the slot in_use and active_io_count unchanged. Only
+					// the TERMINAL CQE (F_MORE clear — single-shot always, or a multishot that ended/
+					// errored/was cancelled) releases the slot and drops the in-flight count, exactly
+					// once per op. Non-recv ops never set F_MORE, so they always take this terminal path.
+					more := .MORE in cqe.flags
+					if !more {
+						loop.active_io_count = max(0, loop.active_io_count - 1)
+						uring_op_release_slot(loop, index)
+					}
 					if slot.recv_cb != nil {
-						// Provided-buffer-ring RECV: decode the kernel-selected buffer id from the
-						// CQE flags (a bit_set — transmute to u32 before the >>16). The callback copies
-						// the bytes then recycles the buffer.
+						// Decode the kernel-selected buffer id from the CQE flags (a bit_set —
+						// transmute to u32 before the >>16). The callback copies the bytes then recycles.
 						has_buf := .BUFFER in cqe.flags
 						bid := u16(transmute(u32)cqe.flags >> 16)
-						slot.recv_cb(loop, slot.user_data, cqe.res, bid, has_buf)
+						slot.recv_cb(loop, slot.user_data, cqe.res, bid, has_buf, more)
 					} else if slot.callback != nil {
 						slot.callback(loop, slot.user_data, cqe.res)
 					}
@@ -979,6 +988,10 @@ buf_ring_init :: proc(loop: ^Loop) -> bool {
 		return false
 	}
 	loop.platform.bufring_ok = true
+	// Attempt multishot (2b) by default: RECV_MULTISHOT is an ioprio flag, not a probeable opcode,
+	// so a kernel with buffer rings (5.19) but without multishot recv (added 6.0) accepts the SQE
+	// and reports -EINVAL via the CQE — net.odin disables multishot on that and re-arms single-shot.
+	loop.platform.multishot_ok = true
 	return true
 }
 
@@ -1018,6 +1031,12 @@ uring_arm_recv_ring :: proc(loop: ^Loop, fd: uintptr, token: u64) -> bool {
 	sqe.len = u32(URING_BUFRING_BUFSIZE)
 	sqe.flags = {.BUFFER_SELECT}
 	sqe.buf_group = URING_BUFRING_BGID
+	// Multishot (2b): the RECV_MULTISHOT flag lives in ioprio (aliased here as sq_send_recv_flags),
+	// NOT msg_flags. One submission then yields many CQEs (each F_MORE-set until it ends).
+	if loop.platform.multishot_ok do sqe.sq_send_recv_flags = {.RECV_MULTISHOT}
 	sqe.user_data = token
 	return true
 }
+
+platform_recv_ring_multishot :: proc(loop: ^Loop) -> bool {return loop.platform.multishot_ok}
+platform_disable_multishot :: proc(loop: ^Loop) {loop.platform.multishot_ok = false}

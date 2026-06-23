@@ -401,14 +401,19 @@ net_maybe_arm_recv :: proc(conn: ^Net_Connection) -> bool {
 	return true
 }
 
-// net_recv_ring_complete: a provided-buffer-ring RECV terminal CQE (Slice 2a). ORDER is load-bearing
-// (rev.4): COPY the kernel-selected buffer while we still own it, RECYCLE it unconditionally (even
-// when closing — a leaked bid drains the shared ring and wedges every conn on -ENOBUFS), THEN deliver.
-net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32, bid: u16, has_buf: bool) {
+// net_recv_ring_complete: a provided-buffer-ring RECV completion (Slice 2a single-shot, or 2b
+// multishot — `more` true = INTERMEDIATE, the op stays armed; false = TERMINAL). ORDER is
+// load-bearing (rev.4): COPY the kernel-selected buffer while we still own it, RECYCLE it
+// unconditionally for any buffer-carrying CQE (even when closing — a leaked bid drains the shared
+// ring), THEN deliver. The op's lifetime accounting (recv_op clear, re-arm, net_op_finished) happens
+// ONLY on the terminal CQE — never per intermediate, or the conn would be freed while the kernel
+// still posts CQEs for the live multishot op.
+net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32, bid: u16, has_buf: bool, more: bool) {
 	context = runtime.default_context()
 	conn := cast(^Net_Connection)user_data
-	conn.recv_op = eventloop.OP_ID_INVALID
-	// 1) Copy FIRST, while the buffer is ours (recycling republishes it; the kernel may overwrite).
+	if !more do conn.recv_op = eventloop.OP_ID_INVALID // terminal: this op is finished
+
+	// (1) copy BEFORE recycle (recycling republishes the buffer; the kernel may overwrite it).
 	arg: jsc.JSValueRef = nil
 	if has_buf && res > 0 && !conn.closing {
 		if src := eventloop.recv_ring_buf(loop, bid, int(res)); src != nil {
@@ -417,29 +422,61 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 			arg = make_uint8_array(conn.ctx, copy_buf)
 		}
 	}
-	// 2) Recycle UNCONDITIONALLY (after the copy), then re-arm one conn parked on -ENOBUFS.
+	// (2) recycle UNCONDITIONALLY for any buffer-carrying CQE (incl. a terminal one), then refill.
 	if has_buf {
 		eventloop.recv_ring_recycle(loop, bid)
 		if state := get_state_from_ctx(conn.ctx); state != nil do net_refill_starved(state)
 	}
-	// 3) Deliver / handle. op_finished is the LAST conn access (reentrant destroy() safe).
+	// (3) deliver / classify.
+	fatal := false
 	if !conn.closing {
 		if res > 0 {
 			if arg != nil do net_emit(conn.ctx, conn.on_data, &arg, 1)
-			net_maybe_arm_recv(conn)
 		} else if res == 0 {
-			conn.read_done = true
+			conn.read_done = true // EOF (always terminal — F_MORE clear)
 			net_emit(conn.ctx, conn.on_end, nil, 0)
-		} else if res == -i32(linux.Errno.ENOBUFS) {
-			net_park_or_rearm(conn) // ring was momentarily empty
-		} else if res == -i32(linux.Errno.EINTR) || res == -i32(linux.Errno.EAGAIN) {
-			net_maybe_arm_recv(conn)
-		} else if res != -i32(linux.Errno.ECANCELED) {
+		} else if res == -i32(linux.Errno.EINVAL) {
+			eventloop.disable_multishot(loop) // kernel has buffer rings but not RECV_MULTISHOT — single-shot from now
+		} else if res == -i32(linux.Errno.ENOBUFS) || res == -i32(linux.Errno.EINTR) ||
+		   res == -i32(linux.Errno.EAGAIN) || res == -i32(linux.Errno.ECANCELED) {
+			// benign/transient — the terminal re-arm path below handles it
+		} else {
 			net_emit_error(conn, "read error")
 			net_close_conn(conn, true)
+			fatal = true
+		}
+	}
+
+	// (4) INTERMEDIATE multishot CQE: the op is still in flight — do NOT re-arm or finish it. If a
+	// data handler just pushed write-backpressure, disarm the multishot (its terminal -ECANCELED then
+	// re-arms via the drain transition) so reads can't outrun writes past the high-water mark.
+	if more {
+		net_maybe_pause_multishot(conn)
+		return
+	}
+	// TERMINAL CQE: re-arm (unless EOF/fatal/closing — net_maybe_arm_recv also no-ops while paused),
+	// then drop the op's in-flight count LAST (reentrant destroy() inside a handler stays safe).
+	if !fatal && !conn.closing && !conn.read_done {
+		if res == -i32(linux.Errno.ENOBUFS) {
+			net_park_or_rearm(conn)
+		} else {
+			net_maybe_arm_recv(conn)
 		}
 	}
 	net_op_finished(conn)
+}
+
+// net_maybe_pause_multishot disarms a multishot ring recv when the connection's outbound buffer has
+// crossed the high-water mark, so a slow-writing peer can't make the kernel keep reading unboundedly
+// (2a single-shot needs none — it pauses by simply not re-arming). The cancel's terminal -ECANCELED
+// CQE drops the op; the drain transition (net_proactor_on_drained) re-arms a fresh recv once the
+// outbound buffer empties. Idempotent-safe: a redundant cancel before the terminal CQE is a harmless
+// kernel no-op (-EALREADY/-ENOENT).
+net_maybe_pause_multishot :: proc(conn: ^Net_Connection) {
+	if conn.io_mode != .ProactorRing || conn.closing do return
+	if conn.recv_op == eventloop.OP_ID_INVALID do return
+	if !eventloop.recv_ring_multishot(conn.loop) do return
+	if net_proactor_buffered(conn) >= NET_WRITE_HWM do eventloop.cancel_op(conn.loop, conn.recv_op)
 }
 
 // NET_RECV_CREDIT_MAX caps banked refill credits at the ring size: there can never be more than that
@@ -766,6 +803,7 @@ net_write_cb :: proc "c" (
 		if conn.closing do return jsc.JSValueMakeBoolean(ctx, false)
 		if net_proactor_buffered(conn) >= NET_WRITE_HWM {
 			conn.want_drain = true // backpressure (Node's write()==false); a 'drain' is owed
+			net_maybe_pause_multishot(conn) // a write from outside on_data can backpressure too
 			return jsc.JSValueMakeBoolean(ctx, false)
 		}
 		return jsc.JSValueMakeBoolean(ctx, true)
