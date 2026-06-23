@@ -170,9 +170,10 @@ platform_submit_recv :: proc(
 	fd: uintptr,
 	buf: []byte,
 	cb: Op_Completion,
+	dispose: Op_Dispose,
 	user_data: rawptr,
-) -> bool {
-	return false
+) -> u64 {
+	return 0
 }
 
 platform_submit_send :: proc(
@@ -180,7 +181,10 @@ platform_submit_send :: proc(
 	fd: uintptr,
 	buf: []byte,
 	cb: Op_Completion,
+	dispose: Op_Dispose,
 	user_data: rawptr,
-) -> bool {
-	return false
+) -> u64 {
+	return 0
 }
+
+platform_cancel_op :: proc(loop: ^Loop, token: u64) {}

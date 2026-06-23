@@ -38,10 +38,17 @@ Uring_Watch_Slot :: struct {
 // own (terminal) CQE.
 Uring_Op_Slot :: struct {
 	callback:   Op_Completion,
+	dispose:    Op_Dispose, // fires instead of callback if the op is dropped at loop destroy
 	user_data:  rawptr,
 	generation: u32,
 	in_use:     bool,
 }
+
+// Max bytes per RECV/SEND SQE. The SQE length is a u32, but Buffer.MAX_LENGTH is 4 GiB and a
+// straight u32(len) would wrap a 4 GiB buffer to 0 (a zero-length recv reads as EOF; a
+// zero-length send spins). Cap each op at max(i32) and let the caller continue from cqe.res
+// (it already handles short reads / partial sends).
+URING_MAX_RW :: int(max(i32))
 
 // Token domains: bit 63 of an io_uring user_data distinguishes a completion-op token (set)
 // from a poll-watcher token (clear). Watcher generations are capped to 31 bits (see
@@ -132,6 +139,18 @@ platform_init :: proc(loop: ^Loop) -> bool {
 
 platform_destroy :: proc(loop: ^Loop) {
 	if loop.platform.use_uring {
+		// Tear the ring down FIRST: closing the io_uring fd cancels every in-flight op in the
+		// kernel and guarantees it will not touch the op buffers again. Only then is it safe
+		// to tell callers (via Op_Dispose) that the buffers of any op still in flight — which
+		// therefore never got a drained completion — are reclaimable. Exactly one of
+		// {callback, dispose} runs per op; here it is dispose.
+		uring.destroy(&loop.platform.ring)
+		for &slot in loop.platform.op_slots {
+			if !slot.in_use do continue
+			loop.active_io_count = max(0, loop.active_io_count - 1)
+			if slot.dispose != nil do slot.dispose(slot.user_data)
+			slot.in_use = false
+		}
 		delete(loop.platform.watch_slots)
 		loop.platform.watch_slots = nil
 		delete(loop.platform.free_slots)
@@ -140,8 +159,8 @@ platform_destroy :: proc(loop: ^Loop) {
 		loop.platform.op_slots = nil
 		delete(loop.platform.op_free)
 		loop.platform.op_free = nil
-		uring.destroy(&loop.platform.ring)
 		loop.platform.use_uring = false
+		loop.platform.proactor_ok = false
 	}
 
 	if loop.platform.epoll_fd >= 0 {
@@ -609,18 +628,21 @@ uring_probe_supports :: proc(probe: ^Uring_Probe, op: linux.IO_Uring_OP) -> bool
 	return (probe.ops[idx].flags & URING_OP_SUPPORTED) != 0
 }
 
+// platform_submit_recv/send return the op token (a non-zero op-domain user_data) on success,
+// or 0 if the proactor is unavailable or no SQE could be obtained.
 platform_submit_recv :: proc(
 	loop: ^Loop,
 	fd: uintptr,
 	buf: []byte,
 	cb: Op_Completion,
+	dispose: Op_Dispose,
 	user_data: rawptr,
-) -> bool {
-	if !loop.platform.proactor_ok do return false
-	token := uring_op_alloc_slot(loop, cb, user_data)
-	if uring_arm_rw(loop, .RECV, fd, buf, token, {}) do return true
+) -> u64 {
+	if !loop.platform.proactor_ok do return 0
+	token := uring_op_alloc_slot(loop, cb, dispose, user_data)
+	if uring_arm_rw(loop, .RECV, fd, buf, token, {}) do return token
 	uring_op_release_slot(loop, uring_op_token_index(token))
-	return false
+	return 0
 }
 
 platform_submit_send :: proc(
@@ -628,15 +650,27 @@ platform_submit_send :: proc(
 	fd: uintptr,
 	buf: []byte,
 	cb: Op_Completion,
+	dispose: Op_Dispose,
 	user_data: rawptr,
-) -> bool {
-	if !loop.platform.proactor_ok do return false
-	token := uring_op_alloc_slot(loop, cb, user_data)
+) -> u64 {
+	if !loop.platform.proactor_ok do return 0
+	token := uring_op_alloc_slot(loop, cb, dispose, user_data)
 	// NOSIGNAL: a send to a peer that has closed surfaces as -EPIPE in the completion rather
 	// than raising SIGPIPE (which would kill the process).
-	if uring_arm_rw(loop, .SEND, fd, buf, token, {.NOSIGNAL}) do return true
+	if uring_arm_rw(loop, .SEND, fd, buf, token, {.NOSIGNAL}) do return token
 	uring_op_release_slot(loop, uring_op_token_index(token))
-	return false
+	return 0
+}
+
+// platform_cancel_op asks the kernel to cancel the op identified by `token`. The op still
+// produces a terminal CQE that releases the slot and fires the callback; this just makes a
+// pending op (e.g. a RECV on a fd being closed) tear down promptly instead of lingering. The
+// generation check avoids issuing a cancel against a slot already reused for a new op.
+platform_cancel_op :: proc(loop: ^Loop, token: u64) {
+	if !loop.platform.proactor_ok do return
+	if uring_op_slot_live(loop, uring_op_token_index(token), uring_op_token_generation(token)) {
+		uring_cancel_poll(loop, token) // ASYNC_CANCEL(addr=token); its own CQE is ignored
+	}
 }
 
 // uring_arm_rw stages a RECV/SEND SQE for `buf` under `token` and flushes it, with the same
@@ -659,7 +693,7 @@ uring_arm_rw :: proc(
 	sqe.opcode = opcode
 	sqe.fd = cast(linux.Fd)fd
 	sqe.addr = cast(u64)uintptr(raw_data(buf))
-	sqe.len = u32(len(buf))
+	sqe.len = u32(min(len(buf), URING_MAX_RW)) // cap so a 4 GiB buffer doesn't wrap to 0
 	sqe.msg_flags = flags
 	sqe.user_data = token
 	uring.submit(&loop.platform.ring, 0, nil)
@@ -684,18 +718,30 @@ uring_op_slot_live :: proc(loop: ^Loop, index: u32, generation: u32) -> bool {
 	return slot.in_use && slot.generation == generation
 }
 
-uring_op_alloc_slot :: proc(loop: ^Loop, cb: Op_Completion, user_data: rawptr) -> u64 {
+uring_op_alloc_slot :: proc(
+	loop: ^Loop,
+	cb: Op_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> u64 {
 	if len(loop.platform.op_free) > 0 {
 		index := pop(&loop.platform.op_free)
 		slot := &loop.platform.op_slots[index]
 		slot.callback = cb
+		slot.dispose = dispose
 		slot.user_data = user_data
 		slot.in_use = true
 		return uring_op_encode_token(index, slot.generation)
 	}
 	append(
 		&loop.platform.op_slots,
-		Uring_Op_Slot{callback = cb, user_data = user_data, generation = 1, in_use = true},
+		Uring_Op_Slot {
+			callback = cb,
+			dispose = dispose,
+			user_data = user_data,
+			generation = 1,
+			in_use = true,
+		},
 	)
 	return uring_op_encode_token(u32(len(loop.platform.op_slots) - 1), 1)
 }
@@ -706,6 +752,7 @@ uring_op_release_slot :: proc(loop: ^Loop, index: u32) {
 	if !slot.in_use do return
 	slot.in_use = false
 	slot.callback = nil
+	slot.dispose = nil
 	slot.user_data = nil
 	slot.generation += 1
 	if slot.generation == 0 || slot.generation >= u32(1) << 31 do slot.generation = 1

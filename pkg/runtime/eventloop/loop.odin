@@ -1246,36 +1246,77 @@ unwatch_fd :: proc(loop: ^Loop, watcher: ^IO_Watcher) -> bool {
 // those ops, and callers fall back to watch_fd. An in-flight op counts as pending work
 // (active_io_count) so the loop stays alive until its completion.
 
-// Op_Completion fires exactly once, on the op's terminal CQE, on the loop thread. `res` is
-// the kernel result: bytes transferred (>= 0), or a negative -errno. The buffer passed to
-// submit_* is the CALLER's and must stay valid until this fires (Slice 1: caller-owned
-// per-connection buffer; teardown must keep it alive until the op completes — see the design).
+// Op_ID identifies a submitted op so the caller can cancel_op it. Returned by submit_recv/
+// submit_send; OP_ID_INVALID (0) means the submission did not happen (proactor unavailable,
+// nil callback, or the SQE could not be obtained). It is the op's io_uring token, opaque to
+// callers.
+Op_ID :: distinct u64
+OP_ID_INVALID :: Op_ID(0)
+
+// Op_Completion fires exactly once for an op that REACHES a terminal completion, on the loop
+// thread. `res` is the kernel result: bytes transferred (>= 0), or a negative -errno
+// (including -ECANCELED for a cancel_op'd op). The buffer passed to submit_* is the CALLER's
+// and must stay valid until either this OR the op's Op_Dispose fires.
 Op_Completion :: proc(loop: ^Loop, user_data: rawptr, res: i32)
+
+// Op_Dispose fires exactly once for an op that is DROPPED without a terminal completion —
+// today only at loop destruction with the op still in flight (the ring is torn down, so no
+// CQE will ever be drained). It is the op's "your buffer/user_data is now safe to reclaim"
+// signal, mirroring a timer/task dispose. For any one op, exactly one of {Op_Completion,
+// Op_Dispose} runs. May be nil if the caller has nothing to release.
+Op_Dispose :: proc(user_data: rawptr)
 
 proactor_available :: proc(loop: ^Loop) -> bool {
 	return platform_proactor_available(loop)
 }
 
 // submit_recv queues a RECV of up to len(buf) bytes from fd into buf; cb fires with the byte
-// count (or -errno). Returns false if the proactor is unavailable or the SQE could not be
-// obtained (caller falls back to the readiness path / retries).
-submit_recv :: proc(loop: ^Loop, fd: uintptr, buf: []byte, cb: Op_Completion, user_data: rawptr) -> bool {
-	if platform_submit_recv(loop, fd, buf, cb, user_data) {
-		loop.active_io_count += 1
-		return true
-	}
-	return false
+// count (or -errno) on completion. Returns OP_ID_INVALID if cb is nil, the proactor is
+// unavailable, or the SQE could not be obtained (caller falls back to the readiness path).
+// LOOP-THREAD ONLY: this mutates the io_uring SQ and the op-slot tables non-atomically;
+// off-loop callers must hand work in via post_async. The op counts as pending work until its
+// completion (or dispose), keeping the loop alive.
+submit_recv :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	buf: []byte,
+	cb: Op_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> Op_ID {
+	if cb == nil do return OP_ID_INVALID // exactly-once completion has no observer; refuse
+	token := platform_submit_recv(loop, fd, buf, cb, dispose, user_data)
+	if token != 0 do loop.active_io_count += 1
+	return Op_ID(token)
 }
 
 // submit_send queues a SEND of buf to fd; cb fires with the bytes sent (or -errno). SEND may
 // complete with res < len(buf) (partial), exactly like send(2): the caller re-submits the
-// unsent tail and keeps buf alive until the whole buffer is acknowledged.
-submit_send :: proc(loop: ^Loop, fd: uintptr, buf: []byte, cb: Op_Completion, user_data: rawptr) -> bool {
-	if platform_submit_send(loop, fd, buf, cb, user_data) {
-		loop.active_io_count += 1
-		return true
-	}
-	return false
+// unsent tail and keeps buf alive until the whole buffer is acknowledged. LOOP-THREAD ONLY
+// (see submit_recv).
+submit_send :: proc(
+	loop: ^Loop,
+	fd: uintptr,
+	buf: []byte,
+	cb: Op_Completion,
+	dispose: Op_Dispose,
+	user_data: rawptr,
+) -> Op_ID {
+	if cb == nil do return OP_ID_INVALID
+	token := platform_submit_send(loop, fd, buf, cb, dispose, user_data)
+	if token != 0 do loop.active_io_count += 1
+	return Op_ID(token)
+}
+
+// cancel_op asks the kernel to cancel an in-flight op (e.g. a RECV pending on a socket being
+// closed — io_uring holds its own file reference, so closing the fd alone does NOT tear the
+// op down). Best-effort: the op still produces a terminal CQE (its own -ECANCELED, or a real
+// result that beat the cancel), which fires Op_Completion and reclaims the slot. The buffer
+// must stay valid until that terminal completion — the cancel CQE alone is not it. No-op for
+// OP_ID_INVALID or when the proactor is unavailable. LOOP-THREAD ONLY.
+cancel_op :: proc(loop: ^Loop, id: Op_ID) {
+	if id == OP_ID_INVALID do return
+	platform_cancel_op(loop, u64(id))
 }
 
 // wakeup allows background worker threads to instantly kick the loop out of sleep.
