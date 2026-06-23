@@ -347,18 +347,31 @@ read `pool[bid]`). Always validate `bid < N`.
 - Ring: **page-aligned** (`mmap(MAP_ANON)` or `posix_memalign(PAGE_SIZE, N*16)`) — the kernel
   `-EINVAL`s a non-page-aligned `ring_addr` on the user-ring path; alignment is MANDATORY, not
   advisory. Assert `ring_addr % PAGE_SIZE == 0` before register. (The pool has no alignment need.)
-- Seed: write all `N` buffers `Uring_Buf{addr=pool+bid*M, len=M, bid=bid}` then publish `tail = N`
-  with a **release** store.
+- Define `buf_ring_add(idx, addr, len, bid)` = write ONLY the 14 bytes `addr`/`len`/`bid` at
+  `bufs[idx]`, NEVER `resv` (bytes 14..15 — the overlaid `tail`). Seed: `buf_ring_add(i, ...)` for
+  all `N` `bid`s, then publish `tail = N` with a **release** store. Both seed and recycle go through
+  this helper, so a full 16-byte `Uring_Buf` struct store (which would clobber `tail` at `idx == 0`)
+  never happens.
 - The CQ ring depth must be **>= N** (`IORING_SETUP_CQSIZE`): a full ring of buffers can produce up
   to `N` completions; CQ overflow drops CQEs and the buffers they carried are leaked from the pool.
+
+### Recv submission
+- **2a (single-shot):** `IORING_OP_RECV` with `addr = 0`, `len = 0` (the kernel sizes from the
+  chosen buffer), `buf_group = BGID`, the `IOSQE.BUFFER_SELECT` SQE flag, op token in `user_data`.
+  This is a NEW arm path, not `uring_arm_rw` (which writes a fixed `addr`/`len` for a per-conn buffer).
+- **2b (multishot):** the same SQE PLUS the multishot flag. **The recv-multishot flag lives in
+  `sqe.ioprio` (`IORING_RECV_MULTISHOT`), NOT in `msg_flags`** — `uring_arm_rw`'s `msg_flags` field
+  carries recv(2) `MSG_*` flags, a different field; setting the multishot bit there would submit an
+  ordinary single-shot recv (or an invalid MSG flag). So the multishot arm explicitly does
+  `sqe.ioprio |= IORING_RECV_MULTISHOT`. (The Odin `RECVSEND` flag set maps to the `ioprio` field.)
 
 ### Buffer recycle (the dominant Slice-2 lifetime rule)
 **Any CQE that carried a buffer recycles its `bid`, regardless of connection state** — before the
 `closing` check, before any delivery decision. Recycle is a pure pool op (no JS reentrancy), so it
-is always safe, including during teardown. Recycle = write the buffer's three fields at
-`bufs[tail & mask]` then release-store `tail+1`. **At ring index 0, write only the 14 bytes
-addr/len/bid — never a 16-byte struct store — so the overlaid `tail` (bytes 14..15) is not
-clobbered.** This closes the dominant leak: a data CQE that lands after `net_close_conn` (the
+is always safe, including during teardown. Recycle = `buf_ring_add(tail & mask, pool+bid*M, M, bid)`
+(the 14-byte helper — a full 16-byte `Uring_Buf` store would clobber the overlaid `tail` at
+`idx == 0`), then release-store `tail+1`. This closes the dominant leak: a data CQE that lands
+after `net_close_conn` (the
 cancel/shutdown race) must still return its buffer, or the ring bleeds one buffer per torn-down
 connection and eventually wedges every connection on `-ENOBUFS`.
 
@@ -407,6 +420,14 @@ The current code does the opposite, so 2b must change three layers:
 - **`-ENOBUFS` is a terminal (`F_MORE`-clear) CQE** for multishot: run the terminal accounting
   (release slot, drop `active_io_count`+`inflight` once), then re-arm via the starved-list refill —
   not an immediate resubmit into an empty ring.
+- **Backpressure must DISARM the multishot, not just skip a re-arm.** 1b/2a bound memory under a
+  slow reader by NOT re-arming while `read_paused` (buffered ≥ `NET_WRITE_HWM`). A multishot is
+  submitted once and stays armed across CQEs, so the kernel keeps delivering `on_data` buffers after
+  reads should have paused — the "don't re-arm" gate doesn't apply. So when a write pushes buffered
+  ≥ HWM, **`cancel_op` the multishot to disarm it** (its `-ECANCELED` is a normal `F_MORE`-clear
+  terminal CQE → terminal accounting), and **re-submit a fresh multishot from the drain transition**
+  (`net_proactor_on_drained`, where 2a re-arms). This preserves the documented 1b memory bound under
+  multishot. (2a needs no such handling — it simply doesn't re-arm while paused.)
 
 ### Integration with 1b + fallback
 - The per-conn mode is decided at the **first submit only** (like 1b): if the first ring recv can't
@@ -435,6 +456,11 @@ The current code does the opposite, so 2b must change three layers:
    delivers any buffer it carried.
 7. All 1b connection invariants still hold (inflight refcount, single free site, reentrancy
    guards, teardown); 2a changes only the buffer source.
+8. (2b) The memory bound holds under a slow reader: reaching `NET_WRITE_HWM` DISARMS the multishot
+   (`cancel_op`) and re-submits it from the drain transition — a still-armed multishot is never left
+   producing `on_data` past backpressure.
+9. The multishot flag is set in `sqe.ioprio` (`IORING_RECV_MULTISHOT`), never in `msg_flags`; the
+   ring recv arm (`addr=0`, `len=0`, `buf_group`, `BUFFER_SELECT`) is a distinct path from `uring_arm_rw`.
 
 ### Gating / tests
 Probe `REGISTER_PBUF_RING` (≈5.19) and, for 2b, multishot recv (`RECV_MULTISHOT` ≈5.19/6.0);
