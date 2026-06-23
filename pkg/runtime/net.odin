@@ -436,8 +436,11 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 	net_op_finished(conn)
 }
 
-// NET_RECV_CREDIT_MAX caps banked refill credits at the ring size (URING_BUFRING_ENTRIES): there can
-// never be more than that many free ring buffers, so a larger bank would over-re-arm a -ENOBUFS burst.
+// NET_RECV_CREDIT_MAX caps banked refill credits at the ring size: there can never be more than that
+// many free ring buffers, so a larger bank would over-re-arm a -ENOBUFS burst. It must track
+// eventloop's URING_BUFRING_ENTRIES (a different package); they match today, and a mismatch is SAFE —
+// too-high only causes a bounded, self-correcting futile re-arm, too-low an extra park woken by the
+// next recycle — never a stranded connection.
 NET_RECV_CREDIT_MAX :: 256
 
 // net_park_or_rearm handles a ProactorRing -ENOBUFS (no ring buffer was selected). The kernel posted
