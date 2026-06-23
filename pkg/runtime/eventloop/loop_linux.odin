@@ -94,11 +94,12 @@ Platform_Loop :: struct {
 	// `bufring_tail` is our running producer index. The -ENOBUFS refill budget is tracked at the net
 	// layer (a recycle-driven credit), NOT here — a userspace ring-occupancy count can't see the
 	// kernel's consumer head and so can't be a reliable credit. See docs/io-uring-proactor.md (Slice 2).
-	bufring_ok:   bool,
-	bufring:      rawptr,
-	bufring_size: uint,
-	bufring_pool: []byte,
-	bufring_tail: u16,
+	bufring_ok:    bool,
+	bufring_tried: bool, // buf_ring_init attempted (lazy: on the first ring-recv check, not loop init)
+	bufring:       rawptr,
+	bufring_size:  uint,
+	bufring_pool:  []byte,
+	bufring_tail:  u16,
 }
 
 platform_name :: proc(loop: ^Loop) -> string {
@@ -137,9 +138,9 @@ platform_init :: proc(loop: ^Loop) -> bool {
 		loop.platform.op_slots = make([dynamic]Uring_Op_Slot, loop.allocator)
 		loop.platform.op_free = make([dynamic]u32, loop.allocator)
 
-		// Best-effort provided-buffer ring (Slice 2a): bufring_ok gates the ring-recv path; if it
-		// can't be set up (no NODROP, mmap/register failure) callers fall back to the 1b per-conn buffer.
-		buf_ring_init(loop)
+		// The provided-buffer ring (Slice 2a) is initialized LAZILY on the first ring-recv check
+		// (platform_bufring_ok), not here — so a CLI/eval workload that never opens a node:net
+		// connection never allocates the multi-MiB pool.
 
 		arm_uring_poll(loop, u64(loop.platform.wakeup_pipe[0]), URING_WAKEUP_USER_DATA, {.IN})
 		return true
@@ -856,7 +857,16 @@ URING_BUFRING_MASK :: URING_BUFRING_ENTRIES - 1
 
 // --- package API (called from loop.odin's eventloop wrappers) ---
 
-platform_bufring_ok :: proc(loop: ^Loop) -> bool {return loop.platform.bufring_ok}
+// platform_bufring_ok reports whether the provided-buffer ring is usable, initializing it lazily on
+// the first call (loop thread; called from net_start_cb). So the pool/ring are allocated only when a
+// connection actually wants ring-mode reads, and only once.
+platform_bufring_ok :: proc(loop: ^Loop) -> bool {
+	if !loop.platform.bufring_tried {
+		loop.platform.bufring_tried = true
+		buf_ring_init(loop)
+	}
+	return loop.platform.bufring_ok
+}
 
 // platform_submit_recv_ring stages a single-shot BUFFER_SELECT RECV (no per-conn buffer — the kernel
 // picks one from the ring at completion). Returns the op token, or 0 (caller falls back to 1b).
@@ -1001,7 +1011,11 @@ uring_arm_recv_ring :: proc(loop: ^Loop, fd: uintptr, token: u64) -> bool {
 	sqe.opcode = .RECV
 	sqe.fd = cast(linux.Fd)fd
 	sqe.addr = 0
-	sqe.len = 0
+	// len MUST be the buffer size, not 0: Linux 5.19 (the oldest kernel with buffer rings, which
+	// our gate accepts) takes len literally for a BUFFER_SELECT recv, so len=0 reads 0 bytes and
+	// completes as a false EOF; only 6.1+ treats 0 as "use the selected buffer's size". The kernel
+	// still reports the actual bytes received in cqe.res (<= this cap).
+	sqe.len = u32(URING_BUFRING_BUFSIZE)
 	sqe.flags = {.BUFFER_SELECT}
 	sqe.buf_group = URING_BUFRING_BGID
 	sqe.user_data = token

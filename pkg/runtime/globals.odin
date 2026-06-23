@@ -66,7 +66,11 @@ Runtime_State :: struct {
 	// is open; net_shutdown_active tears them down before the loop/context die.
 	net_servers:       map[u64]^Net_Server,
 	net_conns:         map[u64]^Net_Connection,
-	net_starved:       [dynamic]^Net_Connection, // ProactorRing conns parked on -ENOBUFS (Slice 2a)
+	// Intrusive FIFO of ProactorRing conns parked on -ENOBUFS (Slice 2a). head/tail + the conn's
+	// starved_next/prev give O(1) enqueue/dequeue/remove (a [dynamic] with ordered_remove was O(K)
+	// per op → O(K^2) to drain/close K parked conns at 10k-conn scale, precisely during overload).
+	net_starved_head:  ^Net_Connection,
+	net_starved_tail:  ^Net_Connection,
 	net_recv_credits:  int, // buffers recycled with no parked taker — consumed by a later park (Slice 2a)
 	next_net_id:       u64,
 	// Node-style process.argv: [execPath, scriptPath, ...userArgs]. Built in eval()

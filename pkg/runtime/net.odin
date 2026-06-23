@@ -109,7 +109,9 @@ Net_Connection :: struct {
 	want_drain:      bool, // write() returned backpressure; a 'drain' is owed
 	silent_close:    bool, // teardown at loop shutdown: free without firing 'close'
 	had_error:       bool, // sticky: set true by any net_close_conn(.., true)
-	recv_starved:    bool, // ProactorRing: parked on state.net_starved after -ENOBUFS (no ring buffer)
+	recv_starved:    bool, // ProactorRing: on the state.net_starved_* FIFO after -ENOBUFS (no ring buffer)
+	starved_next:    ^Net_Connection, // intrusive starved-FIFO links (valid only while recv_starved)
+	starved_prev:    ^Net_Connection,
 }
 
 // make_net_bindings builds the `native` object passed to js/internal/net.js.
@@ -374,11 +376,14 @@ net_force_readiness :: proc() -> bool {
 // net_maybe_arm_recv is the SOLE place a RECV is submitted: at most one is ever in flight (two
 // kernel ops writing the one recv_buf would corrupt it), and never after EOF, while reads are
 // paused by backpressure, or during teardown. read_paused is recomputed here so it can't go stale.
-net_maybe_arm_recv :: proc(conn: ^Net_Connection) {
-	if conn.closing || conn.read_done do return
-	if conn.recv_op != eventloop.OP_ID_INVALID do return // a recv is already in flight
+// net_maybe_arm_recv returns whether it actually submitted a recv: false when it can't arm right now
+// (closing/EOF, a recv already in flight, or write-backpressured) or the submit failed (it then
+// closes the conn — and `conn` may already be freed, so the caller must NOT touch it after a false).
+net_maybe_arm_recv :: proc(conn: ^Net_Connection) -> bool {
+	if conn.closing || conn.read_done do return false
+	if conn.recv_op != eventloop.OP_ID_INVALID do return false // a recv is already in flight
 	conn.read_paused = net_proactor_buffered(conn) >= NET_WRITE_HWM
-	if conn.read_paused do return
+	if conn.read_paused do return false
 	id: eventloop.Op_ID
 	if conn.io_mode == .ProactorRing {
 		// Shared ring: no per-conn buffer; the kernel picks one at completion (net_recv_ring_complete).
@@ -389,10 +394,11 @@ net_maybe_arm_recv :: proc(conn: ^Net_Connection) {
 	if id == eventloop.OP_ID_INVALID {
 		net_emit_error(conn, "read submit failed")
 		net_close_conn(conn, true)
-		return
+		return false
 	}
 	conn.recv_op = id
 	conn.inflight += 1
+	return true
 }
 
 // net_recv_ring_complete: a provided-buffer-ring RECV terminal CQE (Slice 2a). ORDER is load-bearing
@@ -443,10 +449,41 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 // next recycle — never a stranded connection.
 NET_RECV_CREDIT_MAX :: 256
 
+// --- starved FIFO (intrusive doubly-linked, O(1) enqueue/dequeue/remove) ---
+
+@(private = "file")
+net_starved_enqueue :: proc(state: ^Runtime_State, conn: ^Net_Connection) {
+	conn.starved_next = nil
+	conn.starved_prev = state.net_starved_tail
+	if state.net_starved_tail != nil do state.net_starved_tail.starved_next = conn
+	else do state.net_starved_head = conn
+	state.net_starved_tail = conn
+}
+
+@(private = "file")
+net_starved_dequeue :: proc(state: ^Runtime_State) -> ^Net_Connection {
+	conn := state.net_starved_head
+	if conn == nil do return nil
+	state.net_starved_head = conn.starved_next
+	if state.net_starved_head != nil do state.net_starved_head.starved_prev = nil
+	else do state.net_starved_tail = nil
+	conn.starved_next, conn.starved_prev = nil, nil
+	return conn
+}
+
+@(private = "file")
+net_starved_unlink :: proc(state: ^Runtime_State, conn: ^Net_Connection) {
+	if conn.starved_prev != nil do conn.starved_prev.starved_next = conn.starved_next
+	else do state.net_starved_head = conn.starved_next
+	if conn.starved_next != nil do conn.starved_next.starved_prev = conn.starved_prev
+	else do state.net_starved_tail = conn.starved_prev
+	conn.starved_next, conn.starved_prev = nil, nil
+}
+
 // net_park_or_rearm handles a ProactorRing -ENOBUFS (no ring buffer was selected). The kernel posted
 // this CQE when the ring was empty, but a buffer may have been recycled since: if a credit is banked
 // (a recycle that found no parked taker — see net_refill_starved) consume it and re-arm NOW, closing
-// the lost-wakeup; otherwise park on the starved list and take a loop-liveness ref (async_begin) so
+// the lost-wakeup; otherwise park on the starved FIFO and take a loop-liveness ref (async_begin) so
 // the loop cannot exit with our peer's data unread — a future recycle re-arms us.
 net_park_or_rearm :: proc(conn: ^Net_Connection) {
 	if conn.closing || conn.read_done do return
@@ -459,44 +496,37 @@ net_park_or_rearm :: proc(conn: ^Net_Connection) {
 	}
 	if conn.recv_starved do return // no duplicate insertion
 	conn.recv_starved = true
-	append(&state.net_starved, conn)
+	net_starved_enqueue(state, conn)
 	eventloop.async_begin(conn.loop)
 }
 
 // net_refill_starved is called once per recycled buffer (one freed buffer). It hands that buffer to
 // the FIFO-first parked conn that can actually arm a recv NOW — re-arming exactly one (re-arming all
-// would storm, since most would re-fault -ENOBUFS). Conns that can't take the buffer this moment are
-// unparked and SKIPPED, NOT charged the wakeup: a closing/EOF conn never re-arms, and a
-// write-backpressured conn is re-armed by its own drain transition (net_proactor_on_drained), not
-// here — charging either would strand the freed buffer while conns behind it stay parked with unread
-// data (Codex review). If no parked conn can arm, the buffer is banked as a credit (capped) for a
-// conn that parks before the next recycle, so the wakeup is never lost.
+// would storm, since most would re-fault -ENOBUFS). A conn that can't take the buffer this moment is
+// unparked and SKIPPED, NOT charged the wakeup (net_maybe_arm_recv returns false): a closing/EOF conn
+// never re-arms, and a write-backpressured conn is re-armed by its own drain transition
+// (net_proactor_on_drained), not here — charging either would strand the freed buffer while conns
+// behind it stay parked with unread data (Codex review). If no parked conn can arm, the buffer is
+// banked as a credit (capped) for a conn that parks before the next recycle, so the wakeup is never lost.
 net_refill_starved :: proc(state: ^Runtime_State) {
-	for len(state.net_starved) > 0 {
-		conn := state.net_starved[0]
-		ordered_remove(&state.net_starved, 0)
+	for {
+		conn := net_starved_dequeue(state)
+		if conn == nil do break
 		conn.recv_starved = false
 		eventloop.async_cancel(conn.loop) // drop the parked liveness ref
-		if conn.closing || conn.read_done do continue // never re-arms — try the next parked conn
-		if net_proactor_buffered(conn) >= NET_WRITE_HWM do continue // backpressured; its drain re-arms it
-		net_maybe_arm_recv(conn) // armable → this conn consumes the wakeup
-		return
+		if net_maybe_arm_recv(conn) do return // armed → this conn consumes the wakeup
+		// else couldn't arm (closing/EOF/backpressured/submit-failed) — try the next parked conn
 	}
 	if state.net_recv_credits < NET_RECV_CREDIT_MAX do state.net_recv_credits += 1
 }
 
-// net_unpark removes a conn from the starved list before it is freed (lifetime safety: a later
-// recycle must never walk a freed conn), releasing its liveness ref.
+// net_unpark removes a conn from the starved FIFO before it is freed (lifetime safety: a later
+// recycle must never walk a freed conn), releasing its liveness ref. O(1).
 net_unpark :: proc(state: ^Runtime_State, conn: ^Net_Connection) {
 	if !conn.recv_starved do return
 	conn.recv_starved = false
 	eventloop.async_cancel(conn.loop)
-	for c, i in state.net_starved {
-		if c == conn {
-			ordered_remove(&state.net_starved, i)
-			return
-		}
-	}
+	net_starved_unlink(state, conn)
 }
 
 // on_recv_complete: a RECV terminal CQE. Decrement+maybe-free is the LAST act (op_finished),
@@ -995,7 +1025,7 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 		free(conn)
 	}
 	clear(&state.net_conns) // live-op proactor conns (if any) are freed by their Op_Dispose
-	clear(&state.net_starved) // parked conns are freed above / by their disposer; drop the list refs
+	state.net_starved_head, state.net_starved_tail = nil, nil // FIFO emptied (conns freed above / by disposer)
 	for _, server in state.net_servers {
 		if server.closing do continue
 		server.closing = true
@@ -1013,7 +1043,7 @@ net_destroy_state :: proc(state: ^Runtime_State) {
 	net_shutdown_active(state)
 	delete(state.net_servers)
 	delete(state.net_conns)
-	delete(state.net_starved)
+	// net_starved is an intrusive list (head/tail pointers, no backing allocation) — nothing to free.
 }
 
 // --- small helpers -----------------------------------------------------------
