@@ -463,17 +463,23 @@ net_park_or_rearm :: proc(conn: ^Net_Connection) {
 	eventloop.async_begin(conn.loop)
 }
 
-// net_refill_starved is called once per recycled buffer. One recycle frees exactly one buffer, so it
-// re-arms exactly ONE parked conn (FIFO/round-robin) — re-arming all would storm (most would re-fault
-// -ENOBUFS). If nobody is parked, the freed buffer is banked as a credit (capped) for a conn that
-// parks before the next recycle.
+// net_refill_starved is called once per recycled buffer (one freed buffer). It hands that buffer to
+// the FIFO-first parked conn that can actually arm a recv NOW — re-arming exactly one (re-arming all
+// would storm, since most would re-fault -ENOBUFS). Conns that can't take the buffer this moment are
+// unparked and SKIPPED, NOT charged the wakeup: a closing/EOF conn never re-arms, and a
+// write-backpressured conn is re-armed by its own drain transition (net_proactor_on_drained), not
+// here — charging either would strand the freed buffer while conns behind it stay parked with unread
+// data (Codex review). If no parked conn can arm, the buffer is banked as a credit (capped) for a
+// conn that parks before the next recycle, so the wakeup is never lost.
 net_refill_starved :: proc(state: ^Runtime_State) {
-	if len(state.net_starved) > 0 {
+	for len(state.net_starved) > 0 {
 		conn := state.net_starved[0]
 		ordered_remove(&state.net_starved, 0)
 		conn.recv_starved = false
 		eventloop.async_cancel(conn.loop) // drop the parked liveness ref
-		if !conn.closing && !conn.read_done do net_maybe_arm_recv(conn)
+		if conn.closing || conn.read_done do continue // never re-arms — try the next parked conn
+		if net_proactor_buffered(conn) >= NET_WRITE_HWM do continue // backpressured; its drain re-arms it
+		net_maybe_arm_recv(conn) // armable → this conn consumes the wakeup
 		return
 	}
 	if state.net_recv_credits < NET_RECV_CREDIT_MAX do state.net_recv_credits += 1
