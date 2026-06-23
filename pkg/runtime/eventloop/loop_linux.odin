@@ -95,6 +95,7 @@ Platform_Loop :: struct {
 	// layer (a recycle-driven credit), NOT here — a userspace ring-occupancy count can't see the
 	// kernel's consumer head and so can't be a reliable credit. See docs/io-uring-proactor.md (Slice 2).
 	bufring_ok:    bool,
+	multishot_ok:  bool, // submit ring recvs as MULTISHOT (2b); cleared on a -EINVAL (kernel lacks it)
 	bufring_tried: bool, // buf_ring_init attempted (lazy: on the first ring-recv check, not loop init)
 	bufring:       rawptr,
 	bufring_size:  uint,
@@ -403,10 +404,24 @@ platform_poll_uring :: proc(loop: ^Loop, timeout_ms: int) {
 	drain_uring_completions(loop)
 }
 
+// URING_DRAIN_CAP bounds how many completions a single drain processes. A multishot RECV on a
+// continuously-readable peer replenishes the CQ as fast as we drain it (each completion recycles a
+// ring buffer that feeds the next), so an uncapped drain could never return and would starve
+// timers/immediates/other sockets/shutdown. The cap is generous — far above the per-tick load of a
+// busy server, which drains to empty long before reaching it — so normal throughput is unthrottled;
+// it bites only under true monopolization, where we yield to the rest of run_once and the remaining
+// CQEs wait for the next tick (NODROP defers any CQ overflow — no loss).
+URING_DRAIN_CAP :: 1024
+
 drain_uring_completions :: proc(loop: ^Loop) {
-	for {
+	// Drain to empty (NOT just the entry snapshot): a closed-loop client's next request and our own
+	// send-completions land mid-drain, so picking them up here instead of deferring avoids an extra
+	// poll syscall per generation. URING_DRAIN_CAP keeps a hot multishot socket from looping forever.
+	processed := 0
+	for processed < URING_DRAIN_CAP {
 		n, err := uring.copy_cqes(&loop.platform.ring, loop.platform.cqes[:], 0)
 		if err != nil || n == 0 do return
+		processed += int(n)
 
 		for i in 0 ..< int(n) {
 			cqe := loop.platform.cqes[i]
@@ -444,16 +459,24 @@ drain_uring_completions :: proc(loop: ^Loop) {
 				gen := uring_op_token_generation(cqe.user_data)
 				if uring_op_slot_live(loop, index, gen) {
 					slot := loop.platform.op_slots[index]
-					loop.active_io_count = max(0, loop.active_io_count - 1)
 					loop.io_events += 1
-					uring_op_release_slot(loop, index)
+					// A multishot RECV (2b) stays armed across many CQEs: IORING_CQE_F_MORE set means
+					// this is an INTERMEDIATE completion (the op is still live under the same token) —
+					// fire the callback but keep the slot in_use and active_io_count unchanged. Only
+					// the TERMINAL CQE (F_MORE clear — single-shot always, or a multishot that ended/
+					// errored/was cancelled) releases the slot and drops the in-flight count, exactly
+					// once per op. Non-recv ops never set F_MORE, so they always take this terminal path.
+					more := .MORE in cqe.flags
+					if !more {
+						loop.active_io_count = max(0, loop.active_io_count - 1)
+						uring_op_release_slot(loop, index)
+					}
 					if slot.recv_cb != nil {
-						// Provided-buffer-ring RECV: decode the kernel-selected buffer id from the
-						// CQE flags (a bit_set — transmute to u32 before the >>16). The callback copies
-						// the bytes then recycles the buffer.
+						// Decode the kernel-selected buffer id from the CQE flags (a bit_set —
+						// transmute to u32 before the >>16). The callback copies the bytes then recycles.
 						has_buf := .BUFFER in cqe.flags
 						bid := u16(transmute(u32)cqe.flags >> 16)
-						slot.recv_cb(loop, slot.user_data, cqe.res, bid, has_buf)
+						slot.recv_cb(loop, slot.user_data, cqe.res, bid, has_buf, more)
 					} else if slot.callback != nil {
 						slot.callback(loop, slot.user_data, cqe.res)
 					}
@@ -596,13 +619,15 @@ uring_release_slot :: proc(loop: ^Loop, index: u32) {
 // the generation bump in uring_release_slot already makes any surviving completion
 // safe to drop — the cancel is the promptness optimization, not the safety net.
 // The cancel op's own completion carries URING_CANCEL_USER_DATA and is ignored.
-uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) {
+// Returns whether the cancel SQE was actually queued (false = SQ momentarily full),
+// so a caller suppressing duplicate cancels knows whether one is genuinely pending.
+uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) -> bool {
 	sqe, ok := uring.get_sqe(&loop.platform.ring)
 	if !ok {
 		// SQ ring momentarily full: submit to free slots, then retry once.
 		uring.submit(&loop.platform.ring, 0, nil)
 		sqe, ok = uring.get_sqe(&loop.platform.ring)
-		if !ok do return
+		if !ok do return false
 	}
 	// Zero the recycled SQE slot — get_sqe does not clear it (mirrors arm_uring_poll).
 	sqe^ = {}
@@ -610,6 +635,7 @@ uring_cancel_poll :: proc(loop: ^Loop, target_token: u64) {
 	sqe.addr = target_token // match the POLL_ADD whose user_data == target_token
 	sqe.user_data = URING_CANCEL_USER_DATA
 	uring.submit(&loop.platform.ring, 0, nil)
+	return true
 }
 
 // --- Proactor completion-op submission (io_uring RECV/SEND) ---
@@ -713,11 +739,12 @@ platform_submit_send :: proc(
 // produces a terminal CQE that releases the slot and fires the callback; this just makes a
 // pending op (e.g. a RECV on a fd being closed) tear down promptly instead of lingering. The
 // generation check avoids issuing a cancel against a slot already reused for a new op.
-platform_cancel_op :: proc(loop: ^Loop, token: u64) {
-	if !loop.platform.proactor_ok do return
+platform_cancel_op :: proc(loop: ^Loop, token: u64) -> bool {
+	if !loop.platform.proactor_ok do return false
 	if uring_op_slot_live(loop, uring_op_token_index(token), uring_op_token_generation(token)) {
-		uring_cancel_poll(loop, token) // ASYNC_CANCEL(addr=token); its own CQE is ignored
+		return uring_cancel_poll(loop, token) // ASYNC_CANCEL(addr=token); its own CQE is ignored
 	}
+	return false
 }
 
 // uring_arm_rw STAGES a RECV/SEND SQE for `buf` under `token` (it does NOT submit — platform_poll_uring
@@ -979,6 +1006,10 @@ buf_ring_init :: proc(loop: ^Loop) -> bool {
 		return false
 	}
 	loop.platform.bufring_ok = true
+	// Attempt multishot (2b) by default: RECV_MULTISHOT is an ioprio flag, not a probeable opcode,
+	// so a kernel with buffer rings (5.19) but without multishot recv (added 6.0) accepts the SQE
+	// and reports -EINVAL via the CQE — net.odin disables multishot on that and re-arms single-shot.
+	loop.platform.multishot_ok = true
 	return true
 }
 
@@ -1011,13 +1042,25 @@ uring_arm_recv_ring :: proc(loop: ^Loop, fd: uintptr, token: u64) -> bool {
 	sqe.opcode = .RECV
 	sqe.fd = cast(linux.Fd)fd
 	sqe.addr = 0
-	// len MUST be the buffer size, not 0: Linux 5.19 (the oldest kernel with buffer rings, which
-	// our gate accepts) takes len literally for a BUFFER_SELECT recv, so len=0 reads 0 bytes and
-	// completes as a false EOF; only 6.1+ treats 0 as "use the selected buffer's size". The kernel
-	// still reports the actual bytes received in cqe.res (<= this cap).
-	sqe.len = u32(URING_BUFRING_BUFSIZE)
 	sqe.flags = {.BUFFER_SELECT}
 	sqe.buf_group = URING_BUFRING_BGID
+	if loop.platform.multishot_ok {
+		// Multishot (2b): RECV_MULTISHOT lives in ioprio (aliased here as sq_send_recv_flags), NOT
+		// msg_flags; one submission then yields many CQEs (each F_MORE-set until it ends). The
+		// multishot+BUFFER_SELECT API REQUIRES len == 0 (the kernel sizes from the chosen buffer);
+		// a non-zero len is rejected with -EINVAL (which would silently disable multishot).
+		sqe.sq_send_recv_flags = {.RECV_MULTISHOT}
+		sqe.len = 0
+	} else {
+		// Single-shot: len MUST be the buffer size, not 0 — Linux 5.19 (the oldest kernel with
+		// buffer rings, which the gate accepts) takes len literally for a BUFFER_SELECT recv, so
+		// len=0 reads 0 bytes = a false EOF; only 6.1+ treats 0 as "use the buffer's size". The
+		// kernel reports the actual bytes in cqe.res (<= this cap).
+		sqe.len = u32(URING_BUFRING_BUFSIZE)
+	}
 	sqe.user_data = token
 	return true
 }
+
+platform_recv_ring_multishot :: proc(loop: ^Loop) -> bool {return loop.platform.multishot_ok}
+platform_disable_multishot :: proc(loop: ^Loop) {loop.platform.multishot_ok = false}

@@ -1266,13 +1266,16 @@ Op_Completion :: proc(loop: ^Loop, user_data: rawptr, res: i32)
 // Op_Dispose} runs. May be nil if the caller has nothing to release.
 Op_Dispose :: proc(user_data: rawptr)
 
-// Op_Recv_Completion fires for a provided-buffer-ring RECV (Slice 2a). Unlike Op_Completion it
-// reports the kernel-selected buffer: `has_buf` is whether the kernel picked one, `bid` its id.
-// The callback MUST copy what it needs out of get `recv_ring_buf(loop, bid, res)` and then call
-// `recv_ring_recycle(loop, bid)` — copy BEFORE recycle (recycling republishes the buffer and the
-// kernel may immediately overwrite it), and recycle UNCONDITIONALLY (even when discarding the data),
-// or the shared ring leaks a buffer. Loop thread.
-Op_Recv_Completion :: proc(loop: ^Loop, user_data: rawptr, res: i32, bid: u16, has_buf: bool)
+// Op_Recv_Completion fires for a provided-buffer-ring RECV (Slice 2a/2b). It reports the
+// kernel-selected buffer (`has_buf` = whether one was picked, `bid` = its id) and `more` = whether
+// the submission stays armed (multishot, 2b): true on an INTERMEDIATE completion (the op is still
+// live — do NOT re-arm or treat as finished), false on the TERMINAL completion (single-shot always,
+// or a multishot that ended/errored/was cancelled — re-arm then). The callback MUST copy what it
+// needs from `recv_ring_buf(loop, bid, res)` and then call `recv_ring_recycle(loop, bid)` — copy
+// BEFORE recycle (recycling republishes the buffer; the kernel may immediately overwrite it), and
+// recycle UNCONDITIONALLY for any CQE that carried a buffer (even a terminal one, even when
+// discarding the data), or the shared ring leaks a buffer. Loop thread.
+Op_Recv_Completion :: proc(loop: ^Loop, user_data: rawptr, res: i32, bid: u16, has_buf: bool, more: bool)
 
 proactor_available :: proc(loop: ^Loop) -> bool {
 	return platform_proactor_available(loop)
@@ -1284,9 +1287,12 @@ bufring_available :: proc(loop: ^Loop) -> bool {
 	return platform_bufring_ok(loop)
 }
 
-// submit_recv_ring queues a single-shot RECV that draws its destination from the shared buffer ring
-// (no per-conn buffer). cb fires with (res, bid, has_buf). Returns OP_ID_INVALID if cb is nil, the
-// ring is unavailable, or no SQE could be obtained (caller falls back to submit_recv). LOOP-THREAD ONLY.
+// submit_recv_ring queues a RECV that draws its destination from the shared buffer ring (no per-conn
+// buffer). When multishot is available (recv_ring_multishot) it submits a MULTISHOT recv — one
+// submission yields many completions (cb fires repeatedly with more=true), removing the per-request
+// re-arm; otherwise a single-shot recv (cb fires once, more=false). cb fires with (res, bid, has_buf,
+// more). Returns OP_ID_INVALID if cb is nil, the ring is unavailable, or no SQE could be obtained
+// (caller falls back to submit_recv). LOOP-THREAD ONLY.
 submit_recv_ring :: proc(
 	loop: ^Loop,
 	fd: uintptr,
@@ -1298,6 +1304,20 @@ submit_recv_ring :: proc(
 	token := platform_submit_recv_ring(loop, fd, cb, dispose, user_data)
 	if token != 0 do loop.active_io_count += 1
 	return Op_ID(token)
+}
+
+// recv_ring_multishot reports whether ring recvs are submitted in multishot mode (2b). False on a
+// kernel without RECV_MULTISHOT (or after disable_multishot fell back); then each ring recv is
+// single-shot and the caller re-arms per completion.
+recv_ring_multishot :: proc(loop: ^Loop) -> bool {
+	return platform_recv_ring_multishot(loop)
+}
+
+// disable_multishot turns multishot off for all future ring recvs on this loop — called once when a
+// multishot recv completes with -EINVAL (the kernel lacks RECV_MULTISHOT but has buffer rings, so
+// the gate let it through); the caller re-arms the connection in single-shot mode. LOOP-THREAD ONLY.
+disable_multishot :: proc(loop: ^Loop) {
+	platform_disable_multishot(loop)
 }
 
 // recv_ring_buf returns the kernel-selected bytes for a completed ring RECV (copy, do not retain).
@@ -1352,11 +1372,13 @@ submit_send :: proc(
 // closed — io_uring holds its own file reference, so closing the fd alone does NOT tear the
 // op down). Best-effort: the op still produces a terminal CQE (its own -ECANCELED, or a real
 // result that beat the cancel), which fires Op_Completion and reclaims the slot. The buffer
-// must stay valid until that terminal completion — the cancel CQE alone is not it. No-op for
-// OP_ID_INVALID or when the proactor is unavailable. LOOP-THREAD ONLY.
-cancel_op :: proc(loop: ^Loop, id: Op_ID) {
-	if id == OP_ID_INVALID do return
-	platform_cancel_op(loop, u64(id))
+// must stay valid until that terminal completion — the cancel CQE alone is not it. LOOP-THREAD
+// ONLY. Returns whether a cancel SQE was actually queued (false = OP_ID_INVALID, proactor
+// unavailable, the slot already completed, or the SQ was momentarily full), so a caller
+// suppressing duplicate cancels can distinguish a real cancel from a no-op.
+cancel_op :: proc(loop: ^Loop, id: Op_ID) -> bool {
+	if id == OP_ID_INVALID do return false
+	return platform_cancel_op(loop, u64(id))
 }
 
 // wakeup allows background worker threads to instantly kick the loop out of sleep.
