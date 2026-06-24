@@ -148,6 +148,13 @@ eval :: proc(
 	// JSValueUnprotect on cached modules still has a live context.
 	defer destroy_runtime_state(cast(jsc.JSContextRef)ctx, state)
 
+	// Register the graceful-shutdown drain hook (multi-worker, Linux only): when the supervisor
+	// requests a stop, the loop runs net_drain_begin on its own thread to stop accepting and drain
+	// in-flight connections. A no-op for single-worker (request_shutdown is never called).
+	when ODIN_OS == .Linux {
+		if loop != nil do eventloop.set_shutdown_hook(loop, net_drain_begin, state)
+	}
+
 	// Snapshot the standard error constructors while globalThis is still pristine —
 	// before setup_module_environment's builtin JS and, crucially, before any user
 	// code. make_native_error builds native throws from these captured intrinsics, so

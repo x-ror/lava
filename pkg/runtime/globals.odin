@@ -74,6 +74,11 @@ Runtime_State :: struct {
 	net_starved_tail:  ^Net_Connection,
 	net_recv_credits:  int, // buffers recycled with no parked taker — consumed by a later park (Slice 2a)
 	next_net_id:       u64,
+	// Graceful shutdown (Slice 3a): set when the loop's drain hook has closed the listeners and is
+	// letting in-flight connections finish. drain_timer is the bounded-drain deadline that force-exits
+	// if connections don't close in time (0 == none armed).
+	draining:          bool,
+	drain_timer:       eventloop.Timer_ID,
 	// Node-style process.argv: [execPath, scriptPath, ...userArgs]. Built in eval()
 	// and read by install_process. Empty for embedders that don't set it (then
 	// install_process falls back to os.args).
