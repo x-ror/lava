@@ -1,14 +1,15 @@
 # MSG_ZEROCOPY for large writes (Slice 3b) — design (review before impl)
 
-Status: **rev.4** — three internal adversarial rounds (rev.1: 3 crit/12 high; rev.2: 0 crit/7 high;
-rev.3 round-3: 0 crit/0 high) + a Codex review round (5 findings, all real, folded into rev.4). Codex's
-key correction: the `io_uring_enter(2)` ABI is subtler than rev.3 assumed — **`F_MORE` (pinned?) and
-`res` (bytes/errno) are independent axes**: an *errored* ZC can still pin+notify (so `more=true,res<0`
-is real, the error must be carried), and a *copied* ZC is a single `res>0` CQE with no notif (a success,
-not a close). §1 + the §3 state machine are now two-axis; `zc_ok` inits `true`; transient fallbacks pass
-`force_plain`; `-EOPNOTSUPP` joins `-EINVAL` as a capability fallback. The 2b `F_MORE` slot-lifetime
-reuse + the template-mirrored ordering (send_op-clear first, `!closing` guard, `net_op_finished` LAST)
-are unchanged. Ready for review-before-impl.
+Status: **rev.5** — three internal adversarial rounds (rev.1: 3 crit/12 high; rev.2: 0 crit/7 high;
+rev.3 round-3: 0 crit/0 high) + two Codex review rounds (rev.4: 5 findings — the two-axis ABI; rev.5: 4
+Major / 5 Minor — all real, folded in). The two-axis model (`F_MORE` = pinned? vs `res` = bytes/errno,
+independent) is the robust core. rev.5 changes: `zc_ok` set by an **init-time `.SEND_ZC` opcode probe**
+(`SEND_ZC` IS probeable, unlike 2b's ioprio flag — kills the storm + the send-before-recv hole, M1); §1
+softened so the **copied-send CQE count is not asserted** (version-dependent — the state machine
+absorbs both shapes, M2); §10 tests the state machine by **direct invocation**, not an unobservable
+loopback two-CQE sequence (M3); ZC eventloop surface kept **Linux-internal** (no stubs, M4); threshold
+default raised to 32–64 KiB (m7). The 2b `F_MORE` slot-lifetime reuse + template-mirrored ordering are
+unchanged. Ready for review-before-impl.
 
 **Scope:** the proactor send path. Sends ≥ a threshold go via `IORING_OP_SEND_ZC` (kernel transmits
 from user pages instead of copying); smaller sends keep the plain copy-`SEND`. Headline hello-world
@@ -33,12 +34,17 @@ byte count or `-errno`) and `F_MORE` (whether the pages are pinned and a notific
    **≥ 0** (bytes sent, possibly partial) **OR `< 0`** — *an errored request may still have pinned and
    thus still notifies* (man page: "even failed requests may generate a notification"). The notif is
    strictly **ordered after** the result for the same `user_data`. `F_MORE`+`F_NOTIF` never co-occur.
-2. **Not pinned (`F_MORE` clear — a single CQE, no notification):** the buffer is free immediately.
-   Zerocopy is best-effort — the kernel may **copy** a send (small/unaligned/loopback/non-SG NIC, §9
-   Q5), completing it as a single `res > 0` CQE with **no** `F_MORE` and **no** notif — *a normal
-   success that must advance the offset, not an error*. Pre-transmission failures (`-EINVAL`,
-   `-EOPNOTSUPP`, `-EBADF`, `-ENOTSOCK`, `-EAGAIN`/`-EINTR` zero-byte, optmem `-ENOBUFS`/`-ENOMEM`) are
-   also single `F_MORE`-clear CQEs (`res < 0`, never pinned); `res == 0` is a zero-byte stall.
+2. **Best-effort zerocopy — a send the kernel COPIES is a normal success, not an error.** The kernel
+   declines zerocopy for small/unaligned segments, loopback, non-SG NICs (§9 Q5). **Whether a copied
+   send clears `F_MORE` (a single `res > 0` CQE, no notif) OR still posts a result+notif pair (the copy
+   observable only as `IORING_NOTIF_USAGE_ZC_COPIED` in the notif `res` under `REPORT_USAGE`) is
+   KERNEL-VERSION-DEPENDENT** — newer kernels added the `F_MORE`-clear-on-copy optimization; earlier 6.x
+   notify regardless. **The §3 state machine is robust to both**: a copy as `(!saw, res>0)` and a copy as
+   `(saw=true after a res≥0 result, notif res ignored)` both converge on "advance `off`, drain". So we
+   never assert a CQE *count* for the copied path (§10) — only the outcome. Pre-transmission failures
+   (`-EINVAL`, `-EOPNOTSUPP`, `-EBADF`, `-ENOTSOCK`, `-EAGAIN`/`-EINTR` zero-byte, optmem
+   `-ENOBUFS`/`-ENOMEM`) are single `F_MORE`-clear CQEs (`res < 0`, never pinned); `res == 0` is a
+   zero-byte stall.
 3. A **cancel** past the result returns `-ENOENT`/`-EALREADY` and cannot un-pin handed-off pages — the
    notification still fires. A cancel that **beats** transmission yields a single `-ECANCELED`
    (`F_MORE` clear, no notif).
@@ -62,17 +68,26 @@ Slot lifetime is **reused unchanged** from 2b: `drain_uring_completions` release
 release path, no underflow, no leak.
 
 - **`Op_Send_Completion :: proc(loop, user_data, res: i32, more: bool)`** — new completion type.
-- **`Uring_Op_Slot.send_cb`** — new field, **mutually exclusive** with `callback` and `recv_cb`.
-- **`uring_op_alloc_slot_send`** sets **only** `send_cb`; **`uring_op_release_slot` must also null
-  `send_cb`** (else a reused slot misdispatches). Debug assert at alloc: exactly one callback field set.
-- **Drain dispatch order `recv_cb → send_cb → callback`** (mutually exclusive). The `recv_cb` arm (with
-  its `bid := transmute(u32)cqe.flags>>16` BUFFER-select read) is never reached by a ZC CQE (a send slot
-  has `recv_cb == nil`).
-- **`submit_send_zc`** allocates via `uring_op_alloc_slot_send`, **zeroes the SQE** (`sqe^ = {}`, like
-  `uring_arm_rw` — a recycled SQE carries stale bytes in the ZC-specific union arms / addr2 / addr_len /
-  ioprio), then sets `opcode=.SEND_ZC`, `addr`/`len`=buf, `msg_flags={.NOSIGNAL}`, `ioprio=0`
-  (`SEND_ZC_REPORT_USAGE` out of scope, §8). Staged + flushed on the wait `enter` like SEND (1b
-  batching unaffected). `len` capped at `URING_MAX_RW` like SEND.
+- **Slot callback representation — prefer a tagged union.** Adding `send_cb` makes three parallel
+  nullable callback fields (`callback`/`recv_cb`/`send_cb`), only one ever set — fragile (needs the
+  alloc-time "exactly one set" assert, the `recv→send→callback` nil-cascade, AND a "release must null
+  `send_cb`" footgun). Represent the slot's callback as an Odin
+  `union{Op_Completion, Op_Recv_Completion, Op_Send_Completion}` instead: mutual exclusion becomes
+  *structural*, dispatch becomes a `switch` on the variant, and release just clears the union — no
+  assert, no cascade, no per-field null footgun. (Small refactor of the existing 2a/2b slot; recommended
+  while adding the third kind. If kept as separate fields, dispatch order is `recv_cb → send_cb →
+  callback`, `uring_op_release_slot` MUST also null `send_cb`, and a debug assert enforces one-set — but
+  the union removes all three obligations.)
+- A ZC CQE never reaches the `recv_cb` path (its `bid := transmute(u32)cqe.flags>>16` BUFFER-select
+  read), since a send slot's variant is `Op_Send_Completion`, not recv.
+- **`platform_submit_send_zc` reuses `uring_arm_rw`** — do NOT hand-roll the SQE. `uring_arm_rw` already
+  does `sqe^ = {}` (zeroing ioprio/addr2/buf_index — `ioprio=0` falls out, no `REPORT_USAGE`/`FIXED_BUF`),
+  the opcode+flags params, the SQ-full retry, the `URING_MAX_RW` len cap, and 1b staging. So it is just:
+  `tok := uring_op_alloc_slot_send(...)`, `uring_arm_rw(loop, .SEND_ZC, fd, buf, tok, {.NOSIGNAL})`,
+  release-on-fail — identical in shape to `platform_submit_send`. Avoids a second SQE-builder drifting.
+- **Update the stale comment** at `loop_linux.odin:473` ("Non-recv ops never set F_MORE, so they always
+  take this terminal path") — `SEND_ZC` is now exactly such an op. The code is already correct (it tests
+  `.MORE in cqe.flags` generically); only the comment misleads.
 
 ---
 
@@ -136,7 +151,7 @@ net_send_zc_complete(loop, conn, res, more):
     elif len(conn.pending_writes) > 0:                net_proactor_kick_send(conn)                                  # rotate + submit via the choke point
     else:                                            clear(conn.active_send); conn.active_send_off = 0
                                                      net_proactor_on_drained(conn)                                  # 'drain' + re-arm + end_after_drain close
-  conn.zc_err = 0; conn.saw_result = false           # reset (also reset in the choke point at next submit)
+  conn.zc_err = 0; conn.saw_result = false           # load-bearing ONLY on the closing path (no re-submit runs to reset via the choke point); otherwise redundant with net_proactor_submit's reset
   net_op_finished(conn)                              # LAST, unconditional (mirrors on_send_complete:712)
 ```
 
@@ -163,7 +178,10 @@ template's `!closing` envelope. The two **success** entries (`saw` with `zc_err=
   `pending_writes`→`active_send` and then call `net_proactor_submit` (NOT the old plain
   `net_proactor_submit_send` directly), so a back-to-back large rotated chunk gets ZC instead of
   silently degrading to copy-send. (`net_proactor_submit` absorbs the old `net_proactor_submit_send`
-  body; `kick_send` only rotates + gates on `send_op != INVALID`.)
+  body; `kick_send` only rotates + gates on `send_op != INVALID`.) **Precondition (debug assert):**
+  `net_proactor_submit` entry requires `conn.send_op == OP_ID_INVALID` — it owns `send_op`, so a caller
+  must clear/gate first (all sites do). Asserting it documents + enforces the single-in-flight-send
+  invariant cheaply, mirroring the alloc-time "exactly one callback variant" check.
 - **Partial tail re-evaluates the threshold**: a 16 KiB ZC send that partials to a 4 KiB tail re-sends
   the tail as **plain** (sub-threshold) — no second pin+notif for a small tail. A connection thus mixes
   ZC and plain SENDs across submissions of one buffer; the completion variant follows whichever was
@@ -182,11 +200,18 @@ template's `!closing` envelope. The two **success** entries (`saw` with `zc_err=
 
 ## 5. Capability + transient fallback (per-op attribution)
 
-- **`zc_ok` is initialized `true`** at proactor bring-up (where `multishot_ok` is set — `buf_ring_init`
-  / the proactor probe), NOT left at Odin's `false` default. It is only ever *cleared* by `disable_zc`,
-  so without the explicit init the submit predicate `zc_ok && …` would be false forever and ZC would
-  **never** be attempted. (`zc_ok` lives in `Platform_Loop` like `multishot_ok`; `disable_zc` mirrors
-  `disable_multishot`.)
+- **`zc_ok` is set by an init-time opcode PROBE, in `platform_init` beside `proactor_ok` — NOT coupled
+  to `buf_ring_init`.** `SEND_ZC` is a real *opcode*, so — unlike `RECV_MULTISHOT` (an ioprio flag that
+  2b genuinely couldn't probe) — it is probeable exactly like the existing `.RECV`/`.SEND` checks:
+  extend `uring_probe_proactor` with `uring_probe_supports(&probe, .SEND_ZC)` and set
+  `loop.platform.zc_ok` there. This (a) fixes a hole — `buf_ring_init` is **lazy** and recv-ring-specific
+  (runs on the first ring-recv), so a **send-before-recv** conn (the outbound `startConnection` client
+  path) would never have seen `zc_ok=true`; and (b) eliminates the `-EINVAL` storm on a 5.x kernel
+  (`proactor_ok` true, `SEND_ZC` absent) — every worker would otherwise eat a first-send `-EINVAL`
+  before latching off. `zc_ok` lives in `Platform_Loop` like `multishot_ok`; must NOT be left at Odin's
+  `false` default (it is only ever *cleared* by `disable_zc`). The runtime `-EINVAL`/`-EOPNOTSUPP`
+  fallback **stays** for the per-socket/protocol case the probe can't see (a specific socket lacking ZC)
+  — this is **probe AND runtime fallback**, not either/or.
 - **`force_plain` — the one-shot the fallbacks need.** `net_proactor_submit(conn, force_plain := false)`
   computes `use_zc := !force_plain && zc_ok && len(active_send[off:]) >= NET_ZC_THRESHOLD`. A transient
   fallback (below) MUST pass `force_plain=true`: otherwise the choke point recomputes `use_zc` from the
@@ -273,25 +298,43 @@ Moving the full-drain transition from the result to the **notification** (INV-2)
 ---
 
 ## 9. Open questions for review
-1. **Threshold** — 16 KiB vs 32/64 KiB?
+1. **Threshold** — proposal raised to **32–64 KiB** (was 16 KiB): the net break-even is above the raw
+   ~10 KiB zerocopy break-even because §4's serialization makes the next write wait one notification RTT
+   that a plain copy-SEND would overlap (acute for pipelined keep-alive: a 16 KiB body then the next
+   response's headers). Settle via the **pipelined keep-alive** bench (§10), not just one big body.
 2. **Serialized one-ZC-per-conn (§4)** vs a per-op owned-buffer model letting a plain send overlap the
    pinned window — accept the one-notif-RTT serialization for v1 (recommended)?
 3. **`-ENOBUFS`** — per-op copy-fallback only (recommended) vs also a `zc_ok` cooldown?
-4. **Capability** — first-`-EINVAL` latch (recommended, matches 2b) vs a startup `SEND_ZC` probe
-   (extend `uring_probe_proactor`) to gate `zc_ok` up front and skip the per-conn first-send `-EINVAL`
-   on < 6.0?
-5. **Bench interface** — ZC ≈ no-op on loopback (kernel copies); bench on a real NIC, or document the
-   caveat + use `SEND_ZC_REPORT_USAGE` in a verification build to confirm actual zerocopy?
+4. **Capability — RESOLVED: probe AND runtime fallback** (§5), not either/or. The 2b "latch, can't
+   probe" analogy was false (`RECV_MULTISHOT` is an ioprio flag; `SEND_ZC` is a real opcode). Probe
+   `.SEND_ZC` in `uring_probe_proactor` at init to gate `zc_ok` (kills the storm + the send-before-recv
+   hole); keep the `-EINVAL`/`-EOPNOTSUPP` runtime fallback for per-socket/protocol gaps the probe
+   can't see.
+5. **Bench interface** — ZC ≈ no-op on loopback (kernel copies, possibly without even the F_MORE/notif
+   pair, §1(2)); bench on a real NIC, or document the caveat + use `SEND_ZC_REPORT_USAGE` in a
+   verification build to confirm actual zerocopy?
 
 ---
 
 ## 10. Test & verification plan
-- **Unit (eventloop)**: `SEND_ZC` socketpair round-trip — assert the two-CQE sequence (result
-  `more=true` `res`=bytes, then notif `more=false`); `active_io_count` stays 1 across the result, → 0
-  only on the notif; slot released once; the ZC op never enters the `recv_cb` arm. Forced fallback
-  (`zc_ok=false` → plain). Teardown: an in-flight ZC op left **post-result/pre-notif** disposed exactly
-  once at destroy → conn freed once (ASAN). A forced submit-failure during the `-EINVAL` fallback frees
-  the conn exactly once.
+
+**No test asserts a real kernel two-CQE sequence** — loopback always copies and AF_UNIX (the
+`make_socketpair` helper) doesn't support send-zerocopy at all (`SEND_ZC` there copies or returns
+`-EOPNOTSUPP`); a genuine pinned result→notif needs a real NIC, which isn't CI-feasible. So the state
+machine is tested by **direct invocation** and the F_MORE accounting by **reuse of the existing
+multishot machinery**:
+- **Net state machine (primary)**: call `net_send_zc_complete(loop, conn, res, more)` directly with
+  crafted `(res, more)` tuples — no kernel ZC needed — covering **every `(more, res, saw_result)` cell**
+  (next bullet). This is the real correctness test.
+- **Eventloop F_MORE accounting**: it is callback-agnostic (`drain_uring_completions` releases the slot
+  + decrements `active_io_count` only on the `F_MORE`-clear CQE for ANY op), already proven by the
+  multishot-recv test. So SEND_ZC adds only: a unit test that a `send_cb` slot **routes to `send_cb`,
+  never `recv_cb`/`callback`** (dispatch + release-nulls-`send_cb`), plus `submit_send_zc` returning a
+  valid op id + `active_io_count` bookkeeping — NOT a real two-CQE kernel sequence.
+- **Probe**: `uring_probe_proactor` reports `zc_ok` on a ≥6.0 kernel; a large send then actually submits
+  `SEND_ZC` (vs plain below threshold). Forced fallback (`zc_ok=false` → plain). Teardown: an in-flight
+  ZC op left **post-result/pre-notif** (crafted) disposed exactly once at destroy → conn freed once
+  (ASAN); a forced submit-failure during the `-EINVAL` fallback frees the conn once.
 - **State-machine — every `(more, res, saw_result)` cell** (the Codex-round additions): result-then-notif
   success; **`more=true, res<0` (errored-but-pinned)** → the notif surfaces the error (close/fallback),
   NOT a silent tail-resubmit; **`more=false, res>0` single-CQE COPIED success** → advances `off` and
@@ -313,10 +356,25 @@ Moving the full-drain transition from the result to the **notification** (INV-2)
   hello-world unchanged. Optional verification build asserts actual zerocopy via `REPORT_USAGE`.
 
 ## 11. Commit staging (one 3b PR)
-1. Eventloop: `Op_Send_Completion` + `send_cb` slot field + `uring_op_alloc_slot_send` + release nulls
-   it + `recv→send→callback` dispatch + `submit_send_zc` (SQE-zeroed) — with the eventloop unit tests.
-2. Net: the §3 state machine (INV-1..4, ordered exactly as the pseudocode) + the `net_proactor_submit`
-   choke point (threshold + `saw_result`/`send_was_zc` reset) + `zc_ok`/`disable_zc` +
-   `-EINVAL`/`-ENOBUFS` fallbacks + the §7 `want_drain`-into-`net_maybe_arm_recv` move.
-3. Tests (buffer-lifetime incl. cancel-after-result, state rows, large-body integrity, end-after-write,
-   2b-window read-pause) + bench + docs.
+
+**Platform placement (build-correctness):** the ZC eventloop surface — `Op_Send_Completion`, the slot
+callback-union variant, `submit_send_zc`/`platform_submit_send_zc`, `zc_ok`/`disable_zc`, the
+`.SEND_ZC` probe — is defined **inside `loop_linux.odin`** (the proactor is Linux-only) and called only
+from the Linux-only `net.odin`. It is NOT added to the cross-platform `loop.odin` facade, so — unlike
+`submit_recv_ring`, which has a `loop.odin` wrapper + darwin/windows no-op stubs — **no darwin/windows
+stubs are needed** (nothing non-Linux references it). (If a future cross-platform caller appears, add
+the `loop.odin` wrapper + the two stubs then.) This keeps the established "eventloop package compiles
+everywhere" invariant intact.
+
+1. Eventloop (Linux-internal): the `.SEND_ZC` probe in `uring_probe_proactor` → `zc_ok` at
+   `platform_init` (decoupled from `buf_ring_init`, M1); `Op_Send_Completion` + the slot callback union
+   (or `send_cb` field + release-nulls-it) + dispatch; `submit_send_zc` reusing `uring_arm_rw` (m5);
+   `disable_zc`. Update the stale `loop_linux.odin:473` comment (m6). Eventloop unit tests (send_cb
+   routing; NO real two-CQE sequence — §10).
+2. Net (Linux): the §3 state machine (INV-1..4, ordered exactly as the pseudocode, two-axis cells) +
+   the `net_proactor_submit(conn, force_plain)` choke point (threshold + `saw_result`/`zc_err`/
+   `send_was_zc` reset + the `send_op==INVALID` entry assert) + `net_proactor_kick_send` routed through
+   it + `-EINVAL`/`-EOPNOTSUPP`/`-ENOBUFS` fallbacks + the §7 `want_drain`-into-`net_maybe_arm_recv` move.
+3. Tests (state-machine direct-invocation cells, buffer-lifetime ASAN incl. cancel-after-result,
+   large-body integrity, end-after-write, 2b-window read-pause) + bench (pipelined keep-alive, real NIC)
+   + docs.
