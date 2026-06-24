@@ -1,8 +1,9 @@
 # Multi-core workers (Slice 3a) — design (review before impl)
 
-Status: **DRAFT for review** — revised after two adversarial review rounds. The shared-nothing
-direction is validated; this revision tightens the lifecycle contracts (stop/drain/barrier/supervisor)
-that the second round found under-specified or contradictory.
+Status: **IMPLEMENTED** (design merged in #293 after two adversarial review rounds; built here as the
+staged commits in §11). The shared-nothing direction was validated; the lifecycle contracts
+(stop/drain/barrier/supervisor) below are the ones the second review round tightened, and what the
+implementation follows. End-to-end behaviour is covered by `make test-multicore-smoke`.
 
 **Scope:** `SO_REUSEPORT` + per-core worker event loops — the Node `cluster` / Bun shared-nothing
 model. The largest remaining throughput lever: on a 16-core box we use **one** core today (~34–53k
