@@ -5,6 +5,7 @@ import "core:c"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 import pico "lava:pkg/runtime/picohttpparser"
@@ -178,18 +179,42 @@ Fetch_Request :: struct {
 // fetch_cancel_class is a JSClass whose instances carry a ^Fetch_Request as
 // private data and are callable — calling them tears down the in-flight request
 // without invoking any JS callback (the JS side rejects the promise itself).
-// Created once and reused across all fetch calls on a given thread.
+// The four streaming-handle classes are created once for the whole process and reused across every
+// fetch call. JSClassRef is context-group-independent, so a single shared set is valid across all
+// workers (Slice 3a); g_fetch_classes_once makes the lazy creation race-safe when N workers' first
+// fetch() calls collide (previously an unsynchronized check-then-set per class). fetch_init_classes
+// builds all four together — they're cheap (no I/O) and always needed as a set.
 @(private = "file")
 g_fetch_cancel_class: jsc.JSClassRef
+@(private = "file")
+g_fetch_classes_once: sync.Once
+
+@(private = "file")
+fetch_init_classes :: proc() {
+	cancel_def := jsc.JSClassDefinition {
+		class_name       = "FetchCancel",
+		call_as_function = fetch_cancel_fn_cb,
+	}
+	g_fetch_cancel_class = jsc.JSClassCreate(&cancel_def)
+	resume_def := jsc.JSClassDefinition {
+		class_name       = "FetchResume",
+		call_as_function = fetch_resume_fn_cb,
+	}
+	g_fetch_resume_class = jsc.JSClassCreate(&resume_def)
+	push_def := jsc.JSClassDefinition {
+		class_name       = "FetchPushBody",
+		call_as_function = fetch_push_fn_cb,
+	}
+	g_fetch_push_class = jsc.JSClassCreate(&push_def)
+	end_def := jsc.JSClassDefinition {
+		class_name       = "FetchEndBody",
+		call_as_function = fetch_end_fn_cb,
+	}
+	g_fetch_end_class = jsc.JSClassCreate(&end_def)
+}
 
 fetch_get_cancel_class :: proc() -> jsc.JSClassRef {
-	if g_fetch_cancel_class == nil {
-		def := jsc.JSClassDefinition {
-			class_name       = "FetchCancel",
-			call_as_function = fetch_cancel_fn_cb,
-		}
-		g_fetch_cancel_class = jsc.JSClassCreate(&def)
-	}
+	sync.once_do(&g_fetch_classes_once, fetch_init_classes)
 	return g_fetch_cancel_class
 }
 
@@ -221,13 +246,7 @@ fetch_cancel_fn_cb :: proc "c" (
 g_fetch_resume_class: jsc.JSClassRef
 
 fetch_get_resume_class :: proc() -> jsc.JSClassRef {
-	if g_fetch_resume_class == nil {
-		def := jsc.JSClassDefinition {
-			class_name       = "FetchResume",
-			call_as_function = fetch_resume_fn_cb,
-		}
-		g_fetch_resume_class = jsc.JSClassCreate(&def)
-	}
+	sync.once_do(&g_fetch_classes_once, fetch_init_classes)
 	return g_fetch_resume_class
 }
 
@@ -260,24 +279,12 @@ g_fetch_push_class: jsc.JSClassRef
 g_fetch_end_class: jsc.JSClassRef
 
 fetch_get_push_class :: proc() -> jsc.JSClassRef {
-	if g_fetch_push_class == nil {
-		def := jsc.JSClassDefinition {
-			class_name       = "FetchPushBody",
-			call_as_function = fetch_push_fn_cb,
-		}
-		g_fetch_push_class = jsc.JSClassCreate(&def)
-	}
+	sync.once_do(&g_fetch_classes_once, fetch_init_classes)
 	return g_fetch_push_class
 }
 
 fetch_get_end_class :: proc() -> jsc.JSClassRef {
-	if g_fetch_end_class == nil {
-		def := jsc.JSClassDefinition {
-			class_name       = "FetchEndBody",
-			call_as_function = fetch_end_fn_cb,
-		}
-		g_fetch_end_class = jsc.JSClassCreate(&def)
-	}
+	sync.once_do(&g_fetch_classes_once, fetch_init_classes)
 	return g_fetch_end_class
 }
 
