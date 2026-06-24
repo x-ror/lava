@@ -69,6 +69,18 @@ run_command :: proc(args: []string) {
 		os.exit(2)
 	}
 
+	// LAVA_WORKERS>1 runs the file on N shared-nothing worker loops (Slice 3a). Resolved fail-fast:
+	// an invalid value or an unsupported platform exits non-zero rather than silently degrading.
+	worker_count, count_ok, count_msg := lava_runtime.lava_resolve_worker_count()
+	if !count_ok {
+		fmt.eprintfln("lava: %s", count_msg)
+		os.exit(2)
+	}
+	if worker_count > 1 {
+		// args is [scriptPath, ...userArgs]; the supervisor reads the file once and runs N workers.
+		os.exit(lava_runtime.lava_run_workers(args[0], worker_count, args[1:]))
+	}
+
 	loop := eventloop.init(real_time = true)
 	// args is [scriptPath, ...userArgs]; everything after the script is forwarded to
 	// process.argv.slice(2) (Node parity).

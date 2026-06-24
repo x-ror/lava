@@ -67,12 +67,21 @@ release_global_context_after_eval :: proc(ctx: jsc.JSGlobalContextRef) {
 // clean run), and for any path that created handles it does so while the context
 // they are GC-protected against is still alive. Callers must not destroy the loop
 // themselves (a double destroy closes fd 0); they only init it and pass it in.
+// Pre_Run_Hook fires once per eval, after top-level evaluation has succeeded (listeners bound,
+// context up) and BEFORE the event loop starts. It returns whether the loop should run: the
+// multi-worker supervisor uses it as the startup-barrier rendezvous (report ready, block until the
+// supervisor releases or aborts all workers), returning false on abort so this worker skips run() and
+// falls through to the normal teardown. nil (the default) means "just run" — the single-worker path.
+Pre_Run_Hook :: proc(user_data: rawptr) -> bool
+
 eval :: proc(
 	source: string,
 	source_name := "<eval>",
 	loop: ^eventloop.Loop = nil,
 	echo_result := false,
 	script_args: []string = nil,
+	pre_run: Pre_Run_Hook = nil,
+	pre_run_data: rawptr = nil,
 ) -> Result {
 	// eval consumes the loop on EVERY path (see the OWNERSHIP note above). These two
 	// pre-flight rejections return before the JS context (and the deferred teardown
@@ -285,9 +294,17 @@ eval :: proc(
 	drain_next_ticks_settled(cast(jsc.JSContextRef)ctx, state)
 
 	if loop != nil {
-		eventloop.run(loop)
-		// Loop teardown is the deferred eventloop.destroy declared above — it covers
-		// this success path and every early return once the context exists.
+		// Startup-barrier rendezvous (multi-worker): report this worker ready and block until the
+		// supervisor releases all workers, or aborts startup (some worker failed). On abort, skip the
+		// loop entirely and fall through to the deferred teardown — the loop never ran, so this is a
+		// direct teardown, not a drain. nil hook (single-worker) always proceeds.
+		proceed := true
+		if pre_run != nil do proceed = pre_run(pre_run_data)
+		if proceed {
+			eventloop.run(loop)
+			// Loop teardown is the deferred eventloop.destroy declared above — it covers
+			// this success path and every early return once the context exists.
+		}
 	}
 
 	exit_code := resolve_exit_code(cast(jsc.JSContextRef)ctx, state)
