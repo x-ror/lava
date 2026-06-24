@@ -37,6 +37,16 @@ NET_PROACTOR_RECV :: 16 * 1024
 // bytes are buffered, NOT merely because a send op is in flight (every io_uring send is async).
 NET_WRITE_HWM :: 16 * 1024
 
+// NET_ZC_THRESHOLD: only sends whose UNSENT tail (active_send[off:]) is at least this many bytes use
+// SEND_ZC (Slice 3b) — keying off the unsent tail, not total buffered, is intentional: a shrinking
+// partial tail correctly flips ZC→plain near the end of a body. Below it the page-pin + extra-CQE
+// overhead loses, AND §4's one-notif-RTT serialization (the next write waits for the notification) makes
+// the net break-even higher than raw zerocopy. 32 KiB is a PROVISIONAL, uncalibrated default: loopback
+// always copies, so the calibrating real-NIC pipelined keep-alive bench (design §9 Q5) is still owed —
+// until then prefer leaning HIGHER (a too-high threshold only forgoes a win; a too-low one risks a
+// notif-RTT stall on medium bodies). Do not tighten it on loopback numbers.
+NET_ZC_THRESHOLD :: 32 * 1024
+
 // A connection's I/O backend, chosen ONCE at start: .Proactor only after a successful first
 // submit_recv, else .Readiness (the epoll-style watcher path). close/write/end/shutdown branch
 // on this, never on proactor_available or op-ID liveness (both IDs are invalid after EOF on a
@@ -105,13 +115,17 @@ Net_Connection :: struct {
 	active_send_off: int,
 	pending_writes:  [dynamic]byte,
 	inflight:        int, // submitted-but-not-completed ops; the conn outlives its ops
-	read_paused:     bool, // reads not re-armed while buffered >= NET_WRITE_HWM
 	want_drain:      bool, // write() returned backpressure; a 'drain' is owed
 	silent_close:    bool, // teardown at loop shutdown: free without firing 'close'
 	had_error:       bool, // sticky: set true by any net_close_conn(.., true)
 	recv_starved:    bool, // ProactorRing: on the state.net_starved_* FIFO after -ENOBUFS (no ring buffer)
 	recv_multishot:  bool, // ProactorRing: the live recv_op was armed multishot (attributes its -EINVAL)
 	recv_cancel_pending: bool, // ProactorRing: a backpressure cancel is queued for recv_op (suppresses dup cancels)
+	// SEND_ZC (Slice 3b): the live send op's per-op state (one send op per conn, so per-conn == per-op).
+	send_was_zc:     bool, // the live send_op was submitted SEND_ZC (attributes a -EINVAL/-EOPNOTSUPP)
+	zc_unsupported:  bool, // a -EOPNOTSUPP on THIS conn's socket/protocol: deny ZC for this conn only (vs -EINVAL → loop-wide)
+	saw_result:      bool, // a SEND_ZC result CQE (more=true) arrived: the terminal is its notification
+	zc_err:          i32,  // a negative result recorded on a more=true (errored-but-pinned) CQE; surfaced at the terminal
 	starved_next:    ^Net_Connection, // intrusive starved-FIFO links (valid only while recv_starved)
 	starved_prev:    ^Net_Connection,
 }
@@ -404,15 +418,25 @@ net_force_readiness :: proc() -> bool {
 
 // net_maybe_arm_recv is the SOLE place a RECV is submitted: at most one is ever in flight (two
 // kernel ops writing the one recv_buf would corrupt it), and never after EOF, while reads are
-// paused by backpressure, or during teardown. read_paused is recomputed here so it can't go stale.
+// paused by backpressure (want_drain), or during teardown.
 // net_maybe_arm_recv returns whether it actually submitted a recv: false when it can't arm right now
 // (closing/EOF, a recv already in flight, or write-backpressured) or the submit failed (it then
 // closes the conn — and `conn` may already be freed, so the caller must NOT touch it after a false).
 net_maybe_arm_recv :: proc(conn: ^Net_Connection) -> bool {
 	if conn.closing || conn.read_done do return false
 	if conn.recv_op != eventloop.OP_ID_INVALID do return false // a recv is already in flight
-	conn.read_paused = net_proactor_buffered(conn) >= NET_WRITE_HWM
-	if conn.read_paused do return false
+	// A 'drain' is owed (write() returned backpressure): keep reads paused until it fires — Node's
+	// input-paused-until-'drain' semantics. This is the SINGLE gate for every re-arm path (3b §7): it
+	// covers the SEND_ZC result→notif window (buffered drops on the result but 'drain' waits for the
+	// notif) and also tightens 2a/1b — reads no longer resume on a partial drain (buffered < HWM)
+	// before 'drain'. net_proactor_on_drained clears want_drain BEFORE re-arming, so this never deadlocks.
+	if conn.want_drain do return false
+	// Defensive HWM backstop. With the want_drain unification above this is effectively redundant —
+	// any write that crosses HWM sets want_drain (cleared only on a full drain), so buffered >= HWM
+	// implies want_drain and the gate above already returned. Kept as a cheap local guard (no struct
+	// state — it used to be a read_paused field, which created a misleading "second backpressure
+	// mechanism"); it never independently pauses in proactor mode today.
+	if net_proactor_buffered(conn) >= NET_WRITE_HWM do return false
 	id: eventloop.Op_ID
 	if conn.io_mode == .ProactorRing {
 		// Shared ring: no per-conn buffer; the kernel picks one at completion (net_recv_ring_complete).
@@ -501,14 +525,10 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 		if res == -i32(linux.Errno.ENOBUFS) {
 			net_park_or_rearm(conn)
 		} else if res == -i32(linux.Errno.ECANCELED) {
-			// This terminal came from net_maybe_pause_multishot disarming for backpressure (a
-			// teardown cancel is filtered by !conn.closing above). Re-arm ONLY if no drain is still
-			// owed: a partial send can drop buffered below NET_WRITE_HWM while want_drain is set, and
-			// re-arming on that would resume reads before 'drain' (the caller saw write()==false).
-			// While want_drain holds, leave reads disarmed — net_proactor_on_drained re-arms on the
-			// full drain. (The drain may have completed already but couldn't re-arm while this op's
-			// recv_op was still set, so the !want_drain case must re-arm here.)
-			if !conn.want_drain do net_maybe_arm_recv(conn)
+			// This terminal came from net_maybe_pause_multishot disarming for backpressure (a teardown
+			// cancel is filtered by !conn.closing above). net_maybe_arm_recv now gates on want_drain
+			// itself (3b §7), so the re-arm is unconditional here — it no-ops while a 'drain' is owed.
+			net_maybe_arm_recv(conn)
 		} else {
 			net_maybe_arm_recv(conn)
 		}
@@ -579,6 +599,10 @@ net_starved_unlink :: proc(state: ^Runtime_State, conn: ^Net_Connection) {
 // the loop cannot exit with our peer's data unread — a future recycle re-arms us.
 net_park_or_rearm :: proc(conn: ^Net_Connection) {
 	if conn.closing || conn.read_done do return
+	// A 'drain' is owed → net_maybe_arm_recv would no-op (it gates on want_drain), so spending a recv
+	// credit here would buy nothing and defer another parked conn's re-arm by a recycle. The drain
+	// transition (net_proactor_on_drained) re-arms anyway. Mirrors net_refill_starved's want_drain policy.
+	if conn.want_drain do return
 	state := get_state_from_ctx(conn.ctx)
 	if state == nil do return
 	if state.net_recv_credits > 0 {
@@ -657,9 +681,50 @@ net_proactor_buffered :: proc(conn: ^Net_Connection) -> int {
 	return (len(conn.active_send) - conn.active_send_off) + len(conn.pending_writes)
 }
 
-// net_proactor_submit_send submits active_send[off:] (the tail not yet sent). Loop thread.
-net_proactor_submit_send :: proc(conn: ^Net_Connection) {
-	id := eventloop.submit_send(conn.loop, conn.fd, conn.active_send[conn.active_send_off:], on_send_complete, on_op_dispose, conn)
+// M3 (test confidence): when LAVA_ZC_STATS is set, emit one-time evidence to stderr distinguishing a real
+// SEND_ZC run from a silent plain-path fallback (the smoke asserts on it, so a green gate can never be a
+// plain-path run on a ZC-capable kernel — exactly the CI kernels most likely to differ from a dev box).
+// Racy-but-benign across workers (a line may print more than once); the smoke only checks presence.
+@(private = "file") g_zc_ok_reported: bool
+@(private = "file") g_zc_engaged_reported: bool
+net_zc_stats_note :: proc(loop: ^eventloop.Loop, use_zc: bool) {
+	if g_zc_ok_reported && (g_zc_engaged_reported || !use_zc) do return
+	if os.get_env("LAVA_ZC_STATS", context.temp_allocator) == "" do return
+	if !g_zc_ok_reported {
+		g_zc_ok_reported = true
+		os.write_string(os.stderr, eventloop.send_zc_ok(loop) ? "LAVA_ZC: zc_ok=1\n" : "LAVA_ZC: zc_ok=0\n")
+	}
+	if use_zc && !g_zc_engaged_reported {
+		g_zc_engaged_reported = true
+		os.write_string(os.stderr, "LAVA_ZC: SEND_ZC engaged\n")
+	}
+}
+
+// net_proactor_submit submits active_send[off:] (the tail not yet sent) — the SINGLE submitter that
+// owns send_op + inflight, choosing SEND_ZC vs a plain copy-SEND. ALL send sites route through it
+// (initial kick, partial tail, pending rotation via kick_send, and the ZC fallbacks). Loop thread.
+//
+// SEND_ZC (3b) is used iff the kernel supports it (zc_ok, probed at init), the caller didn't force
+// plain (a transient -ENOBUFS/-EINVAL fallback that must NOT re-pick ZC), and the unsent tail is large
+// enough to be worth the page-pin + the notification round-trip. ZC is also denied per-conn after a
+// -EOPNOTSUPP on this socket (conn.zc_unsupported — a per-socket/protocol condition, vs -EINVAL which
+// latches loop-wide). send_was_zc records the choice so the completion can attribute a -EINVAL/-EOPNOTSUPP;
+// saw_result/zc_err are reset per submission (one send op per conn, so this is the per-op reset).
+// PRECONDITION: send_op == INVALID (the caller cleared/gated).
+net_proactor_submit :: proc(conn: ^Net_Connection, force_plain := false) {
+	assert(conn.send_op == eventloop.OP_ID_INVALID, "net_proactor_submit: a send is already in flight")
+	conn.saw_result = false
+	conn.zc_err = 0
+	buf := conn.active_send[conn.active_send_off:]
+	use_zc := !force_plain && !conn.zc_unsupported && eventloop.send_zc_ok(conn.loop) && len(buf) >= NET_ZC_THRESHOLD
+	conn.send_was_zc = use_zc
+	net_zc_stats_note(conn.loop, use_zc) // M3: env-gated stderr evidence that the SEND_ZC path actually ran
+	id: eventloop.Op_ID
+	if use_zc {
+		id = eventloop.submit_send_zc(conn.loop, conn.fd, buf, net_send_zc_complete, on_op_dispose, conn)
+	} else {
+		id = eventloop.submit_send(conn.loop, conn.fd, buf, on_send_complete, on_op_dispose, conn)
+	}
 	if id == eventloop.OP_ID_INVALID {
 		net_emit_error(conn, "write submit failed")
 		net_close_conn(conn, true)
@@ -678,7 +743,7 @@ net_proactor_kick_send :: proc(conn: ^Net_Connection) {
 	conn.active_send, conn.pending_writes = conn.pending_writes, conn.active_send
 	clear(&conn.pending_writes)
 	conn.active_send_off = 0
-	net_proactor_submit_send(conn)
+	net_proactor_submit(conn) // via the choke point — a large rotated chunk gets ZC (3b)
 }
 
 // on_send_complete: a SEND terminal CQE. Advances the offset, re-submits a partial tail, rotates
@@ -691,7 +756,7 @@ on_send_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32) {
 		if res > 0 {
 			conn.active_send_off += int(res)
 			if conn.active_send_off < len(conn.active_send) {
-				net_proactor_submit_send(conn) // partial send — re-submit the unsent tail
+				net_proactor_submit(conn) // partial send — re-submit the unsent tail
 			} else if len(conn.pending_writes) > 0 {
 				net_proactor_kick_send(conn) // active drained; send the queued chunk next
 			} else {
@@ -703,13 +768,82 @@ on_send_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32) {
 			net_emit_error(conn, "write stalled") // zero-progress on a non-empty send
 			net_close_conn(conn, true)
 		} else if res == -i32(linux.Errno.EINTR) || res == -i32(linux.Errno.EAGAIN) {
-			net_proactor_submit_send(conn) // transient — re-submit the tail (a fresh op)
+			net_proactor_submit(conn) // transient — re-submit the tail (a fresh op)
 		} else if res != -i32(linux.Errno.ECANCELED) {
 			net_emit_error(conn, "write error")
 			net_close_conn(conn, true)
 		}
 	}
 	net_op_finished(conn)
+}
+
+// net_send_zc_complete: the send_cb for a SEND_ZC op (Slice 3b) — the TWO-AXIS state machine over
+// (more, res). `more` (from IORING_CQE_F_MORE) is the lifetime axis: more=true is the RESULT CQE (pages
+// pinned, a notification owed — touch ONLY off/zc_err, then return, INV-1); more=false is the TERMINAL
+// (the notification, a single non-pinned CQE, or an error) after which the buffer is free. `res`
+// (bytes/-errno) is the SEPARATE classification axis. Mirrors net_recv_ring_complete / on_send_complete
+// exactly: clear send_op FIRST, do the buffer decision under !closing, net_op_finished LAST. See
+// docs/zerocopy-slice3b-design.md §3.
+net_send_zc_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32, more: bool) {
+	context = runtime.default_context()
+	conn := cast(^Net_Connection)user_data
+	// INTERMEDIATE (result CQE): pages pinned, notif owed. RECORD ONLY, then return (INV-1) — never
+	// finish/clear/free/submit/close here. off advances only on a non-negative result (INV-4); a
+	// negative result is an errored-but-pinned send whose error is carried to the terminal.
+	if more {
+		conn.saw_result = true
+		if res >= 0 do conn.active_send_off += int(res)
+		else do conn.zc_err = res
+		return
+	}
+
+	// TERMINAL (more=false): buffer is free. Clear send_op FIRST so a re-entrant write()/kick sees a
+	// clear gate; do the buffer decision under !closing; net_op_finished LAST (keeps inflight >= 1
+	// across any re-submit, so net_maybe_free can't transiently free the still-needed conn).
+	saw := conn.saw_result
+	conn.send_op = eventloop.OP_ID_INVALID
+	if !conn.closing {
+		err: i32 = 0
+		if saw {
+			err = conn.zc_err // 0 if the result succeeded; <0 if it errored (ignore THIS notif's res — INV-3)
+		} else if res > 0 {
+			conn.active_send_off += int(res) // single-CQE COPIED success (kernel declined ZC) — advance like plain
+		} else if res < 0 {
+			err = res // single-CQE pre-transmission error
+		}
+		if err < 0 { // off untouched on any error (INV-4) → a re-send is the exact unsent tail
+			if err == -i32(linux.Errno.EINVAL) && conn.send_was_zc {
+				eventloop.disable_zc(loop) // missing/rejected opcode is a kernel-wide fact: latch ZC off loop-wide
+				net_proactor_submit(conn, force_plain = true) // re-send PLAIN
+			} else if err == -i32(linux.Errno.EOPNOTSUPP) && conn.send_was_zc {
+				conn.zc_unsupported = true // per-socket/protocol: deny ZC for THIS conn only, leave zc_ok intact
+				net_proactor_submit(conn, force_plain = true) // re-send PLAIN
+			} else if err == -i32(linux.Errno.ENOBUFS) || err == -i32(linux.Errno.ENOMEM) {
+				net_proactor_submit(conn, force_plain = true) // optmem pressure — copy-send, NOT fatal (transient)
+			} else if err == -i32(linux.Errno.EINTR) || err == -i32(linux.Errno.EAGAIN) {
+				net_proactor_submit(conn) // transient retry — re-picks ZC (unlike ENOBUFS/ENOMEM): safe because
+				// EINTR/EAGAIN are pre-transmission (nothing pinned yet) and FAST_POLL bounds the retry
+			} else if err != -i32(linux.Errno.ECANCELED) {
+				net_emit_error(conn, "write error")
+				net_close_conn(conn, true) // fatal (EPIPE, …)
+			}
+			// -ECANCELED: benign (a non-closing cancel doesn't occur on the send path; closing is guarded)
+		} else if !saw && res == 0 {
+			net_emit_error(conn, "write stalled") // zero-byte stall (plain-path parity)
+			net_close_conn(conn, true)
+		} else if conn.active_send_off < len(conn.active_send) {
+			net_proactor_submit(conn) // unsent tail (choke point re-picks ZC vs plain)
+		} else if len(conn.pending_writes) > 0 {
+			net_proactor_kick_send(conn) // rotate + submit via the choke point
+		} else {
+			clear(&conn.active_send) // fully drained (keep the backing)
+			conn.active_send_off = 0
+			net_proactor_on_drained(conn)
+		}
+	}
+	conn.saw_result = false // redundant defensive zero — net_proactor_submit is the canonical per-op reset;
+	conn.zc_err = 0 // nothing reads these on the closing/free path, but keep them clean for the next op
+	net_op_finished(conn) // LAST, unconditional
 }
 
 // net_proactor_on_drained runs the reentrancy-safe drain transition: clear want_drain BEFORE
@@ -741,6 +875,15 @@ on_op_dispose :: proc(user_data: rawptr) {
 	net_op_finished(cast(^Net_Connection)user_data)
 }
 
+// net_zc_pinned_at_teardown reports whether conn's active_send backing may still be pinned by the kernel
+// at teardown: a SEND_ZC whose notification never fired (send_op is still live because we got here via the
+// dispose path, not the more=false terminal that clears it). net_maybe_free LEAKS rather than frees such a
+// backing (M1/M2 — closing the ring fd does not drop the TCP skb page refs). A pure predicate so the leak
+// decision is unit-testable without a real kernel pin (which loopback/AF_UNIX CI can't produce).
+net_zc_pinned_at_teardown :: proc(conn: ^Net_Connection) -> bool {
+	return conn.send_was_zc && conn.send_op != eventloop.OP_ID_INVALID
+}
+
 // net_maybe_free is the SINGLE free site for a proactor conn. It finalizes only on the inflight
 // 1->0 transition while closing (NOT idempotent — a call after free would be a UAF; but inflight
 // == 0 means no op remains to call it again). The fd is closed BEFORE 'close' is emitted, and the
@@ -767,7 +910,20 @@ net_maybe_free :: proc(conn: ^Net_Connection) {
 	net_unprotect(conn.ctx, conn.on_error)
 	net_unprotect(conn.ctx, conn.on_drain)
 	delete(conn.recv_buf)
-	delete(conn.active_send)
+	// M1/M2 (kernel-side UAF): a SEND_ZC whose pages the kernel may STILL hold pinned — its notification
+	// never fired, so we reached here via the eventloop.destroy dispose path (the disposer drove inflight
+	// to 0), NOT the more=false terminal: send_op is still live and the last send was ZC. Closing the ring
+	// fd does NOT drop the TCP skb refs that pin these pages — they release on TX ACK/RST, asynchronously
+	// (io_ring_exit_work tears down io_uring state, not live skbs) — and the linux.close above orphans the
+	// socket with its retransmit queue intact (default linger). Freeing the backing now would let a later
+	// same-heap allocation — a sibling Slice-3a worker shares this address space and heap — overwrite pages
+	// the kernel is still transmitting (silent cross-connection corruption). So LEAK the backing: a bounded
+	// (≤ teardown-time pinned conns), one-time leak reclaimed by the OS at process exit, safe because the
+	// orphaned allocation's address is never reused. The normal path frees it on the notification (send_op
+	// == INVALID by then). See docs/zerocopy-slice3b-design.md §6.
+	if !net_zc_pinned_at_teardown(conn) {
+		delete(conn.active_send)
+	}
 	delete(conn.pending_writes)
 	free(conn)
 }

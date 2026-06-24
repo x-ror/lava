@@ -1,6 +1,14 @@
 # MSG_ZEROCOPY for large writes (Slice 3b) — design (review before impl)
 
-Status: **rev.5** — three internal adversarial rounds (rev.1: 3 crit/12 high; rev.2: 0 crit/7 high;
+Status: **IMPLEMENTED** — commit 1 (eventloop: `.SEND_ZC` probe → `zc_ok`, `send_cb` dispatch,
+`submit_send_zc`), commit 2 (net: the two-axis state machine + `net_proactor_submit` choke point +
+fallbacks + the `want_drain`-into-`net_maybe_arm_recv` move), commit 3 (tests + the `test-zerocopy-smoke`
+CI gate). Threshold shipped at 32 KiB. Verified: the SEND_ZC cell matrix by direct invocation, large-body
+byte-integrity (256 KiB, sha256), smokes both modes, crash guard, darwin/windows cross-check. The
+real-NIC throughput bench (loopback always copies, so it can't show the ZC win) remains a manual
+follow-up (§9 Q5). Design history below.
+
+Status (design): **rev.5** — three internal adversarial rounds (rev.1: 3 crit/12 high; rev.2: 0 crit/7 high;
 rev.3 round-3: 0 crit/0 high) + two Codex review rounds (rev.4: 5 findings — the two-axis ABI; rev.5: 4
 Major / 5 Minor — all real, folded in). The two-axis model (`F_MORE` = pinned? vs `res` = bytes/errno,
 independent) is the robust core. rev.5 changes: `zc_ok` set by an **init-time `.SEND_ZC` opcode probe**
@@ -246,10 +254,26 @@ template's `!closing` envelope. The two **success** entries (`saw` with `zc_err=
   best-effort (`-ENOENT`/`-EALREADY`) — the **notification** is the guaranteed terminal that releases
   buffer+slot+`inflight`; `-ECANCELED` does not substitute for it. `conn.inflight` (held to the terminal
   via INV-2) keeps `active_send` alive until then.
-- **Loop destroy:** `uring.destroy()` closes the ring fd (kernel won't touch the pages after), then
-  `platform_destroy`'s dispose loop fires **once** for the one in-use slot (a post-result/pre-notif op
-  is still `in_use` — `more=true` never released it), so `on_op_dispose → net_op_finished` frees
-  `active_send` once. Exactly-once **because** INV-1 guarantees the result freed/decremented nothing.
+- **Loop destroy (CORRECTED — the earlier reasoning was unsound):** closing the ring fd does **NOT** make
+  the kernel stop reading the pinned pages. For `SEND_ZC` the pages are referenced by the TCP skbs in the
+  socket's send/retransmit queue (via the io_uring `ubuf_info`/notif), released only when the last skb is
+  freed (TX ACK / RST), asynchronously. `io_uring_release` tears down io_uring's request/ring state; it
+  does **not** walk live skbs and drop their page refs. `linux.close(fd)` likewise orphans the socket with
+  its retransmit queue intact (default linger). So `platform_destroy`'s dispose loop runs with **no barrier**
+  against the kernel still transmitting those pages.
+  - At true single-process exit this is benign — the address space is torn down, no meaningful reuse (M1).
+  - Under **multi-worker (Slice 3a)** it is **not** benign: workers are threads sharing one heap, and a
+    worker tearing down (crash or independent graceful drain) while siblings keep serving could free a
+    still-pinned backing that a sibling's allocation then reuses and overwrites → silent in-flight TX
+    corruption (M2). Needs a real NIC + the kernel choosing ZC + a loop destroyed in the post-result/
+    pre-notif window + a racing reuse — rare, but real.
+  - **Fix:** `net_maybe_free` does not free a backing still pinned at teardown. It detects the dispose-path
+    case (`net_zc_pinned_at_teardown`: the last send was ZC and `send_op` is still live — the disposer, not
+    the `more=false` terminal, drove `inflight→0`) and **leaks** the backing instead: a bounded, one-time
+    leak (≤ pinned conns at teardown) reclaimed by the OS at process exit, safe because the orphaned
+    allocation's address is never reused. The normal path is unchanged — the notification (the first
+    `F_MORE`-clear CQE) clears `send_op` first, so `net_maybe_free` frees as before. A future refinement
+    could bounded-drain the ring (or `SO_LINGER{1,0}` RST + reap) to free rather than leak.
 
 ---
 

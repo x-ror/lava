@@ -40,7 +40,8 @@ Uring_Watch_Slot :: struct {
 Uring_Op_Slot :: struct {
 	callback:   Op_Completion,
 	recv_cb:    Op_Recv_Completion, // set instead of callback for a provided-buffer-ring RECV (Slice 2a)
-	dispose:    Op_Dispose, // fires instead of callback/recv_cb if the op is dropped at loop destroy
+	send_cb:    Op_Send_Completion, // set instead of callback for a SEND_ZC (Slice 3b); carries `more`
+	dispose:    Op_Dispose, // fires instead of callback/recv_cb/send_cb if the op is dropped at loop destroy
 	user_data:  rawptr,
 	generation: u32,
 	in_use:     bool,
@@ -96,6 +97,7 @@ Platform_Loop :: struct {
 	// kernel's consumer head and so can't be a reliable credit. See docs/io-uring-proactor.md (Slice 2).
 	bufring_ok:    bool,
 	multishot_ok:  bool, // submit ring recvs as MULTISHOT (2b); cleared on a -EINVAL (kernel lacks it)
+	zc_ok:         bool, // large sends may use SEND_ZC (3b); set by the init-time .SEND_ZC opcode probe, cleared on a -EINVAL/-EOPNOTSUPP
 	bufring_tried: bool, // buf_ring_init attempted (lazy: on the first ring-recv check, not loop init)
 	bufring:       rawptr,
 	bufring_size:  uint,
@@ -129,9 +131,13 @@ platform_init :: proc(loop: ^Loop) -> bool {
 		// net.odin's transient-retry would busy-spin. With FAST_POLL the kernel arms its own
 		// internal poll past the initial EAGAIN — the assumption the retry path relies on. Lacking
 		// either, fall back to the readiness path.
-		loop.platform.proactor_ok =
-			uring_probe_proactor(loop.platform.ring.fd) &&
-			.FAST_POLL in loop.platform.ring.features
+		proactor_supported, zc_supported := uring_probe_proactor(loop.platform.ring.fd)
+		fast_poll := .FAST_POLL in loop.platform.ring.features
+		loop.platform.proactor_ok = proactor_supported && fast_poll
+		// zc_ok gates SEND_ZC for large sends (3b). It needs the proactor usable (it rides the same op
+		// path, hence FAST_POLL too); the runtime -EINVAL/-EOPNOTSUPP fallback covers per-socket gaps the
+		// probe can't see. Initialized HERE (not at Odin's false default) so use_zc can ever be true.
+		loop.platform.zc_ok = zc_supported && fast_poll
 		// Bind the watcher table to the loop allocator (set before platform_init), so
 		// it does not adopt the allocator of whatever first appends to it.
 		loop.platform.watch_slots = make([dynamic]Uring_Watch_Slot, loop.allocator)
@@ -470,18 +476,25 @@ drain_uring_completions :: proc(loop: ^Loop) {
 					// fire the callback but keep the slot in_use and active_io_count unchanged. Only
 					// the TERMINAL CQE (F_MORE clear — single-shot always, or a multishot that ended/
 					// errored/was cancelled) releases the slot and drops the in-flight count, exactly
-					// once per op. Non-recv ops never set F_MORE, so they always take this terminal path.
+					// once per op. F_MORE is set by a multishot RECV's intermediate CQEs (2b) AND by a
+					// SEND_ZC's result CQE, whose notification (F_MORE clear) is the terminal (3b) — so
+					// the count/slot lifetime is driven by F_MORE alone, uniformly, for both.
 					more := .MORE in cqe.flags
 					if !more {
 						loop.active_io_count = max(0, loop.active_io_count - 1)
 						uring_op_release_slot(loop, index)
 					}
+					// Dispatch by callback KIND (mutually exclusive: a slot carries exactly one of
+					// recv_cb/send_cb/callback). Order recv → send → plain; a SEND_ZC CQE never reaches
+					// the recv arm (no recv_cb), so its high flag bits are never misread as a buffer id.
 					if slot.recv_cb != nil {
 						// Decode the kernel-selected buffer id from the CQE flags (a bit_set —
 						// transmute to u32 before the >>16). The callback copies the bytes then recycles.
 						has_buf := .BUFFER in cqe.flags
 						bid := u16(transmute(u32)cqe.flags >> 16)
 						slot.recv_cb(loop, slot.user_data, cqe.res, bid, has_buf, more)
+					} else if slot.send_cb != nil {
+						slot.send_cb(loop, slot.user_data, cqe.res, more)
 					} else if slot.callback != nil {
 						slot.callback(loop, slot.user_data, cqe.res)
 					}
@@ -688,16 +701,22 @@ Uring_Probe :: struct {
 	ops:     [256]Uring_Probe_Op,
 }
 
-uring_probe_proactor :: proc(ring_fd: linux.Fd) -> bool {
+uring_probe_proactor :: proc(ring_fd: linux.Fd) -> (proactor: bool, zc: bool) {
 	probe := Uring_Probe{} // zero-initialized: the kernel requires the whole buffer to be zero.
 	// nr_args is the number of ops[] slots offered; the kernel caps its fill to the opcodes it
 	// knows. REGISTER_PROBE itself postdates RECV/SEND, so an error here means an old kernel
 	// without the proactor opcodes — report unsupported and let callers use the readiness path.
 	if errno := linux.io_uring_register(ring_fd, .REGISTER_PROBE, &probe, u32(len(probe.ops)));
 	   errno != nil {
-		return false
+		return false, false
 	}
-	return uring_probe_supports(&probe, .RECV) && uring_probe_supports(&probe, .SEND)
+	proactor = uring_probe_supports(&probe, .RECV) && uring_probe_supports(&probe, .SEND)
+	// SEND_ZC (Slice 3b) is a real OPCODE, so it is probeable here exactly like RECV/SEND — unlike 2b's
+	// RECV_MULTISHOT, which is an ioprio flag and could only be detected via a runtime -EINVAL. Probing
+	// it up front sets zc_ok before any send, so the first large send doesn't eat a fallback -EINVAL and
+	// a send-before-recv (outbound client) conn isn't denied ZC. Gated on the proactor (ZC rides it).
+	zc = proactor && uring_probe_supports(&probe, .SEND_ZC)
+	return proactor, zc
 }
 
 uring_probe_supports :: proc(probe: ^Uring_Probe, op: linux.IO_Uring_OP) -> bool {
@@ -837,6 +856,7 @@ uring_op_release_slot :: proc(loop: ^Loop, index: u32) {
 	slot.in_use = false
 	slot.callback = nil
 	slot.recv_cb = nil
+	slot.send_cb = nil
 	slot.dispose = nil
 	slot.user_data = nil
 	slot.generation += 1
@@ -1069,3 +1089,42 @@ uring_arm_recv_ring :: proc(loop: ^Loop, fd: uintptr, token: u64) -> bool {
 
 platform_recv_ring_multishot :: proc(loop: ^Loop) -> bool {return loop.platform.multishot_ok}
 platform_disable_multishot :: proc(loop: ^Loop) {loop.platform.multishot_ok = false}
+
+// --- MSG_ZEROCOPY send (Slice 3b) — Linux-internal; called only from the Linux-only net.odin ---
+//
+// Op_Send_Completion fires for a SEND_ZC op. SEND_ZC posts TWO CQEs: a result (`more=true`: bytes sent
+// — the pages are pinned, a notification is owed) then a notification (`more=false`: the pages are
+// released, the buffer is free). `more` is derived from IORING_CQE_F_MORE in the drain, so the existing
+// F_MORE slot-lifetime machinery holds the op as ONE slot / ONE active_io_count from submit to the
+// notification — see docs/zerocopy-slice3b-design.md. The buffer is freeable exactly on the first
+// `more=false` CQE; `res` (bytes/-errno) is an independent axis the net layer classifies.
+Op_Send_Completion :: proc(loop: ^Loop, user_data: rawptr, res: i32, more: bool)
+
+// uring_op_alloc_slot_send allocates an op slot carrying ONLY send_cb (callback/recv_cb stay nil), so
+// the drain dispatches a SEND_ZC CQE to send_cb. Mirrors uring_op_alloc_slot_recv.
+uring_op_alloc_slot_send :: proc(loop: ^Loop, send_cb: Op_Send_Completion, dispose: Op_Dispose, user_data: rawptr) -> u64 {
+	token := uring_op_alloc_slot(loop, nil, dispose, user_data)
+	loop.platform.op_slots[uring_op_token_index(token)].send_cb = send_cb
+	return token
+}
+
+// submit_send_zc stages a SEND_ZC of `buf` and counts the op once (active_io_count, dropped once by the
+// drain on the notification). Returns OP_ID_INVALID on no-proactor or an SQ that stayed full. It reuses
+// uring_arm_rw (which zeroes the SQE — clearing ioprio/addr2 — sets opcode/addr/len/msg_flags, retries
+// once on a full SQ, caps len at URING_MAX_RW, and stages for the batched flush), so the only ZC-specific
+// bit is the .SEND_ZC opcode. NOSIGNAL like plain SEND. LOOP-THREAD ONLY.
+submit_send_zc :: proc(loop: ^Loop, fd: uintptr, buf: []byte, cb: Op_Send_Completion, dispose: Op_Dispose, user_data: rawptr) -> Op_ID {
+	if cb == nil || !loop.platform.proactor_ok do return OP_ID_INVALID
+	token := uring_op_alloc_slot_send(loop, cb, dispose, user_data)
+	if !uring_arm_rw(loop, .SEND_ZC, fd, buf, token, {.NOSIGNAL}) {
+		uring_op_release_slot(loop, uring_op_token_index(token))
+		return OP_ID_INVALID
+	}
+	loop.active_io_count += 1
+	return Op_ID(token)
+}
+
+// send_zc_ok reports whether large sends may use SEND_ZC (probed at init, cleared by disable_zc on a
+// runtime -EINVAL/-EOPNOTSUPP). disable_zc latches it off loop-wide. Both LOOP-THREAD ONLY.
+send_zc_ok :: proc(loop: ^Loop) -> bool {return loop.platform.zc_ok}
+disable_zc :: proc(loop: ^Loop) {loop.platform.zc_ok = false}
