@@ -56,6 +56,17 @@ g_multi_worker: bool
 g_shutdown:        bool
 g_worker_crashed:  bool
 g_worker_exits:    int
+// Set by net_startup_failed when a listener fails to bind / set SO_REUSEPORT during startup, or
+// listen(0) is rejected under multi-worker. A worker checks it in its pre-run hook and aborts startup
+// (M7: all listeners bind or the whole startup aborts — no running with partial/partitioned capacity).
+g_listen_failed:   bool
+
+// net_startup_failed records a fatal startup listener failure (called from net.odin, Linux). Aborting
+// is process-wide: every worker runs the same script, so a bind failure on one means the deployment
+// can't come up, and the others must not serve degraded.
+net_startup_failed :: proc() {
+	sync.atomic_store(&g_listen_failed, true)
+}
 
 // --- startup barrier (abortable two-phase) -------------------------------------------------------
 //
@@ -127,6 +138,12 @@ Worker :: struct {
 worker_pre_run :: proc(user_data: rawptr) -> bool {
 	w := cast(^Worker)user_data
 	w.reported = true
+	// A listener that failed to bind during startup aborts the whole startup (M7): report a failure so
+	// the barrier releases everyone to abort, rather than reporting ready and serving partial capacity.
+	if sync.atomic_load(&g_listen_failed) {
+		barrier_settle(w.barrier, true)
+		return false
+	}
 	// Block at the barrier until all workers are ready (or one failed -> abort). Then proceed to run
 	// UNLESS a shutdown was already requested — a signal during startup must not start serving.
 	if !barrier_ready_wait(w.barrier) do return false

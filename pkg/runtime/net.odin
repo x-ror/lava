@@ -166,14 +166,38 @@ net_listen_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
+	// Multi-worker (Slice 3a): every worker binds the same addr:port and the kernel load-balances
+	// connections across them via SO_REUSEPORT. An ephemeral port (0) can't work — each worker would
+	// get a DIFFERENT port, silently splitting the server into N single-core servers — so reject it
+	// and require an explicit port. net_startup_failed aborts the whole startup (M7): a server that
+	// can't come up on one core must not run degraded on the others.
+	if g_multi_worker && port == 0 {
+		net_startup_failed()
+		if exception != nil do exception^ = make_js_error(ctx, "net.listen: an explicit port is required under LAVA_WORKERS>1 (ephemeral port 0 is not supported)")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
 	sfd, sock_err := linux.socket(.INET, .STREAM, {.NONBLOCK}, .TCP)
 	if sock_err != .NONE {
+		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: could not create socket")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	// SO_REUSEADDR so a restart can rebind a port still in TIME_WAIT (best-effort).
 	reuse: i32 = 1
 	_ = linux.setsockopt(sfd, linux.SOL_SOCKET, linux.Socket_Option.REUSEADDR, &reuse)
+	// SO_REUSEPORT for the multi-worker listener group. Unlike REUSEADDR its result MUST be checked:
+	// every socket sharing the port must set it, or the group is unsafe (a bind would collide). Surface
+	// the failure as a startup abort.
+	if g_multi_worker {
+		if so_err := linux.setsockopt(sfd, linux.SOL_SOCKET, linux.Socket_Option.REUSEPORT, &reuse);
+		   so_err != .NONE {
+			linux.close(sfd)
+			net_startup_failed()
+			if exception != nil do exception^ = make_js_error(ctx, "net.listen: SO_REUSEPORT failed")
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+	}
 
 	// Resolve the bind address. An unsupported host must NOT silently fall back to the
 	// 0.0.0.0 wildcard — that would expose a server meant for loopback on every
@@ -205,11 +229,13 @@ net_listen_cb :: proc "c" (
 	}
 	if bind_err := linux.bind(sfd, &addr); bind_err != .NONE {
 		linux.close(sfd)
+		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: bind failed (address in use?)")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	if listen_err := linux.listen(sfd, i32(backlog)); listen_err != .NONE {
 		linux.close(sfd)
+		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: listen failed")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
@@ -235,6 +261,7 @@ net_listen_cb :: proc "c" (
 		jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)on_connection)
 		linux.close(sfd)
 		free(server)
+		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: could not register listener with the event loop")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
