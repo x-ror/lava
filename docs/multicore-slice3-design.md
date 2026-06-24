@@ -32,6 +32,13 @@ overwhelming majority) are unaffected. In-process shared state (a global counter
 is per-worker — coordination must be external (Redis, DB), exactly as with Node `cluster`. Multi-core
 is **opt-in, never automatic** (auto would silently break single-instance assumptions).
 
+**Linux-only.** Multi-worker depends on `SO_REUSEPORT`, `signalfd`, and the io_uring proactor — all
+Linux. Consistent with the project's Linux-first direction, `LAVA_WORKERS>1` on darwin/windows
+**degrades to a single inline worker** (a warning, not an error). This also means the darwin/windows
+lazy globals that aren't `Once`-guarded (e.g. `tls_darwin.odin`'s `g_extra_anchors_*`,
+`tls_darwin.odin:374-390`) are **never raced** — no N workers exist there. (On Linux those globals are
+stubs.)
+
 ---
 
 ## 2. Validated finding: state is already per-`Runtime_State`
@@ -76,7 +83,8 @@ first-fetch runs the `Once` before its user code touches the value.
 
 ### 3.2 Verified safe under N workers (no action — recorded so review needn't re-chase)
 `ERROR_INTRINSIC_NAMES`, `fs_mkdtemp_alphabet` are `@(rodata)`; `core:net` `dns_config_initialized`
-is already a `sync.Once`; `tls_darwin` anchors are Darwin-only stubs (Linux-first).
+is already a `sync.Once`. `tls_darwin.odin`'s `g_extra_anchors_*` are real lazy mutations (not stubs),
+but Darwin never runs N workers (§1, Linux-only), so they are never raced — no fix needed in 3a.
 
 ### 3.3 Console interleaving
 `console_raw_write` (`globals.odin:596-606`) writes whole strings to `os.stdout`/`stderr` unbuffered;
@@ -121,12 +129,16 @@ Rules (all gated on worker-count > 1; single-worker is byte-for-byte unchanged):
 - **Uniform**: set `SO_REUSEPORT` on **every** TCP listener the runtime creates (not just the first),
   so a multi-server app (8080 + 9090) can't hit `EADDRINUSE` from a partial group.
 - **`listen(0)` / ephemeral (critical fix)**: N workers each binding port 0 would get N *different*
-  ports — silently N single-core servers. **The supervisor pre-resolves one ephemeral port** (bind a
-  temp `SO_REUSEPORT` socket on 0, `getsockname`, close) and injects the concrete port so every
-  worker binds the *same* real port. `server.address().port` (`net.odin:977`, `getsockname` on the
-  worker's own fd) is then consistent across workers. *(Open: dynamically-created servers on port 0
-  can't all be pre-resolved — under multi-worker we require fixed ports for additional dynamic
-  servers, or fall back to single-worker for them. See §9.)*
+  ports — silently N single-core servers. **The supervisor pre-resolves one ephemeral port**: bind a
+  temp `SO_REUSEPORT` socket on 0, `getsockname` the assigned port, inject it so every worker binds the
+  *same* real port — and **keep that reservation socket OPEN** until all worker listeners have bound,
+  then close it. Closing it right after `getsockname` would free the port, letting another process
+  (common on test runners / dense hosts) grab it before the workers bind → intermittent startup
+  `EADDRINUSE`. Holding the `SO_REUSEPORT` reservation keeps the port in the group so worker binds
+  succeed. `server.address().port` (`net.odin:977`, `getsockname` on the worker's own fd) is then
+  consistent across workers. *(Open: dynamically-created servers on port 0 can't all be pre-resolved —
+  under multi-worker we require fixed ports for additional dynamic servers, or fall back to
+  single-worker for them. See §9.)*
 - **Late/partial bind**: a worker that still gets `EADDRINUSE` (staggered `listen`) must surface it as
   a normal `Server` `'error'` event — **not** a fatal worker death that trips the crash policy and
   tears down healthy workers.
@@ -144,13 +156,19 @@ Rules (all gated on worker-count > 1; single-worker is byte-for-byte unchanged):
 ## 6. Worker lifecycle (concrete)
 
 - **Supervisor / workers**: main becomes the supervisor; spawns N worker threads (`core:thread`),
-  each running the **existing `eval()`/`run_file()` unchanged** on its own thread — this is critical:
-  `eval()` already encodes the load-bearing teardown LIFO (dispose hooks fire against a *live* JSC
-  context, then `JSGlobalContextRelease`, `runtime.odin:126-166`). We inject the stop check **only
-  inside `eventloop.run`**, never reimplement teardown. `N==1` runs inline exactly as today (no new
-  threads → CLI/non-server unaffected).
-- **Two-phase startup barrier**: each worker signals `ready` (bound + context up) or `failed` to the
-  supervisor before entering `run()`. Under fail-fast, any `failed` makes the supervisor stop+wake+join
+  each running the existing `eval()`/`run_file()` teardown LIFO **unchanged** on its own thread — this
+  is critical: `eval()` already encodes the load-bearing order (dispose hooks fire against a *live* JSC
+  context, then `JSGlobalContextRelease`, `runtime.odin:126-166`). `N==1` runs inline exactly as today
+  (no new threads → CLI/non-server unaffected).
+- **Pre-run hook (the barrier needs this)**: `eval()` calls `eventloop.run(loop)` internally right
+  after top-level evaluation (`runtime.odin:287-288`), so a worker that just calls `eval()` has *no*
+  point to report `ready`/`failed` to the supervisor before the loop starts. So `eval()` gains an
+  explicit **pre-run callback** invoked after top-level eval returns (listeners bound, context up) and
+  *before* `eventloop.run` — the worker reports `ready`/`failed` there. The teardown defers and the
+  stop-check-inside-`eventloop.run` are otherwise unchanged; this is the one seam we add to `eval()`,
+  not a teardown reimplementation.
+- **Two-phase startup barrier**: each worker reports `ready` (bound + context up) or `failed` via the
+  pre-run hook before entering `run()`. Under fail-fast, any `failed` makes the supervisor stop+wake+join
   all ready workers and exit non-zero — the *same* teardown path as graceful shutdown (one path, not
   two). Covers JSC-init / thread-create / bind failures and partial-spawn cleanup.
 - **Stop flag**: an **atomic** `stop` on `Loop` (or a wrapping `Worker`). Supervisor does
@@ -159,9 +177,17 @@ Rules (all gated on worker-count > 1; single-worker is byte-for-byte unchanged):
   `URING_WAKEUP_USER_DATA`/`EPOLL_WAKEUP_TOKEN`). `run()`'s condition becomes
   `has_pending_work && !backend_error && !atomic_load(stop)` — required because a listening server
   keeps `active_io_count > 0` forever, so the loop never exits on its own.
-- **Graceful drain**: on stop, unwatch listeners + drain their backlog, let in-flight conns finish
-  (existing `net_shutdown_active` / op cancellation), then exit. Per-worker DNS jobs drain naturally
-  because the per-worker pool (§4) joins at the worker's own teardown — no job posts into a freed loop.
+- **Graceful drain — a real two-stage path** (not the existing hard teardown). `net_shutdown_active`
+  (`net.odin:1039-1073`) is a *hard* teardown: it closes every server **and** every connection, and
+  for proactor conns issues `shutdown(.RDWR)` + `cancel_op` — i.e. it **resets** in-flight requests.
+  Using it as "the drain" would drop active responses. So graceful stop is:
+  1. **Stop accepting**: unwatch + close *listeners only* (drain each listener's backlog with `accept`
+     until EAGAIN first, per §5), and clear the stop flag's "force exit" so the loop keeps running.
+  2. **Drain**: keep running the loop while live connections finish (the run condition stays alive
+     while `net_conns` is non-empty), bounded by a **drain timeout** (config; e.g. a few seconds).
+  3. **Hard teardown fallback**: once `net_conns` empties *or* the timeout fires, call
+     `net_shutdown_active` to reset whatever remains, then exit. Per-worker DNS jobs drain naturally —
+     the per-worker pool (§4) joins at the worker's own teardown, so no job posts into a freed loop.
 - **Signals**: block `SIGINT`/`SIGTERM` in workers via `pthread_sigmask` (inherited from the
   supervisor blocking them before spawn); the supervisor uses **`signalfd`/`sigwait`** (not a handler)
   — sidesteps async-signal-safety entirely; on signal it sets each worker's stop flag + wakeup. Today
