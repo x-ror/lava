@@ -440,3 +440,60 @@ proactor_cancel_reports_queued :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, !cancel_op(&loop, id), "cancel of an already-completed op must report no-op")
 }
+
+// 13) SEND_ZC (Slice 3b): a zerocopy send routes its completion(s) to send_cb (NOT recv_cb/callback)
+//     and the F_MORE machinery accounts the op exactly once — active_io_count stays 1 until the
+//     terminal (F_MORE-clear) CQE, then drops to 0 and the slot releases. We do NOT assert a real
+//     two-CQE pinned sequence: loopback/AF_UNIX never zerocopies, so the kernel completes this as a
+//     copy (single res>0 CQE), -EOPNOTSUPP, or -EINVAL (kernel < 6.0) — every case still routes to
+//     send_cb and terminates once, which is exactly the dispatch + accounting under test.
+Send_Rec :: struct {
+	calls:        int,
+	last_res:     i32,
+	saw_terminal: bool, // a more=false CQE fired
+}
+
+sendzc_on_complete :: proc(loop: ^Loop, ud: rawptr, res: i32, more: bool) {
+	rec := cast(^Send_Rec)ud
+	rec.calls += 1
+	rec.last_res = res
+	if !more do rec.saw_terminal = true
+}
+
+@(test)
+proactor_send_zc_routes_and_accounts :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	if !proactor_available(&loop) do return
+
+	sv, sp_ok := make_socketpair(t)
+	if !sp_ok do return
+	defer linux.close(sv[0])
+	defer linux.close(sv[1])
+
+	rec := Send_Rec{}
+	msg := [4]u8{'z', 'e', 'r', 'o'}
+	id := submit_send_zc(&loop, uintptr(sv[1]), msg[:], sendzc_on_complete, nil, &rec)
+	testing.expect(t, id != OP_ID_INVALID, "send_zc submit")
+	testing.expect_value(t, loop.active_io_count, 1) // counted once at submit
+	arm_watchdog(&loop)
+	for _ in 0 ..< 64 {
+		if loop.active_io_count == 0 do break // drained to the terminal (F_MORE clear)
+		run_once(&loop)
+	}
+	testing.expect(t, rec.calls >= 1, "send_cb fired (routed to send_cb, not recv_cb/callback)")
+	testing.expect(t, rec.saw_terminal, "a terminal (more=false) CQE fired")
+	testing.expect_value(t, loop.active_io_count, 0) // released exactly once on the terminal
+}
+
+// 14) send_zc_ok reflects the init probe; disable_zc latches it off (the runtime -EINVAL/-EOPNOTSUPP
+//     fallback path).
+@(test)
+proactor_send_zc_disable :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+	if !proactor_available(&loop) do return
+
+	disable_zc(&loop)
+	testing.expect(t, !send_zc_ok(&loop), "disable_zc clears zc_ok")
+}
