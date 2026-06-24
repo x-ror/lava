@@ -22,8 +22,3 @@ fetch_transport_start :: proc(req: ^Fetch_Request, host: string, port: int) -> (
 fetch_push_body :: proc(req: ^Fetch_Request, data: []byte) {}
 
 fetch_end_body :: proc(req: ^Fetch_Request) {}
-
-// fetch_dns_pool_shutdown is called from the all-platform teardown in fetch.odin.
-// There is no DNS pool without a transport (fetch_dns_pool.odin builds only on
-// linux/darwin/windows), so this is a no-op here.
-fetch_dns_pool_shutdown :: proc() {}

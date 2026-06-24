@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:c"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
@@ -73,6 +74,11 @@ Runtime_State :: struct {
 	net_starved_tail:  ^Net_Connection,
 	net_recv_credits:  int, // buffers recycled with no parked taker — consumed by a later park (Slice 2a)
 	next_net_id:       u64,
+	// Graceful shutdown (Slice 3a): set when the loop's drain hook has closed the listeners and is
+	// letting in-flight connections finish. drain_timer is the bounded-drain deadline that force-exits
+	// if connections don't close in time (0 == none armed).
+	draining:          bool,
+	drain_timer:       eventloop.Timer_ID,
 	// Node-style process.argv: [execPath, scriptPath, ...userArgs]. Built in eval()
 	// and read by install_process. Empty for embedders that don't set it (then
 	// install_process falls back to os.args).
@@ -383,9 +389,7 @@ js_callback_dispose :: proc(user_data: rawptr) {
 report_uncaught :: proc(ctx: jsc.JSContextRef, exception: jsc.JSValueRef) {
 	msg, allocated := jsc_value_to_string_or_default(ctx, exception)
 	defer if allocated do delete(msg, context.allocator)
-	os.write_string(os.stderr, "Uncaught ")
-	os.write_string(os.stderr, msg)
-	os.write_string(os.stderr, "\n")
+	process_write(os.stderr, "Uncaught ", msg, "\n")
 }
 
 // mark_async_failed records that the process should exit non-zero because an
@@ -414,9 +418,7 @@ unhandled_rejection_cb :: proc "c" (
 	if argument_count >= 2 do reason = arguments[1]
 	msg, allocated := jsc_value_to_string_or_default(ctx, reason)
 	defer if allocated do delete(msg, context.allocator)
-	os.write_string(os.stderr, "Uncaught (in promise) ")
-	os.write_string(os.stderr, msg)
-	os.write_string(os.stderr, "\n")
+	process_write(os.stderr, "Uncaught (in promise) ", msg, "\n")
 	mark_async_failed(ctx)
 	return jsc.JSValueMakeUndefined(ctx)
 }
@@ -593,6 +595,21 @@ clear_timer_cb :: proc "c" (
 // as Node implements lib/internal/console. The native layer only exposes two
 // raw write primitives so stdout and stderr stay under Odin's control.
 
+// output_mutex serializes ALL process output (stdout AND stderr) so that under N workers (Slice 3a)
+// concurrent writes can't interleave mid-line. process_write is the single locked writer every output
+// path must use — console, uncaught/rejection reports, internal init failures — writing each message's
+// parts under one lock so a whole line lands atomically relative to other workers.
+@(private = "file")
+output_mutex: sync.Mutex
+
+process_write :: proc(fd: ^os.File, parts: ..string) {
+	sync.lock(&output_mutex)
+	defer sync.unlock(&output_mutex)
+	for p in parts {
+		os.write_string(fd, p)
+	}
+}
+
 console_raw_write :: proc(
 	fd: ^os.File,
 	ctx: jsc.JSContextRef,
@@ -601,7 +618,7 @@ console_raw_write :: proc(
 ) {
 	if argument_count < 1 do return
 	text, allocated := jsc_value_to_string_or_default(ctx, arguments[0])
-	os.write_string(fd, text)
+	process_write(fd, text)
 	if allocated do delete(text, context.allocator)
 }
 
@@ -709,20 +726,25 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 // Unix epoch at that anchor (performance.timeOrigin), so
 // timeOrigin + now() approximates Date.now(). Captured once per process.
 @(private = "file")
-perf_initialized: bool
+perf_once: sync.Once
 @(private = "file")
 perf_origin_tick: time.Tick
 @(private = "file")
 perf_time_origin_ms: f64
 
+// perf_init captures the process-wide clock origin exactly once. Guarded by sync.Once (perf_once) so
+// N workers (Slice 3a) racing their first install_performance neither double-init nor tear the
+// values; a single shared origin is intentional — performance.now() stays comparable across workers.
+@(private = "file")
+perf_init :: proc() {
+	perf_origin_tick = time.tick_now()
+	perf_time_origin_ms = f64(time.to_unix_nanoseconds(time.now())) / 1e6
+}
+
 // install_performance installs the `performance` global with a monotonic now()
 // and a timeOrigin, matching the W3C High Resolution Time surface Node exposes.
 install_performance :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
-	if !perf_initialized {
-		perf_origin_tick = time.tick_now()
-		perf_time_origin_ms = f64(time.to_unix_nanoseconds(time.now())) / 1e6
-		perf_initialized = true
-	}
+	sync.once_do(&perf_once, perf_init)
 
 	performance := jsc.JSObjectMake(ctx, nil, nil)
 	inject_native_function(ctx, performance, "now", performance_now_cb)
@@ -1087,11 +1109,7 @@ eval_internal :: proc(ctx: jsc.JSContextRef, name: string, source: string) -> js
 
 report_internal_exception :: proc(ctx: jsc.JSContextRef, name: string, exception: jsc.JSValueRef) {
 	msg, allocated := jsc_value_to_string_or_default(ctx, exception)
-	os.write_string(os.stderr, "lava: failed to initialize ")
-	os.write_string(os.stderr, name)
-	os.write_string(os.stderr, ": ")
-	os.write_string(os.stderr, msg)
-	os.write_string(os.stderr, "\n")
+	process_write(os.stderr, "lava: failed to initialize ", name, ": ", msg, "\n")
 	if allocated do delete(msg, context.allocator)
 }
 

@@ -26,7 +26,7 @@ Fetch_IO_Result :: enum {
 
 // fetch_transport_start begins a request. An IPv6/IPv4 literal connects
 // synchronously; a hostname is resolved on the bounded DNS pool and the connect is
-// deferred to fetch_dns_pool_complete_cb (run back on the loop thread via
+// deferred to dns_resolve_done (run back on the loop thread via
 // post_async). Returns ok=false with a message only for an immediate failure; the
 // async path returns ok=true and settles later.
 fetch_transport_start :: proc(
@@ -57,17 +57,14 @@ fetch_transport_start :: proc(
 		return fetch_connect_ip4(req, ip4, port)
 	}
 
-	// A hostname: resolve off the loop via the bounded DNS pool (#77,
-	// fetch_dns_pool.odin). async_begin keeps the loop alive while the lookup runs;
-	// drive_pending pins the request so a cancel mid-lookup cannot free it before the
-	// completion runs. Both must precede the submit (a worker may post the completion
-	// before this returns); on a submit failure we undo them so the loop is not kept
-	// alive forever and the fetch settles.
-	eventloop.async_begin(req.loop)
+	// A hostname: resolve off the loop on the loop's generic worker pool (#77, fetch_dns.odin).
+	// drive_pending pins the request so a cancel mid-lookup cannot free it before the completion runs;
+	// it must precede the submit (a worker may post the completion before this returns). pool_submit
+	// does its own async_begin loop keep-alive (and undoes it on a start failure), so we only unwind
+	// our own drive_pending pin here.
 	req.drive_pending += 1
-	if !fetch_dns_pool_submit(req, host) {
+	if !fetch_dns_submit(req, host) {
 		req.drive_pending -= 1
-		eventloop.async_cancel(req.loop)
 		return false, "fetch: could not start DNS resolver"
 	}
 	return true, ""

@@ -166,14 +166,38 @@ net_listen_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
+	// Multi-worker (Slice 3a): every worker binds the same addr:port and the kernel load-balances
+	// connections across them via SO_REUSEPORT. An ephemeral port (0) can't work — each worker would
+	// get a DIFFERENT port, silently splitting the server into N single-core servers — so reject it
+	// and require an explicit port. net_startup_failed aborts the whole startup (M7): a server that
+	// can't come up on one core must not run degraded on the others.
+	if g_multi_worker && port == 0 {
+		net_startup_failed()
+		if exception != nil do exception^ = make_js_error(ctx, "net.listen: an explicit port is required under LAVA_WORKERS>1 (ephemeral port 0 is not supported)")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
 	sfd, sock_err := linux.socket(.INET, .STREAM, {.NONBLOCK}, .TCP)
 	if sock_err != .NONE {
+		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: could not create socket")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	// SO_REUSEADDR so a restart can rebind a port still in TIME_WAIT (best-effort).
 	reuse: i32 = 1
 	_ = linux.setsockopt(sfd, linux.SOL_SOCKET, linux.Socket_Option.REUSEADDR, &reuse)
+	// SO_REUSEPORT for the multi-worker listener group. Unlike REUSEADDR its result MUST be checked:
+	// every socket sharing the port must set it, or the group is unsafe (a bind would collide). Surface
+	// the failure as a startup abort.
+	if g_multi_worker {
+		if so_err := linux.setsockopt(sfd, linux.SOL_SOCKET, linux.Socket_Option.REUSEPORT, &reuse);
+		   so_err != .NONE {
+			linux.close(sfd)
+			net_startup_failed()
+			if exception != nil do exception^ = make_js_error(ctx, "net.listen: SO_REUSEPORT failed")
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+	}
 
 	// Resolve the bind address. An unsupported host must NOT silently fall back to the
 	// 0.0.0.0 wildcard — that would expose a server meant for loopback on every
@@ -205,11 +229,13 @@ net_listen_cb :: proc "c" (
 	}
 	if bind_err := linux.bind(sfd, &addr); bind_err != .NONE {
 		linux.close(sfd)
+		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: bind failed (address in use?)")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 	if listen_err := linux.listen(sfd, i32(backlog)); listen_err != .NONE {
 		linux.close(sfd)
+		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: listen failed")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
@@ -235,6 +261,7 @@ net_listen_cb :: proc "c" (
 		jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)on_connection)
 		linux.close(sfd)
 		free(server)
+		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: could not register listener with the event loop")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
@@ -726,7 +753,10 @@ net_maybe_free :: proc(conn: ^Net_Connection) {
 	// this runs (e.g. net_shutdown_active / an Op_Dispose during eventloop.destroy).
 	context = runtime.default_context()
 	linux.close(linux.Fd(conn.fd))
-	if state := get_state_from_ctx(conn.ctx); state != nil do delete_key(&state.net_conns, conn.id)
+	if state := get_state_from_ctx(conn.ctx); state != nil {
+		delete_key(&state.net_conns, conn.id)
+		net_drain_check_complete(state, conn.loop)
+	}
 	if !conn.silent_close {
 		had := jsc.JSValueMakeBoolean(conn.ctx, b32(conn.had_error))
 		net_emit(conn.ctx, conn.on_close, &had, 1)
@@ -1005,7 +1035,10 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 	net_unprotect(conn.ctx, conn.on_drain) // net.js always registers onDrain, even on readiness
 	conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
 
-	if state := get_state_from_ctx(conn.ctx); state != nil do delete_key(&state.net_conns, conn.id)
+	if state := get_state_from_ctx(conn.ctx); state != nil {
+		delete_key(&state.net_conns, conn.id)
+		net_drain_check_complete(state, conn.loop) // readiness path: drain promptly on the last conn close
+	}
 	eventloop.async_begin(conn.loop)
 	eventloop.post_async(conn.loop, net_conn_free_cb, conn)
 }
@@ -1040,6 +1073,63 @@ net_server_free_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 // still alive, WITHOUT invoking JS 'close' (eval is already returning). Called from eval's
 // pre-destroy teardown, mirroring fetch_shutdown_active. The deferred frees it posts are
 // dropped with the async_queue at eventloop.destroy (their pointers never dereferenced).
+// NET_DRAIN_TIMEOUT_MS bounds the graceful-drain window: once stop is requested the loop stops
+// accepting and lets in-flight connections finish, but no longer than this, after which the deferred
+// hard teardown (net_shutdown_active) resets whatever remains. (A fixed bound for v1; configurable
+// later — design §9.)
+NET_DRAIN_TIMEOUT_MS :: 10_000
+
+// net_drain_begin is the loop's Shutdown_Hook (registered per-eval, Linux only). It runs ONCE on the
+// loop thread the first time a stop is observed: stop accepting (close every listener), then let
+// in-flight connections finish. force_exit is flipped when the last connection closes (net_maybe_free)
+// or the drain timeout fires — at which point run() returns and the deferred net_shutdown_active resets
+// the rest. No JS runs here (the process is exiting); listeners are closed without firing 'close'.
+net_drain_begin :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	context = runtime.default_context()
+	state := cast(^Runtime_State)user_data
+	if state == nil {
+		eventloop.begin_force_exit(loop)
+		return
+	}
+	state.draining = true
+	// Stop accepting: unwatch + close each listener fd. Leave the Net_Server in the map — the final
+	// net_shutdown_active frees it (it skips already-closing servers, so no double close).
+	for _, server in state.net_servers {
+		if server.closing do continue
+		server.closing = true
+		eventloop.unwatch_fd(server.loop, &server.watcher)
+		linux.close(linux.Fd(server.fd))
+		net_unprotect(server.ctx, server.on_connection)
+	}
+	// Nothing in flight -> exit now; otherwise let connections drain, bounded by the timeout.
+	if len(state.net_conns) == 0 {
+		eventloop.begin_force_exit(loop)
+		return
+	}
+	state.drain_timer = eventloop.set_timeout(loop, net_drain_timeout, NET_DRAIN_TIMEOUT_MS, state)
+}
+
+// net_drain_check_complete: during a graceful drain, if this was the last in-flight connection, the
+// drain is done — cancel the bounded-drain timeout and force the loop to exit (run() returns and the
+// deferred teardown runs). Called from BOTH connection free sites — net_maybe_free (proactor) and
+// net_close_conn (readiness) — so a readiness-mode server drains promptly instead of always waiting the
+// full timeout. loop outlives the connection, so it is safe to touch here.
+net_drain_check_complete :: proc(state: ^Runtime_State, loop: ^eventloop.Loop) {
+	if state == nil || !state.draining || len(state.net_conns) != 0 do return
+	if state.drain_timer != 0 {
+		eventloop.clear_timeout(loop, state.drain_timer)
+		state.drain_timer = 0
+	}
+	eventloop.begin_force_exit(loop)
+}
+
+@(private = "file")
+net_drain_timeout :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	state := cast(^Runtime_State)user_data
+	if state != nil do state.drain_timer = 0 // fired; nothing left to cancel
+	eventloop.begin_force_exit(loop)
+}
+
 net_shutdown_active :: proc(state: ^Runtime_State) {
 	if state == nil do return
 	context = runtime.default_context() // alloc/free conns + buffers on the default heap (see net_maybe_free)
@@ -1093,6 +1183,9 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 	clear(&state.net_conns) // live-op proactor conns (if any) are freed by their Op_Dispose
 	state.net_starved_head, state.net_starved_tail = nil, nil // FIFO emptied (conns freed above / by disposer)
 	for _, server in state.net_servers {
+		// COUPLING: net_drain_begin (graceful drain) may already have unwatched + closed this listener
+		// and set closing=true; skip it here to avoid a double unwatch/close. The two functions agree on
+		// this flag — a listener is unwatched+closed exactly once, by whichever runs first.
 		if server.closing do continue
 		server.closing = true
 		eventloop.unwatch_fd(server.loop, &server.watcher)

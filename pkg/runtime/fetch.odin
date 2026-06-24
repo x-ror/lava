@@ -5,6 +5,7 @@ import "core:c"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 import pico "lava:pkg/runtime/picohttpparser"
@@ -122,11 +123,11 @@ Fetch_Request :: struct {
 	request_bytes: []byte,
 	write_offset:  int,
 
-	// DNS for a hostname runs on the bounded resolver pool (#77, fetch_dns_pool.odin):
-	// the lookup result lives on the pool's DNS_Job, not on the request, and the
-	// connect is driven from fetch_dns_pool_complete_cb on the loop thread. While a
-	// lookup is outstanding the request is pinned via drive_pending (so a cancel
-	// mid-lookup cannot free it under the pending completion).
+	// DNS for a hostname runs on the loop's generic worker pool (#77, fetch_dns.odin):
+	// the lookup result lives on a DNS_Job, not on the request, and the connect is
+	// driven from dns_resolve_done on the loop thread. While a lookup is outstanding the
+	// request is pinned via drive_pending (so a cancel mid-lookup cannot free it under
+	// the pending completion).
 	//
 	// Resolved-address list + cursor (#145): a hostname resolves to up to one IPv4
 	// and one IPv6 address (ordered A then AAAA); fetch_advance_connect tries them in
@@ -137,7 +138,7 @@ Fetch_Request :: struct {
 	addr_index:    int,
 	// Back-pointer to this request's outstanding DNS job (nil unless a pool lookup
 	// is in flight), so an abort can cancel a still-queued lookup. Set by
-	// fetch_dns_pool_submit, cleared by its completion; loop-thread-only.
+	// fetch_dns_submit, cleared by its completion; loop-thread-only.
 	dns_job:       ^DNS_Job,
 	response:      [dynamic]byte, // accumulates bytes until the header terminator is found
 	// Length of `response` passed to picohttpparser on the previous (incomplete) head
@@ -178,18 +179,42 @@ Fetch_Request :: struct {
 // fetch_cancel_class is a JSClass whose instances carry a ^Fetch_Request as
 // private data and are callable — calling them tears down the in-flight request
 // without invoking any JS callback (the JS side rejects the promise itself).
-// Created once and reused across all fetch calls on a given thread.
+// The four streaming-handle classes are created once for the whole process and reused across every
+// fetch call. JSClassRef is context-group-independent, so a single shared set is valid across all
+// workers (Slice 3a); g_fetch_classes_once makes the lazy creation race-safe when N workers' first
+// fetch() calls collide (previously an unsynchronized check-then-set per class). fetch_init_classes
+// builds all four together — they're cheap (no I/O) and always needed as a set.
 @(private = "file")
 g_fetch_cancel_class: jsc.JSClassRef
+@(private = "file")
+g_fetch_classes_once: sync.Once
+
+@(private = "file")
+fetch_init_classes :: proc() {
+	cancel_def := jsc.JSClassDefinition {
+		class_name       = "FetchCancel",
+		call_as_function = fetch_cancel_fn_cb,
+	}
+	g_fetch_cancel_class = jsc.JSClassCreate(&cancel_def)
+	resume_def := jsc.JSClassDefinition {
+		class_name       = "FetchResume",
+		call_as_function = fetch_resume_fn_cb,
+	}
+	g_fetch_resume_class = jsc.JSClassCreate(&resume_def)
+	push_def := jsc.JSClassDefinition {
+		class_name       = "FetchPushBody",
+		call_as_function = fetch_push_fn_cb,
+	}
+	g_fetch_push_class = jsc.JSClassCreate(&push_def)
+	end_def := jsc.JSClassDefinition {
+		class_name       = "FetchEndBody",
+		call_as_function = fetch_end_fn_cb,
+	}
+	g_fetch_end_class = jsc.JSClassCreate(&end_def)
+}
 
 fetch_get_cancel_class :: proc() -> jsc.JSClassRef {
-	if g_fetch_cancel_class == nil {
-		def := jsc.JSClassDefinition {
-			class_name       = "FetchCancel",
-			call_as_function = fetch_cancel_fn_cb,
-		}
-		g_fetch_cancel_class = jsc.JSClassCreate(&def)
-	}
+	sync.once_do(&g_fetch_classes_once, fetch_init_classes)
 	return g_fetch_cancel_class
 }
 
@@ -221,13 +246,7 @@ fetch_cancel_fn_cb :: proc "c" (
 g_fetch_resume_class: jsc.JSClassRef
 
 fetch_get_resume_class :: proc() -> jsc.JSClassRef {
-	if g_fetch_resume_class == nil {
-		def := jsc.JSClassDefinition {
-			class_name       = "FetchResume",
-			call_as_function = fetch_resume_fn_cb,
-		}
-		g_fetch_resume_class = jsc.JSClassCreate(&def)
-	}
+	sync.once_do(&g_fetch_classes_once, fetch_init_classes)
 	return g_fetch_resume_class
 }
 
@@ -260,24 +279,12 @@ g_fetch_push_class: jsc.JSClassRef
 g_fetch_end_class: jsc.JSClassRef
 
 fetch_get_push_class :: proc() -> jsc.JSClassRef {
-	if g_fetch_push_class == nil {
-		def := jsc.JSClassDefinition {
-			class_name       = "FetchPushBody",
-			call_as_function = fetch_push_fn_cb,
-		}
-		g_fetch_push_class = jsc.JSClassCreate(&def)
-	}
+	sync.once_do(&g_fetch_classes_once, fetch_init_classes)
 	return g_fetch_push_class
 }
 
 fetch_get_end_class :: proc() -> jsc.JSClassRef {
-	if g_fetch_end_class == nil {
-		def := jsc.JSClassDefinition {
-			class_name       = "FetchEndBody",
-			call_as_function = fetch_end_fn_cb,
-		}
-		g_fetch_end_class = jsc.JSClassCreate(&def)
-	}
+	sync.once_do(&g_fetch_classes_once, fetch_init_classes)
 	return g_fetch_end_class
 }
 
@@ -989,10 +996,10 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 	// A DNS lookup may still be outstanding on the pool. We do NOT block to join it
 	// (the pool owns the worker lifetime); the request stays pinned via drive_pending
 	// — bumped at submit — so the pending completion finds live memory, sees
-	// req.settled, and reclaims it. See fetch_dns_pool.odin. If the lookup is still
+	// req.settled, and reclaims it. See fetch_dns.odin. If the lookup is still
 	// queued, cancel it so the worker skips the blocking resolve rather than doing
 	// network work for an aborted fetch (and holding the loop alive until it returns).
-	if req.dns_job != nil do fetch_dns_pool_cancel_job(req.dns_job)
+	if req.dns_job != nil do fetch_dns_cancel_job(req.dns_job)
 	req.settled = true
 	// Stamp the settle iteration so fetch_reclaim_pending holds this request a couple
 	// of loop ticks — past the in-flight platform_poll batch that may still carry a
@@ -1091,26 +1098,21 @@ fetch_untrack_active :: proc(state: ^Runtime_State, req: ^Fetch_Request) {
 
 // fetch_shutdown_active stops every in-flight request without invoking its JS
 // callbacks. It is used while the JS context is still alive but eval is already
-// returning (for example after a top-level throw). After the requests are settled
-// it stops and joins the DNS resolver pool, so no background worker can post into a
-// loop about to be destroyed — the join blocks only on at most FETCH_DNS_POOL_SIZE
-// in-flight blocking resolves (see fetch_dns_pool.odin).
+// returning (for example after a top-level throw). DNS lookups run on the loop's
+// generic worker pool now (fetch_dns.odin), so quiescing the resolver is no longer
+// this function's job: eventloop.destroy -> pool_shutdown joins the workers and runs
+// dns_resolve_dispose for any job whose completion will not fire, the same as fs and
+// node:dns. We only settle the requests here.
 //
 // Idempotent and intentionally called from several teardown entry points (eval's
 // deferred teardown, destroy_runtime_state, and fetch_destroy_pending): each
-// fetch_request_finish untracks its request, so a second pass sees an empty set,
-// and fetch_dns_pool_shutdown is a no-op once the pool is stopped.
+// fetch_request_finish untracks its request, so a second pass sees an empty set.
 fetch_shutdown_active :: proc(state: ^Runtime_State) {
 	if state == nil do return
 	for len(state.active_fetches) > 0 {
 		req := state.active_fetches[0]
 		fetch_request_finish(req)
 	}
-	// Settle first (above), then quiesce the pool: any completion a worker posts
-	// during the join lands in the loop's async queue and is dropped at teardown
-	// (the request it targets is already settled), and the worker's job is freed by
-	// the shutdown rather than the (never-run) completion.
-	fetch_dns_pool_shutdown()
 }
 
 // fetch_free_request releases a settled request's owned allocations. The cloned

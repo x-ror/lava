@@ -212,6 +212,11 @@ platform_wakeup :: proc(loop: ^Loop) {
 	// One byte is enough to make the read end readable; coalesced wakeups are
 	// drained together. Called from any thread (write() is async-signal-safe and
 	// thread-safe); EAGAIN on a full pipe is fine — a wakeup is already pending.
+	// Skip an invalidated write end (-1 after platform_destroy, 0 after destroy's
+	// `loop^ = Loop{}`): a cross-thread request_shutdown that races teardown past the
+	// shutdown-mutex guard must never write a closed/zeroed fd. The real pipe fd is
+	// always > 2 (stdin/out/err precede it), so this never skips a live wakeup.
+	if loop.platform.wakeup_pipe[1] <= 0 do return
 	b := [1]u8{1}
 	linux.write(loop.platform.wakeup_pipe[1], b[:])
 }

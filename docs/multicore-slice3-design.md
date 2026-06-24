@@ -1,8 +1,9 @@
 # Multi-core workers (Slice 3a) — design (review before impl)
 
-Status: **DRAFT for review** — revised after two adversarial review rounds. The shared-nothing
-direction is validated; this revision tightens the lifecycle contracts (stop/drain/barrier/supervisor)
-that the second round found under-specified or contradictory.
+Status: **IMPLEMENTED** (design merged in #293 after two adversarial review rounds; built here as the
+staged commits in §11). The shared-nothing direction was validated; the lifecycle contracts
+(stop/drain/barrier/supervisor) below are the ones the second review round tightened, and what the
+implementation follows. End-to-end behaviour is covered by `make test-multicore-smoke`.
 
 **Scope:** `SO_REUSEPORT` + per-core worker event loops — the Node `cluster` / Bun shared-nothing
 model. The largest remaining throughput lever: on a 16-core box we use **one** core today (~34–53k
@@ -223,7 +224,11 @@ drain dispatch classifying `F_NOTIF` (distinct from the multishot-RECV `F_MORE` 
 2. **Opt-in**: `LAVA_WORKERS` env (recommended) vs `--workers` flag?
 3. **HOL/skew**: accept the `REUSEPORT` backlog tradeoff for v1 (recommended) vs BPF steering now?
 4. **Drain timeout / backlog budget** default values?
-5. Resolved (recording): DNS → per-loop generic pool (§4); crash → fail-fast (§6.6); `auto` →
+5. **Single-worker graceful drain**: as implemented, only the multi-worker supervisor blocks
+   SIGINT/SIGTERM and calls `request_shutdown`, so a `LAVA_WORKERS` unset/1 run still terminates
+   immediately on SIGTERM (no drain — unchanged from pre-3a). Route the single-worker path through the
+   same block-signals + `request_shutdown` machinery, or keep the divergence documented? (Follow-up.)
+6. Resolved (recording): DNS → per-loop generic pool (§4); crash → fail-fast (§6.6); `auto` →
    `get_processor_core_count` (§7); `process.exit` → whole-process (§3.4); output → one locked writer
    (§3.3); unsupported platform / invalid count → hard error (§1, §7).
 

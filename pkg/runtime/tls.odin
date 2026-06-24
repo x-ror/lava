@@ -4,6 +4,7 @@ package lava_runtime
 import "core:c"
 import "core:net"
 import "core:strings"
+import "core:sync"
 
 // Minimal OpenSSL client bindings for the fetch HTTPS transport on Linux and
 // Windows. We link libssl/libcrypto and bind only the handful of client-side
@@ -91,6 +92,35 @@ foreign openssl_lib {
 // process, like g_fetch_cancel_class.
 @(private = "file")
 g_tls_ctx: SSL_CTX
+// g_tls_ctx_once makes the lazy build race-safe when N workers' (Slice 3a) first https fetches
+// collide. The built SSL_CTX is refcounted and safe to share across workers; a failed build leaves
+// g_tls_ctx nil and is not retried (TLS_client_method / verify-paths failures are deterministic, not
+// transient), which matches the prior behaviour's effective outcome.
+@(private = "file")
+g_tls_ctx_once: sync.Once
+
+@(private = "file")
+tls_build_ctx :: proc() {
+	method := TLS_client_method()
+	if method == nil do return
+	ctx := SSL_CTX_new(method)
+	if ctx == nil do return
+	// Fail closed if the trust store can't be loaded (verification would have
+	// nothing to check against) or the TLS 1.2 floor can't be set. Both return
+	// 1 on success; SSL_CTX_ctrl(SET_MIN_PROTO_VERSION) returns 1 likewise.
+	if SSL_CTX_set_default_verify_paths(ctx) != 1 ||
+	   SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, nil) != 1 {
+		SSL_CTX_free(ctx)
+		return
+	}
+	// Add any platform-native roots (Windows cert store) on top of the OpenSSL
+	// defaults. Best-effort: if it loads nothing, verification simply falls back
+	// to whatever set_default_verify_paths / SSL_CERT_FILE provided and a missing
+	// root fails the handshake closed — it never weakens verification.
+	tls_load_platform_roots(ctx)
+	SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
+	g_tls_ctx = ctx
+}
 
 // tls_client_ctx returns the shared client SSL_CTX, building it on first use:
 // system trust store for verification, peer verification on (so a bad cert
@@ -108,27 +138,7 @@ g_tls_ctx: SSL_CTX
 // SSL_CERT_FILE still works everywhere as an explicit override (both sources feed
 // the same store).
 tls_client_ctx :: proc() -> SSL_CTX {
-	if g_tls_ctx == nil {
-		method := TLS_client_method()
-		if method == nil do return nil
-		ctx := SSL_CTX_new(method)
-		if ctx == nil do return nil
-		// Fail closed if the trust store can't be loaded (verification would have
-		// nothing to check against) or the TLS 1.2 floor can't be set. Both return
-		// 1 on success; SSL_CTX_ctrl(SET_MIN_PROTO_VERSION) returns 1 likewise.
-		if SSL_CTX_set_default_verify_paths(ctx) != 1 ||
-		   SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, nil) != 1 {
-			SSL_CTX_free(ctx)
-			return nil
-		}
-		// Add any platform-native roots (Windows cert store) on top of the OpenSSL
-		// defaults. Best-effort: if it loads nothing, verification simply falls back
-		// to whatever set_default_verify_paths / SSL_CERT_FILE provided and a missing
-		// root fails the handshake closed — it never weakens verification.
-		tls_load_platform_roots(ctx)
-		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
-		g_tls_ctx = ctx
-	}
+	sync.once_do(&g_tls_ctx_once, tls_build_ctx)
 	return g_tls_ctx
 }
 

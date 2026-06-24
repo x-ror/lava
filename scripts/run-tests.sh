@@ -20,6 +20,8 @@ printf '%s\n' '== Odin tests =='
 "$ROOT_DIR/scripts/build-native-deps.sh"
 "$ODIN" test "$ROOT_DIR/cmd/lava" -collection:lava="$ROOT_DIR"
 "$ODIN" test "$ROOT_DIR/pkg/runtime/eventloop"
+# pkg/runtime unit tests (links JSC like cmd/lava): the LAVA_WORKERS parser + the startup barrier.
+"$ODIN" test "$ROOT_DIR/pkg/runtime" -collection:lava="$ROOT_DIR"
 
 if [ "$is_windows" = 1 ] && [ ! -f "$ROOT_DIR/build/sqlite3.lib" ]; then
 	printf '%s\n' 'skip pkg/std/sqlite Odin link test (missing build/sqlite3.lib)'

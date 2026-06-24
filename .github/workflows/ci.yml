@@ -73,6 +73,11 @@ jobs:
       - name: HTTP server smoke
         run: make test-http-smoke
 
+      # Multi-core workers (Slice 3a): N workers share a port via SO_REUSEPORT, load distributes,
+      # listen(0) is rejected, SIGTERM drains gracefully. Binds a local port — its own gate.
+      - name: Multi-core workers smoke
+        run: make test-multicore-smoke
+
       # Benchmarks: print the node-vs-Lava ratio table in the job log. Report-only for
       # now (never fails) because the bench/thresholds.json caps are uncalibrated
       # starters — once the ratios here are observed and the caps tightened, flip this

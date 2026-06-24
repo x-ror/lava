@@ -32,6 +32,10 @@ Result :: struct {
 	exit_code:    int,
 	message:      string,
 	is_allocated: bool,
+	// True when the event loop exited because its backend poll failed fatally (loop.backend_error),
+	// not because work drained or a stop was requested. The multi-worker supervisor reads this to tell
+	// a crashed worker from one that finished cleanly (so a crash stops the other workers).
+	backend_failed: bool,
 }
 
 result_destroy :: proc(res: ^Result) {
@@ -67,12 +71,21 @@ release_global_context_after_eval :: proc(ctx: jsc.JSGlobalContextRef) {
 // clean run), and for any path that created handles it does so while the context
 // they are GC-protected against is still alive. Callers must not destroy the loop
 // themselves (a double destroy closes fd 0); they only init it and pass it in.
+// Pre_Run_Hook fires once per eval, after top-level evaluation has succeeded (listeners bound,
+// context up) and BEFORE the event loop starts. It returns whether the loop should run: the
+// multi-worker supervisor uses it as the startup-barrier rendezvous (report ready, block until the
+// supervisor releases or aborts all workers), returning false on abort so this worker skips run() and
+// falls through to the normal teardown. nil (the default) means "just run" — the single-worker path.
+Pre_Run_Hook :: proc(user_data: rawptr) -> bool
+
 eval :: proc(
 	source: string,
 	source_name := "<eval>",
 	loop: ^eventloop.Loop = nil,
 	echo_result := false,
 	script_args: []string = nil,
+	pre_run: Pre_Run_Hook = nil,
+	pre_run_data: rawptr = nil,
 ) -> Result {
 	// eval consumes the loop on EVERY path (see the OWNERSHIP note above). These two
 	// pre-flight rejections return before the JS context (and the deferred teardown
@@ -138,6 +151,16 @@ eval :: proc(
 	// Runs before the context is released (defers execute in reverse order), so
 	// JSValueUnprotect on cached modules still has a live context.
 	defer destroy_runtime_state(cast(jsc.JSContextRef)ctx, state)
+
+	// Register the graceful-shutdown drain hook (multi-worker, Linux only): when the supervisor
+	// requests a stop, the loop runs net_drain_begin on its own thread to stop accepting and drain
+	// in-flight connections. KNOWN DIVERGENCE (design §9): only the multi-worker supervisor blocks
+	// SIGINT/SIGTERM and calls request_shutdown, so this hook never fires for a single-worker run
+	// (LAVA_WORKERS unset/1) — there SIGTERM still terminates immediately without draining, as it did
+	// before Slice 3a. Routing the single-worker path through the same machinery is a follow-up.
+	when ODIN_OS == .Linux {
+		if loop != nil do eventloop.set_shutdown_hook(loop, net_drain_begin, state)
+	}
 
 	// Snapshot the standard error constructors while globalThis is still pristine —
 	// before setup_module_environment's builtin JS and, crucially, before any user
@@ -285,19 +308,36 @@ eval :: proc(
 	drain_next_ticks_settled(cast(jsc.JSContextRef)ctx, state)
 
 	if loop != nil {
-		eventloop.run(loop)
-		// Loop teardown is the deferred eventloop.destroy declared above — it covers
-		// this success path and every early return once the context exists.
+		// Startup-barrier rendezvous (multi-worker): report this worker ready and block until the
+		// supervisor releases all workers, or aborts startup (some worker failed). On abort, skip the
+		// loop entirely and fall through to the deferred teardown — the loop never ran, so this is a
+		// direct teardown, not a drain. nil hook (single-worker) always proceeds.
+		proceed := true
+		if pre_run != nil do proceed = pre_run(pre_run_data)
+		if proceed {
+			eventloop.run(loop)
+			// Loop teardown is the deferred eventloop.destroy declared above — it covers
+			// this success path and every early return once the context exists.
+		}
 	}
 
 	exit_code := resolve_exit_code(cast(jsc.JSContextRef)ctx, state)
+	// Captured while the loop is still alive (the deferred destroy runs after this returns): a fatal
+	// backend-poll failure means this worker crashed rather than finished/stopped cleanly.
+	backend_failed := loop != nil && loop.backend_error
 
 	if !echo_result || value == nil || jsc.JSValueIsUndefined(cast(jsc.JSContextRef)ctx, value) {
-		return Result{status = .Ok, exit_code = exit_code}
+		return Result{status = .Ok, exit_code = exit_code, backend_failed = backend_failed}
 	}
 
 	msg, allocated := value_to_string(cast(jsc.JSContextRef)ctx, value)
-	return Result{status = .Ok, exit_code = exit_code, message = msg, is_allocated = allocated}
+	return Result {
+		status = .Ok,
+		exit_code = exit_code,
+		message = msg,
+		is_allocated = allocated,
+		backend_failed = backend_failed,
+	}
 }
 
 // resolve_exit_code computes the final process exit code after the event loop
