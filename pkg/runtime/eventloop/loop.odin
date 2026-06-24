@@ -280,7 +280,12 @@ destroy :: proc(loop: ^Loop) {
 	delete(loop.async_queue)
 	delete(loop.async_scratch)
 	pool_destroy(&loop.pool, loop.allocator) // frees the pool backings (workers already joined above)
-	loop^ = Loop{}
+	// NOT `loop^ = Loop{}`: that bulk-zero would race a cross-thread request_shutdown (the worker
+	// supervisor) on the shutdown_mutex/destroyed/wakeup_pipe words. `destroyed` was set true under the
+	// mutex at the top of destroy and must STAY true so a late request_shutdown sees it and no-ops; the
+	// explicit deletes above already released every owned allocation, so the remaining stale scalar
+	// fields are harmless (the loop is on the owner's stack / the process is exiting). LOOP-THREAD ONLY
+	// otherwise; the only legitimate concurrent access after this point is request_shutdown, handled.
 }
 
 // dispose_pending_tasks releases the user_data of every not-yet-fired, not-cancelled

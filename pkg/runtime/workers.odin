@@ -126,10 +126,14 @@ Worker :: struct {
 	script_args: []string,
 	barrier:     ^Worker_Barrier,
 	reported:    bool, // did the ready hook run? (else the wrapper reports a startup failure)
-	// The worker's loop, published atomically once init() returns so the supervisor can
-	// request_shutdown it, and cleared before the worker exits. request_shutdown is destroy-safe (the
-	// loop's shutdown mutex + platform_wakeup's invalidated-fd guard), so even a signal that races
-	// teardown is harmless.
+	// The worker's loop, published once init() returns so the supervisor can request_shutdown it, and
+	// cleared before the worker exits — both UNDER sig_mutex, which the supervisor also holds across its
+	// read+request_shutdown. That keeps the worker's stack-allocated loop alive for the duration of the
+	// supervisor's call (the worker can't clear -> can't return -> stack stays valid), closing the
+	// use-after-return window. sig_mutex lives in this Worker (the supervisor-owned array), so it
+	// outlives the loop. request_shutdown is additionally destroy-safe (the loop's own shutdown mutex +
+	// platform_wakeup's invalidated-fd guard) for the case where the loop is mid/post-destroy.
+	sig_mutex:   sync.Mutex,
 	loop:        ^eventloop.Loop,
 	result:      Result,
 }
@@ -154,12 +158,19 @@ worker_pre_run :: proc(user_data: rawptr) -> bool {
 worker_main :: proc(data: rawptr) {
 	w := cast(^Worker)data
 	loop := eventloop.init(real_time = true)
-	sync.atomic_store(&w.loop, &loop) // publish so the supervisor can request_shutdown this loop
+	// Publish under sig_mutex so the supervisor's read+request_shutdown is serialized against this
+	// publish and the clear below (see the Worker.sig_mutex note).
+	sync.lock(&w.sig_mutex)
+	w.loop = &loop
+	sync.unlock(&w.sig_mutex)
 	// eval consumes the loop (destroys it on every path); the pre-run hook is the barrier rendezvous.
 	w.result = eval(w.source, w.source_name, &loop, false, w.script_args, worker_pre_run, w)
-	// Clear the published loop BEFORE flagging a crash, so a crash-driven signal sweep never reads a
-	// pointer to this (now torn-down) stack loop.
-	sync.atomic_store(&w.loop, nil)
+	// Clear the published loop (under sig_mutex) before this stack frame unwinds, so the supervisor's
+	// sweep never dereferences a pointer to a returned stack — and before flagging a crash, so a
+	// crash-driven sweep can't pick up this loop.
+	sync.lock(&w.sig_mutex)
+	w.loop = nil
+	sync.unlock(&w.sig_mutex)
 	if !w.reported do barrier_settle(w.barrier, true) // eval failed before the ready hook
 	if w.result.backend_failed do sync.atomic_store(&g_worker_crashed, true)
 	sync.atomic_add(&g_worker_exits, 1)

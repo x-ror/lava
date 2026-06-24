@@ -48,10 +48,14 @@ supervisor_wait :: proc(workers: []Worker) {
 		if sync.atomic_load(&g_worker_exits) >= n do return // all finished cleanly -> nothing to signal
 	}
 	// Signal every worker. g_shutdown first closes the startup-vs-signal race (a worker that publishes
-	// its loop after this sweep sees g_shutdown in its pre-run hook and aborts); then request_shutdown
-	// each loop still published — destroy-safe, so a signal racing a worker's teardown is harmless.
+	// its loop after this sweep sees g_shutdown in its pre-run hook and aborts). Then request_shutdown
+	// each published loop UNDER the worker's sig_mutex: holding it across the read + the call keeps that
+	// worker's stack-allocated loop alive for the duration (the worker can't clear+return meanwhile), so
+	// there is no use-after-return; request_shutdown is itself destroy-safe for a mid-teardown loop.
 	sync.atomic_store(&g_shutdown, true)
 	for &w in workers {
-		if l := sync.atomic_load(&w.loop); l != nil do eventloop.request_shutdown(l)
+		sync.lock(&w.sig_mutex)
+		if w.loop != nil do eventloop.request_shutdown(w.loop)
+		sync.unlock(&w.sig_mutex)
 	}
 }

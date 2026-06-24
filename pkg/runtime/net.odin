@@ -755,16 +755,7 @@ net_maybe_free :: proc(conn: ^Net_Connection) {
 	linux.close(linux.Fd(conn.fd))
 	if state := get_state_from_ctx(conn.ctx); state != nil {
 		delete_key(&state.net_conns, conn.id)
-		// Graceful shutdown: if this was the last in-flight connection while draining, the drain is
-		// complete — cancel the bounded-drain timeout and force the loop to exit (run() returns and
-		// the deferred teardown runs). conn.loop outlives the conn, so it is safe to touch here.
-		if state.draining && len(state.net_conns) == 0 {
-			if state.drain_timer != 0 {
-				eventloop.clear_timeout(conn.loop, state.drain_timer)
-				state.drain_timer = 0
-			}
-			eventloop.begin_force_exit(conn.loop)
-		}
+		net_drain_check_complete(state, conn.loop)
 	}
 	if !conn.silent_close {
 		had := jsc.JSValueMakeBoolean(conn.ctx, b32(conn.had_error))
@@ -1044,7 +1035,10 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 	net_unprotect(conn.ctx, conn.on_drain) // net.js always registers onDrain, even on readiness
 	conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
 
-	if state := get_state_from_ctx(conn.ctx); state != nil do delete_key(&state.net_conns, conn.id)
+	if state := get_state_from_ctx(conn.ctx); state != nil {
+		delete_key(&state.net_conns, conn.id)
+		net_drain_check_complete(state, conn.loop) // readiness path: drain promptly on the last conn close
+	}
 	eventloop.async_begin(conn.loop)
 	eventloop.post_async(conn.loop, net_conn_free_cb, conn)
 }
@@ -1113,6 +1107,20 @@ net_drain_begin :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 		return
 	}
 	state.drain_timer = eventloop.set_timeout(loop, net_drain_timeout, NET_DRAIN_TIMEOUT_MS, state)
+}
+
+// net_drain_check_complete: during a graceful drain, if this was the last in-flight connection, the
+// drain is done — cancel the bounded-drain timeout and force the loop to exit (run() returns and the
+// deferred teardown runs). Called from BOTH connection free sites — net_maybe_free (proactor) and
+// net_close_conn (readiness) — so a readiness-mode server drains promptly instead of always waiting the
+// full timeout. loop outlives the connection, so it is safe to touch here.
+net_drain_check_complete :: proc(state: ^Runtime_State, loop: ^eventloop.Loop) {
+	if state == nil || !state.draining || len(state.net_conns) != 0 do return
+	if state.drain_timer != 0 {
+		eventloop.clear_timeout(loop, state.drain_timer)
+		state.drain_timer = 0
+	}
+	eventloop.begin_force_exit(loop)
 }
 
 @(private = "file")
