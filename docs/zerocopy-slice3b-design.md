@@ -1,11 +1,14 @@
 # MSG_ZEROCOPY for large writes (Slice 3b) — design (review before impl)
 
-Status: **CONVERGED (rev.3)** — three adversarial review rounds (rev.1: 3 critical/12 high; rev.2: 0
-critical/7 high — all in the state-machine *prose*; rev.3 round-3: **0 critical/0 high**, 1 medium + 1
-low, both folded in). The approach (reuse Slice 2b's `F_MORE` slot-lifetime machinery for `SEND_ZC`'s
-two-CQE shape) is validated; §3 is now **ordered pseudocode mirroring the proven
-`net_recv_ring_complete`/`on_send_complete` template verbatim** (send_op-clear first, `!conn.closing`
-guard, `net_op_finished` LAST). Ready for review-before-impl.
+Status: **rev.4** — three internal adversarial rounds (rev.1: 3 crit/12 high; rev.2: 0 crit/7 high;
+rev.3 round-3: 0 crit/0 high) + a Codex review round (5 findings, all real, folded into rev.4). Codex's
+key correction: the `io_uring_enter(2)` ABI is subtler than rev.3 assumed — **`F_MORE` (pinned?) and
+`res` (bytes/errno) are independent axes**: an *errored* ZC can still pin+notify (so `more=true,res<0`
+is real, the error must be carried), and a *copied* ZC is a single `res>0` CQE with no notif (a success,
+not a close). §1 + the §3 state machine are now two-axis; `zc_ok` inits `true`; transient fallbacks pass
+`force_plain`; `-EOPNOTSUPP` joins `-EINVAL` as a capability fallback. The 2b `F_MORE` slot-lifetime
+reuse + the template-mirrored ordering (send_op-clear first, `!closing` guard, `net_op_finished` LAST)
+are unchanged. Ready for review-before-impl.
 
 **Scope:** the proactor send path. Sends ≥ a threshold go via `IORING_OP_SEND_ZC` (kernel transmits
 from user pages instead of copying); smaller sends keep the plain copy-`SEND`. Headline hello-world
@@ -21,22 +24,33 @@ shape — that is the kernel ABI. The SQE is a `#raw_union`, so writing `opcode=
 `msg_flags={.NOSIGNAL}` hits the right byte offsets despite the `raw_union_tag`s not listing `.SEND_ZC`
 (tag = fmt metadata only). Plain user buffer; `FIXED_BUF` out of scope.
 
-Kernel guarantees (re-assert at review against the running kernel; `SEND_ZC` is ≥ 6.0):
-1. A `SEND_ZC` that **enters transmission** posts a **result** CQE with `F_MORE` **set** (`res` = bytes
-   sent ≥ 0, possibly **partial**), then exactly **one** **notification** CQE with `F_NOTIF` set,
-   `F_MORE` **clear**, when the pages are released (buffer then free). The notif is strictly **ordered
-   after** the result for the same `user_data`; never reordered. `F_MORE` and `F_NOTIF` never both set.
-2. A `SEND_ZC` that **fails before transmission** (opcode `-EINVAL`, `-EBADF`, `-ENOTSOCK`,
-   `-EAGAIN`/`-EINTR` with zero bytes, optmem `-ENOBUFS`/`-ENOMEM`) posts a **single** CQE, `F_MORE`
-   **clear**, **no** notification. Zero bytes sent; buffer never pinned.
-3. A **cancel** of an op already past its result CQE typically returns `-ENOENT`/`-EALREADY` and cannot
-   un-pin handed-off pages; the notification still fires. A cancel that **beats** transmission yields a
-   single `-ECANCELED` (`F_MORE` clear, no notif).
+Kernel guarantees (per the `io_uring_enter(2)` `IORING_OP_SEND_ZC` text — re-assert at review against
+the running kernel; `SEND_ZC` is ≥ 6.0). **The cardinal rule: check `F_MORE`, NOT `res`.** `res` (the
+byte count or `-errno`) and `F_MORE` (whether the pages are pinned and a notification is owed) are
+**independent** — every `(F_MORE, sign-of-res)` combination occurs:
+1. **Pinned (`F_MORE` set on the result):** the pages are held; **exactly one** notification CQE
+   (`F_NOTIF` set, `F_MORE` clear) follows when they release. This happens whether the result `res` is
+   **≥ 0** (bytes sent, possibly partial) **OR `< 0`** — *an errored request may still have pinned and
+   thus still notifies* (man page: "even failed requests may generate a notification"). The notif is
+   strictly **ordered after** the result for the same `user_data`. `F_MORE`+`F_NOTIF` never co-occur.
+2. **Not pinned (`F_MORE` clear — a single CQE, no notification):** the buffer is free immediately.
+   Zerocopy is best-effort — the kernel may **copy** a send (small/unaligned/loopback/non-SG NIC, §9
+   Q5), completing it as a single `res > 0` CQE with **no** `F_MORE` and **no** notif — *a normal
+   success that must advance the offset, not an error*. Pre-transmission failures (`-EINVAL`,
+   `-EOPNOTSUPP`, `-EBADF`, `-ENOTSOCK`, `-EAGAIN`/`-EINTR` zero-byte, optmem `-ENOBUFS`/`-ENOMEM`) are
+   also single `F_MORE`-clear CQEs (`res < 0`, never pinned); `res == 0` is a zero-byte stall.
+3. A **cancel** past the result returns `-ENOENT`/`-EALREADY` and cannot un-pin handed-off pages — the
+   notification still fires. A cancel that **beats** transmission yields a single `-ECANCELED`
+   (`F_MORE` clear, no notif).
 
-**Load-bearing consequence:** the buffer is freeable **exactly on the first `F_MORE`-clear CQE** for the
-op (notif, single error, or `-ECANCELED`) — never on a `F_MORE`-set result. So `more := .MORE in
-cqe.flags` means "still pinned, terminal owed" (true) vs "free now, terminal" (false). `F_NOTIF` is
-informational; the slot lifetime is driven by `F_MORE`, identical to multishot RECV.
+**Load-bearing consequences:**
+- **Buffer lifetime** is driven by `F_MORE` ALONE: the buffer is freeable **exactly on the first
+  `F_MORE`-clear CQE** for the op (the notification, or a single non-pinned CQE), never on a
+  `F_MORE`-set result. `F_NOTIF` is informational; the slot lifetime is identical to multishot RECV.
+- **Result classification** is `res`-driven and is the *separate* axis: a `F_MORE`-set result records
+  bytes (`res ≥ 0`) or a sticky error (`res < 0`) to act on at the terminal; a `F_MORE`-clear single
+  CQE is a success (`res > 0` → advance), a stall (`res == 0`), or an error (`res < 0`). §3 is the
+  full two-axis state machine.
 
 ---
 
@@ -68,78 +82,81 @@ release path, no underflow, no leak.
 `on_send_complete`: **early-return on the intermediate; on the terminal, clear the op id first, wrap the
 buffer decision in `if !conn.closing`, and call `net_op_finished` LAST and unconditionally.** Invariants:
 
-- **INV-1 (result CQE, `more=true`) touches ONLY `active_send_off`.** It must NOT call
+- **INV-1 (result CQE, `more=true` — pinned, notif owed) RECORDS ONLY; acts at the terminal.** It does
+  exactly one of: `off += res` (if `res ≥ 0`) **or** record a sticky `conn.zc_err = res` (if `res < 0`
+  — an errored-but-pinned send still notifies, so the error must be carried, NOT dropped). It must NOT
   `net_op_finished`, clear `send_op`, touch/rotate/clear/free `active_send`, re-submit, emit `'drain'`,
-  re-arm reads, cancel, or close. This is STRICTER than recv's `more=true` path (which pauses multishot)
-  — a ZC result is purely `off += res` then return. (Drop rev.2's "exactly like recv's if more" analogy;
-  recv's intermediate is not side-effect-free, this one is.)
+  re-arm, cancel, or close. (Stricter than recv's `more=true`, which pauses multishot.)
 - **INV-2 — on the terminal (`more=false`): `send_op = OP_ID_INVALID` FIRST**, then the buffer decision
   **only `if !conn.closing`**, then **`net_op_finished` LAST** (unconditional — the sole terminal act
   that runs even while closing). This exact order is what `on_send_complete` (net.odin:689→712) and
-  `net_recv_ring_complete` (net.odin:448→516) use; `net_op_finished` last is what keeps `inflight ≥ 1`
-  across any re-submit so `net_maybe_free` can't transiently free mid-window (the C1 guard).
-- **INV-3 — the terminal `res` is meaningless for byte accounting** (notif `res` = 0/usage). Bytes come
-  only from the result CQE. The terminal acts on the recorded `off`; it classifies its own `res` ONLY in
-  the no-transmission case (no prior result).
-- **INV-4 — `off` advances only on a non-negative result.** A negative `res` (any error) leaves `off`
-  untouched, so a fallback/retry re-sends exactly `active_send[off:]` (no double-send/skip). `off`
-  monotonic, ≤ `len(active_send)`.
+  `net_recv_ring_complete` (net.odin:448→516) use; `net_op_finished` last keeps `inflight ≥ 1` across
+  any re-submit so `net_maybe_free` can't transiently free mid-window (the C1 guard).
+- **INV-3 — two `res` sources, never confused.** When `saw_result` (a `more=true` result preceded this
+  terminal), the terminal IGNORES its own `res` (the notif's `res` is 0/usage) and acts on the recorded
+  `off`/`zc_err`. When NOT `saw_result` (a single `F_MORE`-clear CQE — a copied success, stall, or
+  pre-transmission error), the terminal's `res` IS the real result and is classified.
+- **INV-4 — `off` advances only on a non-negative result** (a `more=true` result `res ≥ 0`, or a
+  single-CQE `res > 0`). Any negative `res` leaves `off` untouched, so a fallback/retry re-sends exactly
+  `active_send[off:]` (no double-send/skip). `off` monotonic, ≤ `len(active_send)`.
 
-`saw_result` (per-conn, distinguishes "notif after a transmission" from "single error CQE") is **reset
-to false in the single submit choke point `net_proactor_submit`** (§4) — so EVERY submission (initial,
-state-(c) tail, rotation, fallback-to-plain) clears it exactly once; it is never carried stale into the
-next op.
+`saw_result` and `zc_err` (per-conn — safe because one send op per conn, §4) are **reset in the single
+submit choke point `net_proactor_submit`** (§4), so EVERY submission (initial, tail, rotation, fallback)
+clears them; never stale-carried.
 
 ```
 net_send_zc_complete(loop, conn, res, more):
-  # ---- INTERMEDIATE: result CQE. INV-1: record off ONLY. ----
+  # ---- INTERMEDIATE: result CQE, pages PINNED, notif owed. INV-1: RECORD ONLY, then return. ----
   if more:
     conn.saw_result = true
-    if res >= 0: conn.active_send_off += int(res)
-    # (more=true, res<0 is ABI-unreachable per §1(2): a pre-transmission error is a single more=false.
-    #  If it ever occurs, do NOTHING here — NEVER close/cancel/free on more=true (INV-1); the owed
-    #  terminal will handle it. No state needs recording: the terminal's saw_result=true path acts on
-    #  off, which is unchanged, so it re-sends the un-acked tail — safe.)
+    if res >= 0: conn.active_send_off += int(res)   # bytes sent (possibly partial)
+    else:        conn.zc_err = res                  # errored-but-pinned: carry it; the notif surfaces it
     return
 
-  # ---- TERMINAL: more=false. Buffer is free (§1). ----
+  # ---- TERMINAL: more=false, buffer FREE (F_MORE clear, §1). Mirror the template. ----
   saw := conn.saw_result
-  conn.send_op = OP_ID_INVALID                  # FIRST — re-entrant write()/kick sees a clear gate
+  conn.send_op = OP_ID_INVALID                       # FIRST — a re-entrant write()/kick sees a clear gate
   if !conn.closing:
-    if saw:                                      # notif after (possibly partial) transmission; ignore res (INV-3)
-      if conn.active_send_off < len(conn.active_send):
-        net_proactor_submit(conn)                # unsent tail; choke point re-picks ZC vs plain (§4)
-      else if len(conn.pending_writes) > 0:
-        net_proactor_kick_send(conn)             # rotate pending -> active, then submit VIA net_proactor_submit (§4) — so a large rotated chunk gets ZC
-      else:
-        clear(conn.active_send); conn.active_send_off = 0
-        net_proactor_on_drained(conn)            # emit 'drain', re-arm reads, end_after_drain close
-    else:                                        # single terminal, NO transmission: res is the real result (INV-4: off unchanged)
-      switch res:
-        == 0:                       net_emit_error(conn); net_close_conn(conn, true)   # write-stalled (buffer non-empty by §4 gate)
-        -EINVAL and conn.send_was_zc: disable_zc(loop); net_proactor_submit(conn)      # capability -> plain (§5)
-        -ENOBUFS, -ENOMEM:          net_proactor_submit(conn)                          # optmem pressure -> copy-send (NOT fatal, §5)
-        -EINTR, -EAGAIN:            net_proactor_submit(conn)                          # transient retry (off==0, re-sends whole buffer)
-        -ECANCELED:                 pass                                               # benign (closing handled by the guard)
-        else:                       net_emit_error(conn); net_close_conn(conn, true)   # fatal
-  net_op_finished(conn)                          # LAST, unconditional (mirrors on_send_complete:712)
+    # Resolve the effective error and advance off for a single-CQE (non-pinned) success (INV-3/INV-4).
+    err: i32 = 0
+    if saw:           err = conn.zc_err              # 0 if the result succeeded; <0 if it errored (ignore THIS cqe's res)
+    elif res > 0:     conn.active_send_off += int(res)   # single-CQE COPIED success — kernel didn't ZC; advance like plain
+    elif res < 0:     err = res                      # single-CQE pre-transmission error
+    # (saw=false, res==0 falls through with err=0 -> the zero-byte stall close below)
+
+    if err < 0:                                      # off untouched on any error (INV-4) -> re-sends the exact tail
+      switch err:
+        -EINVAL, -EOPNOTSUPP (and conn.send_was_zc): disable_zc(loop); net_proactor_submit(conn, force_plain=true)  # protocol/capability -> plain
+        -ENOBUFS, -ENOMEM:                            net_proactor_submit(conn, force_plain=true)                   # optmem -> copy-send, transient (NOT fatal)
+        -EINTR, -EAGAIN:                              net_proactor_submit(conn)                                     # transient retry
+        -ECANCELED:                                   pass                                                          # benign
+        else:                                         net_emit_error(conn); net_close_conn(conn, true)              # fatal (EPIPE, …)
+    elif !saw and res == 0:                          net_emit_error(conn); net_close_conn(conn, true)               # zero-byte stall (plain-path parity)
+    elif conn.active_send_off < len(conn.active_send): net_proactor_submit(conn)                                   # unsent tail (choke point re-picks ZC vs plain)
+    elif len(conn.pending_writes) > 0:                net_proactor_kick_send(conn)                                  # rotate + submit via the choke point
+    else:                                            clear(conn.active_send); conn.active_send_off = 0
+                                                     net_proactor_on_drained(conn)                                  # 'drain' + re-arm + end_after_drain close
+  conn.zc_err = 0; conn.saw_result = false           # reset (also reset in the choke point at next submit)
+  net_op_finished(conn)                              # LAST, unconditional (mirrors on_send_complete:712)
 ```
 
-Note: every `net_proactor_submit` above runs BEFORE `net_op_finished`, so `inflight` never transiently
-hits 0 (the re-submit re-sets `send_op`+`inflight`); its own internal submit-failure close is safe for
-the same reason. On a closing conn the terminal does only `net_op_finished` → `net_maybe_free` (which
-frees `active_send` exactly once now that the buffer is unpinned), matching the template's `!closing`
-envelope. A ZC submit never stages an empty buffer (the §4 threshold gate implies `len(active_send[off:])
-≥ 16 KiB > 0`), so a `res==0` terminal is a genuine stall, not "nothing to send".
+Notes: every `net_proactor_submit`/`kick_send` runs BEFORE `net_op_finished`, so `inflight` never
+transiently hits 0 (the re-submit re-sets `send_op`+`inflight`); the re-submit's own internal
+submit-failure close is safe for the same reason. On a closing conn the terminal does only
+`net_op_finished` → `net_maybe_free` (frees `active_send` once, the buffer being unpinned), matching the
+template's `!closing` envelope. The two **success** entries (`saw` with `zc_err==0`; or `!saw` with
+`res>0`) converge on the same off-based decision (tail / rotate / drain); a single-CQE `res>0` is a
+**copied** send the kernel chose not to zerocopy (§1(2)) — a normal success, not an error.
 
 ---
 
 ## 4. The submit choke point, threshold, partial sends, serialization
 
-- **Single choke point `net_proactor_submit(conn)`** decides per submission:
-  `use_zc := zc_ok && len(active_send[off:]) >= NET_ZC_THRESHOLD` (proposal 16 KiB). It resets
-  `conn.saw_result = false` and sets `conn.send_was_zc = use_zc` (recomputed EVERY submission, like
-  `recv_multishot` in `net_maybe_arm_recv` — never stale), then calls `submit_send_zc`
+- **Single choke point `net_proactor_submit(conn, force_plain := false)`** decides per submission:
+  `use_zc := !force_plain && zc_ok && len(active_send[off:]) >= NET_ZC_THRESHOLD` (proposal 16 KiB;
+  `force_plain` is the §5 transient-fallback one-shot). It resets `conn.saw_result = false` and
+  `conn.zc_err = 0`, sets `conn.send_was_zc = use_zc` (recomputed EVERY submission, like `recv_multishot`
+  in `net_maybe_arm_recv` — never stale), then calls `submit_send_zc`
   (`send_cb=net_send_zc_complete`) or the plain `submit_send` (`callback=on_send_complete`). It is the
   **single submitter** that owns `send_op`+`inflight`. All submit sites route through it: the initial
   kick, the state-(c) tail, the §5 fallbacks, AND `net_proactor_kick_send` — which is updated to rotate
@@ -165,22 +182,34 @@ envelope. A ZC submit never stages an empty buffer (the §4 threshold gate impli
 
 ## 5. Capability + transient fallback (per-op attribution)
 
-- **`-EINVAL` (kernel < 6.0)** is state-(d) (single `more=false`, no notif, buffer never pinned). Only
-  a `send_was_zc` op treats it as a capability signal: `disable_zc(loop)` (loop-global `zc_ok=false` in
-  `Platform_Loop`, gated by `disable_zc` mirroring `disable_multishot`), then `net_proactor_submit` —
-  which now picks plain (zc_ok false) and re-sends `active_send[off:]` (`off` untouched, INV-4 → exact
-  tail). A **plain**-send `-EINVAL` (`send_was_zc=false`) stays fatal — no fallback loop.
+- **`zc_ok` is initialized `true`** at proactor bring-up (where `multishot_ok` is set — `buf_ring_init`
+  / the proactor probe), NOT left at Odin's `false` default. It is only ever *cleared* by `disable_zc`,
+  so without the explicit init the submit predicate `zc_ok && …` would be false forever and ZC would
+  **never** be attempted. (`zc_ok` lives in `Platform_Loop` like `multishot_ok`; `disable_zc` mirrors
+  `disable_multishot`.)
+- **`force_plain` — the one-shot the fallbacks need.** `net_proactor_submit(conn, force_plain := false)`
+  computes `use_zc := !force_plain && zc_ok && len(active_send[off:]) >= NET_ZC_THRESHOLD`. A transient
+  fallback (below) MUST pass `force_plain=true`: otherwise the choke point recomputes `use_zc` from the
+  still-true `zc_ok` + still-large buffer and re-issues **another `SEND_ZC`** — re-failing/stalling
+  instead of making progress.
+- **`-EINVAL` / `-EOPNOTSUPP` (kernel < 6.0, or a protocol/socket without zerocopy support)** — a
+  capability signal. Only a `send_was_zc` op treats it so: `disable_zc(loop)` (latches `zc_ok=false`
+  loop-wide) **and** `net_proactor_submit(conn, force_plain=true)` — re-sends `active_send[off:]`
+  (`off` untouched, INV-4 → exact tail) as plain. A **plain**-send `-EINVAL` (`send_was_zc=false`) stays
+  fatal — no fallback loop. (Both the single-CQE form and an errored-but-pinned `zc_err` form route here
+  via §3's `err<0` branch; `off` is untouched either way so the plain re-send is exact.)
 - **`-ENOBUFS`/`-ENOMEM` (optmem/`RLIMIT_MEMLOCK` pressure)** is **transient, not fatal** — symmetric
-  with the recv side's `-ENOBUFS` (which parks, never closes). State-(d) routes it to
-  `net_proactor_submit` (copy-send fallback for this op); the connection is not closed. Under the
-  large-body-to-many/slow-clients workload ZC targets, treating it as fatal would mass-drop connections.
-- **Ordering** (already in the §3 pseudocode): clear `send_op` → `net_proactor_submit` (re-sets
+  with the recv side's `-ENOBUFS` (which parks, never closes). Routes to `net_proactor_submit(conn,
+  force_plain=true)` (copy-send for THIS op; does NOT latch `zc_ok` off — pressure is transient). Under
+  the large-body-to-many/slow-clients workload ZC targets, treating it as fatal would mass-drop
+  connections.
+- **Ordering** (in the §3 pseudocode): clear `send_op` → `net_proactor_submit` (re-sets
   `send_op`+`inflight`; its internal failure-close is safe because this op's `inflight` is still
   counted) → `net_op_finished` LAST. So `inflight` never transiently hits 0 mid-close.
-- **Storm bound (corrected)**: `zc_ok` is checked at submit, so once the first `-EINVAL` terminal flips
-  it no new ZC is attempted; the residual is bounded by the large sends **already in flight** when that
-  terminal lands (per worker) × N workers — **not** "exactly one". Self-limiting; tests must not assert
-  "exactly one".
+- **Storm bound (corrected)**: `zc_ok` is checked at submit, so once the first `-EINVAL`/`-EOPNOTSUPP`
+  terminal latches it off, no new ZC is attempted; the residual is bounded by the large sends **already
+  in flight** when that terminal lands (per worker) × N workers — **not** "exactly one". Self-limiting;
+  tests must not assert "exactly one".
 
 ---
 
@@ -263,10 +292,16 @@ Moving the full-drain transition from the result to the **notification** (INV-2)
   (`zc_ok=false` → plain). Teardown: an in-flight ZC op left **post-result/pre-notif** disposed exactly
   once at destroy → conn freed once (ASAN). A forced submit-failure during the `-EINVAL` fallback frees
   the conn exactly once.
-- **State-machine rows (a)–(d)**: result-then-notif; single error vs notif (the `saw_result`
-  distinction); a `write()` between result and notif lands in `pending_writes`, NO second op until the
-  terminal; `off` advances only on non-negative result; a notif arriving on a **closing** conn runs only
-  `net_op_finished` (no submit/drain/emit).
+- **State-machine — every `(more, res, saw_result)` cell** (the Codex-round additions): result-then-notif
+  success; **`more=true, res<0` (errored-but-pinned)** → the notif surfaces the error (close/fallback),
+  NOT a silent tail-resubmit; **`more=false, res>0` single-CQE COPIED success** → advances `off` and
+  drains, does NOT close; `more=false, res==0` stall → close; `-EINVAL`/`-EOPNOTSUPP` → `disable_zc` +
+  plain re-send; `-ENOBUFS` → `force_plain` re-send, conn NOT closed and `zc_ok` NOT latched off;
+  `write()` between result and notif lands in `pending_writes`, NO second op until the terminal; `off`
+  advances only on non-negative `res`; a notif on a **closing** conn runs only `net_op_finished`.
+- **`zc_ok` init**: with no kernel `SEND_ZC` support, the FIRST large send `-EINVAL`s, latches
+  `zc_ok=false`, and falls back to plain — and `zc_ok` must start `true` so ZC is attempted at all
+  (assert a large send actually attempts ZC on a ≥6.0 kernel).
 - **Buffer-lifetime (load-bearing, ASAN)**: large ZC write, **cancel AFTER the result but before the
   notif** → `active_send` freed only on the notif, never on the cancel/`-ECANCELED`; peer RST mid-send.
 - **2b interaction**: 2a single-shot — a recv data terminal in the ZC result→notif window must NOT
