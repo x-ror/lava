@@ -117,7 +117,28 @@ Loop :: struct {
 	// Per-loop worker pool for off-loop blocking/CPU-bound work (threadpool.odin).
 	// Zero-valued until first use (lazily started); joined and freed by destroy.
 	pool:               Thread_Pool,
+	// Graceful-shutdown state machine (Slice 3a): Running (stop_requested false) -> Draining
+	// (stop_requested true: stop accepting + let in-flight work finish) -> Forced (force_exit true:
+	// run() returns and the deferred hard teardown reclaims the rest).
+	//   - stop_requested is set CROSS-THREAD (the worker supervisor) so it is accessed atomically; the
+	//     loop thread observes it once in run_once and invokes on_shutdown (close listeners / arm a
+	//     drain timeout). force_exit and shutdown_observed are loop-thread-only.
+	//   - shutdown_mutex + destroyed serialize request_shutdown's wakeup against destroy(): the
+	//     supervisor must never write the wakeup pipe of a loop being torn down (use-after-free). Both
+	//     request_shutdown and destroy take the mutex; destroy marks `destroyed` before freeing the
+	//     platform fds, so a later request_shutdown sees it and no-ops.
+	stop_requested:     bool,
+	force_exit:         bool,
+	shutdown_observed:  bool,
+	on_shutdown:        Shutdown_Hook,
+	on_shutdown_data:   rawptr,
+	shutdown_mutex:     sync.Mutex,
+	destroyed:          bool,
 }
+
+// Shutdown_Hook runs ONCE on the loop thread the first time run_once observes a stop request. The net
+// layer registers it (set_shutdown_hook) to stop accepting and begin draining in-flight connections.
+Shutdown_Hook :: proc(loop: ^Loop, user_data: rawptr)
 
 Poll_Mode :: enum {
 	Read,
@@ -218,6 +239,14 @@ sync_real_clock :: proc(loop: ^Loop) {
 // race the read here and could post into freed memory. The lava runtime enforces
 // this by calling fetch_shutdown_active (which joins the workers) before destroy.
 destroy :: proc(loop: ^Loop) {
+	// Mark destroyed under the shutdown mutex BEFORE freeing any platform state, so a concurrent
+	// request_shutdown (worker supervisor, another thread) either ran fully before this — having
+	// already woken the still-live loop — or sees `destroyed` and no-ops. Without this the supervisor
+	// could write a freed wakeup pipe fd. (Uncontended in the single-loop / test cases.)
+	sync.lock(&loop.shutdown_mutex)
+	loop.destroyed = true
+	sync.unlock(&loop.shutdown_mutex)
+
 	// Stop and join the worker pool first, so no off-loop worker can post into the
 	// async_queue we are about to tear down (see threadpool.odin / the PRECONDITION
 	// note below). A no-op when the pool was never started.
@@ -670,6 +699,18 @@ run_once :: proc(loop: ^Loop) -> bool {
 	loop.iteration += 1
 	did_work := false
 
+	// Graceful-shutdown observe point: the first run_once after a stop request runs the drain-start
+	// hook (stop accepting, arm the drain timeout) on the loop thread. Subsequent ticks skip it; the
+	// drain driver flips force_exit when in-flight work finishes or the timeout fires, and run()'s
+	// condition then returns.
+	if !loop.shutdown_observed && sync.atomic_load(&loop.stop_requested) {
+		loop.shutdown_observed = true
+		if loop.on_shutdown != nil do loop.on_shutdown(loop, loop.on_shutdown_data)
+	}
+	// Forced: skip this tick's blocking poll and return at once so run()'s condition can exit. Covers
+	// both a hook that drained immediately (force_exit set just above) and a prior tick's drain driver.
+	if loop.force_exit do return false
+
 	// Sample the real clock first so the timer phase fires every timer whose
 	// deadline has actually elapsed (no-op in virtual-clock mode).
 	sync_real_clock(loop)
@@ -930,7 +971,9 @@ run :: proc(loop: ^Loop) {
 	// A fatal backend-poll error (see Loop.backend_error) stops the loop: the poll
 	// syscall can no longer make progress, so continuing would busy-spin while
 	// active_io_count/active_async keep has_pending_work true forever.
-	for has_pending_work(loop) && !loop.backend_error {
+	// force_exit (the Forced shutdown state) exits even while work is pending: a listening server keeps
+	// active_io_count > 0 forever, so without it a stop request could never end run().
+	for has_pending_work(loop) && !loop.backend_error && !loop.force_exit {
 		run_next(loop)
 	}
 }
@@ -1384,4 +1427,35 @@ cancel_op :: proc(loop: ^Loop, id: Op_ID) -> bool {
 // wakeup allows background worker threads to instantly kick the loop out of sleep.
 wakeup :: proc(loop: ^Loop) {
 	platform_wakeup(loop)
+}
+
+// set_shutdown_hook registers the loop-thread drain-start callback (the net layer's "stop accepting +
+// drain"). Loop-thread only, before run().
+set_shutdown_hook :: proc(loop: ^Loop, hook: Shutdown_Hook, user_data: rawptr) {
+	loop.on_shutdown = hook
+	loop.on_shutdown_data = user_data
+}
+
+// request_shutdown asks a (possibly other-thread) loop to begin graceful shutdown: set stop_requested
+// and wake the loop so run_once observes it. CROSS-THREAD SAFE against destroy() — the shutdown_mutex
+// serializes with destroy's `destroyed` mark, so this never writes the wakeup pipe of a torn-down loop.
+// Idempotent. Called by the worker supervisor.
+request_shutdown :: proc(loop: ^Loop) {
+	sync.lock(&loop.shutdown_mutex)
+	defer sync.unlock(&loop.shutdown_mutex)
+	if loop.destroyed do return
+	sync.atomic_store(&loop.stop_requested, true)
+	platform_wakeup(loop)
+}
+
+// shutdown_requested reports whether a stop has been requested (atomic load — may be set by another
+// thread). Used by the worker pre-run hook to abort startup if a signal arrived before run().
+shutdown_requested :: proc(loop: ^Loop) -> bool {
+	return sync.atomic_load(&loop.stop_requested)
+}
+
+// begin_force_exit transitions Draining -> Forced so run() returns. LOOP-THREAD ONLY (the net drain
+// driver calls it when the last connection closes or the drain timeout fires).
+begin_force_exit :: proc(loop: ^Loop) {
+	loop.force_exit = true
 }
