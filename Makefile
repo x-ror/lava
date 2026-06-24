@@ -207,6 +207,7 @@ test-multicore-smoke: build
 
 test-zerocopy-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-zerocopy-smoke.sh
+	LAVA_BIN="$(LAVA)" LAVA_NET_FORCE_READINESS=1 ./scripts/run-zerocopy-smoke.sh
 
 # bench runs the micro/macro benchmarks node-vs-Lava and prints a ratio table; it never
 # fails on timing (report-only). bench-gate adds --gate, enforcing the per-benchmark

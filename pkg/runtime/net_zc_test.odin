@@ -11,12 +11,14 @@ import eventloop "lava:pkg/runtime/eventloop"
 // with crafted (res, more) tuples on a hand-built connection. This reaches the error/copied/fallback
 // cells the large-body integration test cannot. `inflight` is held high so net_maybe_free never fires
 // mid-test (the test owns the conn's lifetime); read_done is set so the drain's recv re-arm no-ops; the
-// JS callbacks are nil so net_emit is a no-op (no JSC context needed).
+// JS callbacks are nil so net_emit is a no-op (no JSC context needed). The fd is a real (unconnected)
+// socket so net_close_conn's shutdown()/close() are clean rather than EBADF on a literal.
 
 @(private = "file")
-zc_conn :: proc(loop: ^eventloop.Loop, fd: linux.Fd, body_len: int) -> ^Net_Connection {
+zc_conn :: proc(loop: ^eventloop.Loop, body_len: int) -> ^Net_Connection {
 	conn := new(Net_Connection)
 	conn.loop = loop
+	fd, _ := linux.socket(.INET, .STREAM, {}, .TCP) // real fd: shutdown()/close() on the close path are clean
 	conn.fd = uintptr(fd)
 	conn.io_mode = .Proactor
 	conn.read_done = true // drain's net_maybe_arm_recv returns early — no recv setup needed
@@ -29,6 +31,7 @@ zc_conn :: proc(loop: ^eventloop.Loop, fd: linux.Fd, body_len: int) -> ^Net_Conn
 
 @(private = "file")
 zc_free :: proc(conn: ^Net_Connection) {
+	linux.close(linux.Fd(conn.fd)) // net_maybe_free never ran (inflight sentinel), so close the real fd here
 	delete(conn.active_send)
 	delete(conn.pending_writes)
 	free(conn)
@@ -42,7 +45,7 @@ zc_result_records_off_only :: proc(t: ^testing.T) {
 		eventloop.destroy(&loop)
 		return
 	}
-	conn := zc_conn(&loop, -1, 100)
+	conn := zc_conn(&loop, 100)
 	defer zc_free(conn) // runs LAST
 	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 
@@ -62,7 +65,7 @@ zc_result_errored_pinned_records_err :: proc(t: ^testing.T) {
 		eventloop.destroy(&loop)
 		return
 	}
-	conn := zc_conn(&loop, 100, 100)
+	conn := zc_conn(&loop, 100)
 	defer zc_free(conn) // runs LAST
 	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 
@@ -80,7 +83,7 @@ zc_terminal_drained :: proc(t: ^testing.T) {
 		eventloop.destroy(&loop)
 		return
 	}
-	conn := zc_conn(&loop, 100, 100)
+	conn := zc_conn(&loop, 100)
 	defer zc_free(conn) // runs LAST
 	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 	conn.saw_result = true
@@ -101,7 +104,7 @@ zc_terminal_copied_success_not_close :: proc(t: ^testing.T) {
 		eventloop.destroy(&loop)
 		return
 	}
-	conn := zc_conn(&loop, 50, 50)
+	conn := zc_conn(&loop, 50)
 	defer zc_free(conn) // runs LAST
 	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 	// saw_result stays false (no prior more=true result): a single F_MORE-clear res>0 CQE.
@@ -119,7 +122,7 @@ zc_terminal_stall_closes :: proc(t: ^testing.T) {
 		eventloop.destroy(&loop)
 		return
 	}
-	conn := zc_conn(&loop, 100, 100)
+	conn := zc_conn(&loop, 100)
 	defer zc_free(conn) // runs LAST
 	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 
@@ -128,8 +131,8 @@ zc_terminal_stall_closes :: proc(t: ^testing.T) {
 	testing.expect(t, conn.had_error, "stall close is an error close")
 }
 
-// (f) -EINVAL on a ZC op (saw=false, send_was_zc): capability fallback — latch zc_ok off, re-submit
-//     PLAIN (send_op re-set), NOT fatal.
+// (f) Single-CQE -EINVAL on a ZC op (saw=false, send_was_zc): capability fallback — latch zc_ok off
+//     loop-wide, re-submit PLAIN (send_op re-set), NOT fatal.
 @(test)
 zc_terminal_einval_falls_back_plain :: proc(t: ^testing.T) {
 	loop := eventloop.init()
@@ -137,7 +140,7 @@ zc_terminal_einval_falls_back_plain :: proc(t: ^testing.T) {
 		eventloop.destroy(&loop)
 		return
 	}
-	conn := zc_conn(&loop, 100, 100)
+	conn := zc_conn(&loop, 100)
 	defer zc_free(conn) // runs LAST
 	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 	conn.send_was_zc = true
@@ -149,7 +152,7 @@ zc_terminal_einval_falls_back_plain :: proc(t: ^testing.T) {
 	testing.expect(t, !conn.send_was_zc, "the fallback re-submit chose plain")
 }
 
-// (g) -ENOBUFS (optmem pressure): transient copy-send fallback — re-submit, NOT fatal, zc NOT latched.
+// (g) Single-CQE -ENOBUFS (optmem pressure): transient copy-send fallback — re-submit, NOT fatal, zc NOT latched.
 @(test)
 zc_terminal_enobufs_not_fatal :: proc(t: ^testing.T) {
 	loop := eventloop.init()
@@ -157,7 +160,7 @@ zc_terminal_enobufs_not_fatal :: proc(t: ^testing.T) {
 		eventloop.destroy(&loop)
 		return
 	}
-	conn := zc_conn(&loop, 100, 100)
+	conn := zc_conn(&loop, 100)
 	defer zc_free(conn) // runs LAST
 	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 	conn.send_was_zc = true
@@ -165,4 +168,136 @@ zc_terminal_enobufs_not_fatal :: proc(t: ^testing.T) {
 	net_send_zc_complete(&loop, conn, -i32(linux.Errno.ENOBUFS), false)
 	testing.expect(t, !conn.closing, "ENOBUFS (optmem) must be transient, NOT a fatal close")
 	testing.expect(t, conn.send_op != eventloop.OP_ID_INVALID, "ENOBUFS re-submitted the tail")
+}
+
+// (h) ERRORED-BUT-PINNED TERMINAL (two-CQE): a more=true result carries res<0, then the more=false
+//     terminal surfaces conn.zc_err (NOT the notif's own res — INV-3) and drives the fatal close. This is
+//     the saw=true carried-error arm that the single-CQE cells (e–g) never reach, and exactly the
+//     "even a failed request may notify" sequence loopback/AF_UNIX CI cannot produce.
+@(test)
+zc_errored_pinned_terminal_closes :: proc(t: ^testing.T) {
+	loop := eventloop.init()
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
+	conn := zc_conn(&loop, 100)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
+	conn.send_was_zc = true
+
+	net_send_zc_complete(&loop, conn, -i32(linux.Errno.EPIPE), true) // errored-but-pinned result
+	net_send_zc_complete(&loop, conn, 0, false) // notif (res ignored): the carried EPIPE drives the close
+	testing.expect(t, conn.closing, "carried EPIPE at the terminal closes (INV-3: notif res ignored)")
+	testing.expect(t, conn.had_error, "an EPIPE close is an error close")
+}
+
+// (i) CARRIED -EINVAL → loop-wide fallback (two-CQE): the errored-but-pinned arm whose carried error is a
+//     capability signal — latch zc_ok off loop-wide and re-submit PLAIN, NOT fatal. Distinct from (f),
+//     which reaches the ladder via the single-CQE (saw=false) arm.
+@(test)
+zc_carried_einval_falls_back_loopwide :: proc(t: ^testing.T) {
+	loop := eventloop.init()
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
+	conn := zc_conn(&loop, 100)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
+	conn.send_was_zc = true
+
+	net_send_zc_complete(&loop, conn, -i32(linux.Errno.EINVAL), true) // errored-pinned, carries EINVAL
+	net_send_zc_complete(&loop, conn, 0, false) // terminal: carried EINVAL → disable_zc + re-submit plain
+	testing.expect(t, !eventloop.send_zc_ok(&loop), "carried EINVAL latches zc_ok off loop-wide")
+	testing.expect(t, !conn.closing, "EINVAL capability fallback (via the carried error) must NOT close")
+	testing.expect(t, conn.send_op != eventloop.OP_ID_INVALID, "fallback re-submitted (plain)")
+	testing.expect(t, !conn.send_was_zc, "the re-submit chose plain")
+}
+
+// (j) -EOPNOTSUPP is PER-CONN, not loop-wide (the EINVAL/EOPNOTSUPP split): a per-socket/protocol denial
+//     sets conn.zc_unsupported and re-submits plain, but leaves loop-wide zc_ok intact so sibling conns
+//     keep using ZC.
+@(test)
+zc_eopnotsupp_is_per_conn :: proc(t: ^testing.T) {
+	loop := eventloop.init()
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
+	conn := zc_conn(&loop, 100)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
+	conn.send_was_zc = true
+
+	net_send_zc_complete(&loop, conn, -i32(linux.Errno.EOPNOTSUPP), false)
+	testing.expect(t, conn.zc_unsupported, "EOPNOTSUPP denies ZC for THIS conn")
+	testing.expect(t, eventloop.send_zc_ok(&loop), "EOPNOTSUPP is per-socket — loop-wide zc_ok stays intact")
+	testing.expect(t, !conn.closing, "EOPNOTSUPP fallback must NOT close")
+	testing.expect(t, conn.send_op != eventloop.OP_ID_INVALID, "re-submitted (plain)")
+	testing.expect(t, !conn.send_was_zc, "the re-submit chose plain (the zc_unsupported gate)")
+}
+
+// (k) PARTIAL result → TERMINAL → resubmit the unsent tail: a result advances off short of len, then the
+//     terminal re-submits active_send[off:] (the choke point re-picks ZC vs plain). off is unchanged
+//     because the new submit is for the remaining tail.
+@(test)
+zc_partial_then_tail_resubmit :: proc(t: ^testing.T) {
+	loop := eventloop.init()
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
+	conn := zc_conn(&loop, 100)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
+
+	net_send_zc_complete(&loop, conn, 60, true) // partial result: off → 60
+	testing.expect_value(t, conn.active_send_off, 60)
+	net_send_zc_complete(&loop, conn, 0, false) // terminal (saw, zc_err==0): off(60) < len(100) → re-submit tail
+	testing.expect(t, conn.send_op != eventloop.OP_ID_INVALID, "the unsent 40-byte tail was re-submitted")
+	testing.expect_value(t, conn.active_send_off, 60) // the re-submit is for [60:]; off is unchanged
+	testing.expect(t, !conn.closing, "a partial-then-tail continuation must not close")
+}
+
+// (l) The teardown-pin predicate (M1/M2): the leak decision net_maybe_free uses. A live ZC send (send_op
+//     not yet cleared by its notif) is pinned → LEAK, don't free; once the terminal clears send_op, or for
+//     a plain send, the backing is safe to free. (The leak itself can't be asserted — Odin's leak tracker
+//     would flag the intentional leak — so the pure predicate carries the coverage.)
+@(test)
+zc_pinned_at_teardown_predicate :: proc(t: ^testing.T) {
+	conn := new(Net_Connection)
+	defer free(conn)
+
+	conn.send_was_zc = true
+	conn.send_op = eventloop.Op_ID(0xABCD) // a ZC send whose notification has not fired
+	testing.expect(t, net_zc_pinned_at_teardown(conn), "a live ZC send is pinned at teardown — leak, don't free")
+
+	conn.send_op = eventloop.OP_ID_INVALID // the more=false terminal cleared it → pages released
+	testing.expect(t, !net_zc_pinned_at_teardown(conn), "after the terminal, the backing is safe to free")
+
+	conn.send_op = eventloop.Op_ID(0xABCD)
+	conn.send_was_zc = false // a plain (copy) send never pins user pages
+	testing.expect(t, !net_zc_pinned_at_teardown(conn), "a plain send's backing is never pinned")
+}
+
+// (m) The §7 read-pause tightening: with a 'drain' owed (want_drain), reads do NOT re-arm — even on a
+//     PARTIAL drain (buffered < HWM), which 2a/1b used to resume on. Regression guard so a future change
+//     can't silently revert to resuming reads before 'drain'. (Drives only the gate — no submit.)
+@(test)
+zc_want_drain_keeps_reads_paused :: proc(t: ^testing.T) {
+	loop := eventloop.init()
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
+	conn := zc_conn(&loop, 0) // empty body → net_proactor_buffered == 0 (< HWM): a "partial drain" state
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST
+
+	conn.read_done = false // eligible to read…
+	conn.recv_op = eventloop.OP_ID_INVALID // …and nothing in flight
+	conn.want_drain = true // …but a 'drain' is owed
+	testing.expect(t, !net_maybe_arm_recv(conn), "want_drain keeps reads paused (no re-arm on a partial drain)")
+	testing.expect_value(t, conn.recv_op, eventloop.OP_ID_INVALID) // nothing was armed
 }

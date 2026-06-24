@@ -50,7 +50,9 @@ const srv = http.createServer((req, res) => {
 srv.listen(0, () => console.log('READY ' + srv.address().port));
 EOF
 
-"$LAVA_BIN" run "$TMP_DIR/srv.js" >"$TMP_DIR/srv.log" 2>&1 &
+# LAVA_ZC_STATS makes the runtime print "LAVA_ZC: zc_ok=<0|1>" and "LAVA_ZC: SEND_ZC engaged" to stderr
+# (captured below) so a green run can be distinguished from a silent plain-path fallback (M3).
+LAVA_ZC_STATS=1 "$LAVA_BIN" run "$TMP_DIR/srv.js" >"$TMP_DIR/srv.log" 2>&1 &
 SRV_PID=$!
 PORT=""
 i=0
@@ -63,13 +65,23 @@ while [ "$i" -lt 50 ]; do
 done
 [ -n "$PORT" ] || fail "server did not become ready (no 'READY <port>' in $(cat "$TMP_DIR/srv.log"))"
 
-# Expected sha256 of the 256 KiB body, computed independently with node.
-EXP=$("$LAVA_BIN" run /dev/stdin <<'EOF' 2>/dev/null || true
+# Expected sha256 of the 256 KiB body, computed with an INDEPENDENT tool (node, else python3) — a bug in
+# lava's own Buffer then can't make the served body and the expected hash wrong in the same way. Falls
+# back to lava only if neither is present (a self-consistency check then, not an independent oracle).
+EXP=""
+if command -v node >/dev/null 2>&1; then
+	EXP=$(node -e 'const b=Buffer.alloc(262144);for(let i=0;i<b.length;i++)b[i]=i&0xff;console.log(require("crypto").createHash("sha256").update(b).digest("hex"))' 2>/dev/null || true)
+elif command -v python3 >/dev/null 2>&1; then
+	EXP=$(python3 -c 'import hashlib;print(hashlib.sha256(bytes(i&0xff for i in range(262144))).hexdigest())' 2>/dev/null || true)
+fi
+if [ -z "$EXP" ]; then
+	EXP=$("$LAVA_BIN" run /dev/stdin <<'EOF' 2>/dev/null || true
 const b = Buffer.alloc(256 * 1024, 0);
 for (let i = 0; i < b.length; i++) b[i] = i & 0xff;
 console.log(require('crypto').createHash('sha256').update(b).digest('hex'));
 EOF
 )
+fi
 [ -n "$EXP" ] || fail "could not compute the expected checksum"
 
 # Hit the large (ZC) body repeatedly; every response must be byte-exact (256 KiB + matching sha256).
@@ -87,6 +99,20 @@ echo "  ok: $n large-body (SEND_ZC) responses byte-exact (256 KiB, sha256 match)
 small=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/small" 2>/dev/null || true)
 [ "$small" = "ok" ] || fail "small-body (plain path) response wrong: '$small'"
 echo "  ok: small-body (plain copy-SEND, below threshold) serves correctly"
+
+# M3: prove the SEND_ZC path was actually exercised — a byte-exact body alone can't tell a real ZC run
+# from a silent plain-path fallback (zc_ok=false on this kernel, or an -EINVAL/-EOPNOTSUPP fallback).
+# When ZC is forced off (the proactor is bypassed entirely under LAVA_NET_FORCE_READINESS), skip the
+# assertion — the run is intentionally plain — but still require the body was byte-exact (checked above).
+if [ -n "${LAVA_NET_FORCE_READINESS:-}" ]; then
+	echo "  ok: forced-readiness pass — large body served byte-exact with the proactor (and ZC) bypassed"
+elif grep -q "LAVA_ZC: zc_ok=1" "$TMP_DIR/srv.log" 2>/dev/null; then
+	grep -q "LAVA_ZC: SEND_ZC engaged" "$TMP_DIR/srv.log" 2>/dev/null \
+		|| fail "kernel reports zc_ok=1 but SEND_ZC never engaged — the gate would have passed on the plain path"
+	echo "  ok: SEND_ZC path confirmed exercised (zc_ok=1 + engaged)"
+else
+	echo "  note: SEND_ZC unavailable on this kernel (zc_ok=0) — large body served via plain copy-SEND, byte-exact"
+fi
 
 kill -9 "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
