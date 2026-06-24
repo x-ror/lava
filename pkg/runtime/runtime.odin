@@ -32,6 +32,10 @@ Result :: struct {
 	exit_code:    int,
 	message:      string,
 	is_allocated: bool,
+	// True when the event loop exited because its backend poll failed fatally (loop.backend_error),
+	// not because work drained or a stop was requested. The multi-worker supervisor reads this to tell
+	// a crashed worker from one that finished cleanly (so a crash stops the other workers).
+	backend_failed: bool,
 }
 
 result_destroy :: proc(res: ^Result) {
@@ -315,13 +319,22 @@ eval :: proc(
 	}
 
 	exit_code := resolve_exit_code(cast(jsc.JSContextRef)ctx, state)
+	// Captured while the loop is still alive (the deferred destroy runs after this returns): a fatal
+	// backend-poll failure means this worker crashed rather than finished/stopped cleanly.
+	backend_failed := loop != nil && loop.backend_error
 
 	if !echo_result || value == nil || jsc.JSValueIsUndefined(cast(jsc.JSContextRef)ctx, value) {
-		return Result{status = .Ok, exit_code = exit_code}
+		return Result{status = .Ok, exit_code = exit_code, backend_failed = backend_failed}
 	}
 
 	msg, allocated := value_to_string(cast(jsc.JSContextRef)ctx, value)
-	return Result{status = .Ok, exit_code = exit_code, message = msg, is_allocated = allocated}
+	return Result {
+		status = .Ok,
+		exit_code = exit_code,
+		message = msg,
+		is_allocated = allocated,
+		backend_failed = backend_failed,
+	}
 }
 
 // resolve_exit_code computes the final process exit code after the event loop

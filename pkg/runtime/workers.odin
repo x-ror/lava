@@ -46,6 +46,17 @@ lava_resolve_worker_count :: proc() -> (count: int, ok: bool, msg: string) {
 // spawn is the happens-before edge, so a plain bool needs no atomics.
 g_multi_worker: bool
 
+// Cross-thread shutdown signalling between the supervisor and the workers (all atomic):
+//   - g_shutdown: the supervisor is shutting everyone down. The worker pre-run hook checks it so a
+//     worker that publishes its loop AFTER the supervisor's signal sweep still aborts (startup-vs-
+//     signal race) instead of starting to serve.
+//   - g_worker_crashed: a worker's loop died abnormally (backend_failed); the supervisor stops the rest.
+//   - g_worker_exits: incremented by each worker as it exits, so the supervisor knows when all are done
+//     (non-server scripts) without treating a clean finish as a crash.
+g_shutdown:        bool
+g_worker_crashed:  bool
+g_worker_exits:    int
+
 // --- startup barrier (abortable two-phase) -------------------------------------------------------
 //
 // Each worker, after its top-level eval succeeds, reports "ready" and blocks until ALL expected
@@ -104,6 +115,11 @@ Worker :: struct {
 	script_args: []string,
 	barrier:     ^Worker_Barrier,
 	reported:    bool, // did the ready hook run? (else the wrapper reports a startup failure)
+	// The worker's loop, published atomically once init() returns so the supervisor can
+	// request_shutdown it, and cleared before the worker exits. request_shutdown is destroy-safe (the
+	// loop's shutdown mutex + platform_wakeup's invalidated-fd guard), so even a signal that races
+	// teardown is harmless.
+	loop:        ^eventloop.Loop,
 	result:      Result,
 }
 
@@ -111,18 +127,25 @@ Worker :: struct {
 worker_pre_run :: proc(user_data: rawptr) -> bool {
 	w := cast(^Worker)user_data
 	w.reported = true
-	return barrier_ready_wait(w.barrier)
+	// Block at the barrier until all workers are ready (or one failed -> abort). Then proceed to run
+	// UNLESS a shutdown was already requested — a signal during startup must not start serving.
+	if !barrier_ready_wait(w.barrier) do return false
+	return !sync.atomic_load(&g_shutdown)
 }
 
 @(private = "file")
 worker_main :: proc(data: rawptr) {
 	w := cast(^Worker)data
 	loop := eventloop.init(real_time = true)
+	sync.atomic_store(&w.loop, &loop) // publish so the supervisor can request_shutdown this loop
 	// eval consumes the loop (destroys it on every path); the pre-run hook is the barrier rendezvous.
 	w.result = eval(w.source, w.source_name, &loop, false, w.script_args, worker_pre_run, w)
-	// If eval returned before the ready hook ran (JSC create / top-level throw / bind failure), this
-	// worker failed startup — report it so blocked peers abort instead of waiting forever.
-	if !w.reported do barrier_settle(w.barrier, true)
+	// Clear the published loop BEFORE flagging a crash, so a crash-driven signal sweep never reads a
+	// pointer to this (now torn-down) stack loop.
+	sync.atomic_store(&w.loop, nil)
+	if !w.reported do barrier_settle(w.barrier, true) // eval failed before the ready hook
+	if w.result.backend_failed do sync.atomic_store(&g_worker_crashed, true)
+	sync.atomic_add(&g_worker_exits, 1)
 }
 
 // lava_run_workers is the multi-worker supervisor: read the entry once, spawn `count` workers each
@@ -139,6 +162,10 @@ lava_run_workers :: proc(path: string, count: int, script_args: []string) -> int
 	source := string(data)
 
 	g_multi_worker = true
+
+	// Block SIGINT/SIGTERM on the supervisor BEFORE spawning, so the workers inherit the block and the
+	// supervisor is the only thread that receives them (via supervisor_wait's sigwait). No-op off Linux.
+	supervisor_block_signals()
 
 	barrier := Worker_Barrier {
 		total = count,
@@ -165,14 +192,19 @@ lava_run_workers :: proc(path: string, count: int, script_args: []string) -> int
 		}
 	}
 
+	// Block until SIGINT/SIGTERM, a worker crash, or all workers finishing on their own — then signal
+	// every live worker to begin graceful shutdown (request_shutdown each, after setting g_shutdown).
+	supervisor_wait(workers)
+
 	for t in threads {
 		thread.join(t)
 		thread.destroy(t)
 	}
 
-	// Non-zero if startup was aborted (a worker / thread failed) or any worker exited non-zero.
+	// Non-zero if startup was aborted (a worker / thread failed), a worker crashed, or any worker
+	// exited non-zero.
 	code := 0
-	if barrier.any_failed do code = 1
+	if barrier.any_failed || sync.atomic_load(&g_worker_crashed) do code = 1
 	for i in 0 ..< count {
 		if workers[i].result.exit_code != 0 do code = workers[i].result.exit_code
 		result_destroy(&workers[i].result)
