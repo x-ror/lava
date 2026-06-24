@@ -154,7 +154,10 @@ eval :: proc(
 
 	// Register the graceful-shutdown drain hook (multi-worker, Linux only): when the supervisor
 	// requests a stop, the loop runs net_drain_begin on its own thread to stop accepting and drain
-	// in-flight connections. A no-op for single-worker (request_shutdown is never called).
+	// in-flight connections. KNOWN DIVERGENCE (design §9): only the multi-worker supervisor blocks
+	// SIGINT/SIGTERM and calls request_shutdown, so this hook never fires for a single-worker run
+	// (LAVA_WORKERS unset/1) — there SIGTERM still terminates immediately without draining, as it did
+	// before Slice 3a. Routing the single-worker path through the same machinery is a follow-up.
 	when ODIN_OS == .Linux {
 		if loop != nil do eventloop.set_shutdown_hook(loop, net_drain_begin, state)
 	}

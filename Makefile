@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-multicore-smoke bench bench-gate bench-http fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-multicore-smoke bench bench-gate bench-http fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -161,6 +161,9 @@ test-odin: native-deps
 
 test-eventloop-odin:
 	$(ODIN) test pkg/runtime/eventloop
+
+test-runtime-odin:
+	$(ODIN) test pkg/runtime -collection:lava=.
 
 ifeq ($(OS),Windows_NT)
 test-sqlite-odin:

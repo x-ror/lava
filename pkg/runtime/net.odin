@@ -1183,6 +1183,9 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 	clear(&state.net_conns) // live-op proactor conns (if any) are freed by their Op_Dispose
 	state.net_starved_head, state.net_starved_tail = nil, nil // FIFO emptied (conns freed above / by disposer)
 	for _, server in state.net_servers {
+		// COUPLING: net_drain_begin (graceful drain) may already have unwatched + closed this listener
+		// and set closing=true; skip it here to avoid a double unwatch/close. The two functions agree on
+		// this flag — a listener is unwatched+closed exactly once, by whichever runs first.
 		if server.closing do continue
 		server.closing = true
 		eventloop.unwatch_fd(server.loop, &server.watcher)

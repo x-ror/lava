@@ -63,7 +63,11 @@ cat >"$TMP_DIR/srv.js" <<EOF
 const http = require('http');
 // pid is shared across thread-workers, so a per-worker random id identifies which worker replied.
 const wid = Math.floor(Math.random() * 1e9).toString(36);
-http.createServer((req, res) => res.end(wid)).listen($PORT, () => {});
+http.createServer((req, res) => {
+  // /slow responds after a delay, so a request can be in flight across SIGTERM (drain coverage).
+  if (req.url === '/slow') setTimeout(() => res.end('drained-' + wid), 400);
+  else res.end(wid);
+}).listen($PORT, () => {});
 EOF
 LAVA_WORKERS=4 "$LAVA_BIN" run "$TMP_DIR/srv.js" >"$TMP_DIR/srv.out" 2>&1 &
 SUP_PID=$!
@@ -93,7 +97,12 @@ distinct=$(sort -u "$TMP_DIR/ids" | grep -c .) || true
 [ "$distinct" -ge 2 ] || fail "expected load spread across >=2 workers, saw $distinct distinct id(s)"
 echo "  ok: $distinct workers shared :$PORT and served requests (SO_REUSEPORT distribution)"
 
-# --- 5) SIGTERM drains and exits gracefully within a bounded time ------------------------------------
+# --- 5) SIGTERM during an in-flight request: the request DRAINS (not reset), then exit is prompt -----
+# Start a slow (400ms) request, let it land on a worker, then SIGTERM mid-flight. A graceful drain
+# completes the in-flight response (covers net_drain_begin-with-conns + net_maybe_free force-exit),
+# rather than resetting it. The other workers (no conns) force-exit at once.
+( curl -s --max-time 5 "http://127.0.0.1:$PORT/slow" >"$TMP_DIR/slow.out" 2>/dev/null; echo done >"$TMP_DIR/slow.done" ) &
+sleep 0.15 # ensure the slow request is in flight on some worker before the signal
 kill -TERM "$SUP_PID"
 k=0
 while [ "$k" -lt 50 ]; do
@@ -107,6 +116,10 @@ if kill -0 "$SUP_PID" 2>/dev/null; then
 fi
 wait "$SUP_PID" 2>/dev/null || true
 SUP_PID=""
-echo "  ok: SIGTERM drained and exited gracefully"
+# The in-flight request must have completed (drained), not been reset.
+i=0
+while [ "$i" -lt 50 ] && [ ! -f "$TMP_DIR/slow.done" ]; do i=$((i + 1)); sleep 0.1; done
+grep -q "drained-" "$TMP_DIR/slow.out" || fail "in-flight request was reset on SIGTERM instead of drained (got: $(cat "$TMP_DIR/slow.out" 2>/dev/null))"
+echo "  ok: SIGTERM drained the in-flight request and exited gracefully"
 
 echo "MULTICORE SMOKE OK"

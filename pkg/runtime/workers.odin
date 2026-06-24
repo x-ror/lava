@@ -15,22 +15,32 @@ import eventloop "lava:pkg/runtime/eventloop"
 // LAVA_WORKERS_MAX bounds the worker count so a typo/overflow can't spawn thousands of threads.
 LAVA_WORKERS_MAX :: 256
 
-// lava_resolve_worker_count reads LAVA_WORKERS and resolves how many workers to run. Unset / "1" -> 1
-// (the single inline path, unchanged). "auto" -> the CPU core count. An explicit integer in
-// [1, LAVA_WORKERS_MAX] -> that. Anything else fails fast (ok=false + a message), never a silent
-// degrade: malformed / 0 / negative / oversized, or LAVA_WORKERS>1 on a non-Linux platform
-// (multi-worker needs SO_REUSEPORT/signalfd/io_uring — Linux only).
+// lava_resolve_worker_count reads LAVA_WORKERS and resolves how many workers to run. Thin wrapper over
+// the pure lava_parse_worker_count (env + CPU count injected) so the parsing/validation is unit-testable.
 lava_resolve_worker_count :: proc() -> (count: int, ok: bool, msg: string) {
 	raw, has := os.lookup_env("LAVA_WORKERS", context.temp_allocator)
-	if !has || raw == "" || raw == "1" do return 1, true, ""
+	return lava_parse_worker_count(raw, has, os.get_processor_core_count())
+}
+
+// lava_parse_worker_count is the pure resolver (no env / no syscalls — cpu_count is passed in). Unset
+// / "1" -> 1 (the single inline path, unchanged). "auto" -> cpu_count. An explicit base-10 integer in
+// [1, LAVA_WORKERS_MAX] -> that. Anything else fails fast (ok=false + a message), never a silent
+// degrade: malformed / partial (e.g. "0x10", "1_0", trailing junk) / 0 / negative / oversized, or
+// LAVA_WORKERS>1 on a non-Linux platform (multi-worker needs SO_REUSEPORT/signalfd/io_uring — Linux only).
+lava_parse_worker_count :: proc(raw: string, has_env: bool, cpu_count: int) -> (count: int, ok: bool, msg: string) {
+	if !has_env || raw == "" || raw == "1" do return 1, true, ""
 
 	n: int
 	if raw == "auto" {
-		n = os.get_processor_core_count()
+		n = cpu_count
 		if n < 1 do n = 1
 	} else {
-		parsed, pok := strconv.parse_int(raw)
-		if !pok do return 0, false, "LAVA_WORKERS must be a positive integer or 'auto'"
+		// Base 10 explicitly + require the WHOLE string consumed, so "0x10" is not reinterpreted as hex
+		// and trailing junk ("10abc") is rejected rather than partially parsed. (parse_int still accepts
+		// an underscore separator, so "1_0" -> 10 — benign, still bounded by [1,256].)
+		consumed: int
+		parsed, pok := strconv.parse_int(raw, 10, &consumed)
+		if !pok || consumed != len(raw) do return 0, false, "LAVA_WORKERS must be a positive integer or 'auto'"
 		n = parsed
 	}
 	if n < 1 do return 0, false, "LAVA_WORKERS must be >= 1"
@@ -86,32 +96,33 @@ Worker_Barrier :: struct {
 	released:   bool, // outcome (valid once decided): true = run, false = abort
 }
 
-// barrier_settle records one report under the mutex and, once all expected workers have reported,
-// decides (release iff nobody failed) and wakes everyone. failed=true marks a startup failure.
-@(private = "file")
+// barrier_maybe_decide: once all expected workers have reported, latch the outcome (release iff none
+// failed). Mutex held by the caller; idempotent via the decided latch.
+barrier_maybe_decide :: proc(b: ^Worker_Barrier) {
+	if b.reported >= b.total && !b.decided {
+		b.decided = true
+		b.released = !b.any_failed
+	}
+}
+
+// barrier_settle records one report and wakes everyone, deciding if it was the last. failed=true marks
+// a startup failure (so the barrier aborts). Non-blocking — the failure/abort path.
 barrier_settle :: proc(b: ^Worker_Barrier, failed: bool) {
 	sync.lock(&b.mutex)
 	defer sync.unlock(&b.mutex)
 	if failed do b.any_failed = true
 	b.reported += 1
-	if b.reported >= b.total && !b.decided {
-		b.decided = true
-		b.released = !b.any_failed
-	}
+	barrier_maybe_decide(b)
 	sync.cond_broadcast(&b.cond)
 }
 
 // barrier_ready_wait is the success path: report ready, then block until the barrier decides. Returns
 // whether to proceed (released) or abort.
-@(private = "file")
 barrier_ready_wait :: proc(b: ^Worker_Barrier) -> bool {
 	sync.lock(&b.mutex)
 	defer sync.unlock(&b.mutex)
 	b.reported += 1
-	if b.reported >= b.total && !b.decided {
-		b.decided = true
-		b.released = !b.any_failed
-	}
+	barrier_maybe_decide(b)
 	sync.cond_broadcast(&b.cond)
 	for !b.decided do sync.cond_wait(&b.cond, &b.mutex)
 	return b.released
@@ -214,9 +225,13 @@ lava_run_workers :: proc(path: string, count: int, script_args: []string) -> int
 		if t != nil {
 			append(&threads, t)
 		} else {
-			// A thread that never started can't report — settle a failure on its behalf so the
-			// barrier reaches `total` (no forever-wait) and ready peers abort.
+			// A thread that never started can't report or ever run worker_main — settle a failure on
+			// its behalf so the BARRIER reaches `total` (started peers abort), AND bump g_worker_exits
+			// so the SUPERVISOR's exits>=n tally can still complete: worker_main is the only other
+			// g_worker_exits increment, so without this an unspawned slot would hang supervisor_wait
+			// forever (no signal, not a crash) after the started workers abort.
 			barrier_settle(&barrier, true)
+			sync.atomic_add(&g_worker_exits, 1)
 		}
 	}
 
@@ -229,13 +244,20 @@ lava_run_workers :: proc(path: string, count: int, script_args: []string) -> int
 		thread.destroy(t)
 	}
 
-	// Non-zero if startup was aborted (a worker / thread failed), a worker crashed, or any worker
-	// exited non-zero.
+	// Exit code: a startup abort or a worker crash takes PRECEDENCE (code 1) — "the deployment did not
+	// come up" must not be masked by a worker that happened to set process.exitCode. Otherwise the
+	// first non-zero worker exit code wins. (Destroy every Result regardless.)
 	code := 0
-	if barrier.any_failed || sync.atomic_load(&g_worker_crashed) do code = 1
-	for i in 0 ..< count {
-		if workers[i].result.exit_code != 0 do code = workers[i].result.exit_code
-		result_destroy(&workers[i].result)
+	if barrier.any_failed || sync.atomic_load(&g_worker_crashed) {
+		code = 1
+	} else {
+		for i in 0 ..< count {
+			if workers[i].result.exit_code != 0 {
+				code = workers[i].result.exit_code
+				break
+			}
+		}
 	}
+	for i in 0 ..< count do result_destroy(&workers[i].result)
 	return code
 }
