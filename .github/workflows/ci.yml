@@ -78,6 +78,11 @@ jobs:
       - name: Multi-core workers smoke
         run: make test-multicore-smoke
 
+      # MSG_ZEROCOPY (Slice 3b): a large body served via SEND_ZC must arrive byte-exact (the two-CQE
+      # buffer-lifetime guard against a kernel-side UAF). Binds a local port — its own gate.
+      - name: Zerocopy send smoke
+        run: make test-zerocopy-smoke
+
       # Benchmarks: print the node-vs-Lava ratio table in the job log. Report-only for
       # now (never fails) because the bench/thresholds.json caps are uncalibrated
       # starters — once the ratios here are observed and the caps tightened, flip this

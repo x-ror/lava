@@ -1,6 +1,14 @@
 # MSG_ZEROCOPY for large writes (Slice 3b) — design (review before impl)
 
-Status: **rev.5** — three internal adversarial rounds (rev.1: 3 crit/12 high; rev.2: 0 crit/7 high;
+Status: **IMPLEMENTED** — commit 1 (eventloop: `.SEND_ZC` probe → `zc_ok`, `send_cb` dispatch,
+`submit_send_zc`), commit 2 (net: the two-axis state machine + `net_proactor_submit` choke point +
+fallbacks + the `want_drain`-into-`net_maybe_arm_recv` move), commit 3 (tests + the `test-zerocopy-smoke`
+CI gate). Threshold shipped at 32 KiB. Verified: the SEND_ZC cell matrix by direct invocation, large-body
+byte-integrity (256 KiB, sha256), smokes both modes, crash guard, darwin/windows cross-check. The
+real-NIC throughput bench (loopback always copies, so it can't show the ZC win) remains a manual
+follow-up (§9 Q5). Design history below.
+
+Status (design): **rev.5** — three internal adversarial rounds (rev.1: 3 crit/12 high; rev.2: 0 crit/7 high;
 rev.3 round-3: 0 crit/0 high) + two Codex review rounds (rev.4: 5 findings — the two-axis ABI; rev.5: 4
 Major / 5 Minor — all real, folded in). The two-axis model (`F_MORE` = pinned? vs `res` = bytes/errno,
 independent) is the robust core. rev.5 changes: `zc_ok` set by an **init-time `.SEND_ZC` opcode probe**
