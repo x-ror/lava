@@ -33,32 +33,35 @@ fail() {
 	exit 1
 }
 
-PORT=$(( (RANDOM % 20000) + 20000 ))
-
 # Server: a small body (plain path) at /small and a 256 KiB deterministic body (ZC path, > the 32 KiB
 # threshold) at /big. The body is `i & 0xff` so corruption from a mis-managed pinned buffer is detectable.
-cat >"$TMP_DIR/srv.js" <<EOF
+# It binds port 0 (kernel-assigned) and prints "READY <port>" — POSIX-safe (no $RANDOM, which is unset
+# under dash/sh) and collision-free, vs hardcoding a port.
+cat >"$TMP_DIR/srv.js" <<'EOF'
 const http = require('http');
 const big = Buffer.alloc(256 * 1024, 0);
 for (let i = 0; i < big.length; i++) big[i] = i & 0xff;
 const small = Buffer.from('ok');
-http.createServer((req, res) => {
+const srv = http.createServer((req, res) => {
   const b = req.url === '/big' ? big : small;
   res.setHeader('Content-Length', b.length);
   res.end(b);
-}).listen($PORT, () => console.log('READY'));
+});
+srv.listen(0, () => console.log('READY ' + srv.address().port));
 EOF
 
 "$LAVA_BIN" run "$TMP_DIR/srv.js" >"$TMP_DIR/srv.log" 2>&1 &
 SRV_PID=$!
+PORT=""
 i=0
 while [ "$i" -lt 50 ]; do
-	grep -q READY "$TMP_DIR/srv.log" 2>/dev/null && break
+	PORT=$(sed -n 's/^READY \([0-9][0-9]*\)$/\1/p' "$TMP_DIR/srv.log" 2>/dev/null | head -1)
+	[ -n "$PORT" ] && break
 	kill -0 "$SRV_PID" 2>/dev/null || fail "server exited during startup: $(cat "$TMP_DIR/srv.log")"
 	i=$((i + 1))
 	sleep 0.1
 done
-grep -q READY "$TMP_DIR/srv.log" 2>/dev/null || fail "server did not become ready"
+[ -n "$PORT" ] || fail "server did not become ready (no 'READY <port>' in $(cat "$TMP_DIR/srv.log"))"
 
 # Expected sha256 of the 256 KiB body, computed independently with node.
 EXP=$("$LAVA_BIN" run /dev/stdin <<'EOF' 2>/dev/null || true

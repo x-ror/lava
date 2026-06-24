@@ -38,10 +38,13 @@ zc_free :: proc(conn: ^Net_Connection) {
 @(test)
 zc_result_records_off_only :: proc(t: ^testing.T) {
 	loop := eventloop.init()
-	defer eventloop.destroy(&loop)
-	if !eventloop.proactor_available(&loop) do return
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
 	conn := zc_conn(&loop, -1, 100)
-	defer zc_free(conn)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 
 	net_send_zc_complete(&loop, conn, 60, true) // partial result: 60 of 100 bytes
 	testing.expect_value(t, conn.active_send_off, 60)
@@ -55,10 +58,13 @@ zc_result_records_off_only :: proc(t: ^testing.T) {
 @(test)
 zc_result_errored_pinned_records_err :: proc(t: ^testing.T) {
 	loop := eventloop.init()
-	defer eventloop.destroy(&loop)
-	if !eventloop.proactor_available(&loop) do return
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
 	conn := zc_conn(&loop, 100, 100)
-	defer zc_free(conn)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 
 	net_send_zc_complete(&loop, conn, -i32(linux.Errno.EPIPE), true)
 	testing.expect_value(t, conn.zc_err, -i32(linux.Errno.EPIPE))
@@ -70,10 +76,13 @@ zc_result_errored_pinned_records_err :: proc(t: ^testing.T) {
 @(test)
 zc_terminal_drained :: proc(t: ^testing.T) {
 	loop := eventloop.init()
-	defer eventloop.destroy(&loop)
-	if !eventloop.proactor_available(&loop) do return
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
 	conn := zc_conn(&loop, 100, 100)
-	defer zc_free(conn)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 	conn.saw_result = true
 	conn.active_send_off = 100 // the result CQE already advanced off to len
 
@@ -88,10 +97,13 @@ zc_terminal_drained :: proc(t: ^testing.T) {
 @(test)
 zc_terminal_copied_success_not_close :: proc(t: ^testing.T) {
 	loop := eventloop.init()
-	defer eventloop.destroy(&loop)
-	if !eventloop.proactor_available(&loop) do return
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
 	conn := zc_conn(&loop, 50, 50)
-	defer zc_free(conn)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 	// saw_result stays false (no prior more=true result): a single F_MORE-clear res>0 CQE.
 
 	net_send_zc_complete(&loop, conn, 50, false)
@@ -103,10 +115,13 @@ zc_terminal_copied_success_not_close :: proc(t: ^testing.T) {
 @(test)
 zc_terminal_stall_closes :: proc(t: ^testing.T) {
 	loop := eventloop.init()
-	defer eventloop.destroy(&loop)
-	if !eventloop.proactor_available(&loop) do return
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
 	conn := zc_conn(&loop, 100, 100)
-	defer zc_free(conn)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 
 	net_send_zc_complete(&loop, conn, 0, false)
 	testing.expect(t, conn.closing, "a zero-byte stall must close")
@@ -118,10 +133,13 @@ zc_terminal_stall_closes :: proc(t: ^testing.T) {
 @(test)
 zc_terminal_einval_falls_back_plain :: proc(t: ^testing.T) {
 	loop := eventloop.init()
-	defer eventloop.destroy(&loop)
-	if !eventloop.proactor_available(&loop) do return
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
 	conn := zc_conn(&loop, 100, 100)
-	defer zc_free(conn)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 	conn.send_was_zc = true
 
 	net_send_zc_complete(&loop, conn, -i32(linux.Errno.EINVAL), false)
@@ -135,10 +153,13 @@ zc_terminal_einval_falls_back_plain :: proc(t: ^testing.T) {
 @(test)
 zc_terminal_enobufs_not_fatal :: proc(t: ^testing.T) {
 	loop := eventloop.init()
-	defer eventloop.destroy(&loop)
-	if !eventloop.proactor_available(&loop) do return
+	if !eventloop.proactor_available(&loop) {
+		eventloop.destroy(&loop)
+		return
+	}
 	conn := zc_conn(&loop, 100, 100)
-	defer zc_free(conn)
+	defer zc_free(conn) // runs LAST
+	defer eventloop.destroy(&loop) // registered 2nd -> runs FIRST: dispose ops while conn is still live, then free
 	conn.send_was_zc = true
 
 	net_send_zc_complete(&loop, conn, -i32(linux.Errno.ENOBUFS), false)
