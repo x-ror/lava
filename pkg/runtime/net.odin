@@ -53,7 +53,7 @@ NET_ZC_THRESHOLD :: 32 * 1024
 // live proactor conn).
 Net_IO_Mode :: enum u8 {
 	Readiness = 0,
-	Proactor,     // io_uring completion, per-conn recv_buf (Slice 1b)
+	Proactor, // io_uring completion, per-conn recv_buf (Slice 1b)
 	ProactorRing, // io_uring completion, shared provided-buffer ring (Slice 2a) — no recv_buf
 }
 
@@ -83,51 +83,51 @@ Net_Server :: struct {
 // the read watcher is armed. They are payload-only (the JS handler is already bound to
 // its own Socket), so on_data(buf), on_end(), on_close(hadError), on_error(message).
 Net_Connection :: struct {
-	ctx:             jsc.JSContextRef,
-	loop:            ^eventloop.Loop,
-	id:              u64,
-	fd:              uintptr,
-	watcher:         eventloop.IO_Watcher,
-	on_data:         jsc.JSObjectRef,
-	on_end:          jsc.JSObjectRef,
-	on_close:        jsc.JSObjectRef,
-	on_error:        jsc.JSObjectRef,
-	on_drain:        jsc.JSObjectRef, // proactor: fired when the outbound buffer empties
-	handlers_set:    bool,
+	ctx:                 jsc.JSContextRef,
+	loop:                ^eventloop.Loop,
+	id:                  u64,
+	fd:                  uintptr,
+	watcher:             eventloop.IO_Watcher,
+	on_data:             jsc.JSObjectRef,
+	on_end:              jsc.JSObjectRef,
+	on_close:            jsc.JSObjectRef,
+	on_error:            jsc.JSObjectRef,
+	on_drain:            jsc.JSObjectRef, // proactor: fired when the outbound buffer empties
+	handlers_set:        bool,
 	// Pending outbound bytes not yet accepted by the kernel send buffer. Bound to the
 	// default heap on first append (a proc "c" runs under runtime.default_context); the
 	// dynamic array carries that allocator, so delete() frees it correctly anywhere.
-	write_queue:     [dynamic]byte,
-	writing:         bool, // watcher currently in .Write mode (draining a blocked write)
-	end_after_drain: bool, // socket.end() / read EOF: close once write_queue empties
-	read_done:       bool, // peer half-closed (read EOF) — never re-arm the read watcher
-	closing:         bool,
+	write_queue:         [dynamic]byte,
+	writing:             bool, // watcher currently in .Write mode (draining a blocked write)
+	end_after_drain:     bool, // socket.end() / read EOF: close once write_queue empties
+	read_done:           bool, // peer half-closed (read EOF) — never re-arm the read watcher
+	closing:             bool,
 	// --- proactor (io_uring completion) state; io_mode == .Proactor ---------------
-	io_mode:         Net_IO_Mode,
-	recv_buf:        []byte, // reused kernel landing zone (copied per chunk; never JSC no-copy)
-	recv_op:         eventloop.Op_ID, // live RECV (OP_ID_INVALID == none in flight)
-	send_op:         eventloop.Op_ID, // live SEND
+	io_mode:             Net_IO_Mode,
+	recv_buf:            []byte, // reused kernel landing zone (copied per chunk; never JSC no-copy)
+	recv_op:             eventloop.Op_ID, // live RECV (OP_ID_INVALID == none in flight)
+	send_op:             eventloop.Op_ID, // live SEND
 	// active_send is the IMMUTABLE buffer currently submitted to send_op (the op submits
 	// active_send[active_send_off:]); pending_writes is the mutable queue appends land in.
 	// Both stay [dynamic]byte (a []byte would drop the allocator/capacity) and are ROTATED
 	// (swapped + cleared), never reallocated, so a backing the kernel is reading never moves.
-	active_send:     [dynamic]byte,
-	active_send_off: int,
-	pending_writes:  [dynamic]byte,
-	inflight:        int, // submitted-but-not-completed ops; the conn outlives its ops
-	want_drain:      bool, // write() returned backpressure; a 'drain' is owed
-	silent_close:    bool, // teardown at loop shutdown: free without firing 'close'
-	had_error:       bool, // sticky: set true by any net_close_conn(.., true)
-	recv_starved:    bool, // ProactorRing: on the state.net_starved_* FIFO after -ENOBUFS (no ring buffer)
-	recv_multishot:  bool, // ProactorRing: the live recv_op was armed multishot (attributes its -EINVAL)
+	active_send:         [dynamic]byte,
+	active_send_off:     int,
+	pending_writes:      [dynamic]byte,
+	inflight:            int, // submitted-but-not-completed ops; the conn outlives its ops
+	want_drain:          bool, // write() returned backpressure; a 'drain' is owed
+	silent_close:        bool, // teardown at loop shutdown: free without firing 'close'
+	had_error:           bool, // sticky: set true by any net_close_conn(.., true)
+	recv_starved:        bool, // ProactorRing: on the state.net_starved_* FIFO after -ENOBUFS (no ring buffer)
+	recv_multishot:      bool, // ProactorRing: the live recv_op was armed multishot (attributes its -EINVAL)
 	recv_cancel_pending: bool, // ProactorRing: a backpressure cancel is queued for recv_op (suppresses dup cancels)
 	// SEND_ZC (Slice 3b): the live send op's per-op state (one send op per conn, so per-conn == per-op).
-	send_was_zc:     bool, // the live send_op was submitted SEND_ZC (attributes a -EINVAL/-EOPNOTSUPP)
-	zc_unsupported:  bool, // a -EOPNOTSUPP on THIS conn's socket/protocol: deny ZC for this conn only (vs -EINVAL → loop-wide)
-	saw_result:      bool, // a SEND_ZC result CQE (more=true) arrived: the terminal is its notification
-	zc_err:          i32,  // a negative result recorded on a more=true (errored-but-pinned) CQE; surfaced at the terminal
-	starved_next:    ^Net_Connection, // intrusive starved-FIFO links (valid only while recv_starved)
-	starved_prev:    ^Net_Connection,
+	send_was_zc:         bool, // the live send_op was submitted SEND_ZC (attributes a -EINVAL/-EOPNOTSUPP)
+	zc_unsupported:      bool, // a -EOPNOTSUPP on THIS conn's socket/protocol: deny ZC for this conn only (vs -EINVAL → loop-wide)
+	saw_result:          bool, // a SEND_ZC result CQE (more=true) arrived: the terminal is its notification
+	zc_err:              i32, // a negative result recorded on a more=true (errored-but-pinned) CQE; surfaced at the terminal
+	starved_next:        ^Net_Connection, // intrusive starved-FIFO links (valid only while recv_starved)
+	starved_prev:        ^Net_Connection,
 }
 
 // make_net_bindings builds the `native` object passed to js/internal/net.js.
@@ -204,8 +204,12 @@ net_listen_cb :: proc "c" (
 	// every socket sharing the port must set it, or the group is unsafe (a bind would collide). Surface
 	// the failure as a startup abort.
 	if g_multi_worker {
-		if so_err := linux.setsockopt(sfd, linux.SOL_SOCKET, linux.Socket_Option.REUSEPORT, &reuse);
-		   so_err != .NONE {
+		if so_err := linux.setsockopt(
+			sfd,
+			linux.SOL_SOCKET,
+			linux.Socket_Option.REUSEPORT,
+			&reuse,
+		); so_err != .NONE {
 			linux.close(sfd)
 			net_startup_failed()
 			if exception != nil do exception^ = make_js_error(ctx, "net.listen: SO_REUSEPORT failed")
@@ -354,7 +358,13 @@ net_start_cb :: proc "c" (
 	// readiness watcher. The mode is set ONLY on a successful submit (never count a failed one).
 	if !net_force_readiness() && eventloop.proactor_available(conn.loop) {
 		if eventloop.bufring_available(conn.loop) {
-			id := eventloop.submit_recv_ring(conn.loop, conn.fd, net_recv_ring_complete, on_op_dispose, conn)
+			id := eventloop.submit_recv_ring(
+				conn.loop,
+				conn.fd,
+				net_recv_ring_complete,
+				on_op_dispose,
+				conn,
+			)
 			if id != eventloop.OP_ID_INVALID {
 				conn.io_mode = .ProactorRing // no recv_buf — reads draw from the shared ring
 				conn.recv_op = id
@@ -363,7 +373,14 @@ net_start_cb :: proc "c" (
 			}
 		}
 		conn.recv_buf = make([]byte, NET_PROACTOR_RECV, context.allocator)
-		id := eventloop.submit_recv(conn.loop, conn.fd, conn.recv_buf, on_recv_complete, on_op_dispose, conn)
+		id := eventloop.submit_recv(
+			conn.loop,
+			conn.fd,
+			conn.recv_buf,
+			on_recv_complete,
+			on_op_dispose,
+			conn,
+		)
 		if id != eventloop.OP_ID_INVALID {
 			conn.io_mode = .Proactor
 			conn.recv_op = id
@@ -440,14 +457,27 @@ net_maybe_arm_recv :: proc(conn: ^Net_Connection) -> bool {
 	id: eventloop.Op_ID
 	if conn.io_mode == .ProactorRing {
 		// Shared ring: no per-conn buffer; the kernel picks one at completion (net_recv_ring_complete).
-		id = eventloop.submit_recv_ring(conn.loop, conn.fd, net_recv_ring_complete, on_op_dispose, conn)
+		id = eventloop.submit_recv_ring(
+			conn.loop,
+			conn.fd,
+			net_recv_ring_complete,
+			on_op_dispose,
+			conn,
+		)
 		// Record THIS op's submission mode so its completion can attribute a -EINVAL correctly: a
 		// multishot op's -EINVAL means "kernel lacks RECV_MULTISHOT" (fall back); a single-shot op's
 		// -EINVAL is a genuine error (close), never a capability signal to re-arm into a loop.
 		conn.recv_multishot = eventloop.recv_ring_multishot(conn.loop)
 		conn.recv_cancel_pending = false // a fresh op has no backpressure cancel outstanding
 	} else {
-		id = eventloop.submit_recv(conn.loop, conn.fd, conn.recv_buf, on_recv_complete, on_op_dispose, conn)
+		id = eventloop.submit_recv(
+			conn.loop,
+			conn.fd,
+			conn.recv_buf,
+			on_recv_complete,
+			on_op_dispose,
+			conn,
+		)
 	}
 	if id == eventloop.OP_ID_INVALID {
 		net_emit_error(conn, "read submit failed")
@@ -466,7 +496,14 @@ net_maybe_arm_recv :: proc(conn: ^Net_Connection) -> bool {
 // ring), THEN deliver. The op's lifetime accounting (recv_op clear, re-arm, net_op_finished) happens
 // ONLY on the terminal CQE — never per intermediate, or the conn would be freed while the kernel
 // still posts CQEs for the live multishot op.
-net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32, bid: u16, has_buf: bool, more: bool) {
+net_recv_ring_complete :: proc(
+	loop: ^eventloop.Loop,
+	user_data: rawptr,
+	res: i32,
+	bid: u16,
+	has_buf: bool,
+	more: bool,
+) {
 	context = runtime.default_context()
 	conn := cast(^Net_Connection)user_data
 	if !more {
@@ -502,8 +539,10 @@ net_recv_ring_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i3
 			// re-arms this conn single-shot. A single-shot -EINVAL is NOT this — it falls through to the
 			// fatal branch (close), so a genuine error can never re-arm into an -EINVAL loop.
 			eventloop.disable_multishot(loop)
-		} else if res == -i32(linux.Errno.ENOBUFS) || res == -i32(linux.Errno.EINTR) ||
-		   res == -i32(linux.Errno.EAGAIN) || res == -i32(linux.Errno.ECANCELED) {
+		} else if res == -i32(linux.Errno.ENOBUFS) ||
+		   res == -i32(linux.Errno.EINTR) ||
+		   res == -i32(linux.Errno.EAGAIN) ||
+		   res == -i32(linux.Errno.ECANCELED) {
 			// benign/transient — the terminal re-arm path below handles it
 		} else {
 			net_emit_error(conn, "read error")
@@ -685,14 +724,19 @@ net_proactor_buffered :: proc(conn: ^Net_Connection) -> int {
 // SEND_ZC run from a silent plain-path fallback (the smoke asserts on it, so a green gate can never be a
 // plain-path run on a ZC-capable kernel — exactly the CI kernels most likely to differ from a dev box).
 // Racy-but-benign across workers (a line may print more than once); the smoke only checks presence.
-@(private = "file") g_zc_ok_reported: bool
-@(private = "file") g_zc_engaged_reported: bool
+@(private = "file")
+g_zc_ok_reported: bool
+@(private = "file")
+g_zc_engaged_reported: bool
 net_zc_stats_note :: proc(loop: ^eventloop.Loop, use_zc: bool) {
 	if g_zc_ok_reported && (g_zc_engaged_reported || !use_zc) do return
 	if os.get_env("LAVA_ZC_STATS", context.temp_allocator) == "" do return
 	if !g_zc_ok_reported {
 		g_zc_ok_reported = true
-		os.write_string(os.stderr, eventloop.send_zc_ok(loop) ? "LAVA_ZC: zc_ok=1\n" : "LAVA_ZC: zc_ok=0\n")
+		os.write_string(
+			os.stderr,
+			eventloop.send_zc_ok(loop) ? "LAVA_ZC: zc_ok=1\n" : "LAVA_ZC: zc_ok=0\n",
+		)
 	}
 	if use_zc && !g_zc_engaged_reported {
 		g_zc_engaged_reported = true
@@ -712,16 +756,30 @@ net_zc_stats_note :: proc(loop: ^eventloop.Loop, use_zc: bool) {
 // saw_result/zc_err are reset per submission (one send op per conn, so this is the per-op reset).
 // PRECONDITION: send_op == INVALID (the caller cleared/gated).
 net_proactor_submit :: proc(conn: ^Net_Connection, force_plain := false) {
-	assert(conn.send_op == eventloop.OP_ID_INVALID, "net_proactor_submit: a send is already in flight")
+	assert(
+		conn.send_op == eventloop.OP_ID_INVALID,
+		"net_proactor_submit: a send is already in flight",
+	)
 	conn.saw_result = false
 	conn.zc_err = 0
 	buf := conn.active_send[conn.active_send_off:]
-	use_zc := !force_plain && !conn.zc_unsupported && eventloop.send_zc_ok(conn.loop) && len(buf) >= NET_ZC_THRESHOLD
+	use_zc :=
+		!force_plain &&
+		!conn.zc_unsupported &&
+		eventloop.send_zc_ok(conn.loop) &&
+		len(buf) >= NET_ZC_THRESHOLD
 	conn.send_was_zc = use_zc
 	net_zc_stats_note(conn.loop, use_zc) // M3: env-gated stderr evidence that the SEND_ZC path actually ran
 	id: eventloop.Op_ID
 	if use_zc {
-		id = eventloop.submit_send_zc(conn.loop, conn.fd, buf, net_send_zc_complete, on_op_dispose, conn)
+		id = eventloop.submit_send_zc(
+			conn.loop,
+			conn.fd,
+			buf,
+			net_send_zc_complete,
+			on_op_dispose,
+			conn,
+		)
 	} else {
 		id = eventloop.submit_send(conn.loop, conn.fd, buf, on_send_complete, on_op_dispose, conn)
 	}
@@ -811,7 +869,7 @@ net_send_zc_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32,
 		} else if res < 0 {
 			err = res // single-CQE pre-transmission error
 		}
-		if err < 0 { // off untouched on any error (INV-4) → a re-send is the exact unsent tail
+		if err < 0 { 	// off untouched on any error (INV-4) → a re-send is the exact unsent tail
 			if err == -i32(linux.Errno.EINVAL) && conn.send_was_zc {
 				eventloop.disable_zc(loop) // missing/rejected opcode is a kernel-wide fact: latch ZC off loop-wide
 				net_proactor_submit(conn, force_plain = true) // re-send PLAIN
@@ -856,7 +914,9 @@ net_proactor_on_drained :: proc(conn: ^Net_Connection) {
 	}
 	if conn.closing do return // a 'drain' listener destroyed the socket
 	net_maybe_arm_recv(conn) // recomputes read_paused from the (possibly new) buffered count
-	if conn.end_after_drain && conn.send_op == eventloop.OP_ID_INVALID && len(conn.pending_writes) == 0 {
+	if conn.end_after_drain &&
+	   conn.send_op == eventloop.OP_ID_INVALID &&
+	   len(conn.pending_writes) == 0 {
 		net_close_conn(conn, false)
 	}
 }
@@ -963,7 +1023,7 @@ conn_read_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			net_close_conn(conn, true)
 			return
 		}
-		if n == 0 { // peer half-closed (read EOF)
+		if n == 0 { 	// peer half-closed (read EOF)
 			// Stop the read watcher (EOF is persistent — it would re-fire forever) and
 			// fire 'end'. Do NOT close here: this is a true half-close. The peer is done
 			// sending, but the write side stays open so the app can still write (an HTTP
@@ -1107,7 +1167,9 @@ net_end_cb :: proc "c" (
 		defer net_op_finished(conn)
 		net_proactor_kick_send(conn)
 		// Nothing left to drain → close now; otherwise on_send_complete closes once drained.
-		if !conn.closing && conn.send_op == eventloop.OP_ID_INVALID && len(conn.pending_writes) == 0 {
+		if !conn.closing &&
+		   conn.send_op == eventloop.OP_ID_INVALID &&
+		   len(conn.pending_writes) == 0 {
 			net_close_conn(conn, false)
 		}
 		return jsc.JSValueMakeUndefined(ctx)
@@ -1189,7 +1251,8 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 	net_unprotect(conn.ctx, conn.on_close)
 	net_unprotect(conn.ctx, conn.on_error)
 	net_unprotect(conn.ctx, conn.on_drain) // net.js always registers onDrain, even on readiness
-	conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
+	conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain =
+		nil, nil, nil, nil, nil
 
 	if state := get_state_from_ctx(conn.ctx); state != nil {
 		delete_key(&state.net_conns, conn.id)
@@ -1305,7 +1368,8 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 			net_unprotect(conn.ctx, conn.on_close)
 			net_unprotect(conn.ctx, conn.on_error)
 			net_unprotect(conn.ctx, conn.on_drain)
-			conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain = nil, nil, nil, nil, nil
+			conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain =
+				nil, nil, nil, nil, nil
 			if conn.recv_starved {
 				conn.recv_starved = false // the whole starved list is cleared after this loop
 				eventloop.async_cancel(conn.loop) // balance the parked liveness ref
@@ -1387,7 +1451,12 @@ net_unprotect :: proc(ctx: jsc.JSContextRef, fn: jsc.JSObjectRef) {
 	if fn != nil do jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)fn)
 }
 
-net_emit :: proc(ctx: jsc.JSContextRef, fn: jsc.JSObjectRef, args: [^]jsc.JSValueRef, argc: c.size_t) {
+net_emit :: proc(
+	ctx: jsc.JSContextRef,
+	fn: jsc.JSObjectRef,
+	args: [^]jsc.JSValueRef,
+	argc: c.size_t,
+) {
 	if fn == nil do return
 	exception: jsc.JSValueRef
 	invoke_user_callback(ctx, fn, args, argc, &exception)

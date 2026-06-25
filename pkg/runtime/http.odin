@@ -96,7 +96,13 @@ http_parse_request_cb :: proc "c" (
 	n := len(hdr_list)
 	headers_arr := jsc.JSObjectMakeArray(ctx, 0, nil, nil)
 	for i in 0 ..< n {
-		jsc.JSObjectSetPropertyAtIndex(ctx, headers_arr, c.uint(i), http_latin1_string(ctx, hdr_list[i]), nil)
+		jsc.JSObjectSetPropertyAtIndex(
+			ctx,
+			headers_arr,
+			c.uint(i),
+			http_latin1_string(ctx, hdr_list[i]),
+			nil,
+		)
 	}
 
 	set_named(ctx, result, "state", js_string_value(ctx, "complete"))
@@ -108,11 +114,24 @@ http_parse_request_cb :: proc "c" (
 	return cast(jsc.JSValueRef)result
 }
 
-// http_latin1_string builds a JS string by mapping each input BYTE to one UTF-16 code
-// unit (latin1 / ISO-8859-1), matching how Node decodes HTTP/1 request bytes — preserving
-// raw 0x80-0xFF obs-text instead of mis-interpreting it as UTF-8.
+// http_latin1_string builds a JS string from HTTP/1 header bytes (latin1 / ISO-8859-1), matching how Node
+// exposes them. Two paths:
+//   - ASCII (every byte 0x01-0x7F — the overwhelming common case): take the UTF-8 path, which yields a
+//     DENSE 8-bit (LChar) StringImpl. JSStringCreateWithCharacters always builds a 2-byte/char (16-bit)
+//     StringImpl even for pure ASCII — wasting half the backing bytes (and a widening temp); ASCII is
+//     byte-identical under UTF-8, so this is JS-observably the same string at half the memory/bandwidth.
+//   - obs-text present (any byte 0x80-0xFF, or a NUL): map each byte to one UTF-16 unit. UTF-8 decoding
+//     would mis-interpret 0x80-0xFF (and truncate at a NUL), corrupting the raw bytes we must preserve.
 http_latin1_string :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef {
 	if len(value) == 0 do return js_string_value(ctx, "")
+	ascii := true
+	for i in 0 ..< len(value) {
+		if value[i] == 0 || value[i] >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii do return js_string_value(ctx, value) // 8-bit StringImpl via the UTF-8 path
 	units := make([]jsc.JSChar, len(value), context.temp_allocator)
 	for i in 0 ..< len(value) do units[i] = jsc.JSChar(value[i])
 	js_str := jsc.JSStringCreateWithCharacters(raw_data(units), c.size_t(len(value)))
