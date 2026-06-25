@@ -98,6 +98,7 @@ Net_Connection :: struct {
 	// default heap on first append (a proc "c" runs under runtime.default_context); the
 	// dynamic array carries that allocator, so delete() frees it correctly anywhere.
 	write_queue:         [dynamic]byte,
+	write_off:           int, // readiness path: bytes of write_queue already sent (avoids O(N^2) per-partial compaction)
 	writing:             bool, // watcher currently in .Write mode (draining a blocked write)
 	end_after_drain:     bool, // socket.end() / read EOF: close once write_queue empties
 	read_done:           bool, // peer half-closed (read EOF) — never re-arm the read watcher
@@ -1084,6 +1085,13 @@ net_write_cb :: proc "c" (
 	}
 
 	if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
+		// Drop the already-sent prefix before appending so the queue doesn't retain dead bytes across
+		// writes during sustained backpressure (write_off>0). copy is memmove-safe for the overlap.
+		if conn.write_off > 0 {
+			n := copy(conn.write_queue[:], conn.write_queue[conn.write_off:])
+			resize(&conn.write_queue, n)
+			conn.write_off = 0
+		}
 		append(&conn.write_queue, ..view)
 	}
 	backpressured := net_flush(conn)
@@ -1095,8 +1103,11 @@ net_write_cb :: proc "c" (
 // .Write watcher and reports backpressure; on full drain it restores the .Read watcher
 // and, if end() was requested, closes. Returns whether bytes remain buffered.
 net_flush :: proc(conn: ^Net_Connection) -> (backpressured: bool) {
-	for len(conn.write_queue) > 0 {
-		sent, send_err := linux.send(linux.Fd(conn.fd), conn.write_queue[:], {.NOSIGNAL})
+	// Send from write_off (the already-sent prefix) rather than compacting after each partial send: a
+	// large write draining over many writable callbacks is then O(total bytes), not O(N^2). The prefix
+	// is released on full drain (clear below) or dropped when a new write arrives (net_write_cb).
+	for conn.write_off < len(conn.write_queue) {
+		sent, send_err := linux.send(linux.Fd(conn.fd), conn.write_queue[conn.write_off:], {.NOSIGNAL})
 		if send_err == .EINTR do continue // interrupted by a signal — retry, not fatal
 		if send_err == .EAGAIN {
 			net_set_mode(conn, .Write) // wait for writability, then conn_write_cb drains
@@ -1107,11 +1118,14 @@ net_flush :: proc(conn: ^Net_Connection) -> (backpressured: bool) {
 			net_close_conn(conn, true)
 			return true
 		}
-		if sent <= 0 do break
-		remaining := len(conn.write_queue) - sent
-		if remaining > 0 do copy(conn.write_queue[:], conn.write_queue[sent:])
-		resize(&conn.write_queue, remaining)
+		if sent <= 0 {
+			net_set_mode(conn, .Write) // no progress this time — wait for the next writable event
+			return true
+		}
+		conn.write_off += sent
 	}
+	clear(&conn.write_queue) // fully drained
+	conn.write_off = 0
 	// Drained. Restore read interest only if the read side is still open; after a read
 	// EOF (read_done) the socket is write-only and about to close.
 	if conn.writing && !conn.read_done do net_set_mode(conn, .Read)
