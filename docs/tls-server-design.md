@@ -17,6 +17,13 @@ and readiness backends supported.
 0-RTT. M1 ships one cert+key, TLS 1.2+ (1.3 if the linked OpenSSL supports it), no client verification —
 mirroring how `node:http` shipped as "M2" with a deliberately minimal surface.
 
+**Deferred-but-security-sensitive options must be REJECTED, not silently ignored** (Codex P2-§17): if a
+caller passes `requestCert`, `ca`, `rejectUnauthorized`, `minVersion`, `maxVersion`, `ciphers`,
+`passphrase`, `SNICallback`, or `ALPNProtocols`, `https.createServer` **throws** (`ERR_TLS_*`-shaped) rather
+than treating them as the M1 no-client-auth / TLS-1.2-floor default — silently ignoring e.g.
+`rejectUnauthorized:true` or `minVersion:'TLSv1.3'` would give the caller weaker security than they
+explicitly requested.
+
 ## 2. The load-bearing decision: memory-BIO, not `SSL_set_fd`
 
 The fetch **client** binds the socket fd into OpenSSL (`SSL_set_fd`) and lets libssl do the `read()/write()`
@@ -58,10 +65,17 @@ timeouts, the whole `onConnection` loop. So TLS is wrapped at the **native `net.
   ciphertext to rbio, drive the handshake or `SSL_read`-decrypt loop, emit plaintext via `on_data`.
 - **write** (`net_write_cb` → `net_proactor_submit` / readiness `net_flush`) — `SSL_write` the plaintext,
   drain wbio ciphertext into the existing send buffers.
-- **close** (`net_close_conn`) — `SSL_shutdown` (close_notify) before the fd close.
+- **close** — a new `.TLS_Closing` phase (§6e) sends close_notify *before* the existing hard teardown.
+- On a TLS conn, the native side sets **`socket.encrypted = true`** (Codex P2-§156) so HTTPS middleware that
+  checks `req.socket.encrypted` (secure-cookie, redirect-to-https, `req.secure`) classifies the request
+  correctly — even though full `TLSSocket` is deferred.
 
-http.js requires **zero changes**. `https.createServer` is `http.createServer` whose underlying listener
-carries TLS options.
+http.js's **request/response machinery is unchanged**, but the claim of "zero changes" is too strong (Codex
+P2-§64): `http.Server` builds `this._net = net.createServer(...)` internally and only consumes `options` for
+timeouts, so it needs a **small hook** to forward a `tls` option through to the `net` listener. `https.js`
+calls `http.createServer(opts, listener)` with the TLS context attached; `http.Server.listen` threads that
+context to `net.createServer`/`listen`. No change to the parser, `IncomingMessage`/`ServerResponse`, or the
+`onConnection` loop.
 
 ## 4. New OpenSSL bindings (add to `tls.odin`; libssl/libcrypto already linked)
 
@@ -75,20 +89,30 @@ PEM load from memory (Node passes PEM *content*, not paths): `PEM_read_bio_X509`
 Hardening: `SSL_CTX_set_options` + constants `SSL_OP_NO_RENEGOTIATION` (0x40000000),
 `SSL_OP_NO_SSLv3`/`TLSv1`/`TLSv1_1`; min-proto via the existing `SSL_CTX_ctrl(SET_MIN_PROTO_VERSION)`.
 
-## 5. Server context (`tls_server_ctx`) — built once at `listen`, validated fail-fast
+## 5. Server context (`tls_server_ctx`) — PER-LISTENER, built+validated in `https.createServer`
 
-Mirror the client's `g_tls_ctx`/`sync.Once`, but server-mode and **per cert+key**. Built when `listen()` is
-called with TLS options:
+The context is **per-listener (one cert+key), NOT process-global** (Codex P2-§174, resolves Q1): unlike the
+client's single `g_tls_ctx`, two `https.createServer` calls with different certs need two contexts — a shared
+`g_*` would make the second listener present the first's cert. It is created when `https.createServer`
+parses its options and owned by that listener's `Net_Server` (one ctx per cert+key; shared across the 3a
+workers of the *same* listener since `SSL_new` is thread-safe).
+
+It is **built and validated synchronously inside `https.createServer`** (Codex P2-§89), NOT deferred to
+`net_listen_cb`: the existing `net.Server.listen` catches `native.listen` errors and emits `'error'`
+async (next tick), but Node throws bad-cert/key from `createServer(...)` itself — a caller's `try/catch`
+around `createServer` must see it. So `https.createServer` does, synchronously:
 
 1. `SSL_CTX_new(TLS_server_method())`.
 2. Load the leaf cert + chain from `options.cert` PEM (in-memory BIO), the key from `options.key`.
 3. `SSL_CTX_check_private_key` — assert key matches cert.
 4. Security baseline: min proto **TLS 1.2**; `SSL_OP_NO_RENEGOTIATION` (see §8); rely on OpenSSL 1.1.1+
    strong cipher defaults (no NULL/EXPORT/RC4/DES); no client verification in M1.
-5. **Any failure → `listen()` throws synchronously** (bad PEM, key/cert mismatch, missing field) — matches
-   Node (`ERR_TLS_*`), never a deferred runtime handshake failure.
+5. **Any failure throws synchronously from `createServer`** (bad PEM, key/cert mismatch, missing field) —
+   matches Node (`ERR_TLS_*`), never a deferred runtime handshake failure. The validated context handle is
+   then carried to `listen`.
 
-Per connection: `SSL_new(ctx)` + `SSL_set_accept_state` + wire rbio/wbio. Cheap; the context is shared.
+Per connection: `SSL_new(listener.ctx)` + `SSL_set_accept_state` + wire rbio/wbio. Cheap; the context is
+shared within the listener.
 
 ## 6. Connection lifecycle (ordered, mirrors net.odin's existing phases)
 
@@ -102,7 +126,11 @@ Arm the first recv.
 
 **(b) Handshake** — on each recv completion while `tls_handshaking`:
 `BIO_write(rbio, recv_buf, n)`; `r = SSL_accept(ssl)`; then drain wbio → send (any handshake records SSL
-produced); branch on `SSL_get_error` (reuse `fetch_tls_classify`):
+produced); branch on `SSL_get_error`. NOTE (Codex P2-§105): `fetch_tls_classify` itself is **not** reusable
+— it takes a `Fetch_Request` and acts by calling `fetch_set_watch_mode` on the client socket. Reuse only the
+**pure** `SSL_get_error → {Pending(WANT_READ/WANT_WRITE)|Eof(ZERO_RETURN)|Fatal}` mapping (factor it out of
+`fetch_tls.odin` into a shared helper); the server's *action* on each outcome is its own (drain wbio + arm a
+net SEND, or arm a net RECV), never `fetch_set_watch_mode`:
 - `r==1` → handshake done: `tls_handshaking=false`, run any buffered `SSL_read` (a TLS1.3 client may have
   sent app-data with its Finished), then steady-state.
 - `WANT_READ` → arm another recv (need more ciphertext).
@@ -119,10 +147,18 @@ produced); branch on `SSL_get_error` (reuse `fetch_tls_classify`):
 **existing** `net_proactor_submit` path (incl. SEND_ZC for large bodies). Backpressure = buffered
 **ciphertext** (`active_send` tail + `pending_writes`) ≥ `NET_WRITE_HWM`, identical gate to plaintext.
 
-**(e) Close** — `net_close_conn`: if TLS and handshake completed and not already shutting down,
-`SSL_shutdown(ssl)` → drain wbio close_notify → SEND; allow the peer's close_notify (`SSL_read` →
-`ZERO_RETURN`) with a bounded timeout (reuse the 2b/3a drain-timeout machinery), then `SSL_free` (frees the
-BIOs) and `close(fd)`. A mid-handshake close skips close_notify.
+**(e) Close — a distinct `.TLS_Closing` phase BEFORE the existing hard teardown** (Codex P2-§124). The
+current `net_close_conn_proactor` immediately `shutdown(fd, RDWR)` + cancels both recv/send ops
+(`net.odin:1003-1005`) — there is no writable socket left for close_notify. So an *orderly* close (a graceful
+`socket.end()` / keep-alive close on a handshake-complete TLS conn) must first:
+1. enter `.TLS_Closing`; `SSL_shutdown(ssl)` → `BIO_read(wbio)` the close_notify record → queue as a normal
+   SEND (the send path is still live — we have NOT hard-closed yet);
+2. on that SEND completion, optionally read the peer's close_notify (`SSL_read` → `ZERO_RETURN`) bounded by
+   a short timeout (reuse the 3a `net_drain_*` machinery so a half-open peer can't pin the conn);
+3. THEN fall into the existing hard path (`net_close_conn_proactor`: shutdown(RDWR), cancel ops),
+   `SSL_free` (frees the BIOs) and the fd close on `net_maybe_free`.
+An **abrupt/error close** (handshake never completed, a fatal TLS/socket error, or `socket.destroy()`) skips
+close_notify and goes straight to the hard path.
 
 ## 7. Buffer-lifetime invariants (the safety core — same discipline as the proactor net layer)
 
@@ -151,13 +187,20 @@ teardown-leak rule (M1/M2 of the zerocopy slice) applies identically to the ciph
 
 ## 9. JS API surface
 
-`js/internal/https.js` (new): `https.createServer(options, requestListener)` → builds an `http.Server` but
-passes `{ tls: { key, cert } }` through to the underlying `net` listener. `https.Server` is `http.Server`
-with TLS transport; same `'request'` event, same `IncomingMessage`/`ServerResponse`.
-`net.listen` gains an optional TLS-options field (native `net_listen_cb` reads `tls.key`/`tls.cert`, builds
-`tls_server_ctx`, stamps the listener `tls=true`). `tls.createServer` + `TLSSocket` deferred to M2.
-Wire `make_https_bindings` (or fold into the net bindings) into `globals.odin` alongside http/net; register
-`node:https` in the builtin loader.
+`js/internal/https.js` (new): `https.createServer(options, requestListener)`:
+1. **Validate options synchronously** — reject the deferred security-sensitive fields (§1) by throwing; then
+   build+validate the per-listener `SSL_CTX` from `options.key`/`options.cert` via the native binding, which
+   **throws on bad PEM / key-cert mismatch** (§5). This is the synchronous-throw point Node callers expect.
+2. Build an `http.Server` (reusing all of `node:http`) and attach the validated TLS context handle, threaded
+   through `http.Server.listen` → `net.createServer`/`listen` (the small http.js hook, §3).
+`net.listen` gains an optional TLS field carrying the **already-built context handle** (not raw key/cert —
+parsing/validation already happened in `createServer`); `net_listen_cb` stamps the listener `tls=true` +
+stores the ctx. `https.Server` is `http.Server` with TLS transport — same `'request'` event,
+`IncomingMessage`/`ServerResponse`. `tls.createServer` + `TLSSocket` deferred to M2.
+Native: `make_https_bindings` (or fold into net) wired into `globals.odin` alongside http/net. **Register the
+builtin factory under the unprefixed key `https`** (Codex P2-§160) — the loader strips `node:` and keys the
+table by bare names (`net`, `http`), so `require('https')` and `require('node:https')` both resolve;
+registering `node:https` literally would break both.
 
 ## 10. Proactor + readiness + the buffer-ring/multishot/ZC stack
 
@@ -170,8 +213,9 @@ is thread-safe for `SSL_new`, or build one per worker). Readiness fallback works
 
 ## 11. Open questions for review
 
-Q1. SSL_CTX sharing across workers (3a): one process-wide `tls_server_ctx` shared via `SSL_new` (OpenSSL
-makes `SSL_new` thread-safe), or one per worker? (Lean: one shared, like `g_tls_ctx`.)
+Q1. **RESOLVED** (Codex P2-§174): SSL_CTX is **per-listener** (one per cert+key, owned by the `Net_Server`),
+NOT process-global — two `https.createServer`s with different certs need distinct contexts. Shared across
+the 3a workers of the *same* listener (`SSL_new` is thread-safe). See §5.
 Q2. PEM in-memory load vs temp-file (`SSL_CTX_use_certificate_file`): in-memory (`BIO_new_mem_buf` +
 `PEM_read_bio_*`) avoids FS coupling and matches Node's PEM-content options. (Lean: in-memory.)
 Q3. close_notify drain timeout — reuse the 3a `NET_DRAIN_TIMEOUT_MS` machinery, or a shorter TLS-specific
