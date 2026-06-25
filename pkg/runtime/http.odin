@@ -3,8 +3,39 @@ package lava_runtime
 import "base:runtime"
 import "core:c"
 import "core:strings"
+import "core:sync"
 import jsc "lava:pkg/jsc"
 import pico "lava:pkg/runtime/picohttpparser"
+
+// The parseRequest result object's property NAMES and the three state VALUES are constant. Their
+// JSStringRefs are created ONCE (process-wide; a JSStringRef is immutable and context-group-independent,
+// so it is safe to share read-only across the per-worker VMs) and reused — instead of allocating and
+// releasing ~9 JSStrings per request. Initialized via http_intern_strings (sync.Once) at binding setup.
+@(private = "file") g_http_str_once: sync.Once
+@(private = "file") g_str_state, g_str_consumed, g_str_method, g_str_url, g_str_minor, g_str_headers: jsc.JSStringRef
+@(private = "file") g_str_complete, g_str_partial, g_str_error: jsc.JSStringRef
+
+@(private = "file")
+http_intern_strings :: proc() {
+	sync.once_do(&g_http_str_once, proc() {
+		g_str_state = jsc.JSStringCreateWithUTF8CString("state")
+		g_str_consumed = jsc.JSStringCreateWithUTF8CString("consumed")
+		g_str_method = jsc.JSStringCreateWithUTF8CString("method")
+		g_str_url = jsc.JSStringCreateWithUTF8CString("url")
+		g_str_minor = jsc.JSStringCreateWithUTF8CString("minor")
+		g_str_headers = jsc.JSStringCreateWithUTF8CString("headers")
+		g_str_complete = jsc.JSStringCreateWithUTF8CString("complete")
+		g_str_partial = jsc.JSStringCreateWithUTF8CString("partial")
+		g_str_error = jsc.JSStringCreateWithUTF8CString("error")
+	})
+}
+
+// set_named_ref sets a property using a pre-interned name JSStringRef (vs set_named, which creates the
+// name string each call). Loop thread; the cached refs are immutable and never released.
+@(private = "file")
+set_named_ref :: proc(ctx: jsc.JSContextRef, obj: jsc.JSObjectRef, name: jsc.JSStringRef, value: jsc.JSValueRef) {
+	jsc.JSObjectSetProperty(ctx, obj, name, value, {}, nil)
+}
 
 // node:http server support — the request-HEAD parser bridge. The protocol surface
 // (Server, IncomingMessage, ServerResponse) lives in js/internal/http.js on top of
@@ -20,6 +51,7 @@ import pico "lava:pkg/runtime/picohttpparser"
 // (pure parsing); the server itself needs node:net, which is Linux-first.
 
 make_http_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
+	http_intern_strings() // create the constant result-object JSStringRefs once (idempotent across workers)
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
 	inject_native_function(ctx, bindings, "parseRequest", http_parse_request_cb)
 	return bindings
@@ -37,13 +69,13 @@ http_parse_request_cb :: proc "c" (
 	context = runtime.default_context()
 	result := jsc.JSObjectMake(ctx, nil, nil)
 	if argument_count < 2 {
-		set_named(ctx, result, "state", js_string_value(ctx, "error"))
+		set_named_ref(ctx, result, g_str_state, jsc.JSValueMakeString(ctx, g_str_error))
 		return cast(jsc.JSValueRef)result
 	}
 	args := arguments[:int(argument_count)]
 	view, ok := typed_array_view(ctx, args[0])
 	if !ok {
-		set_named(ctx, result, "state", js_string_value(ctx, "error"))
+		set_named_ref(ctx, result, g_str_state, jsc.JSValueMakeString(ctx, g_str_error))
 		return cast(jsc.JSValueRef)result
 	}
 	last_len := int(jsc.JSValueToNumber(ctx, args[1], nil))
@@ -51,11 +83,11 @@ http_parse_request_cb :: proc "c" (
 	hdrs: [pico.MAX_HEADERS]pico.Header
 	consumed, minor, num, method, path, res := pico.parse_request(view, last_len, hdrs[:])
 	if res == .Partial {
-		set_named(ctx, result, "state", js_string_value(ctx, "partial"))
+		set_named_ref(ctx, result, g_str_state, jsc.JSValueMakeString(ctx, g_str_partial))
 		return cast(jsc.JSValueRef)result
 	}
 	if res == .Error {
-		set_named(ctx, result, "state", js_string_value(ctx, "error"))
+		set_named_ref(ctx, result, g_str_state, jsc.JSValueMakeString(ctx, g_str_error))
 		return cast(jsc.JSValueRef)result
 	}
 
@@ -105,12 +137,12 @@ http_parse_request_cb :: proc "c" (
 		)
 	}
 
-	set_named(ctx, result, "state", js_string_value(ctx, "complete"))
-	set_named(ctx, result, "consumed", jsc.JSValueMakeNumber(ctx, f64(consumed)))
-	set_named(ctx, result, "method", http_latin1_string(ctx, method))
-	set_named(ctx, result, "url", http_latin1_string(ctx, path))
-	set_named(ctx, result, "minor", jsc.JSValueMakeNumber(ctx, f64(minor)))
-	set_named(ctx, result, "headers", cast(jsc.JSValueRef)headers_arr)
+	set_named_ref(ctx, result, g_str_state, jsc.JSValueMakeString(ctx, g_str_complete))
+	set_named_ref(ctx, result, g_str_consumed, jsc.JSValueMakeNumber(ctx, f64(consumed)))
+	set_named_ref(ctx, result, g_str_method, http_latin1_string(ctx, method))
+	set_named_ref(ctx, result, g_str_url, http_latin1_string(ctx, path))
+	set_named_ref(ctx, result, g_str_minor, jsc.JSValueMakeNumber(ctx, f64(minor)))
+	set_named_ref(ctx, result, g_str_headers, cast(jsc.JSValueRef)headers_arr)
 	return cast(jsc.JSValueRef)result
 }
 
