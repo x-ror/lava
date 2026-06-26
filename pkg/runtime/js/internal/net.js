@@ -32,6 +32,10 @@
     this._closeEmitted = false;
     this.writableEnded = false;
     this.readableEnded = false;
+    // true on a TLS connection (https). Set by the Server in _onConnection so HTTPS-aware
+    // middleware that checks req.socket.encrypted classifies the request correctly. Full
+    // TLSSocket is deferred — this is the one property the http layer actually needs.
+    this.encrypted = false;
   }
   Socket.prototype = Object.create(EventEmitter.prototype);
   Socket.prototype.constructor = Socket;
@@ -110,6 +114,9 @@
     this._port = 0;
     this._host = '0.0.0.0';
     this._sockets = new Set(); // live accepted connections (for server.close timing)
+    // TLS context handle (https.createServer → native.createSecureContext), threaded to
+    // native.listen so every accepted connection is TLS-wrapped natively. undefined ⇒ plaintext.
+    this._tlsContext = options && typeof options === 'object' ? options.tls : undefined;
     if (typeof connectionListener === 'function') this.on('connection', connectionListener);
   }
   Server.prototype = Object.create(EventEmitter.prototype);
@@ -124,6 +131,7 @@
   Server.prototype._onConnection = function (id) {
     var self = this;
     var socket = new Socket(id);
+    socket.encrypted = !!this._tlsContext; // before 'connection' fires, so handlers see it
     // Track the socket so server.close() can wait for it (Node fires the server 'close'
     // event only after the last live connection ends).
     this._sockets.add(socket);
@@ -193,9 +201,17 @@
     var self = this;
     if (typeof cb === 'function') this.once('listening', cb);
     try {
-      this._id = native.listen(port >>> 0, host, backlog, function (id) {
-        self._onConnection(id);
-      });
+      // The 5th arg is the TLS context handle (undefined for plaintext); native.listen wraps every
+      // accepted connection on it. Passed AFTER onConnection so the plaintext arg order is unchanged.
+      this._id = native.listen(
+        port >>> 0,
+        host,
+        backlog,
+        function (id) {
+          self._onConnection(id);
+        },
+        this._tlsContext,
+      );
     } catch (e) {
       process.nextTick(function () {
         self.emit('error', e);

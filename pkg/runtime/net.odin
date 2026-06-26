@@ -5,6 +5,7 @@ import "base:runtime"
 import "core:c"
 import "core:net"
 import "core:os"
+import "core:strconv"
 import "core:sys/linux"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
@@ -28,6 +29,29 @@ import eventloop "lava:pkg/runtime/eventloop"
 
 NET_READ_CHUNK :: 64 * 1024
 NET_DEFAULT_BACKLOG :: 511
+
+// Bound on a TLS handshake (https.createServer): a peer that opens a connection and never
+// completes (or dribbles) the handshake holds an fd + SSL + two BIOs with no progress — a
+// TLS-layer slowloris that http.js's post-handshake timeouts never see. 30 s is generous for a
+// slow-but-legitimate client yet reaps a stalled one. Armed in net_accept_cb, cancelled on
+// handshake completion (tls_server.odin) and in both free sites. Overridable via
+// LAVA_TLS_HANDSHAKE_TIMEOUT_MS (the smoke uses a short value to exercise the reaper).
+TLS_HANDSHAKE_TIMEOUT_MS :: 30_000
+
+@(private = "file")
+net_tls_handshake_timeout_ms_cached: u64 = 0
+
+net_tls_handshake_timeout_ms :: proc() -> u64 {
+	if net_tls_handshake_timeout_ms_cached == 0 {
+		net_tls_handshake_timeout_ms_cached = TLS_HANDSHAKE_TIMEOUT_MS
+		if v := os.get_env("LAVA_TLS_HANDSHAKE_TIMEOUT_MS", context.temp_allocator); v != "" {
+			if ms, ok := strconv.parse_int(v); ok && ms > 0 {
+				net_tls_handshake_timeout_ms_cached = u64(ms)
+			}
+		}
+	}
+	return net_tls_handshake_timeout_ms_cached
+}
 
 // Proactor (io_uring completion-mode) tunables — see docs/io-uring-proactor.md (Slice 1b).
 // A per-conn recv landing buffer is a real idle-memory cost vs the readiness path's transient
@@ -76,6 +100,12 @@ Net_Server :: struct {
 	watcher:       eventloop.IO_Watcher,
 	on_connection: jsc.JSObjectRef,
 	closing:       bool,
+	// TLS (https.createServer): when tls, every accepted conn is wrapped via tls_server_attach on
+	// this per-listener context. tls_ctx is an ^SSL_CTX built+validated synchronously in
+	// https.createServer (carried here as rawptr so this struct need not name the OpenSSL binding);
+	// it is freed once, on server close (net_close_server). See tls_server.odin.
+	tls:           bool,
+	tls_ctx:       rawptr,
 }
 
 // Net_Connection owns one accepted socket. The per-connection handlers are registered
@@ -103,6 +133,16 @@ Net_Connection :: struct {
 	end_after_drain:     bool, // socket.end() / read EOF: close once write_queue empties
 	read_done:           bool, // peer half-closed (read EOF) — never re-arm the read watcher
 	closing:             bool,
+	// --- TLS (https.createServer; tls_server.odin). All zero on a plaintext conn. The SSL owns
+	// rbio/wbio (freed by SSL_free in tls_server_free_conn); rbio/wbio are retained here only for
+	// BIO_read/BIO_write and are NEVER freed separately. tls_handshaking gates the recv-side driver
+	// (SSL_accept vs SSL_read); handshake_timer bounds a stalled handshake (TLS-layer slowloris). ---
+	tls:                 bool,
+	tls_handshaking:     bool,
+	ssl:                 rawptr,
+	rbio:                rawptr,
+	wbio:                rawptr,
+	handshake_timer:     eventloop.Timer_ID,
 	// --- proactor (io_uring completion) state; io_mode == .Proactor ---------------
 	io_mode:             Net_IO_Mode,
 	recv_buf:            []byte, // reused kernel landing zone (copied per chunk; never JSC no-copy)
@@ -259,11 +299,33 @@ net_listen_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
+	// Optional 5th arg: a TLS context id (from https.createServer → createSecureContext). Consumed
+	// here, AFTER bind/listen succeed, so an EADDRINUSE leaves the context in the registry (freed at
+	// teardown or by https.js's freeSecureContext). Ownership moves from the registry to the
+	// Net_Server, which frees the SSL_CTX on close.
+	tls_ctx: rawptr = nil
+	tls_enabled := false
+	if argument_count >= 5 && jsc.JSValueIsNumber(ctx, args[4]) {
+		ctx_id := u64(jsc.JSValueToNumber(ctx, args[4], nil))
+		if found, ok := state.tls_server_ctxs[ctx_id]; ok {
+			tls_ctx = found
+			tls_enabled = true
+			delete_key(&state.tls_server_ctxs, ctx_id)
+		} else {
+			linux.close(sfd)
+			if g_multi_worker do net_startup_failed()
+			if exception != nil do exception^ = make_js_error(ctx, "net.listen: invalid TLS context handle")
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+	}
+
 	server := new(Net_Server)
 	server.ctx = ctx
 	server.loop = loop
 	server.fd = uintptr(sfd)
 	server.on_connection = on_connection
+	server.tls = tls_enabled
+	server.tls_ctx = tls_ctx
 	server.id = state.next_net_id
 	state.next_net_id += 1
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_connection)
@@ -279,6 +341,7 @@ net_listen_cb :: proc "c" (
 		delete_key(&state.net_servers, server.id)
 		jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)on_connection)
 		linux.close(sfd)
+		if server.tls do tls_server_ctx_free(cast(SSL_CTX)server.tls_ctx)
 		free(server)
 		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: could not register listener with the event loop")
@@ -316,10 +379,40 @@ net_accept_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 		state.next_net_id += 1
 		state.net_conns[conn.id] = conn
 
+		// TLS listener: wrap the conn in an SSL session (rbio/wbio memory BIOs) BEFORE 'connection'
+		// is emitted, so socket.encrypted is already correct, and arm a handshake-deadline timer (a
+		// stalled handshake is a TLS-layer slowloris that http.js's post-handshake timeouts can't
+		// bound). The handshake itself is driven by the recv completions armed in net_start_cb.
+		if server.tls {
+			if !tls_server_attach(conn, cast(SSL_CTX)server.tls_ctx) {
+				net_close_conn(conn, true) // SSL/BIO alloc failed — drop this conn (no JS yet)
+				continue
+			}
+			conn.handshake_timer = eventloop.set_timeout(
+				loop,
+				net_tls_handshake_timeout,
+				net_tls_handshake_timeout_ms(),
+				conn,
+			)
+		}
+
 		cid := jsc.JSValueMakeNumber(server.ctx, f64(conn.id))
 		net_emit(server.ctx, server.on_connection, &cid, 1)
 		if server.closing do break // a 'connection' handler closed the server
 	}
+}
+
+// net_tls_handshake_timeout fires if a TLS handshake hasn't completed within the deadline. It
+// abruptly closes the conn (no close_notify — the session never came up). Zero the timer id FIRST
+// (a one-shot frees itself on return, so the free site must not also clear it). Loop thread.
+net_tls_handshake_timeout :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	context = runtime.default_context()
+	conn := cast(^Net_Connection)user_data
+	if conn == nil do return
+	conn.handshake_timer = 0
+	if conn.closing || !conn.tls_handshaking do return
+	net_emit_error(conn, "tls handshake timeout")
+	net_close_conn(conn, true)
 }
 
 // --- per-connection handler registration + reads ----------------------------
@@ -512,13 +605,19 @@ net_recv_ring_complete :: proc(
 		conn.recv_cancel_pending = false // any backpressure cancel for this op is now consumed
 	}
 
-	// (1) copy BEFORE recycle (recycling republishes the buffer; the kernel may overwrite it).
+	// (1) copy/feed BEFORE recycle (recycling republishes the buffer; the kernel may overwrite it).
+	// For TLS, feed ciphertext into the state machine here (it copies into rbio and emits decrypted
+	// plaintext itself), leaving arg nil so the plaintext-delivery step below is skipped.
 	arg: jsc.JSValueRef = nil
 	if has_buf && res > 0 && !conn.closing {
 		if src := eventloop.recv_ring_buf(loop, bid, int(res)); src != nil {
-			copy_buf := make([]byte, len(src), context.allocator)
-			copy(copy_buf, src)
-			arg = make_uint8_array(conn.ctx, copy_buf)
+			if conn.tls {
+				tls_server_on_ciphertext(conn, src)
+			} else {
+				copy_buf := make([]byte, len(src), context.allocator)
+				copy(copy_buf, src)
+				arg = make_uint8_array(conn.ctx, copy_buf)
+			}
 		}
 	}
 	// (2) recycle UNCONDITIONALLY for any buffer-carrying CQE (incl. a terminal one), then refill.
@@ -694,14 +793,21 @@ on_recv_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32) {
 	conn.recv_op = eventloop.OP_ID_INVALID
 	if !conn.closing {
 		if res > 0 {
-			// Copy out of the reused landing buffer into a JSC-owned Uint8Array (no-copy handoff
-			// frees copy_buf on GC). The landing buffer must NOT be handed to JSC — it is reused.
 			n := int(res)
-			copy_buf := make([]byte, n, context.allocator)
-			copy(copy_buf, conn.recv_buf[:n])
-			arg := make_uint8_array(conn.ctx, copy_buf)
-			net_emit(conn.ctx, conn.on_data, &arg, 1)
-			net_maybe_arm_recv(conn) // its guards handle a handler that closed/paused
+			if conn.tls {
+				// Feed ciphertext to the TLS state machine (it copies into rbio, drives the
+				// handshake or decrypt loop, and emits decrypted plaintext as on_data), then re-arm.
+				tls_server_on_ciphertext(conn, conn.recv_buf[:n])
+				if !conn.closing do net_maybe_arm_recv(conn)
+			} else {
+				// Copy out of the reused landing buffer into a JSC-owned Uint8Array (no-copy handoff
+				// frees copy_buf on GC). The landing buffer must NOT be handed to JSC — it is reused.
+				copy_buf := make([]byte, n, context.allocator)
+				copy(copy_buf, conn.recv_buf[:n])
+				arg := make_uint8_array(conn.ctx, copy_buf)
+				net_emit(conn.ctx, conn.on_data, &arg, 1)
+				net_maybe_arm_recv(conn) // its guards handle a handler that closed/paused
+			}
 		} else if res == 0 {
 			conn.read_done = true // half-close: never re-arm
 			net_emit(conn.ctx, conn.on_end, nil, 0)
@@ -909,11 +1015,19 @@ net_send_zc_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32,
 // emitting 'drain' (the listener may write >= HWM again or destroy()), then re-check state and
 // re-arm reads / close only against the FRESH state.
 net_proactor_on_drained :: proc(conn: ^Net_Connection) {
+	resumed := conn.want_drain
 	if conn.want_drain {
 		conn.want_drain = false
 		net_emit(conn.ctx, conn.on_drain, nil, 0)
 	}
 	if conn.closing do return // a 'drain' listener destroyed the socket
+	// TLS: reads may have paused mid-decrypt with plaintext still buffered in the rbio; now that the
+	// write drained, decrypt+emit that remainder before re-arming the recv (it lives in userspace, so
+	// the recv re-arm alone would never deliver it). No-op if nothing is buffered.
+	if conn.tls && resumed {
+		tls_server_pump_reads(conn)
+		if conn.closing do return
+	}
 	net_maybe_arm_recv(conn) // recomputes read_paused from the (possibly new) buffered count
 	if conn.end_after_drain &&
 	   conn.send_op == eventloop.OP_ID_INVALID &&
@@ -986,6 +1100,10 @@ net_maybe_free :: proc(conn: ^Net_Connection) {
 		delete(conn.active_send)
 	}
 	delete(conn.pending_writes)
+	// Free the TLS session (and, with it, both BIOs) + cancel any handshake timer. OUTSIDE the
+	// ZC-pin guard above (which only forgoes active_send): the SSL is never kernel-pinned, so it
+	// must always be freed. No-op on a plaintext conn.
+	tls_server_free_conn(conn)
 	free(conn)
 }
 
@@ -1013,7 +1131,10 @@ net_close_conn_proactor :: proc(conn: ^Net_Connection, had_error: bool) {
 // if conn.closing — safe because net_close_conn defers the actual free. Loop thread.
 conn_read_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	conn := cast(^Net_Connection)user_data
-	if conn == nil || conn.closing do return
+	// read_done guard: on a TLS conn the EOF is detected INSIDE the state machine (a close_notify
+	// arrives as n>0 ciphertext, SSL_read → ZERO_RETURN → on_end), not via the n==0 branch below, so
+	// without this guard the peer's subsequent FIN would re-enter here and fire 'end' a second time.
+	if conn == nil || conn.closing || conn.read_done do return
 	buf: [NET_READ_CHUNK]byte
 	for {
 		n, recv_err := linux.recv(linux.Fd(conn.fd), buf[:], {})
@@ -1036,13 +1157,25 @@ conn_read_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 			net_emit(conn.ctx, conn.on_end, nil, 0)
 			return
 		}
-		// Copy out of the transient stack buffer into a JSC-owned Uint8Array (no-copy
-		// handoff frees copy_buf on GC), mirroring fetch_deliver_chunk.
-		copy_buf := make([]byte, n, context.allocator)
-		copy(copy_buf, buf[:n])
-		arg := make_uint8_array(conn.ctx, copy_buf)
-		net_emit(conn.ctx, conn.on_data, &arg, 1)
+		if conn.tls {
+			// Feed ciphertext to the TLS state machine (decrypts + emits plaintext on_data, drains
+			// any ciphertext via net_flush). Then honor the same closing/backpressure gates below.
+			tls_server_on_ciphertext(conn, buf[:n])
+		} else {
+			// Copy out of the transient stack buffer into a JSC-owned Uint8Array (no-copy
+			// handoff frees copy_buf on GC), mirroring fetch_deliver_chunk.
+			copy_buf := make([]byte, n, context.allocator)
+			copy(copy_buf, buf[:n])
+			arg := make_uint8_array(conn.ctx, copy_buf)
+			net_emit(conn.ctx, conn.on_data, &arg, 1)
+		}
 		if conn.closing do return // a data handler closed the socket
+		if conn.read_done {
+			// TLS close_notify surfaced as a clean EOF inside the state machine (on_end already
+			// fired). Unwatch like the n==0 branch so the peer's FIN can't re-fire and double 'end'.
+			eventloop.unwatch_fd(conn.loop, &conn.watcher)
+			return
+		}
 		if conn.writing do return // a data handler wrote and hit backpressure — pause reads
 	}
 }
@@ -1071,10 +1204,19 @@ net_write_cb :: proc "c" (
 		// alive until we have read its state and computed the return (mirrors a completion's ref).
 		conn.inflight += 1
 		defer net_op_finished(conn)
-		if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
-			append(&conn.pending_writes, ..view)
+		if conn.tls {
+			// SSL_write the plaintext; tls_server_write drains the resulting ciphertext into
+			// pending_writes and kicks the send. The backpressure gate below measures buffered
+			// CIPHERTEXT (net_proactor_buffered), identical to the plaintext path.
+			if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
+				if !tls_server_write(conn, view) do return jsc.JSValueMakeBoolean(ctx, false)
+			}
+		} else {
+			if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
+				append(&conn.pending_writes, ..view)
+			}
+			net_proactor_kick_send(conn)
 		}
-		net_proactor_kick_send(conn)
 		if conn.closing do return jsc.JSValueMakeBoolean(ctx, false)
 		if net_proactor_buffered(conn) >= NET_WRITE_HWM {
 			conn.want_drain = true // backpressure (Node's write()==false); a 'drain' is owed
@@ -1084,19 +1226,34 @@ net_write_cb :: proc "c" (
 		return jsc.JSValueMakeBoolean(ctx, true)
 	}
 
-	if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
-		// Drop the already-sent prefix before appending so the queue doesn't retain dead bytes across
-		// writes during sustained backpressure (write_off>0). copy is memmove-safe for the overlap.
-		if conn.write_off > 0 {
-			n := copy(conn.write_queue[:], conn.write_queue[conn.write_off:])
-			resize(&conn.write_queue, n)
-			conn.write_off = 0
+	if conn.tls {
+		// SSL_write + pump (tls_pump_wbio drains ciphertext into write_queue and runs net_flush,
+		// which sets conn.writing on backpressure).
+		if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
+			if !tls_server_write(conn, view) do return jsc.JSValueMakeBoolean(ctx, false)
 		}
+		backpressured := conn.writing
+		if backpressured do conn.want_drain = true
+		return jsc.JSValueMakeBoolean(ctx, b32(!backpressured))
+	}
+
+	if view, ok := typed_array_view(ctx, args[1]); ok && len(view) > 0 {
+		net_compact_write_queue(conn) // drop the sent prefix so backpressure doesn't retain dead bytes
 		append(&conn.write_queue, ..view)
 	}
 	backpressured := net_flush(conn)
 	if backpressured do conn.want_drain = true // owe a 'drain' once the queue empties
 	return jsc.JSValueMakeBoolean(ctx, b32(!backpressured))
+}
+
+// net_compact_write_queue drops the already-sent prefix [0:write_off] from the readiness write
+// queue so sustained backpressure (repeated writes / TLS pumps while write_off > 0) doesn't retain
+// dead bytes until a full drain. copy is memmove-safe for the overlap; no-op when nothing was sent.
+net_compact_write_queue :: proc(conn: ^Net_Connection) {
+	if conn.write_off <= 0 do return
+	n := copy(conn.write_queue[:], conn.write_queue[conn.write_off:])
+	resize(&conn.write_queue, n)
+	conn.write_off = 0
 }
 
 // net_flush writes as much of write_queue as the kernel accepts. On EAGAIN it arms the
@@ -1146,6 +1303,13 @@ conn_write_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	conn := cast(^Net_Connection)user_data
 	if conn == nil || conn.closing do return
 	net_flush(conn)
+	// Readiness TLS: once the write fully drains (reads resume — net_flush restored .Read, so
+	// conn.writing is clear), decrypt+emit any plaintext that paused in the rbio under backpressure.
+	// Done AFTER net_flush returns (not inside it) so the pump's on_data → write → net_flush is a
+	// fresh top-level call, never a nested re-entry into the flush we're in.
+	if conn.tls && !conn.closing && !conn.writing && !conn.read_done {
+		tls_server_pump_reads(conn)
+	}
 }
 
 // net_set_mode flips the connection watcher between read and write interest (the reactor
@@ -1179,7 +1343,11 @@ net_end_cb :: proc "c" (
 		// Guarded like net_write_cb: kick / close below may free the conn otherwise.
 		conn.inflight += 1
 		defer net_op_finished(conn)
-		net_proactor_kick_send(conn)
+		// TLS: queue a close_notify (SSL_shutdown → pump) before draining; the close_notify's send
+		// keeps send_op live so the close-if-empty check below defers to on_send_complete. A
+		// still-handshaking conn has no session — begin_close no-ops and we hard-close immediately.
+		if conn.tls do tls_server_begin_close(conn)
+		else do net_proactor_kick_send(conn)
 		// Nothing left to drain → close now; otherwise on_send_complete closes once drained.
 		if !conn.closing &&
 		   conn.send_op == eventloop.OP_ID_INVALID &&
@@ -1188,7 +1356,11 @@ net_end_cb :: proc "c" (
 		}
 		return jsc.JSValueMakeUndefined(ctx)
 	}
-	net_flush(conn)
+	// Readiness: begin_close queues a close_notify (a no-op while still handshaking); net_flush then
+	// drains whatever is queued and, on full drain, honors end_after_drain — so a plain conn, a
+	// handshaking TLS conn (nothing to send → closes now), and an established TLS conn all converge.
+	if conn.tls do tls_server_begin_close(conn)
+	if !conn.closing do net_flush(conn)
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
@@ -1280,6 +1452,7 @@ net_conn_free_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	context = runtime.default_context() // free with the same heap net_accept_cb/proc"c" allocated under
 	conn := cast(^Net_Connection)user_data
 	delete(conn.write_queue)
+	tls_server_free_conn(conn) // free SSL/BIOs + cancel handshake timer (no-op on a plaintext conn)
 	free(conn)
 }
 
@@ -1293,6 +1466,14 @@ net_close_server :: proc(server: ^Net_Server) {
 	linux.close(linux.Fd(server.fd))
 	net_unprotect(server.ctx, server.on_connection)
 	server.on_connection = nil
+	// Free the per-listener SSL_CTX (unlike the client's process-global g_tls_ctx). Existing TLS
+	// connections keep their own SSL (per-conn, freed at their own teardown); SSL_CTX is refcounted,
+	// so freeing it here while conns still hold SSL_new references is safe.
+	if server.tls {
+		tls_server_ctx_free(cast(SSL_CTX)server.tls_ctx)
+		server.tls = false
+		server.tls_ctx = nil
+	}
 	if state := get_state_from_ctx(server.ctx); state != nil do delete_key(&state.net_servers, server.id)
 	eventloop.async_begin(server.loop)
 	eventloop.post_async(server.loop, net_server_free_cb, server)
@@ -1395,6 +1576,12 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 				eventloop.cancel_op(conn.loop, conn.recv_op)
 				eventloop.cancel_op(conn.loop, conn.send_op)
 			}
+			// Cancel an armed handshake timer NOW (loop still alive) so a deferred Op_Dispose free
+			// during eventloop.destroy doesn't clear_timeout against a torn-down timer heap.
+			if conn.handshake_timer != 0 {
+				eventloop.clear_timeout(conn.loop, conn.handshake_timer)
+				conn.handshake_timer = 0
+			}
 			// Zero-inflight (e.g. post-EOF, no op/disposer) finalizes now; a live-op conn is a
 			// no-op here and is freed by its Op_Dispose during eventloop.destroy, which the
 			// deferred teardown runs BEFORE destroy_runtime_state deletes net_conns (so the
@@ -1412,11 +1599,18 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 		net_unprotect(conn.ctx, conn.on_error)
 		net_unprotect(conn.ctx, conn.on_drain)
 		delete(conn.write_queue)
+		tls_server_free_conn(conn) // free SSL/BIOs + cancel handshake timer (no-op on a plaintext conn)
 		free(conn)
 	}
 	clear(&state.net_conns) // live-op proactor conns (if any) are freed by their Op_Dispose
 	state.net_starved_head, state.net_starved_tail = nil, nil // FIFO emptied (conns freed above / by disposer)
 	for _, server in state.net_servers {
+		// Free the per-listener SSL_CTX for every server about to be cleared (TLS or not, closing or
+		// not) so a drain_begin-closed listener doesn't leak its context at teardown.
+		if server.tls {
+			tls_server_ctx_free(cast(SSL_CTX)server.tls_ctx)
+			server.tls_ctx = nil
+		}
 		// COUPLING: net_drain_begin (graceful drain) may already have unwatched + closed this listener
 		// and set closing=true; skip it here to avoid a double unwatch/close. The two functions agree on
 		// this flag — a listener is unwatched+closed exactly once, by whichever runs first.
@@ -1436,6 +1630,10 @@ net_destroy_state :: proc(state: ^Runtime_State) {
 	net_shutdown_active(state)
 	delete(state.net_servers)
 	delete(state.net_conns)
+	// Free any TLS contexts still parked in the registry (createServer without a successful listen);
+	// listened ones moved to their Net_Server and were freed in net_shutdown_active.
+	for _, ctx_ptr in state.tls_server_ctxs do tls_server_ctx_free(cast(SSL_CTX)ctx_ptr)
+	delete(state.tls_server_ctxs)
 	// net_starved is an intrusive list (head/tail pointers, no backing allocation) — nothing to free.
 }
 

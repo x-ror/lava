@@ -17,6 +17,12 @@ make_net_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	return jsc.JSObjectMake(ctx, nil, nil)
 }
 
+// node:https is Linux-first too (tls_server.odin). Empty bindings so js/internal/https.js surfaces
+// a clear "unavailable" error instead of referencing missing native procs.
+make_https_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
+	return jsc.JSObjectMake(ctx, nil, nil)
+}
+
 net_shutdown_active :: proc(state: ^Runtime_State) {}
 
 net_destroy_state :: proc(state: ^Runtime_State) {}
