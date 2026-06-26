@@ -42,9 +42,6 @@ expectThrow('encrypted key without passphrase (must not hang)', () =>
 );
 expectThrow('missing cert', () => https.createServer({ key }));
 expectThrow('missing key', () => https.createServer({ cert }));
-expectThrow('rejectUnauthorized:true (deferred)', () =>
-  https.createServer({ key, cert, rejectUnauthorized: true }),
-);
 expectThrow('requestCert:true (deferred)', () =>
   https.createServer({ key, cert, requestCert: true }),
 );
@@ -52,17 +49,25 @@ expectThrow('ca set (deferred)', () => https.createServer({ key, cert, ca: cert 
 expectThrow('minVersion (deferred)', () =>
   https.createServer({ key, cert, minVersion: 'TLSv1.3' }),
 );
+expectThrow('secureProtocol (deferred legacy)', () =>
+  https.createServer({ key, cert, secureProtocol: 'TLSv1_2_method' }),
+);
+expectThrow('pfx (deferred)', () => https.createServer({ key, cert, pfx: cert }));
+expectThrow('sigalgs (deferred)', () => https.createServer({ key, cert, sigalgs: 'ECDSA+SHA256' }));
 expectThrow('requestListener-only form (no key/cert)', () => https.createServer(() => {}));
 
-// A benign options bag whose deferred fields are undefined/default must NOT throw.
-expectOk('benign options bag (undefined deferred fields)', () =>
+// A benign options bag whose deferred fields are undefined/null/default must NOT throw. Includes
+// rejectUnauthorized:true (a server no-op without requestCert) and null-valued knobs, both of which
+// are common in shared client/server config and must not spuriously throw.
+expectOk('benign options bag (undefined/null/default deferred fields)', () =>
   https.createServer({
     key,
     cert,
     ca: undefined,
     requestCert: false,
-    rejectUnauthorized: undefined,
-    minVersion: undefined,
+    rejectUnauthorized: true,
+    minVersion: null,
+    ciphers: null,
   }),
 );
 

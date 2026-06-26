@@ -28,26 +28,30 @@
     throw e;
   }
 
-  // Reject the deferred, security-sensitive options — but only when set to a value that would
-  // CHANGE behavior, so an ordinary options bag carrying `undefined`/default-equivalent fields
-  // (very common when spreading config) still works. Includes the legacy protocol/cipher knobs
-  // (secureProtocol/secureOptions/honorCipherOrder/ecdhCurve/dhparam) so a pin via the old API is
-  // rejected the same as the modern minVersion/ciphers — never silently weaker than requested.
+  // Reject the deferred, security-sensitive options — but only when set to a behavior-changing value
+  // (`!= null` skips both undefined AND null, so an ordinary options bag carrying defaults still
+  // works). Includes the legacy protocol/cipher knobs (secureProtocol/secureOptions/honorCipherOrder/
+  // ecdhCurve/dhparam/sigalgs) and pfx so a pin via any API is rejected the same as the modern
+  // minVersion/ciphers — never silently weaker than requested. rejectUnauthorized is intentionally
+  // NOT listed: on a server it is a no-op unless requestCert (rejected above), so a shared
+  // client/server config carrying `rejectUnauthorized: true` must not spuriously throw.
   function rejectDeferred(options) {
     if (options.requestCert) unsupported('requestCert');
-    if (options.rejectUnauthorized === true) unsupported('rejectUnauthorized');
     if (options.ca != null) unsupported('ca');
-    if (options.minVersion !== undefined) unsupported('minVersion');
-    if (options.maxVersion !== undefined) unsupported('maxVersion');
-    if (options.secureProtocol !== undefined) unsupported('secureProtocol');
-    if (options.secureOptions !== undefined) unsupported('secureOptions');
-    if (options.ciphers !== undefined) unsupported('ciphers');
-    if (options.honorCipherOrder !== undefined) unsupported('honorCipherOrder');
-    if (options.ecdhCurve !== undefined) unsupported('ecdhCurve');
+    if (options.minVersion != null) unsupported('minVersion');
+    if (options.maxVersion != null) unsupported('maxVersion');
+    if (options.secureProtocol != null) unsupported('secureProtocol');
+    if (options.secureOptions != null) unsupported('secureOptions');
+    if (options.ciphers != null) unsupported('ciphers');
+    if (options.honorCipherOrder != null) unsupported('honorCipherOrder');
+    if (options.ecdhCurve != null) unsupported('ecdhCurve');
+    if (options.sigalgs != null) unsupported('sigalgs');
     if (options.dhparam != null) unsupported('dhparam');
-    if (options.passphrase !== undefined) unsupported('passphrase');
+    if (options.privateKeyEngine != null) unsupported('privateKeyEngine');
+    if (options.pfx != null) unsupported('pfx');
+    if (options.passphrase != null) unsupported('passphrase');
     if (typeof options.SNICallback === 'function') unsupported('SNICallback');
-    if (options.ALPNProtocols !== undefined) unsupported('ALPNProtocols');
+    if (options.ALPNProtocols != null) unsupported('ALPNProtocols');
   }
 
   // Node accepts key/cert as a string, a Buffer, or (for multiple contexts) an array. M1 is one
@@ -114,12 +118,12 @@
       requestListener,
     );
 
-    // Free the context once the server is done with it. After a successful listen the native side
-    // owns it (freed on server close), so this no-ops then; it only matters for a context that was
-    // built but never listened on (createServer without listen, or a listen that failed). Such a
-    // context that is also never closed lingers until process teardown (net_destroy_state frees it),
-    // so a long-lived process that repeatedly builds-and-drops unlistened servers accumulates them —
-    // acceptable for M1, revisit if it becomes a real pattern.
+    // Free the context once the server is done with it, on 'close'. We do NOT free on 'error': that
+    // would add an 'error' listener and silently swallow a real bind failure (EADDRINUSE/EACCES),
+    // whereas Node lets it throw "Unhandled error" — the native listen path frees the context itself
+    // on a failed bind/listen (net_listen_cb's deferred free), so there is nothing to clean up here.
+    // A context built but never listened on (createServer without listen) is freed at process
+    // teardown (net_destroy_state); acceptable for M1.
     var freed = false;
     function freeCtx() {
       if (freed) return;
@@ -127,7 +131,6 @@
       if (typeof native.freeSecureContext === 'function') native.freeSecureContext(ctxId);
     }
     server.once('close', freeCtx);
-    server.once('error', freeCtx);
 
     return server;
   }
@@ -161,14 +164,16 @@
     clientUnsupported('https.Agent');
   }
 
+  // globalAgent is a plain object in Node, and is commonly READ at config time
+  // (https.globalAgent.maxSockets = N, typeof, destructuring). A throwing getter would crash on
+  // mere access — worse than undefined — so expose an inert object. The HTTPS client is fetch;
+  // this agent is never actually used to drive a request.
   module.exports = {
     createServer: createServer,
     Server: Server,
     request: request,
     get: get,
     Agent: Agent,
-    get globalAgent() {
-      return clientUnsupported('https.globalAgent');
-    },
+    globalAgent: { maxSockets: Infinity, maxFreeSockets: 256, sockets: {}, requests: {} },
   };
 });

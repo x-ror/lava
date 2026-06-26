@@ -145,6 +145,9 @@
         socket.emit('data', asBuffer(u8));
       },
       function () {
+        // Defense-in-depth: 'end' is a once-per-socket signal (Readable contract). The native side
+        // guards against a double EOF, but never emit twice even if a backend slips one through.
+        if (socket.readableEnded) return;
         socket.readableEnded = true;
         socket.emit('end');
       },

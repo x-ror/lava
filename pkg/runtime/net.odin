@@ -41,6 +41,9 @@ TLS_HANDSHAKE_TIMEOUT_MS :: 30_000
 @(private = "file")
 net_tls_handshake_timeout_ms_cached: u64 = 0
 
+// Racy-but-benign across Slice-3a worker threads (same pattern as net_force_readiness): the
+// check-then-write on this package global is an unsynchronized RMW, but every worker reads the same
+// env and writes the same value with an aligned store, so the worst case is a redundant recompute.
 net_tls_handshake_timeout_ms :: proc() -> u64 {
 	if net_tls_handshake_timeout_ms_cached == 0 {
 		net_tls_handshake_timeout_ms_cached = TLS_HANDSHAKE_TIMEOUT_MS
@@ -221,6 +224,28 @@ net_listen_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
+	// Optional 5th arg: a TLS context id (https.createServer → createSecureContext). Consume it from
+	// the registry up front and free it via the defer on ANY failure below (bad socket/bind/listen/
+	// watch). This means a failed listen never leaks the context AND never needs an 'error'-swallowing
+	// JS listener (which would hide EADDRINUSE). Ownership moves to the Net_Server only on success
+	// (listen_ok), at which point the defer no-ops and net_close_server owns the free.
+	tls_ctx: rawptr = nil
+	tls_enabled := false
+	if argument_count >= 5 && jsc.JSValueIsNumber(ctx, args[4]) {
+		ctx_id := u64(jsc.JSValueToNumber(ctx, args[4], nil))
+		if found, ok := state.tls_server_ctxs[ctx_id]; ok {
+			tls_ctx = found
+			tls_enabled = true
+			delete_key(&state.tls_server_ctxs, ctx_id)
+		} else {
+			if g_multi_worker do net_startup_failed()
+			if exception != nil do exception^ = make_js_error(ctx, "net.listen: invalid TLS context handle")
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+	}
+	listen_ok := false
+	defer if !listen_ok && tls_enabled do tls_server_ctx_free(cast(SSL_CTX)tls_ctx)
+
 	// Multi-worker (Slice 3a): every worker binds the same addr:port and the kernel load-balances
 	// connections across them via SO_REUSEPORT. An ephemeral port (0) can't work — each worker would
 	// get a DIFFERENT port, silently splitting the server into N single-core servers — so reject it
@@ -299,26 +324,6 @@ net_listen_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
-	// Optional 5th arg: a TLS context id (from https.createServer → createSecureContext). Consumed
-	// here, AFTER bind/listen succeed, so an EADDRINUSE leaves the context in the registry (freed at
-	// teardown or by https.js's freeSecureContext). Ownership moves from the registry to the
-	// Net_Server, which frees the SSL_CTX on close.
-	tls_ctx: rawptr = nil
-	tls_enabled := false
-	if argument_count >= 5 && jsc.JSValueIsNumber(ctx, args[4]) {
-		ctx_id := u64(jsc.JSValueToNumber(ctx, args[4], nil))
-		if found, ok := state.tls_server_ctxs[ctx_id]; ok {
-			tls_ctx = found
-			tls_enabled = true
-			delete_key(&state.tls_server_ctxs, ctx_id)
-		} else {
-			linux.close(sfd)
-			if g_multi_worker do net_startup_failed()
-			if exception != nil do exception^ = make_js_error(ctx, "net.listen: invalid TLS context handle")
-			return jsc.JSValueMakeUndefined(ctx)
-		}
-	}
-
 	server := new(Net_Server)
 	server.ctx = ctx
 	server.loop = loop
@@ -341,12 +346,12 @@ net_listen_cb :: proc "c" (
 		delete_key(&state.net_servers, server.id)
 		jsc.JSValueUnprotect(ctx, cast(jsc.JSValueRef)on_connection)
 		linux.close(sfd)
-		if server.tls do tls_server_ctx_free(cast(SSL_CTX)server.tls_ctx)
-		free(server)
+		free(server) // the deferred ctx-free (listen_ok still false) releases server.tls_ctx
 		if g_multi_worker do net_startup_failed()
 		if exception != nil do exception^ = make_js_error(ctx, "net.listen: could not register listener with the event loop")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
+	listen_ok = true // success: the Net_Server now owns tls_ctx; the defer no-ops
 	return jsc.JSValueMakeNumber(ctx, f64(server.id))
 }
 
@@ -631,8 +636,13 @@ net_recv_ring_complete :: proc(
 		if res > 0 {
 			if arg != nil do net_emit(conn.ctx, conn.on_data, &arg, 1)
 		} else if res == 0 {
+			// On a MULTISHOT ring recv the op stays armed across CQEs, so a graceful TLS close arrives
+			// as TWO completions — the close_notify (res>0, decrypted to a clean SSL EOF inside
+			// tls_server_on_ciphertext, which already set read_done + fired 'end') and then the FIN
+			// (res==0, here). Guard on read_done so the FIN does not fire a SECOND 'end'. A plaintext
+			// half-close reaches res==0 only once, so the guard is a no-op there.
+			if !conn.read_done do net_emit(conn.ctx, conn.on_end, nil, 0)
 			conn.read_done = true // EOF (always terminal — F_MORE clear)
-			net_emit(conn.ctx, conn.on_end, nil, 0)
 		} else if res == -i32(linux.Errno.EINVAL) && conn.recv_multishot {
 			// This op was submitted MULTISHOT and the kernel rejected it (has buffer rings but not
 			// RECV_MULTISHOT, e.g. Linux 5.19): disable multishot loop-wide; the terminal re-arm below
@@ -809,8 +819,10 @@ on_recv_complete :: proc(loop: ^eventloop.Loop, user_data: rawptr, res: i32) {
 				net_maybe_arm_recv(conn) // its guards handle a handler that closed/paused
 			}
 		} else if res == 0 {
+			// Single-shot can't double-fire (net_maybe_arm_recv gates on read_done after a TLS EOF),
+			// but guard for consistency with the ring path: never fire 'end' twice.
+			if !conn.read_done do net_emit(conn.ctx, conn.on_end, nil, 0)
 			conn.read_done = true // half-close: never re-arm
-			net_emit(conn.ctx, conn.on_end, nil, 0)
 		} else if res == -i32(linux.Errno.EINTR) || res == -i32(linux.Errno.EAGAIN) {
 			net_maybe_arm_recv(conn) // transient — a fresh submit (kernel re-polls), not a spin
 		} else if res != -i32(linux.Errno.ECANCELED) {
@@ -1233,7 +1245,14 @@ net_write_cb :: proc "c" (
 			if !tls_server_write(conn, view) do return jsc.JSValueMakeBoolean(ctx, false)
 		}
 		backpressured := conn.writing
-		if backpressured do conn.want_drain = true
+		if backpressured {
+			conn.want_drain = true
+		} else if !conn.closing && !conn.read_done {
+			// The queue drained via THIS write (not conn_write_cb). If a prior write had paused the
+			// decrypt loop with records still in the rbio, resume it now — no recv will arrive to
+			// drive the leftover (it's in userspace). No-op when nothing is buffered.
+			tls_server_pump_reads(conn)
+		}
 		return jsc.JSValueMakeBoolean(ctx, b32(!backpressured))
 	}
 

@@ -108,6 +108,11 @@ check-runtime:
 	$(ODIN) check pkg/runtime/eventloop -no-entry-point
 	$(ODIN) check pkg/runtime/picohttpparser -no-entry-point
 	$(ODIN) check pkg/std/sqlite -no-entry-point
+	# Cross-platform front-end check (no link): catches a compile/symbol regression in the
+	# non-Linux stubs (net_other.odin) and the linux,windows TLS bindings before they reach a
+	# Windows/macOS build. `odin check` doesn't link, so it can't fully prove symbol elision.
+	$(ODIN) check pkg/runtime -no-entry-point -collection:lava=. -target:windows_amd64
+	$(ODIN) check pkg/runtime -no-entry-point -collection:lava=. -target:darwin_arm64
 
 # Compile vendored C deps (picohttpparser) Odin links into the runtime. Idempotent;
 # `odin check` does not need it, but every link of cmd/lava (build, test-odin) does.

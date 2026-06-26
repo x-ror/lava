@@ -235,6 +235,7 @@ tls_server_on_ciphertext :: proc(conn: ^Net_Connection, cipher: []byte) {
 @(private = "file")
 tls_server_do_handshake :: proc(conn: ^Net_Connection) -> (done: bool) {
 	ssl := cast(SSL)conn.ssl
+	ERR_clear_error() // clear cross-conn error-queue residue before classifying (see tls_server_read_loop)
 	ret := SSL_accept(ssl)
 	step := tls_step(ssl, ret) // capture before any BIO op
 	tls_pump_wbio(conn) // send whatever handshake records SSL_accept produced
@@ -275,6 +276,10 @@ tls_server_pump_reads :: proc(conn: ^Net_Connection) {
 @(private = "file")
 tls_server_read_loop :: proc(conn: ^Net_Connection) {
 	ssl := cast(SSL)conn.ssl
+	// The error queue is thread-local and shared by every conn on this loop: a prior conn's failed op
+	// could leave residue that flips this op's SSL_get_error (SYSCALL vs SSL) and misclassify a clean
+	// EOF as fatal. Clear before classifying. (A clean SSL_read never pushes, so once per loop is enough.)
+	ERR_clear_error()
 	buf: [16384]byte
 	for {
 		n := SSL_read(ssl, raw_data(buf[:]), c.int(len(buf)))
@@ -315,6 +320,7 @@ tls_server_read_loop :: proc(conn: ^Net_Connection) {
 tls_server_write :: proc(conn: ^Net_Connection, plaintext: []byte) -> bool {
 	if len(plaintext) == 0 do return !conn.closing
 	ssl := cast(SSL)conn.ssl
+	ERR_clear_error() // clear cross-conn error-queue residue before classifying (see tls_server_read_loop)
 	n := SSL_write(ssl, raw_data(plaintext), c.int(len(plaintext)))
 	step := tls_step(ssl, n) // capture before the pump
 	tls_pump_wbio(conn)
