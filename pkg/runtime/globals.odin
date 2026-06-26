@@ -67,6 +67,12 @@ Runtime_State :: struct {
 	// is open; net_shutdown_active tears them down before the loop/context die.
 	net_servers:       map[u64]^Net_Server,
 	net_conns:         map[u64]^Net_Connection,
+	// node:https per-listener TLS contexts (tls_server.odin): id -> ^SSL_CTX (rawptr so this
+	// cross-platform struct need not name the OpenSSL binding). createSecureContext builds one and
+	// parks it here; net.listen consumes it (ownership moves to the Net_Server); any left unconsumed
+	// (createServer without listen) are freed at teardown. Keyed off next_net_id. Linux-only in
+	// practice; the map is inert on platforms without node:net.
+	tls_server_ctxs:   map[u64]rawptr,
 	// Intrusive FIFO of ProactorRing conns parked on -ENOBUFS (Slice 2a). head/tail + the conn's
 	// starved_next/prev give O(1) enqueue/dequeue/remove (a [dynamic] with ordered_remove was O(K)
 	// per op → O(K^2) to drain/close K parked conns at 10k-conn scale, precisely during overload).
@@ -135,6 +141,7 @@ new_runtime_state :: proc(loop: ^eventloop.Loop) -> ^Runtime_State {
 	state.next_sqlite_id = 1
 	state.net_servers = make(map[u64]^Net_Server)
 	state.net_conns = make(map[u64]^Net_Connection)
+	state.tls_server_ctxs = make(map[u64]rawptr)
 	state.next_net_id = 1
 	return state
 }
@@ -939,6 +946,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"dns/promises", INTERNAL_DNS_PROMISES},
 		{"net", INTERNAL_NET},
 		{"http", INTERNAL_HTTP},
+		{"https", INTERNAL_HTTPS},
 		{"os", INTERNAL_OS},
 		{"querystring", INTERNAL_QUERYSTRING},
 		{"string_decoder", INTERNAL_STRING_DECODER},
@@ -978,6 +986,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "dns", cast(jsc.JSValueRef)make_dns_bindings(ctx))
 	set_named(ctx, natives, "net", cast(jsc.JSValueRef)make_net_bindings(ctx))
 	set_named(ctx, natives, "http", cast(jsc.JSValueRef)make_http_bindings(ctx))
+	set_named(ctx, natives, "https", cast(jsc.JSValueRef)make_https_bindings(ctx))
 	set_named(ctx, natives, "os", cast(jsc.JSValueRef)make_os_bindings(ctx))
 	set_named(ctx, natives, "tty", cast(jsc.JSValueRef)make_tty_bindings(ctx))
 
@@ -1238,6 +1247,7 @@ INTERNAL_CONSOLE :: #load("js/internal/console.js", string)
 INTERNAL_TTY :: #load("js/internal/tty.js", string)
 INTERNAL_NET :: #load("js/internal/net.js", string)
 INTERNAL_HTTP :: #load("js/internal/http.js", string)
+INTERNAL_HTTPS :: #load("js/internal/https.js", string)
 INTERNAL_DIAGNOSTICS_CHANNEL :: #load("js/internal/diagnostics_channel.js", string)
 INTERNAL_PARSE_ARGS :: #load("js/internal/parse_args.js", string)
 INTERNAL_PARSE_ENV :: #load("js/internal/parse_env.js", string)

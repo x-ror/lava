@@ -73,6 +73,12 @@ jobs:
       - name: HTTP server smoke
         run: make test-http-smoke
 
+      # node:https server: a self-signed cert is generated, the Lava HTTPS server is hit by
+      # Lava's own TLS client (fetch) over both backends (proactor + readiness), and the
+      # synchronous cert/option error cases are asserted. Binds a local port — its own gate.
+      - name: HTTPS server smoke
+        run: make test-https-smoke
+
       # Multi-core workers (Slice 3a): N workers share a port via SO_REUSEPORT, load distributes,
       # listen(0) is rejected, SIGTERM drains gracefully. Binds a local port — its own gate.
       - name: Multi-core workers smoke

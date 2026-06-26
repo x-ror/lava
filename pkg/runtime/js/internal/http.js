@@ -739,13 +739,17 @@
     this.requestTimeout = 300000;
     // Honor timeouts configured at construction (Node's createServer(options) form), not
     // only post-construction mutation.
+    var tlsContext;
     if (options && typeof options === 'object') {
       if (typeof options.keepAliveTimeout === 'number')
         this.keepAliveTimeout = options.keepAliveTimeout;
       if (typeof options.headersTimeout === 'number') this.headersTimeout = options.headersTimeout;
       if (typeof options.requestTimeout === 'number') this.requestTimeout = options.requestTimeout;
+      // https.createServer threads its built TLS context here; net wraps each connection on it.
+      // The decrypted socket runs the SAME request/response machinery — nothing else changes.
+      tlsContext = options.tls;
     }
-    this._net = net.createServer(function (socket) {
+    this._net = net.createServer({ tls: tlsContext }, function (socket) {
       onConnection(self, socket);
     });
     this._net.on('listening', function () {

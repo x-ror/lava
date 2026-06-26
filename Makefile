@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -108,6 +108,11 @@ check-runtime:
 	$(ODIN) check pkg/runtime/eventloop -no-entry-point
 	$(ODIN) check pkg/runtime/picohttpparser -no-entry-point
 	$(ODIN) check pkg/std/sqlite -no-entry-point
+	# Cross-platform front-end check (no link): catches a compile/symbol regression in the
+	# non-Linux stubs (net_other.odin) and the linux,windows TLS bindings before they reach a
+	# Windows/macOS build. `odin check` doesn't link, so it can't fully prove symbol elision.
+	$(ODIN) check pkg/runtime -no-entry-point -collection:lava=. -target:windows_amd64
+	$(ODIN) check pkg/runtime -no-entry-point -collection:lava=. -target:darwin_arm64
 
 # Compile vendored C deps (picohttpparser) Odin links into the runtime. Idempotent;
 # `odin check` does not need it, but every link of cmd/lava (build, test-odin) does.
@@ -201,6 +206,11 @@ test-net-smoke: build
 test-http-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-http-smoke.sh
 	LAVA_BIN="$(LAVA)" LAVA_NET_FORCE_READINESS=1 ./scripts/run-http-smoke.sh
+
+# The https smoke drives BOTH backends itself (proactor + readiness inside the script), so it is a
+# single invocation unlike the http/zerocopy smokes.
+test-https-smoke: build
+	LAVA_BIN="$(LAVA)" ./scripts/run-https-smoke.sh
 
 test-multicore-smoke: build
 	LAVA_BIN="$(LAVA)" ./scripts/run-multicore-smoke.sh
