@@ -164,8 +164,14 @@
     var args = Array.prototype.slice.call(arguments, 4);
     var ctx = context || {};
     var self = this;
-    if (position === undefined || position === null || position < 0) position = args.length;
+    // Node's default is -1: negative positions resolve from the end (args.at),
+    // so the wrapper REPLACES the last argument instead of being appended past it.
+    if (position === undefined || position === null) position = -1;
+    if (position < 0) position = args.length + position;
     var callback = args[position];
+    if (typeof callback !== 'function') {
+      throw new TypeError('The "callback" argument must be of type function');
+    }
     args[position] = function (err) {
       if (err) {
         ctx.error = err;

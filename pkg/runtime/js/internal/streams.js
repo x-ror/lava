@@ -956,6 +956,13 @@
   }
 
   function writableStreamClose(stream) {
+    // Spec step 2: a closed/errored stream rejects — its close/write algorithms
+    // were already cleared, so falling through would crash on _closeAlgorithm().
+    if (stream._state === 'closed' || stream._state === 'errored') {
+      return promiseRejectedWith(
+        new TypeError('Cannot close a ' + stream._state + ' WritableStream'),
+      );
+    }
     var deferred = newDeferred();
     stream._closeRequest = deferred;
     var writer = stream._writer;

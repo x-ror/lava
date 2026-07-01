@@ -46,8 +46,12 @@
     }
     var listeners = signal._listeners.slice();
     for (var i = 0; i < listeners.length; i++) {
+      if (listeners[i].once) {
+        var at = signal._listeners.indexOf(listeners[i]);
+        if (at !== -1) signal._listeners.splice(at, 1);
+      }
       try {
-        listeners[i].call(signal, event);
+        listeners[i].fn.call(signal, event);
       } catch (e) {
         reportOrIgnore(e);
       }
@@ -67,6 +71,9 @@
     signal._aborted = true;
     signal._reason = reason === undefined ? abortError() : reason;
     fireAbort(signal);
+    // An aborted signal can never fire again: drop every listener so their
+    // closures (and anything they capture) become collectable immediately.
+    signal._listeners.length = 0;
   }
 
   Object.defineProperty(AbortSignal.prototype, 'aborted', {
@@ -93,13 +100,21 @@
   AbortSignal.prototype.throwIfAborted = function () {
     if (this._aborted) throw this._reason;
   };
-  AbortSignal.prototype.addEventListener = function (type, listener) {
+  function findListener(list, listener) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].fn === listener) return i;
+    }
+    return -1;
+  }
+  AbortSignal.prototype.addEventListener = function (type, listener, options) {
     if (type !== ABORT || typeof listener !== 'function') return;
-    if (this._listeners.indexOf(listener) === -1) this._listeners.push(listener);
+    if (findListener(this._listeners, listener) === -1) {
+      this._listeners.push({ fn: listener, once: !!(options && options.once) });
+    }
   };
   AbortSignal.prototype.removeEventListener = function (type, listener) {
     if (type !== ABORT) return;
-    var index = this._listeners.indexOf(listener);
+    var index = findListener(this._listeners, listener);
     if (index !== -1) this._listeners.splice(index, 1);
   };
   AbortSignal.prototype.dispatchEvent = function (event) {
