@@ -6,7 +6,7 @@ import "core:c"
 import jsc "lava:pkg/jsc"
 import eventloop "lava:pkg/runtime/eventloop"
 
-// TLS server state machine for https.createServer (design: docs/tls-server-design.md).
+// TLS server state machine for https.createServer (design reviewed in PR #298, implemented in #299).
 // Transparent at the native net layer: net.odin wraps an accepted connection in an SSL
 // object backed by two BIO_s_mem memory BIOs, so the proactor still owns the socket and
 // SSL_read/SSL_write run synchronously on completion-mode buffers (the fetch CLIENT's
