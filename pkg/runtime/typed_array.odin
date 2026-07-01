@@ -27,6 +27,9 @@ typed_array_view :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> ([]byt
 	obj := cast(jsc.JSObjectRef)value
 	n := int(jsc.JSObjectGetTypedArrayByteLength(ctx, obj, nil))
 	if n == 0 do return nil, true
+	// Re-verified 2026-07-01: javascriptcoregtk-6.0's BytesPtr STILL returns the
+	// buffer base with the view's byteOffset unapplied (a pooled Buffer decodes the
+	// pool prefix instead of itself), so the 3-call chain below stays mandatory.
 	buffer := jsc.JSObjectGetTypedArrayBuffer(ctx, obj, nil)
 	if buffer == nil do return nil, false
 	base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, buffer, nil)
