@@ -126,6 +126,10 @@ for (const name of names) {
     const ratio = n.ms > 0 ? l.ms / n.ms : 0;
     ratioStr = `${ratio.toFixed(2)}x`;
     if (GATE && cap != null && ratio > cap) breaches.push({ name, ratio, cap });
+  } else if (haveLava && GATE && cap != null) {
+    // A gated benchmark that produced no lava result (crash, missing ##BENCH##
+    // line) must breach, not silently vanish from the gate.
+    breaches.push({ name, ratio: Infinity, cap });
   }
   console.log(
     `${pad(name, 26)} ${padL(n.ms.toFixed(3), 12)} ${padL(l ? l.ms.toFixed(3) : '-', 12)} ${padL(ratioStr, 8)} ${padL(capStr, 6)}`,
