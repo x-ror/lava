@@ -3,8 +3,6 @@ package lava_runtime
 import "base:runtime"
 import "core:bytes"
 import "core:c"
-import "core:encoding/base64"
-import "core:encoding/hex"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -17,6 +15,37 @@ import jsc "lava:pkg/jsc"
 // the loader passes as the factory's fourth argument — same mechanism as crypto
 // (see runtime-native-builtin-bindings). The JS layer owns Node's encoding
 // quirks (lenient base64 normalization, ascii/latin1); these do the bulk work.
+
+// Codec lookup tables. The encoders write straight into a NUL-terminated temp
+// buffer that goes to JSStringCreateWithUTF8CString (pure-ASCII output, so JSC
+// builds an 8-bit StringImpl) — one write pass + one JSC pass, no intermediate
+// clone. The decode tables map a byte to its value, 0xFF = not in the alphabet.
+@(private = "file") HEX_DIGITS := "0123456789abcdef"
+@(private = "file") B64_ALPHABET := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+@(private = "file") g_hex_val: [256]u8
+@(private = "file") g_b64_val: [256]u8
+
+@(init, private = "file")
+buffer_codec_tables_init :: proc "contextless" () {
+	for i in 0 ..< 256 {
+		g_hex_val[i] = 0xFF
+		g_b64_val[i] = 0xFF
+	}
+	for ch, v in "0123456789" do g_hex_val[ch] = u8(v)
+	for ch, v in "abcdef" do g_hex_val[ch] = u8(v) + 10
+	for ch, v in "ABCDEF" do g_hex_val[ch] = u8(v) + 10
+	for ch, v in B64_ALPHABET do g_b64_val[ch] = u8(v)
+}
+
+// ascii_string_value builds a JS string from a NUL-terminated ASCII buffer that
+// was allocated with exactly one spare byte for the terminator. Factored so every
+// encoder returns through the same JSC path.
+@(private = "file")
+ascii_string_value :: proc(ctx: jsc.JSContextRef, buf: []byte) -> jsc.JSValueRef {
+	js_str := jsc.JSStringCreateWithUTF8CString(cstring(raw_data(buf)))
+	defer jsc.JSStringRelease(js_str)
+	return jsc.JSValueMakeString(ctx, js_str)
+}
 
 // hexEncode(u8) -> string. Lowercase hex, matching Buffer.toString('hex').
 buffer_hex_encode_cb :: proc "c" (
@@ -33,9 +62,13 @@ buffer_hex_encode_cb :: proc "c" (
 	data, ok := typed_array_view(ctx, arguments[0])
 	if !ok || len(data) == 0 do return js_string_value(ctx, "")
 
-	encoded, err := hex.encode(data, context.temp_allocator)
-	if err != nil do return js_string_value(ctx, "")
-	return js_string_value(ctx, string(encoded))
+	out := make([]byte, len(data) * 2 + 1, context.temp_allocator)
+	for b, i in data {
+		out[i * 2] = HEX_DIGITS[b >> 4]
+		out[i * 2 + 1] = HEX_DIGITS[b & 0x0F]
+	}
+	out[len(data) * 2] = 0
+	return ascii_string_value(ctx, out)
 }
 
 // hexDecode(string) -> Uint8Array. Decodes byte pairs and stops at the first
@@ -51,16 +84,32 @@ buffer_hex_decode_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return make_uint8_array(ctx, nil)
 
-	str, alloc := jsc_value_to_string_or_default(ctx, arguments[0])
-	defer if alloc do delete(str, context.allocator)
+	// Read the string as UTF-16 code units in place (GetCharactersPtr) instead of
+	// converting to a UTF-8 copy: hex input is ASCII, so each unit IS the char and
+	// a unit >= 256 is simply not in the alphabet (the table covers 0..255).
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
+	if js_string == nil do return make_uint8_array(ctx, nil)
+	defer jsc.JSStringRelease(js_string)
+	length := int(jsc.JSStringGetLength(js_string))
+	if length < 2 do return make_uint8_array(ctx, nil)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return make_uint8_array(ctx, nil)
 
-	out := make([dynamic]byte, 0, len(str) / 2, context.allocator)
-	for i := 0; i + 1 < len(str); i += 2 {
-		b, ok := hex.decode_sequence(str[i:i + 2])
-		if !ok do break
-		append(&out, b)
+	// Exact-capacity output owned by context.allocator: make_uint8_array hands the
+	// backing store to JSC NoCopy and jsc_buffer_deallocator frees it on collection.
+	out := make([]byte, length / 2, context.allocator)
+	n := 0
+	for i := 0; i + 1 < length; i += 2 {
+		c0 := chars[i]
+		c1 := chars[i + 1]
+		if c0 >= 256 || c1 >= 256 do break
+		hi := g_hex_val[c0]
+		lo := g_hex_val[c1]
+		if hi == 0xFF || lo == 0xFF do break
+		out[n] = hi << 4 | lo
+		n += 1
 	}
-	return make_uint8_array(ctx, out[:])
+	return make_uint8_array(ctx, out[:n])
 }
 
 // base64Encode(u8) -> string. Standard alphabet with padding, matching
@@ -79,14 +128,42 @@ buffer_base64_encode_cb :: proc "c" (
 	data, ok := typed_array_view(ctx, arguments[0])
 	if !ok || len(data) == 0 do return js_string_value(ctx, "")
 
-	encoded, err := base64.encode(data, base64.ENC_TABLE, context.temp_allocator)
-	if err != nil do return js_string_value(ctx, "")
-	return js_string_value(ctx, encoded)
+	n := len(data)
+	out := make([]byte, (n + 2) / 3 * 4 + 1, context.temp_allocator)
+	di := 0
+	i := 0
+	for ; i + 2 < n; i += 3 {
+		v := u32(data[i]) << 16 | u32(data[i + 1]) << 8 | u32(data[i + 2])
+		out[di] = B64_ALPHABET[v >> 18]
+		out[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
+		out[di + 2] = B64_ALPHABET[v >> 6 & 0x3F]
+		out[di + 3] = B64_ALPHABET[v & 0x3F]
+		di += 4
+	}
+	switch n - i {
+	case 1:
+		v := u32(data[i]) << 16
+		out[di] = B64_ALPHABET[v >> 18]
+		out[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
+		out[di + 2] = '='
+		out[di + 3] = '='
+		di += 4
+	case 2:
+		v := u32(data[i]) << 16 | u32(data[i + 1]) << 8
+		out[di] = B64_ALPHABET[v >> 18]
+		out[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
+		out[di + 2] = B64_ALPHABET[v >> 6 & 0x3F]
+		out[di + 3] = '='
+		di += 4
+	}
+	out[di] = 0
+	return ascii_string_value(ctx, out)
 }
 
 // base64Decode(string) -> Uint8Array. The JS layer normalizes the input
 // (strips non-alphabet chars, fixes padding) so the string handed here is clean,
-// padded standard base64 — exactly what core:encoding/base64 expects.
+// padded standard base64; anything else yields an empty array, matching the old
+// core:encoding/base64 error behavior.
 buffer_base64_decode_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -98,13 +175,50 @@ buffer_base64_decode_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return make_uint8_array(ctx, nil)
 
-	str, alloc := jsc_value_to_string_or_default(ctx, arguments[0])
-	defer if alloc do delete(str, context.allocator)
-	if len(str) == 0 do return make_uint8_array(ctx, nil)
+	// Same in-place UTF-16 read as hexDecode: base64 input is ASCII by contract.
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
+	if js_string == nil do return make_uint8_array(ctx, nil)
+	defer jsc.JSStringRelease(js_string)
+	length := int(jsc.JSStringGetLength(js_string))
+	if length == 0 || length % 4 != 0 do return make_uint8_array(ctx, nil)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return make_uint8_array(ctx, nil)
 
-	decoded, err := base64.decode(str, base64.DEC_TABLE)
-	if err != nil do return make_uint8_array(ctx, nil)
-	return make_uint8_array(ctx, decoded)
+	groups := length / 4
+	out := make([]byte, groups * 3, context.allocator)
+	n := 0
+	for g in 0 ..< groups {
+		s := chars[g * 4:g * 4 + 4]
+		if s[0] >= 256 || s[1] >= 256 || s[2] >= 256 || s[3] >= 256 {
+			delete(out, context.allocator)
+			return make_uint8_array(ctx, nil)
+		}
+		d0 := g_b64_val[s[0]]
+		d1 := g_b64_val[s[1]]
+		pad2 := s[2] == '='
+		pad3 := s[3] == '='
+		d2 := pad2 ? 0 : g_b64_val[s[2]]
+		d3 := pad3 ? 0 : g_b64_val[s[3]]
+		// Padding is only legal in the final group, and '=' before a non-'=' is
+		// malformed ("x=y="); both fail closed like core:encoding/base64 did.
+		if d0 == 0xFF || d1 == 0xFF || d2 == 0xFF || d3 == 0xFF ||
+		   (pad2 && !pad3) || ((pad2 || pad3) && g != groups - 1) {
+			delete(out, context.allocator)
+			return make_uint8_array(ctx, nil)
+		}
+		v := u32(d0) << 18 | u32(d1) << 12 | u32(d2) << 6 | u32(d3)
+		out[n] = byte(v >> 16)
+		n += 1
+		if !pad2 && !pad3 {
+			out[n] = byte(v >> 8)
+			out[n + 1] = byte(v)
+			n += 2
+		} else if !pad2 {
+			out[n] = byte(v >> 8)
+			n += 1
+		}
+	}
+	return make_uint8_array(ctx, out[:n])
 }
 
 // utf8Encode(string) -> Uint8Array. JavaScriptCore already produced a UTF-8
@@ -246,6 +360,26 @@ buffer_utf8_decode_cb :: proc "c" (
 
 	data, ok := typed_array_view(ctx, arguments[0])
 	if !ok || len(data) == 0 do return js_string_value(ctx, "")
+
+	// Fast path: NUL-free input goes through JSC's own UTF-8 conversion
+	// (JSStringCreateWithUTF8CString), which validates strictly and builds an
+	// 8-bit StringImpl for ASCII — one JSC pass instead of our WHATWG decode into
+	// a UTF-16 buffer plus a second copying create. Valid UTF-8 decodes
+	// identically under both, so this only diverts inputs where the replacement
+	// rule cannot fire. Invalid input comes back as an EMPTY string (that is the
+	// documented C-API failure mode), which a non-empty input can never produce
+	// legitimately — detected below and sent down the WHATWG path.
+	if bytes.index_byte(data, 0) < 0 {
+		tmp := make([]byte, len(data) + 1, context.temp_allocator)
+		copy(tmp, data)
+		tmp[len(data)] = 0
+		js_str := jsc.JSStringCreateWithUTF8CString(cstring(raw_data(tmp)))
+		if jsc.JSStringGetLength(js_str) > 0 {
+			defer jsc.JSStringRelease(js_str)
+			return jsc.JSValueMakeString(ctx, js_str)
+		}
+		jsc.JSStringRelease(js_str)
+	}
 
 	// +1 headroom for a trailing-replacement at end of input (see proc docs).
 	units := make([]u16, len(data) + 1, context.temp_allocator)
