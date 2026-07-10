@@ -19,6 +19,8 @@
   var nativeIsValidUtf8 = typeof native.isValidUtf8 === 'function' ? native.isValidUtf8 : null;
   var nativeUtf8WriteInto =
     typeof native.utf8WriteInto === 'function' ? native.utf8WriteInto : null;
+  var nativeLatin1WriteInto =
+    typeof native.latin1WriteInto === 'function' ? native.latin1WriteInto : null;
   var nativeLatin1Encode = typeof native.latin1Encode === 'function' ? native.latin1Encode : null;
   var nativeLatin1Decode = typeof native.latin1Decode === 'function' ? native.latin1Decode : null;
   var nativeAsciiDecode = typeof native.asciiDecode === 'function' ? native.asciiDecode : null;
@@ -769,6 +771,13 @@
         if (max > remaining) max = remaining;
         if (max <= 0) return 0;
         return nativeUtf8WriteInto(this, String(string), offset, max);
+      }
+      // latin1/ascii: one output byte per code unit — write in place like utf8WriteInto.
+      if ((enc === 'latin1' || enc === 'ascii') && nativeLatin1WriteInto !== null) {
+        var maxL = length === undefined ? remaining : toInteger(length, 0);
+        if (maxL > remaining) maxL = remaining;
+        if (maxL <= 0) return 0;
+        return nativeLatin1WriteInto(this, String(string), offset, maxL);
       }
       var bytes = strToBytes(String(string), enc);
       length =

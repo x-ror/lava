@@ -576,8 +576,8 @@ buffer_latin1_encode_cb :: proc "c" (
 // latin1_string_from_bytes builds a JS string where each input byte becomes one
 // UTF-16 unit (ISO-8859-1 / Node 'latin1'). Pure ASCII without NULs takes the
 // dense 8-bit StringImpl path (UTF-8 create); anything with a high bit or NUL
-// goes through CreateWithCharacters so bytes are preserved.
-@(private = "file")
+// goes through CreateWithCharacters so bytes are preserved. Shared with the
+// node:http request parser (header name/value/method/url).
 latin1_string_from_bytes :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef {
 	if len(data) == 0 do return js_string_value(ctx, "")
 	ascii := true
@@ -651,6 +651,48 @@ buffer_ascii_decode_cb :: proc "c" (
 	return latin1_string_from_bytes(ctx, masked)
 }
 
+// latin1WriteInto(target, string, offset, maxLength) -> bytesWritten. Copies the
+// low byte of each UTF-16 code unit of `string` into `target` at `offset`, up to
+// maxLength / remaining space — the in-place form of latin1Encode used by
+// Buffer.write('latin1'/'ascii') and node:http response-head serialization
+// (writeLatin1Into / head coalesce). No intermediate Uint8Array.
+buffer_latin1_write_into_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 4 do return jsc.JSValueMakeNumber(ctx, 0)
+	target, tok := typed_array_view(ctx, arguments[0])
+	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
+
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[1], nil)
+	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
+	defer jsc.JSStringRelease(js_string)
+	slen := int(jsc.JSStringGetLength(js_string))
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil || slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+
+	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
+	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
+	if offset < 0 do offset = 0
+	if offset > len(target) do offset = len(target)
+	avail := len(target) - offset
+	n := slen
+	if n > max do n = max
+	if n > avail do n = avail
+	if n <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
+
+	dst := target[offset:][:n]
+	for i in 0 ..< n {
+		dst[i] = byte(chars[i] & 0xFF)
+	}
+	return jsc.JSValueMakeNumber(ctx, f64(n))
+}
+
 // utf8WriteInto(target, string, offset, maxLength) -> bytesWritten. Encodes the
 // string to UTF-8 (JSC already produced those bytes when the value was read) and
 // copies up to maxLength of them straight into the caller's Buffer at offset —
@@ -699,6 +741,7 @@ make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "latin1Encode", buffer_latin1_encode_cb)
 	inject_native_function(ctx, bindings, "latin1Decode", buffer_latin1_decode_cb)
 	inject_native_function(ctx, bindings, "asciiDecode", buffer_ascii_decode_cb)
+	inject_native_function(ctx, bindings, "latin1WriteInto", buffer_latin1_write_into_cb)
 	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
 	inject_native_function(ctx, bindings, "compare", buffer_compare_cb)
 	inject_native_function(ctx, bindings, "indexOf", buffer_index_of_cb)
