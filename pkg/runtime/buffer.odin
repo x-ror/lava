@@ -70,8 +70,6 @@ buffer_hex_encode_cb :: proc "c" (
 	return ascii_string_value(ctx, out)
 }
 
-// hexDecode(string) -> Uint8Array. Decodes byte pairs and stops at the first
-// non-hex pair (or a dangling nibble), mirroring Node's Buffer.from(str, 'hex').
 buffer_hex_decode_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -83,9 +81,6 @@ buffer_hex_decode_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return make_uint8_array(ctx, nil)
 
-	// Read the string as UTF-16 code units in place (GetCharactersPtr) instead of
-	// converting to a UTF-8 copy: hex input is ASCII, so each unit IS the char and
-	// a unit >= 256 is simply not in the alphabet (the table covers 0..255).
 	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
 	if js_string == nil do return make_uint8_array(ctx, nil)
 	defer jsc.JSStringRelease(js_string)
@@ -94,21 +89,21 @@ buffer_hex_decode_cb :: proc "c" (
 	chars := jsc.JSStringGetCharactersPtr(js_string)
 	if chars == nil do return make_uint8_array(ctx, nil)
 
-	// Exact-capacity output owned by context.allocator: make_uint8_array hands the
-	// backing store to JSC NoCopy and jsc_buffer_deallocator frees it on collection.
-	out := make([]byte, length / 2, context.allocator)
 	n := 0
 	for i := 0; i + 1 < length; i += 2 {
 		c0 := chars[i]
 		c1 := chars[i + 1]
 		if c0 >= 256 || c1 >= 256 do break
-		hi := g_hex_val[c0]
-		lo := g_hex_val[c1]
-		if hi == 0xFF || lo == 0xFF do break
-		out[n] = hi << 4 | lo
+		if g_hex_val[c0] == 0xFF || g_hex_val[c1] == 0xFF do break
 		n += 1
 	}
-	return make_uint8_array(ctx, out[:n])
+	if n == 0 do return make_uint8_array(ctx, nil)
+
+	out := make([]byte, n, context.allocator)
+	for i, j := 0, 0; j < n; i, j = i + 2, j + 1 {
+		out[j] = g_hex_val[chars[i]] << 4 | g_hex_val[chars[i + 1]]
+	}
+	return make_uint8_array(ctx, out)
 }
 
 // base64Encode(u8) -> string. Standard alphabet with padding, matching

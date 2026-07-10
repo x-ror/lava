@@ -76,6 +76,11 @@ os_avail_parallelism :: proc() -> int {
 	return 1
 }
 
+os_process_rss_bytes :: proc() -> u64 {
+	// task_info is not bound; fall back to 0 (rss still useful on Linux where we probe).
+	return 0
+}
+
 os_totalmem :: proc() -> u64 {
 	v, ok := sysctl_u64("hw.memsize")
 	if !ok {
