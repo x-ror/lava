@@ -1,13 +1,19 @@
-// node:buffer — Buffer implemented as a Uint8Array subclass. The hot codecs are
-// backed by Odin (pkg/runtime/buffer.odin); API glue and Node compatibility
-// behavior live here.
+/**
+ * @fileoverview node:buffer — `Buffer` as a `Uint8Array` subclass.
+ *
+ * Codecs and byte-ops are Odin natives (`pkg/runtime/buffer.odin`) injected via
+ * the loader's fourth `native` argument. This file owns Node API glue, errors,
+ * pooling, and Blob/File/object-URL helpers.
+ *
+ * @module lava/internal/buffer
+ */
+
 (function (require, module, exports, native) {
   'use strict';
 
   if (!native) throw new Error('node:buffer requires native codec bindings');
 
-  // Require the full native codec surface. No JS polyfills / size-gated fallbacks —
-  // every encode/decode/byte-op goes through Odin (pkg/runtime/buffer.odin).
+  /** @param {string} name @returns {Function} */
   function requireNative(name) {
     var fn = native[name];
     if (typeof fn !== 'function') throw new Error('node:buffer missing native binding: ' + name);
@@ -31,70 +37,65 @@
   var nativeCompare = requireNative('compare');
   var nativeIndexOf = requireNative('indexOf');
   var nativeIsValidUtf8 = requireNative('isValidUtf8');
-  // (size) -> uninitialized Uint8Array | null — optional; null → zero-filled fallback
-  // in allocUnsafeNoZero (allocation failure path, not a codec polyfill).
+  /** @type {((size: number) => Uint8Array|null)|null} */
   var nativeAllocUninit = typeof native.allocUninit === 'function' ? native.allocUninit : null;
 
+  /** @param {string} str @returns {Uint8Array} */
   function utf8Encode(str) {
     return utf8EncodeNative(String(str));
   }
+  /** @param {Uint8Array} bytes @returns {string} */
   function utf8Decode(bytes) {
     return utf8DecodeNative(bytes);
   }
+  /** @param {Uint8Array} bytes @returns {string} */
   function hexEncode(bytes) {
     return hexEncodeNative(bytes);
   }
+  /** @param {string} str @returns {Uint8Array} */
   function hexDecode(str) {
     return hexDecodeNative(String(str));
   }
+  /** @param {Uint8Array} bytes @returns {string} */
   function base64Encode(bytes) {
     return base64EncodeNative(bytes);
   }
+  /** @param {string} str @returns {Uint8Array} */
   function latin1Encode(str) {
     return latin1EncodeNative(String(str));
   }
+  /** @param {Uint8Array} bytes @returns {string} */
   function latin1Decode(bytes) {
     return latin1DecodeNative(bytes);
   }
+  /** @param {Uint8Array} bytes @returns {string} */
   function asciiDecode(bytes) {
     return asciiDecodeNative(bytes);
   }
+  /** @param {string} str @returns {Uint8Array} */
   function utf16leEncode(str) {
     return utf16leEncodeNative(String(str));
   }
+  /** @param {Uint8Array} bytes @returns {string} */
   function utf16leDecode(bytes) {
     return utf16leDecodeNative(bytes);
   }
 
-  // node:buffer length limits. MAX_STRING_LENGTH is V8's string cap. MAX_LENGTH is
-  // the largest buffer this runtime will allocate: native computes the practical
-  // JavaScriptCore ceiling for the platform (overridable via LAVA_MAX_BUFFER_BYTES;
-  // see max_buffer_alloc_bytes in buffer.odin) and passes it as maxAllocBytes.
-  // JSC can abort the process on an allocation it cannot satisfy, so MAX_LENGTH is a
-  // hard, *enforced* ceiling here. The default (4 GiB on 64-bit) matches Bun, the
-  // other JSC-based runtime, which likewise reports kMaxLength === 4294967296 rather
-  // than the Number.MAX_SAFE_INTEGER that V8/Node advertise on 64-bit — this is the
-  // JSC-family convention, not a lava-only choice. Requests past it throw a catchable
-  // RangeError before JSC is asked to allocate; packages read MAX_LENGTH to size work.
-  var MAX_SAFE = 9007199254740991; // Number.MAX_SAFE_INTEGER
+  var MAX_SAFE = 9007199254740991;
   var MAX_ALLOC_BYTES =
     native && typeof native.maxAllocBytes === 'number' && native.maxAllocBytes > 0
       ? Math.min(native.maxAllocBytes, MAX_SAFE)
       : 4294967296;
+  /** Max Buffer size (JSC ceiling; override via LAVA_MAX_BUFFER_BYTES). */
   var K_MAX_LENGTH = MAX_ALLOC_BYTES;
+  /** V8-style max string length reported as Buffer.constants.MAX_STRING_LENGTH. */
   var K_STRING_MAX_LENGTH = 536870888;
   var inspectMaxBytes = 50;
 
-  // Node renders Buffers through util.inspect's custom hook; matching the
-  // well-known symbol lets console.log/util.inspect print "<Buffer ..>" instead
-  // of the generic object dump. internal/util.js and console.js look it up too.
+  /** @type {symbol|null} util.inspect custom hook. */
   var customInspectSymbol =
     typeof Symbol !== 'undefined' && Symbol.for ? Symbol.for('nodejs.util.inspect.custom') : null;
 
-  // --- Node-style coded errors --------------------------------------------
-  // Real packages branch on err.code (and occasionally parse the message), so
-  // we reproduce Node's codes and message shapes rather than throwing generic
-  // Error objects.
   function describeType(value) {
     if (value === null) return 'null';
     var t = typeof value;
@@ -111,8 +112,6 @@
     return 'an instance of ' + (ctor || 'Object');
   }
 
-  // Mirror Node's addNumericSeparator: group integer digits with underscores so
-  // large out-of-range values read the same ("9_007_199_254_740_991").
   function numericSeparator(value) {
     var str;
     if (typeof value === 'bigint') str = value.toString();
@@ -127,6 +126,7 @@
     return (neg ? '-' : '') + str.slice(0, i) + out;
   }
 
+  /** @returns {TypeError & {code: string}} */
   function errInvalidArgType(name, expected, actual) {
     var e = new TypeError(
       'The "' + name + '" argument must be ' + expected + '. Received ' + describeType(actual),
@@ -145,11 +145,8 @@
     return e;
   }
 
+  /** @returns {RangeError & {code: string}} */
   function errOutOfRange(name, range, received) {
-    // Node only digit-groups a received value whose magnitude exceeds 2**32
-    // (writeUInt16BE(65536) -> "65536", but writeUIntLE(2**48,..) ->
-    // "281_474_976_710_656"); a bigint additionally gets a trailing "n"
-    // (writeBigUInt64LE(2n**64n) -> "18_446_744_073_709_551_616n").
     var rendered;
     if (typeof received === 'bigint') {
       var bigWide = received > BigInt('4294967296') || received < -BigInt('4294967296');
@@ -166,10 +163,6 @@
     return e;
   }
 
-  // Node throws ERR_INVALID_ARG_VALUE when a fill value cannot be represented in
-  // the requested encoding (a non-empty string that decodes to no bytes, or an
-  // empty Buffer/Uint8Array). The received value is rendered the way Node does:
-  // strings single-quoted, Buffers as "<Buffer ..>".
   function errInvalidArgValue(name, value) {
     var rendered;
     if (typeof value === 'string') rendered = "'" + value + "'";
@@ -180,11 +173,6 @@
     return e;
   }
 
-  // validateByteLength guards the variable-width accessors (readUIntLE/BE,
-  // readIntLE/BE, writeUIntLE/BE, writeIntLE/BE). Node requires an integer in
-  // 1..6: a missing/non-numeric byteLength is ERR_INVALID_ARG_TYPE, a fractional
-  // one is ERR_OUT_OF_RANGE ("an integer"), and 0 / >6 is ERR_OUT_OF_RANGE
-  // (">= 1 and <= 6").
   function validateByteLength(byteLength) {
     if (typeof byteLength !== 'number')
       throw errInvalidArgType('byteLength', 'of type number', byteLength);
@@ -194,13 +182,6 @@
       throw errOutOfRange('byteLength', '>= 1 and <= 6', byteLength);
   }
 
-  // checkValueInt reproduces Node's checkInt() value-range guard for the integer
-  // writers. blMinus1 is Node's internal "byteLength" parameter (the real byte
-  // width minus one): when it exceeds 3 the message switches from the plain
-  // ">= min and <= max" form to the ">= 0 and < 2 ** N" / signed-power form Node
-  // emits for >32-bit writes; a bigint min/max appends the "n" suffix. The store
-  // (typed-array element or per-byte) truncates a fractional but in-range value,
-  // exactly as Node does — so only an out-of-range value throws here.
   function checkValueInt(value, min, max, blMinus1) {
     if (value > max || value < min) {
       var n = typeof min === 'bigint' ? 'n' : '';
@@ -220,10 +201,6 @@
     }
   }
 
-  // validateWriteOffset enforces Node's write()/fill() offset contract: an
-  // integer in [0, max]. Note the "&&" message form — distinct from the "and"
-  // form checkBounds() uses for the fixed-width numeric accessors (Node spells
-  // these two error sites differently, and packages occasionally match on it).
   function validateWriteOffset(offset, max, name) {
     if (Math.floor(offset) !== offset) throw errOutOfRange(name, 'an integer', offset);
     if (offset < 0 || offset > max) throw errOutOfRange(name, '>= 0 && <= ' + max, offset);
@@ -242,17 +219,14 @@
     return e;
   }
 
-  // assertSize guards Buffer.alloc/allocUnsafe. A negative or non-numeric size
-  // throws ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE rather than reaching the
-  // Uint8Array constructor as a multi-gigabyte (or NaN) allocation, and a size
-  // beyond K_MAX_LENGTH throws rather than aborting JSC. Fractional sizes are
-  // allowed — the Uint8Array constructor truncates them, matching Node.
+  /** Validates size for alloc/allocUnsafe (Node + JSC abort guard). */
   function assertSize(size) {
     if (typeof size !== 'number') throw errInvalidArgType('size', 'number', size);
     if (!(size >= 0 && size <= K_MAX_LENGTH))
       throw errOutOfRange('size', '>= 0 && <= ' + K_MAX_LENGTH, size);
   }
 
+  /** @returns {string} Canonical encoding name (default utf8). */
   function normalizeEncoding(encoding) {
     encoding = (encoding || 'utf8').toLowerCase();
     if (encoding === 'utf-8') return 'utf8';
@@ -261,10 +235,8 @@
     return encoding;
   }
 
+  /** @returns {boolean} True if encoding is a known Buffer encoding. */
   function isEncodingName(encoding) {
-    // Match against the raw (lowercased) name and its aliases directly. Going
-    // through normalizeEncoding would map the empty string to 'utf8' and wrongly
-    // report it as valid; Node rejects '' and unknown names.
     switch (String(encoding).toLowerCase()) {
       case 'utf8':
       case 'utf-8':
@@ -283,6 +255,7 @@
     return false;
   }
 
+  /** Lenient Node base64/base64url normalization before native decode. */
   function normalizeBase64(str) {
     str = String(str)
       .replaceAll('-', '+')
@@ -297,6 +270,7 @@
     return str.replaceAll('+', '-').replaceAll('/', '_').replaceAll(/=+$/g, '');
   }
 
+  /** @returns {Uint8Array} Encode `str` with `encoding` via native codecs. */
   function strToBytes(str, encoding) {
     encoding = normalizeEncoding(encoding);
     if (encoding === 'utf8') return utf8Encode(str);
@@ -304,14 +278,13 @@
     if (encoding === 'hex') return hexDecode(str);
     if (encoding === 'base64' || encoding === 'base64url') {
       var norm = normalizeBase64(str);
-      // JS owns lenient base64 normalization; decode is always native.
       return norm ? base64DecodeNative(norm) : new Uint8Array(0);
     }
-    // ascii and latin1 share the encode path (low byte of each code unit).
     if (encoding === 'ascii' || encoding === 'latin1') return latin1Encode(str);
     throw errUnknownEncoding(encoding);
   }
 
+  /** @returns {string} Decode `bytes` with `encoding` via native codecs. */
   function bytesToString(bytes, encoding) {
     encoding = normalizeEncoding(encoding);
     if (encoding === 'utf8') return utf8Decode(bytes);
@@ -345,12 +318,9 @@
     return e;
   }
 
+  /** Node-style offset bounds for fixed-width numeric accessors. */
   function checkBounds(buf, offset, byteLength) {
     if (offset === undefined) offset = 0;
-    // Node validates the offset (validateNumber + integer check) before testing
-    // the range, and distinguishes "type doesn't fit at all" (the max valid
-    // offset is negative -> ERR_BUFFER_OUT_OF_BOUNDS) from a plain out-of-range
-    // offset (ERR_OUT_OF_RANGE).
     if (typeof offset !== 'number') throw errInvalidArgType('offset', 'number', offset);
     if (Math.floor(offset) !== offset) throw errOutOfRange('offset', 'an integer', offset);
     var max = buf.length - byteLength;
@@ -365,14 +335,8 @@
     return value;
   }
 
-  // One cached DataView per Buffer rather than a fresh allocation on every numeric
-  // read/write. A Buffer's (buffer, byteOffset, byteLength) is fixed for its
-  // lifetime, so the view stays valid; the WeakMap keeps no Buffer alive and adds
-  // no observable own property. This removes the per-accessor allocation that drove
-  // GC pressure in tight binary-parsing loops — without the correctness traps of
-  // hand-rolled bitwise math (readUInt32 would need >>>0, signed reads need
-  // sign-extension, and floats can't be reinterpreted bitwise in JS at all).
   var dataViewCache = new WeakMap();
+  /** @returns {DataView} Cached DataView for `buf` (WeakMap). */
   function viewOf(buf) {
     var dv = dataViewCache.get(buf);
     if (dv === undefined) {
@@ -382,6 +346,7 @@
     return dv;
   }
 
+  /** @returns {-1|0|1} Lexicographic compare (native). */
   function compareBytes(a, b) {
     return nativeCompare(a, b);
   }
@@ -394,6 +359,7 @@
     throw new TypeError('value must be string, number, Buffer, or Uint8Array');
   }
 
+  /** indexOf / lastIndexOf implementation (native search). */
   function bidirectionalIndexOf(buf, value, byteOffset, encoding, forward) {
     var needle = toSearchBytes(value, encoding);
     if (needle.length === 0)
@@ -401,15 +367,10 @@
         ? clampIndex(byteOffset, buf.length, 0)
         : Math.min(clampIndex(byteOffset, buf.length, buf.length), buf.length);
     var start = clampIndex(byteOffset, buf.length, forward ? 0 : buf.length);
-    // Empty-needle / clamp stay in JS; search itself is always native.
     if (needle.length > buf.length) return -1;
     return nativeIndexOf(buf, needle, start, forward);
   }
 
-  // Coerce + range-check a fixed-width integer write value the way Node does
-  // (value before bounds): returns the coerced Number so the caller can store it
-  // through a DataView/typed-array slot, which truncates a fractional in-range
-  // value exactly as Node's writer does.
   function checkFixed(value, min, max, blMinus1) {
     value = +value;
     checkValueInt(value, min, max, blMinus1);
@@ -429,8 +390,6 @@
   }
 
   function readInt(buf, offset, byteLength, littleEndian) {
-    // readUInt validates byteLength + bounds first, so the pow below only runs
-    // for a valid 1..6 width.
     var value = readUInt(buf, offset, byteLength, littleEndian);
     var sign = Math.pow(2, byteLength * 8 - 1);
     var full = sign * 2;
@@ -439,9 +398,6 @@
 
   function writeUInt(buf, value, offset, byteLength, littleEndian) {
     validateByteLength(byteLength);
-    // 2 ** (8 * byteLength) - 1 is exact for byteLength <= 6 (<= 2**48 - 1, well
-    // within MAX_SAFE_INTEGER). Range-check the raw value before flooring so a
-    // fractional but over-range value (e.g. 65535.5 into 2 bytes) still throws.
     var max = Math.pow(2, 8 * byteLength) - 1;
     value = +value;
     checkValueInt(value, 0, max, byteLength - 1);
@@ -449,7 +405,7 @@
     value = Math.floor(value);
     for (var i = 0; i < byteLength; i++) {
       var index = littleEndian ? offset + i : offset + byteLength - 1 - i;
-      buf[index] = value & 0xff; // ToInt32 preserves the low byte for value < 2**48
+      buf[index] = value & 0xff;
       value = Math.floor(value / 0x100);
     }
     return offset + byteLength;
@@ -457,7 +413,7 @@
 
   function writeInt(buf, value, offset, byteLength, littleEndian) {
     validateByteLength(byteLength);
-    var limit = Math.pow(2, 8 * byteLength - 1); // exact for byteLength <= 6
+    var limit = Math.pow(2, 8 * byteLength - 1);
     value = +value;
     checkValueInt(value, -limit, limit - 1, byteLength - 1);
     offset = checkBounds(buf, offset, byteLength);
@@ -490,7 +446,6 @@
 
   function writeBigUInt(buf, value, offset, littleEndian) {
     value = BigInt(value);
-    // checkValueInt with blMinus1 = 7 yields Node's ">= 0n and < 2n ** 64n".
     checkValueInt(value, BigInt(0), (BigInt(1) << BigInt(64)) - BigInt(1), 7);
     offset = checkBounds(buf, offset, 8);
     for (var i = 0; i < 8; i++) {
@@ -504,9 +459,9 @@
   function writeBigInt(buf, value, offset, littleEndian) {
     value = BigInt(value);
     var limit = BigInt(1) << BigInt(63);
-    checkValueInt(value, -limit, limit - BigInt(1), 7); // ">= -(2n ** 63n) and < 2n ** 63n"
+    checkValueInt(value, -limit, limit - BigInt(1), 7);
     offset = checkBounds(buf, offset, 8);
-    if (value < 0) value += BigInt(1) << BigInt(64); // two's-complement, then write the bytes
+    if (value < 0) value += BigInt(1) << BigInt(64);
     for (var i = 0; i < 8; i++) {
       var index = littleEndian ? offset + i : offset + 7 - i;
       buf[index] = Number(value & BigInt(0xff));
@@ -515,37 +470,33 @@
     return offset + 8;
   }
 
+  /**
+   * Node-compatible Buffer: Uint8Array subclass with codecs, numerics, and pool.
+   * @extends {Uint8Array}
+   */
   class Buffer extends Uint8Array {
+    /**
+     * @param {number|string|ArrayBuffer|ArrayBufferView|ArrayLike<number>} arg
+     * @param {number|string} [byteOffset]
+     * @param {number} [length]
+     */
     constructor(arg, byteOffset, length) {
-      // The deprecated `new Buffer(string[, encoding])` form delegates to
-      // Buffer.from (Node keeps it working, just with a DEP0005 warning). Without
-      // this, `super(string, …)` would mis-encode the string — `new Buffer('abc')`
-      // yielded an empty buffer and `new Buffer('616263','hex')` random garbage. A
-      // derived constructor may return an object instead of calling super(), and
-      // Buffer.from for a string allocates a fresh (pooled) Buffer with no
-      // recursion (its inner alloc uses the numeric/ArrayBuffer-view forms). The
-      // array / Buffer / ArrayBuffer-view / size forms are equivalent to the
-      // Uint8Array super() call, so they pass straight through (with the ceiling
-      // check below). `new Buffer(size)` is zero-filled, matching Buffer.alloc.
       if (typeof arg === 'string') {
         return Buffer.from(arg, byteOffset);
       }
-      // A numeric first argument is the size form (new Buffer(size)). Validate it
-      // against the practical ceiling *before* super() so an oversized request —
-      // reached through any route (alloc/allocUnsafe, fromArrayLike, concat) —
-      // throws a catchable RangeError instead of aborting the process inside JSC.
-      // The ArrayBuffer/SharedArrayBuffer view form (object first arg) shares
-      // existing memory and allocates nothing, so it is passed straight through.
       if (typeof arg === 'number' && arg > K_MAX_LENGTH) {
         throw errOutOfRange('size', '>= 0 && <= ' + K_MAX_LENGTH, arg);
       }
       super(arg, byteOffset, length);
     }
 
+    /**
+     * @param {string} [encoding='utf8']
+     * @param {number} [start]
+     * @param {number} [end]
+     * @returns {string}
+     */
     toString(encoding, start, end) {
-      // Node's slowToString clamps a negative start to 0 (it does NOT wrap like
-      // slice/subarray), and a start past the end yields ''. end clamps to the
-      // length. Use int32 truncation (|0) on in-range values, matching Node.
       var len = this.length;
       if (start <= 0) start = 0;
       else if (start >= len) return '';
@@ -556,12 +507,14 @@
       return bytesToString(this.subarray(start, end), encoding || 'utf8');
     }
 
+    /**
+     * @param {Uint8Array} target
+     * @param {number} [targetStart]
+     * @param {number} [sourceStart]
+     * @param {number} [sourceEnd]
+     * @returns {number} Bytes copied
+     */
     copy(target, targetStart, sourceStart, sourceEnd) {
-      // Each index is coerced with toInteger (so a fractional index is floored,
-      // NOT rejected) and a negative one throws ERR_OUT_OF_RANGE — a negative
-      // offset is an error, not an index from the end. The upper bounds are
-      // clamped rather than thrown: a targetStart past the target, or
-      // sourceStart >= sourceEnd, copies nothing.
       if (!(target instanceof Uint8Array))
         throw errInvalidArgType('target', 'an instance of Buffer or Uint8Array', target);
       if (targetStart === undefined) {
@@ -590,20 +543,22 @@
       return len;
     }
 
+    /**
+     * @param {string} string
+     * @param {number|string} [offset]
+     * @param {number|string} [length]
+     * @param {string} [encoding]
+     * @returns {number} Bytes written
+     */
     write(string, offset, length, encoding) {
       if (offset === undefined) {
-        // write(string)
         offset = 0;
         length = this.length;
       } else if (typeof offset === 'string') {
-        // write(string, encoding)
         encoding = offset;
         offset = 0;
         length = this.length;
       } else {
-        // write(string, offset[, length][, encoding]). Node validates offset as
-        // an integer in [0, length] and throws ERR_OUT_OF_RANGE otherwise; it no
-        // longer wraps a negative offset from the end the way clampIndex did.
         offset = validateWriteOffset(+offset, this.length, 'offset');
         if (typeof length === 'string') {
           encoding = length;
@@ -615,8 +570,6 @@
       var max = length === undefined ? remaining : toInteger(length, 0);
       if (max > remaining) max = remaining;
       if (max <= 0) return 0;
-      // Encode straight into this buffer for every encoding (native writeInto for
-      // utf8/latin1/ascii/utf16le; hex/base64 still go through strToBytes + set).
       if (enc === 'utf8') return utf8WriteIntoNative(this, String(string), offset, max);
       if (enc === 'latin1' || enc === 'ascii')
         return latin1WriteIntoNative(this, String(string), offset, max);
@@ -679,19 +632,10 @@
         encoding = end;
         end = this.length;
       }
-      // Node validates start (which it names "offset") and end as integers and
-      // throws ERR_OUT_OF_RANGE for negatives. start has no enforced upper bound
-      // (a start past the end fills nothing); end must be within the buffer.
-      // Previously both ran through clampIndex, so negatives wrapped from the end.
       if (start === undefined) start = 0;
       else start = validateWriteOffset(+start, K_MAX_LENGTH, 'offset');
       if (end === undefined) end = this.length;
       else end = validateWriteOffset(+end, this.length, 'end');
-      // Resolve the repeating fill pattern. A number/boolean masks to one byte; a
-      // Uint8Array is used as-is. A string is encoded with `encoding` (an unknown
-      // encoding throws ERR_UNKNOWN_ENCODING via strToBytes). The empty string
-      // fills with a single 0 byte, but any other source that yields zero bytes
-      // (bad hex, an empty Buffer) is ERR_INVALID_ARG_VALUE.
       var bytes;
       if (typeof value === 'number') {
         bytes = new Uint8Array([value & 0xff]);
@@ -705,7 +649,7 @@
         bytes = strToBytes(str, encoding || 'utf8');
         if (bytes.length === 0) {
           if (str.length !== 0) throw errInvalidArgValue('value', value);
-          bytes = new Uint8Array([0]); // fill('') zero-fills the range
+          bytes = new Uint8Array([0]);
         }
       }
       if (end <= start) return this;
@@ -767,9 +711,6 @@
 
   var p = Buffer.prototype;
 
-  // Shared renderer for the legacy .inspect() method and the util.inspect custom
-  // hook. Caps the dump at INSPECT_MAX_BYTES, appending "... N more byte(s)" like
-  // Node when the buffer is longer.
   function inspectBuffer(buf) {
     var max = inspectMaxBytes;
     var shown = buf.length > max ? max : buf.length;
@@ -792,8 +733,6 @@
     return inspectBuffer(this);
   };
   if (customInspectSymbol) {
-    // Non-enumerable + symbol-keyed, so it stays off Object.getOwnPropertyNames
-    // (the API-surface probe) exactly as in Node.
     Object.defineProperty(p, customInspectSymbol, {
       value: function () {
         return inspectBuffer(this);
@@ -919,14 +858,13 @@
   p.writeUInt8 = p.writeUint8 = function (value, offset) {
     value = checkFixed(value, 0, 0xff, 0);
     offset = checkBounds(this, offset, 1);
-    this[offset] = value; // Uint8 store truncates a fractional in-range value (Node parity)
+    this[offset] = value;
     return offset + 1;
   };
   p.writeInt8 = function (value, offset) {
-    // Distinct signed range: writeInt8(128) must throw, where writeUInt8(128) is fine.
     value = checkFixed(value, -0x80, 0x7f, 0);
     offset = checkBounds(this, offset, 1);
-    this[offset] = value; // store wraps a negative to its two's-complement byte
+    this[offset] = value;
     return offset + 1;
   };
   p.writeUIntLE = p.writeUintLE = function (value, offset, byteLength) {
@@ -1035,52 +973,22 @@
     },
   });
 
-  // --- Allocation pool (Node parity) --------------------------------------
-  // Node carves small *unsafe* allocations out of a shared poolSize-byte
-  // ArrayBuffer, so several small Buffers share one backing store at different
-  // byteOffsets (observable via buf.buffer / buf.byteOffset / buf.buffer
-  // .byteLength). This state is plain module scope: node:buffer is instantiated
-  // once per runtime/context, so the pool is per-runtime and never leaks across
-  // isolated runtimes. Pooled bytes are uninitialized — only allocUnsafe and the
-  // Buffer.from(...) copy paths (where Node pools) draw from it; Buffer.alloc,
-  // allocUnsafeSlow, and SlowBuffer stay on their own backing store (alloc is
-  // zero-filled; the allocUnsafeSlow/SlowBuffer paths go through allocUnsafeNoZero).
-  var poolBufferSize; // byteLength of the live allocPool (its real size)
-  var poolOffset; // next free byte in allocPool
-  var allocPool; // shared backing ArrayBuffer
+  var poolBufferSize;
+  var poolOffset;
+  var allocPool;
 
+  /** (Re)build the shared allocUnsafe pool from Buffer.poolSize. */
   function createPool() {
-    // Size the pool straight from Buffer.poolSize the way Node does — Node builds
-    // its pool with `new Uint8Array(Buffer.poolSize)`. Routing through a typed
-    // array (rather than `new ArrayBuffer(Buffer.poolSize >>> 0)`) reproduces Node's
-    // exact coercion: a fractional poolSize is truncated by ToIndex (8192.7 -> 8192),
-    // and a negative or non-finite poolSize throws a catchable RangeError on the
-    // (re-)pool — instead of `>>> 0` silently wrapping it (-1 -> a ~4 GiB request,
-    // 1e12 -> ~3.5 GiB, 2^32 -> 0). poolBufferSize reads back the realized byteLength
-    // so the carve math below uses the true size. One benign divergence remains: for
-    // a poolSize large enough to exceed JavaScriptCore's typed-array allocation cap
-    // (a few GiB), this throws RangeError where Node (V8's cap is ~2^53) would instead
-    // build a multi-gigabyte pool. That is only reachable by deliberately setting
-    // poolSize to gigabytes AND forcing a re-pool, and throwing is the safer choice —
-    // we never attempt the giant allocation. A failed (re-)pool also leaves the
-    // existing allocPool/poolBufferSize intact (they are assigned only on success),
-    // so the throw is recoverable.
     allocPool = new Uint8Array(Buffer.poolSize).buffer;
     poolBufferSize = allocPool.byteLength;
     poolOffset = 0;
   }
 
-  // allocUnsafeNoZero(size) backs the *unpooled* unsafe allocations — large
-  // Buffer.allocUnsafe, Buffer.allocUnsafeSlow, and SlowBuffer. Node leaves these
-  // uninitialized (its allocator skips the zero-fill); a JS `new Buffer(size)`
-  // cannot, because every ArrayBuffer is zero-initialized. So we ask the native
-  // binding for an uninitialized region and wrap it as a Buffer *view* over the
-  // same backing store — no copy, byteOffset 0, buffer sized exactly to `size`.
-  // The native call returns null when the binding is unavailable or the allocation
-  // fails; we then fall back to a zero-filled own-backing Buffer, which is strictly
-  // safe and still throws the RangeError Node throws for an impossible size. The
-  // floor + guards keep a fractional/non-finite size off the native path (it stays
-  // on `new Buffer(size)`, matching Node's truncation / RangeError exactly).
+  /**
+   * Unpooled uninitialized allocation (allocUnsafe large path / SlowBuffer).
+   * @param {number} size
+   * @returns {Buffer}
+   */
   function allocUnsafeNoZero(size) {
     size = Math.floor(size);
     if (size <= 0) return new Buffer(0);
@@ -1091,21 +999,13 @@
     return new Buffer(size);
   }
 
-  // Round the next offset up to an 8-byte boundary, matching Node's alignPool();
-  // keeps every pooled buffer's byteOffset 8-aligned.
   function alignPool() {
     if (poolOffset & 0x7) poolOffset = (poolOffset | 0x7) + 1;
   }
 
-  // allocate(size) mirrors Node's internal allocate(): sizes strictly below
-  // poolSize/2 are served from the shared pool (uninitialized); anything larger
-  // (or exactly poolSize/2 — Node's threshold is `< (poolSize >>> 1)`) gets its
-  // own backing store via allocUnsafeNoZero (native-uninitialized, like Node). The
-  // pool is recreated when the request no longer fits in what remains. Callers that
-  // expose the bytes (Buffer.from) overwrite the whole view; allocUnsafe
-  // deliberately leaves stale pool / uninitialized bytes visible.
+  /** Small sizes use the shared pool; larger call allocUnsafeNoZero. */
   function allocate(size) {
-    if (!(size > 0)) return new Buffer(0); // 0, negative, or NaN
+    if (!(size > 0)) return new Buffer(0);
     if (size < Buffer.poolSize >>> 1) {
       size = Math.floor(size);
       if (size === 0) return new Buffer(0);
@@ -1115,29 +1015,24 @@
       alignPool();
       return b;
     }
-    return allocUnsafeNoZero(size); // own store, uninitialized; Infinity -> ctor throws, like Node
+    return allocUnsafeNoZero(size);
   }
 
-  // fromArrayLike copies element values (each coerced to a byte) into a small
-  // pooled (or own, for large) Buffer — used for Arrays, generic TypedArrays,
-  // and array-like objects. The length goes through a ToLength-style conversion
-  // (NaN/negative -> 0, finite fractional floored) so a hostile `{ length: -1 }`
-  // cannot wrap to a 4 GiB allocation; Node likewise returns an empty Buffer for
-  // those. The loop overwrites every byte, so no stale pool data leaks through.
   function fromArrayLike(obj) {
     var len = Number(obj.length);
-    if (!(len > 0)) return new Buffer(0); // 0, negative, or NaN
-    len = Math.floor(len); // Infinity stays Infinity -> Buffer ctor throws, like Node
+    if (!(len > 0)) return new Buffer(0);
+    len = Math.floor(len);
     var b = allocate(len);
-    for (var i = 0; i < len; i++) b[i] = obj[i]; // Uint8Array store coerces & masks
+    for (var i = 0; i < len; i++) b[i] = obj[i];
     return b;
   }
 
+  /** @see https://nodejs.org/api/buffer.html#static-method-bufferfromarray */
   Buffer.from = function (value, encodingOrOffset, length) {
     if (typeof value === 'string') {
       var bytes = strToBytes(value, encodingOrOffset);
-      var b = allocate(bytes.length); // pooled for small strings, like Node
-      b.set(bytes); // overwrites the whole view -> no stale pool bytes
+      var b = allocate(bytes.length);
+      b.set(bytes);
       return b;
     }
     if (value !== null && typeof value === 'object') {
@@ -1145,11 +1040,8 @@
         value instanceof ArrayBuffer ||
         (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)
       ) {
-        // Shares the backing store (a view), matching Node.
         return new Buffer(value, encodingOrOffset === undefined ? 0 : encodingOrOffset, length);
       }
-      // Node consults valueOf() before treating the object as array-like, so a
-      // boxed primitive (new String(...)) resolves to its primitive form first.
       if (typeof value.valueOf === 'function') {
         var valueOf = value.valueOf();
         if (
@@ -1161,8 +1053,6 @@
         }
       }
       if (ArrayBuffer.isView(value)) {
-        // Copy element values (Uint8Array.set masks each to a byte). Pooled for
-        // small inputs like Node; set() overwrites the whole view.
         var copy = allocate(value.length);
         copy.set(value);
         return copy;
@@ -1170,7 +1060,6 @@
       if (Array.isArray(value) || typeof value.length === 'number') {
         return fromArrayLike(value);
       }
-      // Revive JSON.parse(JSON.stringify(buffer)) -> {type:'Buffer', data:[...]}.
       if (value.type === 'Buffer' && Array.isArray(value.data)) {
         return fromArrayLike(value.data);
       }
@@ -1182,6 +1071,7 @@
     throw errInvalidFromArg(value);
   };
 
+  /** Zero-filled (or filled) allocation. */
   Buffer.alloc = function (size, fill, encoding) {
     assertSize(size);
     var b = new Buffer(size);
@@ -1189,14 +1079,16 @@
     return b;
   };
 
+  /** Uninitialized; may use the shared pool when size < poolSize/2. */
   Buffer.allocUnsafe = function (size) {
     assertSize(size);
-    return allocate(size); // small sizes share the per-runtime pool
+    return allocate(size);
   };
 
+  /** Uninitialized, never pooled. */
   Buffer.allocUnsafeSlow = function (size) {
     assertSize(size);
-    return allocUnsafeNoZero(size); // never pooled — its own uninitialized backing store, like Node
+    return allocUnsafeNoZero(size);
   };
 
   Buffer.isBuffer = function (b) {
@@ -1209,8 +1101,6 @@
 
   Buffer.byteLength = function (string, encoding) {
     if (typeof string === 'string') {
-      // Node treats an unknown/empty encoding here as UTF-8 (unlike from/toString,
-      // which throw) and returns the byte length rather than rejecting the label.
       var enc = encoding === undefined || !isEncodingName(encoding) ? 'utf8' : encoding;
       return strToBytes(string, enc).length;
     }
@@ -1239,6 +1129,7 @@
       throw errInvalidArgType('list[' + index + ']', 'an instance of Buffer or Uint8Array', item);
   }
 
+  /** @param {Array<Uint8Array|Buffer>} list @param {number} [totalLength] */
   Buffer.concat = function (list, totalLength) {
     if (!Array.isArray(list)) throw errInvalidArgType('list', 'an instance of Array', list);
     if (list.length === 0) return new Buffer(0);
@@ -1255,11 +1146,6 @@
       if (totalLength < 0 || totalLength > K_MAX_LENGTH)
         throw errOutOfRange('length', '>= 0 && <= ' + K_MAX_LENGTH, totalLength);
     }
-    // Pooled like Node: small concat results share the per-runtime pool. The
-    // copies below write [0, offset); any tail left when an explicit totalLength
-    // exceeds the input data is zero-filled, because pooled memory is otherwise
-    // uninitialized (Node fills the gap the same way). Every byte is thus either
-    // copied or zeroed, so no stale pool bytes leak through.
     var result = allocate(totalLength);
     var offset = 0;
     for (var j = 0; j < list.length; j++) {
@@ -1267,7 +1153,7 @@
       assertConcatElement(item, j);
       if (offset + item.length > totalLength) {
         result.set(item.subarray(0, totalLength - offset), offset);
-        offset = totalLength; // buffer is now full; suppress the tail fill below
+        offset = totalLength;
         break;
       }
       result.set(item, offset);
@@ -1290,28 +1176,28 @@
     return Buffer.from(Array.prototype.slice.call(arguments));
   };
 
-  // Default pool size, matching Node >= 26.3 (Node <= 25 and Bun default to
-  // 8192). It may be reassigned; kMaxLength stays the JSC-family 4 GiB.
+  /** Shared pool size for small allocUnsafe (bytes). */
   Buffer.poolSize = 65536;
 
-  // Build the initial pool now that Buffer.poolSize is set. Nothing in this
-  // module allocates Buffers during evaluation, so a single eager call is enough
-  // (allocate() re-pools on demand thereafter).
   createPool();
 
+  /** @deprecated Use Buffer.allocUnsafeSlow. */
   function SlowBuffer(size) {
     assertSize(size);
-    return allocUnsafeNoZero(size); // unpooled + uninitialized by definition
+    return allocUnsafeNoZero(size);
   }
 
+  /** Base64 → latin1 (Node global atob polyfill surface). */
   function atob(data) {
     return Buffer.from(String(data), 'base64').toString('latin1');
   }
 
+  /** latin1 → Base64 (Node global btoa polyfill surface). */
   function btoa(data) {
     return Buffer.from(String(data), 'latin1').toString('base64');
   }
 
+  /** @param {ArrayBuffer|Uint8Array} input @returns {boolean} */
   function isAscii(input) {
     var bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : input;
     if (!(bytes instanceof Uint8Array))
@@ -1320,6 +1206,7 @@
     return true;
   }
 
+  /** Strict UTF-8 validity (native). @param {ArrayBuffer|Uint8Array} input */
   function isUtf8(input) {
     var bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : input;
     if (!(bytes instanceof Uint8Array))
@@ -1327,25 +1214,17 @@
     return nativeIsValidUtf8(bytes);
   }
 
+  /** Re-encode buffer contents between encodings. */
   function transcode(source, fromEnc, toEnc) {
     return Buffer.from(Buffer.from(source).toString(fromEnc), toEnc);
   }
 
-  // --- Blob / File (Web platform classes also exported from node:buffer) ----
-
-  // WHATWG "convert line endings to native". Node uses require('os').EOL; Lava has
-  // no node:os, so the platform line ending is derived from process.platform (read
-  // lazily — process is installed natively and may post-date this module's eval).
   function nativeEol() {
     return globalThis.process && globalThis.process.platform === 'win32' ? '\r\n' : '\n';
   }
 
-  // Returns a part's bytes as an array of Uint8Array chunks (never one giant
-  // copy): a Blob part contributes its existing immutable chunks by reference, so
-  // nesting Blobs adds no allocation. Only string parts are subject to line-ending
-  // conversion; binary parts (Blob, ArrayBuffer, views) are copied verbatim.
   function blobPartToChunks(part, nativeEndings) {
-    if (part instanceof Blob) return part._parts; // shared, immutable
+    if (part instanceof Blob) return part._parts;
     if (part instanceof ArrayBuffer) return [new Uint8Array(part.slice(0))];
     if (ArrayBuffer.isView(part)) {
       return [
@@ -1353,15 +1232,10 @@
       ];
     }
     var str = String(part);
-    // Node converts "\n" and "\r\n" to the native newline but leaves a lone "\r"
-    // untouched, i.e. /\r?\n/ rather than every CR.
     if (nativeEndings) str = str.replace(/\r?\n/g, nativeEol());
     return [new Uint8Array(Buffer.from(str, 'utf8'))];
   }
 
-  // Concatenate a Blob's chunks into one contiguous Uint8Array. Only the methods
-  // that must yield the whole content (arrayBuffer/bytes/text) call this; the
-  // constructor, size, stream, and slice never materialize the full blob.
   function blobJoin(parts, total) {
     var merged = new Uint8Array(total),
       off = 0;
@@ -1377,31 +1251,30 @@
     var type = String(options.type);
     for (var i = 0; i < type.length; i++) {
       var code = type.charCodeAt(i);
-      if (code < 0x20 || code > 0x7e) return ''; // Node drops types with non-printable chars
+      if (code < 0x20 || code > 0x7e) return '';
     }
     return type.toLowerCase();
   }
 
+  /**
+   * Minimal Blob: stores parts without eager concat; materializes on demand.
+   * @param {Array<*>} parts
+   * @param {{type?: string, endings?: string}} [options]
+   */
   function Blob(parts, options) {
     if (!(this instanceof Blob)) throw new TypeError("Constructor Blob requires 'new'");
-    // Store the parts as a list of chunks instead of eagerly concatenating them
-    // into one contiguous buffer. A Blob built from ten 100 MB parts costs ~0 extra
-    // memory at construction; the bytes are only joined on demand by
-    // arrayBuffer()/bytes()/text(), and stream() emits them chunk by chunk.
     var chunks = [],
       total = 0;
     if (parts !== undefined && parts !== null) {
       if (typeof parts !== 'object' || typeof parts[Symbol.iterator] !== 'function') {
         throw new TypeError('The "parts" argument must be an iterable object');
       }
-      // endings: 'native' converts line endings in string parts to the platform
-      // newline; 'transparent' (the default) leaves them as-is.
       var nativeEndings = !!(options && options.endings === 'native');
       var list = Array.from(parts);
       for (var i = 0; i < list.length; i++) {
         var cs = blobPartToChunks(list[i], nativeEndings);
         for (var j = 0; j < cs.length; j++) {
-          if (cs[j].length === 0) continue; // empty parts contribute nothing
+          if (cs[j].length === 0) continue;
           chunks.push(cs[j]);
           total += cs[j].length;
         }
@@ -1413,7 +1286,7 @@
   }
   Object.defineProperty(Blob.prototype, 'size', {
     get: function () {
-      return this._size; // O(1); no materialization
+      return this._size;
     },
     configurable: true,
   });
@@ -1424,19 +1297,11 @@
     configurable: true,
   });
   Blob.prototype.arrayBuffer = function () {
-    // The merged Uint8Array owns a buffer sized exactly to _size, so its .buffer is
-    // already the right ArrayBuffer to hand back (a private copy of the contents).
     return Promise.resolve(blobJoin(this._parts, this._size).buffer);
   };
   Blob.prototype.bytes = function () {
     return Promise.resolve(blobJoin(this._parts, this._size));
   };
-  // stream() returns a WHATWG ReadableStream that emits the Blob's bytes. We emit
-  // each stored part as its own chunk (a fresh copy, so a consumer mutating a read
-  // chunk can't write back into the Blob's immutable bytes), then close — Node
-  // streams an in-memory Blob the same chunked way and likewise never materializes
-  // the whole thing. node:stream/web is required lazily because it loads after
-  // node:buffer (see internal/loader.js), so it is not available at eval time.
   Blob.prototype.stream = function () {
     var parts = this._parts;
     var ReadableStream = require('node:stream/web').ReadableStream;
@@ -1455,9 +1320,6 @@
     var s = start === undefined ? 0 : start < 0 ? Math.max(len + start, 0) : Math.min(start, len);
     var e = end === undefined ? len : end < 0 ? Math.max(len + end, 0) : Math.min(end, len);
     if (e < s) e = s;
-    // Collect only the chunks overlapping [s, e) and copy just that range — slicing
-    // a huge blob never materializes the whole thing. Each pushed subarray is a
-    // view; the Blob constructor copies it (ArrayBuffer.isView path) to the new blob.
     var out = [];
     var pos = 0;
     var parts = this._parts;
@@ -1475,6 +1337,7 @@
     return '[object Blob]';
   };
 
+  /** @extends Blob */
   function File(parts, name, options) {
     if (!(this instanceof File)) throw new TypeError("Constructor File requires 'new'");
     if (arguments.length < 2)
@@ -1515,21 +1378,11 @@
     });
   }
 
-  // --- blob: URL registry (URL.createObjectURL / buffer.resolveObjectURL) ----
-  //
-  // Node keeps Blobs created with URL.createObjectURL() in a process-wide
-  // registry keyed by a `blob:nodedata:<uuid>` URL; buffer.resolveObjectURL()
-  // looks one up and URL.revokeObjectURL() drops it. The registry lives here
-  // because node:buffer owns Blob and exports resolveObjectURL, so the two
-  // object-URL statics are attached to globalThis.URL from here. internal/url.js
-  // provides the WHATWG URL class itself and copies these statics across when it
-  // installs the global; both modules guard defensively so load order is moot.
   var objectUrlRegistry = new Map();
 
   function objectUrlId() {
     var c = globalThis.crypto;
     if (c && typeof c.randomUUID === 'function') return c.randomUUID();
-    // Defensive fallback: a v4 UUID from whatever randomness is available.
     var bytes = new Uint8Array(16);
     if (c && typeof c.getRandomValues === 'function') c.getRandomValues(bytes);
     else for (var i = 0; i < 16; i++) bytes[i] = (Math.random() * 256) & 0xff;
@@ -1543,6 +1396,7 @@
     return s;
   }
 
+  /** @param {Blob|File} obj @returns {string} blob: URL */
   function createObjectURL(obj) {
     if (!(obj instanceof Blob)) {
       var typeErr = new TypeError('The "obj" argument must be an instance of Blob.');
@@ -1554,26 +1408,20 @@
     return id;
   }
 
+  /** @param {string} url */
   function revokeObjectURL(url) {
     if (url === undefined) {
       var missingErr = new TypeError('The "url" argument must be specified');
       missingErr.code = 'ERR_MISSING_ARGS';
       throw missingErr;
     }
-    // Coerce like Node; an unregistered or malformed id is a silent no-op.
     objectUrlRegistry.delete(String(url));
   }
 
+  /** @param {string} id @returns {Blob|File|null} */
   function resolveObjectURL(id) {
-    // Node coerces the argument with `${id}`, so a URL object or anything with a
-    // toString() resolves the same as its string form; a non-registered or junk
-    // id then misses the registry and returns undefined (never throws). The
-    // template form matches Node's ToString exactly — including throwing a
-    // TypeError on a Symbol, which String(id) would silently stringify instead.
     var blob = objectUrlRegistry.get(`${id}`);
     if (blob === undefined) return;
-    // Node returns a fresh Blob over the same bytes rather than the registered
-    // instance, and a registered File resolves back as a plain Blob.
     return new Blob([blob], { type: blob.type });
   }
 
