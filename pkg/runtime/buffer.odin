@@ -35,9 +35,10 @@ buffer_codec_tables_init :: proc "contextless" () {
 	for ch, v in B64_ALPHABET do g_b64_val[ch] = u8(v)
 }
 
-// ascii_string_value builds a JS string from a NUL-terminated ASCII buffer that
-// was allocated with exactly one spare byte for the terminator. Factored so every
-// encoder returns through the same JSC path.
+// ascii_string_value builds a JS string from a NUL-terminated pure-ASCII buffer
+// via JSStringCreateWithUTF8CString (JSC stores pure ASCII as 8-bit StringImpl).
+// Measured faster on javascriptcoregtk than CreateWithCharacters(UTF-16 widen).
+// True "write into LChar StringImpl" needs private WTF APIs (see docs/jsc-private-string-p0.md).
 @(private = "file")
 ascii_string_value :: proc(ctx: jsc.JSContextRef, buf: []byte) -> jsc.JSValueRef {
 	js_str := jsc.JSStringCreateWithUTF8CString(cstring(raw_data(buf)))
@@ -586,7 +587,6 @@ latin1_string_from_bytes :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSV
 		}
 	}
 	if ascii {
-		// NUL-free 0x01-0x7F: one write + JSStringCreateWithUTF8CString → LChar.
 		tmp := make([]byte, len(data) + 1, context.temp_allocator)
 		copy(tmp, data)
 		tmp[len(data)] = 0

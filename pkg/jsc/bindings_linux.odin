@@ -18,6 +18,10 @@ foreign jsc_lib {
 
 	JSStringCreateWithUTF8CString :: proc(string: cstring) -> JSStringRef ---
 	JSStringCreateWithCharacters :: proc(chars: [^]JSChar, num_chars: c.size_t) -> JSStringRef ---
+	// Private API (JSStringRefPrivate.h): StringImpl without copying the buffer.
+	// Buffer must outlive the JSString (no freer) — only for immortal/static data,
+	// or for a window where the buffer is not freed until after JSStringRelease.
+	JSStringCreateWithCharactersNoCopy :: proc(chars: [^]JSChar, num_chars: c.size_t) -> JSStringRef ---
 	JSStringGetLength :: proc(string: JSStringRef) -> c.size_t ---
 	JSStringGetCharactersPtr :: proc(string: JSStringRef) -> [^]JSChar ---
 	JSStringGetMaximumUTF8CStringSize :: proc(string: JSStringRef) -> c.size_t ---

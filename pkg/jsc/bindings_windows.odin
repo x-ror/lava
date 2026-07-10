@@ -22,6 +22,7 @@ foreign jsc_lib {
 
 	JSStringCreateWithUTF8CString :: proc(string: cstring) -> JSStringRef ---
 	JSStringCreateWithCharacters :: proc(chars: [^]JSChar, num_chars: c.size_t) -> JSStringRef ---
+	JSStringCreateWithCharactersNoCopy :: proc(chars: [^]JSChar, num_chars: c.size_t) -> JSStringRef ---
 	JSStringGetLength :: proc(string: JSStringRef) -> c.size_t ---
 	JSStringGetCharactersPtr :: proc(string: JSStringRef) -> [^]JSChar ---
 	JSStringGetMaximumUTF8CStringSize :: proc(string: JSStringRef) -> c.size_t ---
