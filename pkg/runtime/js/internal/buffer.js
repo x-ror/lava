@@ -6,26 +6,161 @@
 
   if (!native) throw new Error('node:buffer requires native codec bindings');
 
-  var utf8Encode = native.utf8Encode; // (string) -> Uint8Array
-  var utf8Decode = native.utf8Decode; // (Uint8Array) -> string
-  var hexEncode = native.hexEncode; // (Uint8Array) -> string
-  var hexDecode = native.hexDecode; // (string) -> Uint8Array
-  var base64Encode = native.base64Encode; // (Uint8Array) -> string
   // (size) -> uninitialized Uint8Array | null — native uninitialized allocation
   // backing the unpooled unsafe paths; null signals "fall back to a zero-filled
   // own-backing Buffer" (binding missing or allocation failed). See allocUnsafeNoZero.
   var nativeAllocUninit = typeof native.allocUninit === 'function' ? native.allocUninit : null;
-  // Native byte-op fast paths, feature-detected so an older native build still
-  // works through the JS fallbacks below. compare/indexOf are only used once an
-  // input is at least NATIVE_BYTEOP_MIN bytes — below that the FFI crossing costs
-  // more than the JS loop. isValidUtf8 replaces a JS decode/re-encode round-trip,
-  // and utf8WriteInto encodes straight into the destination Buffer (no temp array).
+  // Native byte-op / codec fast paths, feature-detected so an older native build
+  // still works through the JS fallbacks below. Below the size thresholds the FFI
+  // crossing costs more than a tight JS loop (measured ~550–750ns fixed cost on
+  // javascriptcoregtk), so tiny inputs stay in JS.
   var nativeCompare = typeof native.compare === 'function' ? native.compare : null;
   var nativeIndexOf = typeof native.indexOf === 'function' ? native.indexOf : null;
   var nativeIsValidUtf8 = typeof native.isValidUtf8 === 'function' ? native.isValidUtf8 : null;
   var nativeUtf8WriteInto =
     typeof native.utf8WriteInto === 'function' ? native.utf8WriteInto : null;
-  var NATIVE_BYTEOP_MIN = 64; // bytes; below this, stay in JS
+  var nativeLatin1Encode = typeof native.latin1Encode === 'function' ? native.latin1Encode : null;
+  var nativeLatin1Decode = typeof native.latin1Decode === 'function' ? native.latin1Decode : null;
+  var nativeAsciiDecode = typeof native.asciiDecode === 'function' ? native.asciiDecode : null;
+  var NATIVE_BYTEOP_MIN = 64; // compare / indexOf: stay in JS below this
+  // Codecs: cross to native at 32 bytes (crossover ~16–32 on Lava; 32 leaves
+  // headroom and keeps the 1 KiB microbench on the native path).
+  var NATIVE_CODEC_MIN = 32;
+
+  // --- small-input JS codec fallbacks (used below NATIVE_CODEC_MIN) -----------
+  var HEX_TABLE = new Array(256);
+  var HEX_VAL = new Int8Array(128);
+  (function initHexTables() {
+    var digits = '0123456789abcdef';
+    var i;
+    for (i = 0; i < 256; i++) HEX_TABLE[i] = digits[i >> 4] + digits[i & 15];
+    for (i = 0; i < 128; i++) HEX_VAL[i] = -1;
+    for (i = 0; i < 10; i++) HEX_VAL[48 + i] = i; // '0'-'9'
+    for (i = 0; i < 6; i++) {
+      HEX_VAL[97 + i] = 10 + i; // 'a'-'f'
+      HEX_VAL[65 + i] = 10 + i; // 'A'-'F'
+    }
+  })();
+
+  function hexEncodeJs(bytes) {
+    var n = bytes.length;
+    if (n === 0) return '';
+    var parts = new Array(n);
+    for (var i = 0; i < n; i++) parts[i] = HEX_TABLE[bytes[i]];
+    return parts.join('');
+  }
+
+  function hexDecodeJs(str) {
+    str = String(str);
+    var len = str.length;
+    var out = new Uint8Array(len >>> 1);
+    var n = 0;
+    for (var i = 0; i + 1 < len; i += 2) {
+      var c0 = str.charCodeAt(i);
+      var c1 = str.charCodeAt(i + 1);
+      if (c0 > 127 || c1 > 127) break;
+      var hi = HEX_VAL[c0];
+      var lo = HEX_VAL[c1];
+      if (hi < 0 || lo < 0) break;
+      out[n++] = (hi << 4) | lo;
+    }
+    return n === out.length ? out : out.subarray(0, n);
+  }
+
+  var B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  function base64EncodeJs(bytes) {
+    var n = bytes.length;
+    if (n === 0) return '';
+    var out = '';
+    var i = 0;
+    for (; i + 2 < n; i += 3) {
+      var v = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+      out +=
+        B64_ALPHABET[(v >> 18) & 63] +
+        B64_ALPHABET[(v >> 12) & 63] +
+        B64_ALPHABET[(v >> 6) & 63] +
+        B64_ALPHABET[v & 63];
+    }
+    if (n - i === 1) {
+      v = bytes[i] << 16;
+      out += B64_ALPHABET[(v >> 18) & 63] + B64_ALPHABET[(v >> 12) & 63] + '==';
+    } else if (n - i === 2) {
+      v = (bytes[i] << 16) | (bytes[i + 1] << 8);
+      out +=
+        B64_ALPHABET[(v >> 18) & 63] +
+        B64_ALPHABET[(v >> 12) & 63] +
+        B64_ALPHABET[(v >> 6) & 63] +
+        '=';
+    }
+    return out;
+  }
+
+  var textEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+  var textDecoder = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8') : null;
+
+  function latin1EncodeJs(str) {
+    str = String(str);
+    var a = new Uint8Array(str.length);
+    for (var i = 0; i < str.length; i++) a[i] = str.charCodeAt(i) & 0xff;
+    return a;
+  }
+
+  function latin1DecodeJs(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return s;
+  }
+
+  function asciiDecodeJs(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i] & 0x7f);
+    return s;
+  }
+
+  // Size-gated wrappers: native bulk work past NATIVE_CODEC_MIN, JS below.
+  function utf8Encode(str) {
+    str = String(str);
+    if (textEncoder !== null && str.length < NATIVE_CODEC_MIN) return textEncoder.encode(str);
+    return native.utf8Encode(str);
+  }
+
+  function utf8Decode(bytes) {
+    if (textDecoder !== null && bytes.length < NATIVE_CODEC_MIN) return textDecoder.decode(bytes);
+    return native.utf8Decode(bytes);
+  }
+
+  function hexEncode(bytes) {
+    if (bytes.length < NATIVE_CODEC_MIN) return hexEncodeJs(bytes);
+    return native.hexEncode(bytes);
+  }
+
+  function hexDecode(str) {
+    str = String(str);
+    if (str.length < NATIVE_CODEC_MIN * 2) return hexDecodeJs(str);
+    return native.hexDecode(str);
+  }
+
+  function base64Encode(bytes) {
+    if (bytes.length < NATIVE_CODEC_MIN) return base64EncodeJs(bytes);
+    return native.base64Encode(bytes);
+  }
+
+  function latin1Encode(str) {
+    str = String(str);
+    if (nativeLatin1Encode === null || str.length < NATIVE_CODEC_MIN) return latin1EncodeJs(str);
+    return nativeLatin1Encode(str);
+  }
+
+  function latin1Decode(bytes) {
+    if (nativeLatin1Decode === null || bytes.length < NATIVE_CODEC_MIN)
+      return latin1DecodeJs(bytes);
+    return nativeLatin1Decode(bytes);
+  }
+
+  function asciiDecode(bytes) {
+    if (nativeAsciiDecode === null || bytes.length < NATIVE_CODEC_MIN) return asciiDecodeJs(bytes);
+    return nativeAsciiDecode(bytes);
+  }
 
   // node:buffer length limits. MAX_STRING_LENGTH is V8's string cap. MAX_LENGTH is
   // the largest buffer this runtime will allocate: native computes the practical
@@ -278,19 +413,17 @@
 
   function strToBytes(str, encoding) {
     encoding = normalizeEncoding(encoding);
-    if (encoding === 'utf8') return utf8Encode(String(str));
+    if (encoding === 'utf8') return utf8Encode(str);
     if (encoding === 'utf16le') return utf16leEncode(String(str));
-    if (encoding === 'hex') return hexDecode(String(str));
+    if (encoding === 'hex') return hexDecode(str);
     if (encoding === 'base64' || encoding === 'base64url') {
       var norm = normalizeBase64(str);
+      // Always native after JS normalization (padding / alphabet cleanup); the
+      // normalize step dominates tiny inputs, so a second size-gate is not useful.
       return norm ? native.base64Decode(norm) : new Uint8Array(0);
     }
-    if (encoding === 'ascii' || encoding === 'latin1') {
-      str = String(str);
-      var a = new Uint8Array(str.length);
-      for (var i = 0; i < str.length; i++) a[i] = str.charCodeAt(i) & 0xff;
-      return a;
-    }
+    // ascii and latin1 share the encode path (low byte of each code unit).
+    if (encoding === 'ascii' || encoding === 'latin1') return latin1Encode(str);
     throw errUnknownEncoding(encoding);
   }
 
@@ -301,12 +434,8 @@
     if (encoding === 'hex') return hexEncode(bytes);
     if (encoding === 'base64') return base64Encode(bytes);
     if (encoding === 'base64url') return toBase64Url(base64Encode(bytes));
-    if (encoding === 'ascii' || encoding === 'latin1') {
-      var s = '';
-      for (var i = 0; i < bytes.length; i++)
-        s += String.fromCharCode(encoding === 'ascii' ? bytes[i] & 0x7f : bytes[i]);
-      return s;
-    }
+    if (encoding === 'latin1') return latin1Decode(bytes);
+    if (encoding === 'ascii') return asciiDecode(bytes);
     throw errUnknownEncoding(encoding);
   }
 

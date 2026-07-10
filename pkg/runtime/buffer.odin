@@ -10,11 +10,11 @@ import "core:unicode/utf8"
 import jsc "lava:pkg/jsc"
 
 // Native codec backing for the node:buffer built-in. The hand-rolled JS
-// encoders in js/internal/buffer.js (kept as a fallback) are replaced on the hot
-// paths by these Odin primitives, reached through the `native` bindings object
-// the loader passes as the factory's fourth argument — same mechanism as crypto
-// (see runtime-native-builtin-bindings). The JS layer owns Node's encoding
-// quirks (lenient base64 normalization, ascii/latin1); these do the bulk work.
+// encoders in js/internal/buffer.js (kept as a small-input fallback) are replaced
+// on the hot paths by these Odin primitives, reached through the `native` bindings
+// object the loader passes as the factory's fourth argument — same mechanism as
+// crypto (see runtime-native-builtin-bindings). The JS layer owns Node's encoding
+// quirks (lenient base64 normalization) and size-gates the FFI for tiny inputs.
 
 // Codec lookup tables. The encoders write straight into a NUL-terminated temp
 // buffer that goes to JSStringCreateWithUTF8CString (pure-ASCII output, so JSC
@@ -544,6 +544,113 @@ buffer_is_valid_utf8_cb :: proc "c" (
 	return jsc.JSValueMakeBoolean(ctx, b32(utf8.valid_string(string(data))))
 }
 
+// latin1Encode(string) -> Uint8Array. One output byte per UTF-16 code unit,
+// low 8 bits only — Node's Buffer.from(str, 'latin1') / 'ascii' (encode side).
+// Reads units in place via GetCharactersPtr (no UTF-8 intermediate).
+buffer_latin1_encode_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return make_uint8_array(ctx, nil)
+
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
+	if js_string == nil do return make_uint8_array(ctx, nil)
+	defer jsc.JSStringRelease(js_string)
+	length := int(jsc.JSStringGetLength(js_string))
+	if length == 0 do return make_uint8_array(ctx, nil)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return make_uint8_array(ctx, nil)
+
+	out := make([]byte, length, context.allocator)
+	for i in 0 ..< length {
+		out[i] = byte(chars[i] & 0xFF)
+	}
+	return make_uint8_array(ctx, out)
+}
+
+// latin1_string_from_bytes builds a JS string where each input byte becomes one
+// UTF-16 unit (ISO-8859-1 / Node 'latin1'). Pure ASCII without NULs takes the
+// dense 8-bit StringImpl path (UTF-8 create); anything with a high bit or NUL
+// goes through CreateWithCharacters so bytes are preserved.
+@(private = "file")
+latin1_string_from_bytes :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef {
+	if len(data) == 0 do return js_string_value(ctx, "")
+	ascii := true
+	for b in data {
+		if b == 0 || b >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		// NUL-free 0x01-0x7F: one write + JSStringCreateWithUTF8CString → LChar.
+		tmp := make([]byte, len(data) + 1, context.temp_allocator)
+		copy(tmp, data)
+		tmp[len(data)] = 0
+		return ascii_string_value(ctx, tmp)
+	}
+	units := make([]jsc.JSChar, len(data), context.temp_allocator)
+	for i in 0 ..< len(data) do units[i] = jsc.JSChar(data[i])
+	js_str := jsc.JSStringCreateWithCharacters(raw_data(units), c.size_t(len(data)))
+	defer jsc.JSStringRelease(js_str)
+	return jsc.JSValueMakeString(ctx, js_str)
+}
+
+// latin1Decode(u8) -> string. Buffer.toString('latin1') / 'binary'.
+buffer_latin1_decode_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return js_string_value(ctx, "")
+
+	data, ok := typed_array_view(ctx, arguments[0])
+	if !ok || len(data) == 0 do return js_string_value(ctx, "")
+	return latin1_string_from_bytes(ctx, data)
+}
+
+// asciiDecode(u8) -> string. Buffer.toString('ascii'): each byte masked to 7 bits.
+// After the mask the alphabet is pure ASCII (possibly with NULs); reuse the
+// latin1 builder so NUL/dense-ASCII paths stay correct.
+buffer_ascii_decode_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return js_string_value(ctx, "")
+
+	data, ok := typed_array_view(ctx, arguments[0])
+	if !ok || len(data) == 0 do return js_string_value(ctx, "")
+
+	// Mask in a temp only when a high bit is present; otherwise latin1 path is
+	// identical and avoids an extra pass + allocation.
+	needs_mask := false
+	for b in data {
+		if b >= 0x80 {
+			needs_mask = true
+			break
+		}
+	}
+	if !needs_mask do return latin1_string_from_bytes(ctx, data)
+
+	masked := make([]byte, len(data), context.temp_allocator)
+	for b, i in data do masked[i] = b & 0x7F
+	return latin1_string_from_bytes(ctx, masked)
+}
+
 // utf8WriteInto(target, string, offset, maxLength) -> bytesWritten. Encodes the
 // string to UTF-8 (JSC already produced those bytes when the value was read) and
 // copies up to maxLength of them straight into the caller's Buffer at offset —
@@ -589,6 +696,9 @@ make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "base64Decode", buffer_base64_decode_cb)
 	inject_native_function(ctx, bindings, "utf8Encode", buffer_utf8_encode_cb)
 	inject_native_function(ctx, bindings, "utf8Decode", buffer_utf8_decode_cb)
+	inject_native_function(ctx, bindings, "latin1Encode", buffer_latin1_encode_cb)
+	inject_native_function(ctx, bindings, "latin1Decode", buffer_latin1_decode_cb)
+	inject_native_function(ctx, bindings, "asciiDecode", buffer_ascii_decode_cb)
 	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
 	inject_native_function(ctx, bindings, "compare", buffer_compare_cb)
 	inject_native_function(ctx, bindings, "indexOf", buffer_index_of_cb)
