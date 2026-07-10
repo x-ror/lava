@@ -13,6 +13,8 @@
     "buffer-from-hex-tiny": 8.0,
     "buffer-to-latin1": 50.0,
     "buffer-from-latin1": 50.0,
+    "buffer-to-utf16le": 35.0,
+    "buffer-from-utf16le": 35.0,
     "require-builtin-events": 5.0,
     "require-builtin-util": 5.0,
     "fs-write-read-64k": 3.0

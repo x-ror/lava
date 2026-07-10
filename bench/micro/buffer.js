@@ -38,3 +38,13 @@ bench('buffer-to-latin1', () => latin1Buf.toString('latin1'), {
 bench('buffer-from-latin1', () => Buffer.from(latin1Text, 'latin1'), {
   iterations: 20000,
 });
+
+// utf16le — decode was pure-JS String.fromCharCode concat (~100× Node at 1 KiB).
+const u16text = 'hello world — buffers '.repeat(24); // ~512 code units → 1 KiB
+const u16buf = Buffer.from(u16text, 'utf16le');
+bench('buffer-to-utf16le', () => u16buf.toString('utf16le'), {
+  iterations: 20000,
+});
+bench('buffer-from-utf16le', () => Buffer.from(u16text, 'utf16le'), {
+  iterations: 20000,
+});
