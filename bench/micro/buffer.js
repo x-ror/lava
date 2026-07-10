@@ -1,8 +1,6 @@
 'use strict';
 
-// Buffer codec throughput. The 1 KiB cases exercise the native path
-// (NATIVE_CODEC_MIN = 32). Tiny + latin1 cases cover size-gating and the
-// latin1/ascii native codecs.
+// Buffer codec throughput — all codecs are always-native (no JS polyfills).
 const { bench } = require('../lib/harness');
 
 const buf = Buffer.alloc(1024);
@@ -25,13 +23,12 @@ bench('buffer-from-utf8', () => Buffer.from(text, 'utf8'), {
 });
 bench('buffer-to-utf8', () => utf8.toString('utf8'), { iterations: 30000 });
 
-// Tiny (JS path) — should not regress when native FFI is expensive.
+// Tiny inputs still hit native (FFI floor vs Node is expected).
 bench('buffer-to-hex-tiny', () => tiny.toString('hex'), { iterations: 50000 });
 bench('buffer-from-hex-tiny', () => Buffer.from('deadbeefcafebabe', 'hex'), {
   iterations: 50000,
 });
 
-// latin1 — previously pure-JS string concat; now native past NATIVE_CODEC_MIN.
 bench('buffer-to-latin1', () => latin1Buf.toString('latin1'), {
   iterations: 20000,
 });
@@ -39,7 +36,6 @@ bench('buffer-from-latin1', () => Buffer.from(latin1Text, 'latin1'), {
   iterations: 20000,
 });
 
-// utf16le — decode was pure-JS String.fromCharCode concat (~100× Node at 1 KiB).
 const u16text = 'hello world — buffers '.repeat(24); // ~512 code units → 1 KiB
 const u16buf = Buffer.from(u16text, 'utf16le');
 bench('buffer-to-utf16le', () => u16buf.toString('utf16le'), {

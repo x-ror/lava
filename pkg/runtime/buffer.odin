@@ -9,12 +9,10 @@ import "core:strings"
 import "core:unicode/utf8"
 import jsc "lava:pkg/jsc"
 
-// Native codec backing for the node:buffer built-in. The hand-rolled JS
-// encoders in js/internal/buffer.js (kept as a small-input fallback) are replaced
-// on the hot paths by these Odin primitives, reached through the `native` bindings
-// object the loader passes as the factory's fourth argument — same mechanism as
-// crypto (see runtime-native-builtin-bindings). The JS layer owns Node's encoding
-// quirks (lenient base64 normalization) and size-gates the FFI for tiny inputs.
+// Native codec backing for the node:buffer built-in. All codecs and byte-ops are
+// required Odin primitives reached through the `native` bindings object the loader
+// passes as the factory's fourth argument — no JS polyfills in buffer.js. The JS
+// layer owns Node API glue and encoding quirks (lenient base64 normalization).
 
 // Codec lookup tables. The encoders write straight into a NUL-terminated temp
 // buffer that goes to JSStringCreateWithUTF8CString (pure-ASCII output, so JSC
