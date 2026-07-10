@@ -966,14 +966,52 @@
     return b;
   }
 
+  /**
+   * Buffer.from(string) without the encode-then-copy round trip: encodings with
+   * a knowable byte length (latin1/ascii = length, utf16le = 2*length, utf8 =
+   * native exact count) allocate once — usually from the pool, like Node — and
+   * the native writeInto fills that allocation directly. hex/base64 decode into
+   * a fresh native-backed array; the Buffer becomes a view over that same
+   * ArrayBuffer instead of copying it.
+   * @returns {Buffer}
+   */
+  function fromString(str, encoding) {
+    encoding = normalizeEncoding(encoding);
+    str = String(str);
+    if (str.length === 0) return allocate(0);
+    if (encoding === 'latin1' || encoding === 'ascii') {
+      var b = allocate(str.length);
+      latin1WriteIntoNative(b, str, 0, str.length);
+      return b;
+    }
+    if (encoding === 'utf16le') {
+      var b16 = allocate(str.length * 2);
+      utf16leWriteIntoNative(b16, str, 0, str.length * 2);
+      return b16;
+    }
+    if (encoding === 'utf8') {
+      var n = utf8ByteLengthNative(str);
+      if (n === 0) return allocate(0);
+      var b8 = allocate(n);
+      utf8WriteIntoNative(b8, str, 0, n);
+      return b8;
+    }
+    var bytes = strToBytes(str, encoding);
+    if (bytes.length === 0) return allocate(0);
+    // Small results: pooled copy (materializing .buffer costs more than the
+    // copy). Large results: view the decode's own ArrayBuffer, zero copy.
+    if (bytes.length < 512) {
+      var bc = allocate(bytes.length);
+      bc.set(bytes);
+      return bc;
+    }
+    return new Buffer(bytes.buffer, bytes.byteOffset, bytes.length);
+  }
+
   /** @see https://nodejs.org/api/buffer.html#static-method-bufferfromarray */
   Buffer.from = function (value, encodingOrOffset, length) {
     if (typeof value === 'string') {
-      var bytes = strToBytes(value, encodingOrOffset);
-      if (bytes.length === 0) return allocate(0);
-      var b = allocate(bytes.length);
-      b.set(bytes);
-      return b;
+      return fromString(value, encodingOrOffset);
     }
     if (value !== null && typeof value === 'object') {
       if (

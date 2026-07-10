@@ -1,5 +1,6 @@
 package lava_runtime
 
+import "base:intrinsics"
 import "base:runtime"
 import "core:bytes"
 import "core:c"
@@ -35,18 +36,64 @@ buffer_codec_tables_init :: proc "contextless" () {
 	for ch, v in B64_ALPHABET do g_b64_val[ch] = u8(v)
 }
 
-// ascii_string_value builds a JS string from a NUL-terminated pure-ASCII buffer
-// via JSStringCreateWithUTF8CString (JSC stores pure ASCII as 8-bit StringImpl).
-// Measured faster on javascriptcoregtk than CreateWithCharacters(UTF-16 widen).
-// True "write into LChar StringImpl" needs private WTF APIs (see docs/jsc-private-string-p0.md).
+// bytes_all_ascii reports whether every byte is < 0x80 (NULs allowed), eight
+// bytes per step. ASCII content can go into an 8-bit StringImpl byte-for-byte.
+bytes_all_ascii :: proc(data: []byte) -> bool {
+	i := 0
+	for ; i + 8 <= len(data); i += 8 {
+		chunk := intrinsics.unaligned_load((^u64)(raw_data(data[i:])))
+		if chunk & 0x8080808080808080 != 0 do return false
+	}
+	for ; i < len(data); i += 1 {
+		if data[i] >= 0x80 do return false
+	}
+	return true
+}
+
+// bytes_all_ascii_no_nul is bytes_all_ascii but also rejects 0x00, for callers
+// whose fallback path is NUL-truncating (js_string_value) and must not change
+// behavior when the fast path is unavailable.
+bytes_all_ascii_no_nul :: proc(data: []byte) -> bool {
+	i := 0
+	for ; i + 8 <= len(data); i += 8 {
+		chunk := intrinsics.unaligned_load((^u64)(raw_data(data[i:])))
+		has_nul := (chunk - 0x0101010101010101) & ~chunk & 0x8080808080808080
+		if chunk & 0x8080808080808080 != 0 || has_nul != 0 do return false
+	}
+	for ; i < len(data); i += 1 {
+		if data[i] >= 0x80 || data[i] == 0 do return false
+	}
+	return true
+}
+
+// ascii_string_value builds a JS string from a NUL-terminated pure-ASCII buffer.
+// Fast path: copy straight into an 8-bit StringImpl (jsc.string_alloc8), no
+// validation pass. Fallback: JSStringCreateWithUTF8CString (JSC stores pure
+// ASCII as 8-bit StringImpl; measured faster on javascriptcoregtk than
+// CreateWithCharacters' UTF-16 widen).
 @(private = "file")
 ascii_string_value :: proc(ctx: jsc.JSContextRef, buf: []byte) -> jsc.JSValueRef {
+	if str, dst, ok := jsc.string_alloc8(len(buf) - 1); ok {
+		copy(dst, buf[:len(buf) - 1])
+		defer jsc.JSStringRelease(str)
+		return jsc.JSValueMakeString(ctx, str)
+	}
 	js_str := jsc.JSStringCreateWithUTF8CString(cstring(raw_data(buf)))
 	defer jsc.JSStringRelease(js_str)
 	return jsc.JSValueMakeString(ctx, js_str)
 }
 
+@(private = "file")
+hex_write :: proc(dst: []byte, src: []byte) {
+	for b, i in src {
+		dst[i * 2] = HEX_DIGITS[b >> 4]
+		dst[i * 2 + 1] = HEX_DIGITS[b & 0x0F]
+	}
+}
+
 // hexEncode(u8) -> string. Lowercase hex, matching Buffer.toString('hex').
+// Digits are written directly into the result string's 8-bit storage when the
+// private constructor is available — one pass, no temp, no UTF-8 re-scan.
 buffer_hex_encode_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -61,13 +108,41 @@ buffer_hex_encode_cb :: proc "c" (
 	data, ok := typed_array_view(ctx, arguments[0])
 	if !ok || len(data) == 0 do return js_string_value(ctx, "")
 
-	out := make([]byte, len(data) * 2 + 1, context.temp_allocator)
-	for b, i in data {
-		out[i * 2] = HEX_DIGITS[b >> 4]
-		out[i * 2 + 1] = HEX_DIGITS[b & 0x0F]
+	n := len(data) * 2
+	if str, dst, ok8 := jsc.string_alloc8(n); ok8 {
+		hex_write(dst, data)
+		defer jsc.JSStringRelease(str)
+		return jsc.JSValueMakeString(ctx, str)
 	}
-	out[len(data) * 2] = 0
+	out := make([]byte, n + 1, context.temp_allocator)
+	hex_write(out[:n], data)
+	out[n] = 0
 	return ascii_string_value(ctx, out)
+}
+
+// hex_pairs counts the leading valid hex digit pairs (Node stops at the first
+// invalid pair). Generic over the string's storage width; the >= 256 range
+// check compiles away for 8-bit storage.
+@(private = "file")
+hex_pairs :: proc(chars: []$T) -> int {
+	n := 0
+	for i := 0; i + 1 < len(chars); i += 2 {
+		c0 := chars[i]
+		c1 := chars[i + 1]
+		when size_of(T) > 1 {
+			if c0 >= 256 || c1 >= 256 do break
+		}
+		if g_hex_val[c0] == 0xFF || g_hex_val[c1] == 0xFF do break
+		n += 1
+	}
+	return n
+}
+
+@(private = "file")
+hex_fill :: proc(out: []byte, chars: []$T) {
+	for j in 0 ..< len(out) {
+		out[j] = g_hex_val[chars[j * 2]] << 4 | g_hex_val[chars[j * 2 + 1]]
+	}
 }
 
 buffer_hex_decode_cb :: proc "c" (
@@ -86,28 +161,58 @@ buffer_hex_decode_cb :: proc "c" (
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length < 2 do return make_uint8_array(ctx, nil)
+
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		n := hex_pairs(s8)
+		if n == 0 do return make_uint8_array(ctx, nil)
+		out := make([]byte, n, context.allocator)
+		hex_fill(out, s8)
+		return make_uint8_array(ctx, out)
+	}
+
 	chars := jsc.JSStringGetCharactersPtr(js_string)
 	if chars == nil do return make_uint8_array(ctx, nil)
-
-	n := 0
-	for i := 0; i + 1 < length; i += 2 {
-		c0 := chars[i]
-		c1 := chars[i + 1]
-		if c0 >= 256 || c1 >= 256 do break
-		if g_hex_val[c0] == 0xFF || g_hex_val[c1] == 0xFF do break
-		n += 1
-	}
+	n := hex_pairs(chars[:length])
 	if n == 0 do return make_uint8_array(ctx, nil)
-
 	out := make([]byte, n, context.allocator)
-	for i, j := 0, 0; j < n; i, j = i + 2, j + 1 {
-		out[j] = g_hex_val[chars[i]] << 4 | g_hex_val[chars[i + 1]]
-	}
+	hex_fill(out, chars[:length])
 	return make_uint8_array(ctx, out)
 }
 
+// base64_write fills dst (exactly (len(src)+2)/3*4 bytes) with standard-alphabet
+// padded base64.
+@(private = "file")
+base64_write :: proc(dst: []byte, src: []byte) {
+	n := len(src)
+	di := 0
+	i := 0
+	for ; i + 2 < n; i += 3 {
+		v := u32(src[i]) << 16 | u32(src[i + 1]) << 8 | u32(src[i + 2])
+		dst[di] = B64_ALPHABET[v >> 18]
+		dst[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
+		dst[di + 2] = B64_ALPHABET[v >> 6 & 0x3F]
+		dst[di + 3] = B64_ALPHABET[v & 0x3F]
+		di += 4
+	}
+	switch n - i {
+	case 1:
+		v := u32(src[i]) << 16
+		dst[di] = B64_ALPHABET[v >> 18]
+		dst[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
+		dst[di + 2] = '='
+		dst[di + 3] = '='
+	case 2:
+		v := u32(src[i]) << 16 | u32(src[i + 1]) << 8
+		dst[di] = B64_ALPHABET[v >> 18]
+		dst[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
+		dst[di + 2] = B64_ALPHABET[v >> 6 & 0x3F]
+		dst[di + 3] = '='
+	}
+}
+
 // base64Encode(u8) -> string. Standard alphabet with padding, matching
-// Buffer.toString('base64').
+// Buffer.toString('base64'). Written directly into the result string's 8-bit
+// storage when the private constructor is available.
 buffer_base64_encode_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -122,35 +227,15 @@ buffer_base64_encode_cb :: proc "c" (
 	data, ok := typed_array_view(ctx, arguments[0])
 	if !ok || len(data) == 0 do return js_string_value(ctx, "")
 
-	n := len(data)
-	out := make([]byte, (n + 2) / 3 * 4 + 1, context.temp_allocator)
-	di := 0
-	i := 0
-	for ; i + 2 < n; i += 3 {
-		v := u32(data[i]) << 16 | u32(data[i + 1]) << 8 | u32(data[i + 2])
-		out[di] = B64_ALPHABET[v >> 18]
-		out[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
-		out[di + 2] = B64_ALPHABET[v >> 6 & 0x3F]
-		out[di + 3] = B64_ALPHABET[v & 0x3F]
-		di += 4
+	n := (len(data) + 2) / 3 * 4
+	if str, dst, ok8 := jsc.string_alloc8(n); ok8 {
+		base64_write(dst, data)
+		defer jsc.JSStringRelease(str)
+		return jsc.JSValueMakeString(ctx, str)
 	}
-	switch n - i {
-	case 1:
-		v := u32(data[i]) << 16
-		out[di] = B64_ALPHABET[v >> 18]
-		out[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
-		out[di + 2] = '='
-		out[di + 3] = '='
-		di += 4
-	case 2:
-		v := u32(data[i]) << 16 | u32(data[i + 1]) << 8
-		out[di] = B64_ALPHABET[v >> 18]
-		out[di + 1] = B64_ALPHABET[v >> 12 & 0x3F]
-		out[di + 2] = B64_ALPHABET[v >> 6 & 0x3F]
-		out[di + 3] = '='
-		di += 4
-	}
-	out[di] = 0
+	out := make([]byte, n + 1, context.temp_allocator)
+	base64_write(out[:n], data)
+	out[n] = 0
 	return ascii_string_value(ctx, out)
 }
 
@@ -169,23 +254,40 @@ buffer_base64_decode_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return make_uint8_array(ctx, nil)
 
-	// Same in-place UTF-16 read as hexDecode: base64 input is ASCII by contract.
+	// Same in-place read as hexDecode: base64 input is ASCII by contract.
 	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
 	if js_string == nil do return make_uint8_array(ctx, nil)
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length == 0 || length % 4 != 0 do return make_uint8_array(ctx, nil)
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return make_uint8_array(ctx, nil)
 
-	groups := length / 4
-	out := make([]byte, groups * 3, context.allocator)
+	out := make([]byte, length / 4 * 3, context.allocator)
 	n := 0
+	okp := false
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		n, okp = base64_parse(out, s8)
+	} else {
+		chars := jsc.JSStringGetCharactersPtr(js_string)
+		if chars != nil do n, okp = base64_parse(out, chars[:length])
+	}
+	if !okp {
+		delete(out, context.allocator)
+		return make_uint8_array(ctx, nil)
+	}
+	return make_uint8_array(ctx, out[:n])
+}
+
+// base64_parse decodes clean, padded standard base64 into out (len(chars)/4*3
+// capacity), returning bytes written. Padding is only legal in the final group,
+// and '=' before a non-'=' is malformed ("x=y="); both fail closed like
+// core:encoding/base64 did. Generic over string storage width.
+@(private = "file")
+base64_parse :: proc(out: []byte, chars: []$T) -> (n: int, ok: bool) {
+	groups := len(chars) / 4
 	for g in 0 ..< groups {
 		s := chars[g * 4:g * 4 + 4]
-		if s[0] >= 256 || s[1] >= 256 || s[2] >= 256 || s[3] >= 256 {
-			delete(out, context.allocator)
-			return make_uint8_array(ctx, nil)
+		when size_of(T) > 1 {
+			if s[0] >= 256 || s[1] >= 256 || s[2] >= 256 || s[3] >= 256 do return 0, false
 		}
 		d0 := g_b64_val[s[0]]
 		d1 := g_b64_val[s[1]]
@@ -193,12 +295,9 @@ buffer_base64_decode_cb :: proc "c" (
 		pad3 := s[3] == '='
 		d2 := pad2 ? 0 : g_b64_val[s[2]]
 		d3 := pad3 ? 0 : g_b64_val[s[3]]
-		// Padding is only legal in the final group, and '=' before a non-'=' is
-		// malformed ("x=y="); both fail closed like core:encoding/base64 did.
 		if d0 == 0xFF || d1 == 0xFF || d2 == 0xFF || d3 == 0xFF ||
 		   (pad2 && !pad3) || ((pad2 || pad3) && g != groups - 1) {
-			delete(out, context.allocator)
-			return make_uint8_array(ctx, nil)
+			return 0, false
 		}
 		v := u32(d0) << 18 | u32(d1) << 12 | u32(d2) << 6 | u32(d3)
 		out[n] = byte(v >> 16)
@@ -212,7 +311,7 @@ buffer_base64_decode_cb :: proc "c" (
 			n += 1
 		}
 	}
-	return make_uint8_array(ctx, out[:n])
+	return n, true
 }
 
 // utf8Encode(string) -> Uint8Array. JavaScriptCore already produced a UTF-8
@@ -354,6 +453,17 @@ buffer_utf8_decode_cb :: proc "c" (
 
 	data, ok := typed_array_view(ctx, arguments[0])
 	if !ok || len(data) == 0 do return js_string_value(ctx, "")
+
+	// Fastest path: pure-ASCII bytes (embedded NULs included — Node keeps them)
+	// are already valid 8-bit string content; copy them straight into the result
+	// string's storage with no validation pass.
+	if bytes_all_ascii(data) {
+		if str, dst, ok8 := jsc.string_alloc8(len(data)); ok8 {
+			copy(dst, data)
+			defer jsc.JSStringRelease(str)
+			return jsc.JSValueMakeString(ctx, str)
+		}
+	}
 
 	// Fast path: NUL-free input goes through JSC's own UTF-8 conversion
 	// (JSStringCreateWithUTF8CString), which validates strictly and builds an
@@ -557,10 +667,18 @@ buffer_latin1_encode_cb :: proc "c" (
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length == 0 do return make_uint8_array(ctx, nil)
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return make_uint8_array(ctx, nil)
 
 	out := make([]byte, length, context.allocator)
+	// 8-bit storage IS the latin1 byte sequence — one copy, no widen.
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		copy(out, s8)
+		return make_uint8_array(ctx, out)
+	}
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil {
+		delete(out, context.allocator)
+		return make_uint8_array(ctx, nil)
+	}
 	for i in 0 ..< length {
 		out[i] = byte(chars[i] & 0xFF)
 	}
@@ -568,12 +686,19 @@ buffer_latin1_encode_cb :: proc "c" (
 }
 
 // latin1_string_from_bytes builds a JS string where each input byte becomes one
-// UTF-16 unit (ISO-8859-1 / Node 'latin1'). Pure ASCII without NULs takes the
-// dense 8-bit StringImpl path (UTF-8 create); anything with a high bit or NUL
-// goes through CreateWithCharacters so bytes are preserved. Shared with the
-// node:http request parser (header name/value/method/url).
+// code point U+0000..U+00FF (ISO-8859-1 / Node 'latin1'). Latin-1 bytes ARE
+// 8-bit StringImpl content, so the fast path is a single copy into the result
+// string's storage — NULs and high bytes included, no scan. Fallback: pure
+// ASCII without NULs takes the dense 8-bit StringImpl path (UTF-8 create);
+// anything else goes through CreateWithCharacters so bytes are preserved.
+// Shared with the node:http request parser (header name/value/method/url).
 latin1_string_from_bytes :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef {
 	if len(data) == 0 do return js_string_value(ctx, "")
+	if str, dst, ok := jsc.string_alloc8(len(data)); ok {
+		copy(dst, data)
+		defer jsc.JSStringRelease(str)
+		return jsc.JSValueMakeString(ctx, str)
+	}
 	ascii := true
 	for b in data {
 		if b == 0 || b >= 0x80 {
@@ -662,10 +787,21 @@ buffer_utf16le_encode_cb :: proc "c" (
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length == 0 do return make_uint8_array(ctx, nil)
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return make_uint8_array(ctx, nil)
 
 	out := make([]byte, length * 2, context.allocator)
+	// 8-bit storage: each unit is a byte, high byte always 0 — no widen pass.
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		for b, i in s8 {
+			out[i * 2] = b
+			out[i * 2 + 1] = 0
+		}
+		return make_uint8_array(ctx, out)
+	}
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil {
+		delete(out, context.allocator)
+		return make_uint8_array(ctx, nil)
+	}
 	for i in 0 ..< length {
 		u := chars[i]
 		out[i * 2] = byte(u & 0xFF)
@@ -692,13 +828,25 @@ buffer_utf16le_decode_cb :: proc "c" (
 	if !ok || len(data) < 2 do return js_string_value(ctx, "")
 
 	n := len(data) / 2
-	units := make([]jsc.JSChar, n, context.temp_allocator)
-	for i in 0 ..< n {
-		units[i] = jsc.JSChar(data[i * 2]) | (jsc.JSChar(data[i * 2 + 1]) << 8)
+	if str, dst, ok16 := jsc.string_alloc16(n); ok16 {
+		utf16le_units_write(dst, data)
+		defer jsc.JSStringRelease(str)
+		return jsc.JSValueMakeString(ctx, str)
 	}
+	units := make([]jsc.JSChar, n, context.temp_allocator)
+	utf16le_units_write(units, data)
 	js_str := jsc.JSStringCreateWithCharacters(raw_data(units), c.size_t(n))
 	defer jsc.JSStringRelease(js_str)
 	return jsc.JSValueMakeString(ctx, js_str)
+}
+
+// utf16le_units_write combines little-endian byte pairs into dst's len(dst)
+// UTF-16 code units.
+@(private = "file")
+utf16le_units_write :: proc(dst: []jsc.JSChar, data: []byte) {
+	for i in 0 ..< len(dst) {
+		dst[i] = jsc.JSChar(data[i * 2]) | (jsc.JSChar(data[i * 2 + 1]) << 8)
+	}
 }
 
 // utf16leWriteInto(target, string, offset, maxLength) -> bytesWritten. Writes
@@ -722,8 +870,6 @@ buffer_utf16le_write_into_cb :: proc "c" (
 	defer jsc.JSStringRelease(js_string)
 	slen := int(jsc.JSStringGetLength(js_string))
 	if slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
 
 	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
 	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
@@ -738,6 +884,15 @@ buffer_utf16le_write_into_cb :: proc "c" (
 	n_units := max / 2
 	if n_units > slen do n_units = slen
 	dst := target[offset:]
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		for i in 0 ..< n_units {
+			dst[i * 2] = s8[i]
+			dst[i * 2 + 1] = 0
+		}
+		return jsc.JSValueMakeNumber(ctx, f64(n_units * 2))
+	}
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
 	for i in 0 ..< n_units {
 		u := chars[i]
 		dst[i * 2] = byte(u & 0xFF)
@@ -768,8 +923,7 @@ buffer_latin1_write_into_cb :: proc "c" (
 	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
 	defer jsc.JSStringRelease(js_string)
 	slen := int(jsc.JSStringGetLength(js_string))
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil || slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	if slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
 
 	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
 	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
@@ -782,6 +936,13 @@ buffer_latin1_write_into_cb :: proc "c" (
 	if n <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
 
 	dst := target[offset:][:n]
+	// 8-bit storage IS the latin1 byte sequence — straight copy.
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		copy(dst, s8)
+		return jsc.JSValueMakeNumber(ctx, f64(n))
+	}
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
 	for i in 0 ..< n {
 		dst[i] = byte(chars[i] & 0xFF)
 	}
@@ -811,8 +972,6 @@ buffer_utf8_write_into_cb :: proc "c" (
 	defer jsc.JSStringRelease(js_string)
 	slen := int(jsc.JSStringGetLength(js_string))
 	if slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
 
 	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
 	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
@@ -822,6 +981,15 @@ buffer_utf8_write_into_cb :: proc "c" (
 	if max > avail do max = avail
 	if max <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
 
+	// ASCII 8-bit storage is already UTF-8 — straight capped copy. (Latin-1 high
+	// bytes need 2-byte expansion; that rare case falls back to the widen path.)
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 && bytes_all_ascii(s8) {
+		n := copy(target[offset:][:max], s8)
+		return jsc.JSValueMakeNumber(ctx, f64(n))
+	}
+
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
 	n := utf16_js_to_utf8_capped(chars, slen, target[offset:][:max])
 	return jsc.JSValueMakeNumber(ctx, f64(n))
 }
@@ -842,33 +1010,52 @@ buffer_base64url_encode_cb :: proc "c" (
 	data, ok := typed_array_view(ctx, arguments[0])
 	if !ok || len(data) == 0 do return js_string_value(ctx, "")
 
+	// Unpadded: exact output length is known up front.
 	n := len(data)
-	out := make([]byte, (n + 2) / 3 * 4 + 1, context.temp_allocator)
+	rem := n % 3
+	out_len := n / 3 * 4
+	switch rem {
+	case 1:
+		out_len += 2
+	case 2:
+		out_len += 3
+	}
+	if str, dst, ok8 := jsc.string_alloc8(out_len); ok8 {
+		base64url_write(dst, data)
+		defer jsc.JSStringRelease(str)
+		return jsc.JSValueMakeString(ctx, str)
+	}
+	out := make([]byte, out_len + 1, context.temp_allocator)
+	base64url_write(out[:out_len], data)
+	out[out_len] = 0
+	return ascii_string_value(ctx, out)
+}
+
+// base64url_write fills dst (exact unpadded base64url length) from src.
+@(private = "file")
+base64url_write :: proc(dst: []byte, src: []byte) {
+	n := len(src)
 	di := 0
 	i := 0
 	for ; i + 2 < n; i += 3 {
-		v := u32(data[i]) << 16 | u32(data[i + 1]) << 8 | u32(data[i + 2])
-		out[di] = B64URL_ALPHABET[v >> 18]
-		out[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
-		out[di + 2] = B64URL_ALPHABET[v >> 6 & 0x3F]
-		out[di + 3] = B64URL_ALPHABET[v & 0x3F]
+		v := u32(src[i]) << 16 | u32(src[i + 1]) << 8 | u32(src[i + 2])
+		dst[di] = B64URL_ALPHABET[v >> 18]
+		dst[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
+		dst[di + 2] = B64URL_ALPHABET[v >> 6 & 0x3F]
+		dst[di + 3] = B64URL_ALPHABET[v & 0x3F]
 		di += 4
 	}
 	switch n - i {
 	case 1:
-		v := u32(data[i]) << 16
-		out[di] = B64URL_ALPHABET[v >> 18]
-		out[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
-		di += 2
+		v := u32(src[i]) << 16
+		dst[di] = B64URL_ALPHABET[v >> 18]
+		dst[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
 	case 2:
-		v := u32(data[i]) << 16 | u32(data[i + 1]) << 8
-		out[di] = B64URL_ALPHABET[v >> 18]
-		out[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
-		out[di + 2] = B64URL_ALPHABET[v >> 6 & 0x3F]
-		di += 3
+		v := u32(src[i]) << 16 | u32(src[i + 1]) << 8
+		dst[di] = B64URL_ALPHABET[v >> 18]
+		dst[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
+		dst[di + 2] = B64URL_ALPHABET[v >> 6 & 0x3F]
 	}
-	out[di] = 0
-	return ascii_string_value(ctx, out[:di + 1])
 }
 
 buffer_utf8_byte_length_cb :: proc "c" (
@@ -887,6 +1074,15 @@ buffer_utf8_byte_length_cb :: proc "c" (
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	// 8-bit storage: no surrogates possible; UTF-8 length is len + one extra
+	// byte per Latin-1 high byte.
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		n := length
+		for b in s8 {
+			if b >= 0x80 do n += 1
+		}
+		return jsc.JSValueMakeNumber(ctx, f64(n))
+	}
 	chars := jsc.JSStringGetCharactersPtr(js_string)
 	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
 	return jsc.JSValueMakeNumber(ctx, f64(utf16_js_utf8_byte_len(chars, length)))
@@ -908,9 +1104,17 @@ buffer_base64_byte_length_cb :: proc "c" (
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	len := length
+	// Only the final two characters matter; don't widen the whole string for them.
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		if s8[len - 1] == '=' {
+			len -= 1
+			if len > 0 && s8[len - 1] == '=' do len -= 1
+		}
+		return jsc.JSValueMakeNumber(ctx, f64((len * 3) >> 2))
+	}
 	chars := jsc.JSStringGetCharactersPtr(js_string)
 	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	len := length
 	if chars[len - 1] == '=' {
 		len -= 1
 		if len > 0 && chars[len - 1] == '=' do len -= 1
