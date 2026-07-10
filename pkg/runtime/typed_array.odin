@@ -32,6 +32,10 @@ g_bytes_ptr_mode: BytesPtr_Mode // written once after first offset view; read th
 // typed_array_view borrows the backing store of a TypedArray or DataView as an
 // Odin byte slice. Valid only for the duration of the native call.
 typed_array_view :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> ([]byte, bool) {
+	// Direct cell read (Uint8Array of any Structure, byteOffset pre-applied) —
+	// zero C-API calls. Other view types and DataView fall through.
+	if data, ok := jsc.typed_array_bytes(ctx, value); ok do return data, true
+
 	if jsc.JSValueGetTypedArrayType(ctx, value, nil) == .None do return nil, false
 	obj := cast(jsc.JSObjectRef)value
 	n := int(jsc.JSObjectGetTypedArrayByteLength(ctx, obj, nil))

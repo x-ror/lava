@@ -15,6 +15,9 @@ foreign jsc_lib {
 	// not the public C API headers). The handler is invoked as fn(promise, reason)
 	// when a promise rejects with no handler at a microtask checkpoint.
 	JSGlobalContextSetUnhandledRejectionCallback :: proc(ctx: JSGlobalContextRef, function: JSObjectRef, exception: ^JSValueRef) ---
+	// A context group is JSC::VM* under the C API — used by host_function.odin to
+	// pass VM& to the private JSFunction::create.
+	JSContextGetGroup :: proc(ctx: JSContextRef) -> rawptr ---
 
 	JSStringCreateWithUTF8CString :: proc(string: cstring) -> JSStringRef ---
 	JSStringCreateWithCharacters :: proc(chars: [^]JSChar, num_chars: c.size_t) -> JSStringRef ---

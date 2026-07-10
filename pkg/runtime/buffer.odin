@@ -83,6 +83,76 @@ ascii_string_value :: proc(ctx: jsc.JSContextRef, buf: []byte) -> jsc.JSValueRef
 	return jsc.JSValueMakeString(ctx, js_str)
 }
 
+// String_Read borrows a string argument's storage in whichever width it has:
+// direct cell read when possible, else through the C API (which also flattens
+// ropes). When `str` is non-nil the caller must JSStringRelease it after the
+// last use of the borrowed slice.
+@(private = "file")
+String_Read :: struct {
+	s8:  []byte,
+	s16: []jsc.JSChar,
+	is8: bool,
+	str: jsc.JSStringRef,
+	ok:  bool,
+}
+
+@(private = "file")
+read_string_arg :: proc(ctx: jsc.JSContextRef, v: jsc.JSValueRef) -> (r: String_Read) {
+	if s8, ok := jsc.value_chars8(ctx, v); ok {
+		r.s8 = s8
+		r.is8 = true
+		r.ok = true
+		return
+	}
+	if s16, ok := jsc.value_chars16(ctx, v); ok {
+		r.s16 = s16
+		r.ok = true
+		return
+	}
+	str := jsc.JSValueToStringCopy(ctx, v, nil)
+	if str == nil do return
+	if s8, ok := jsc.string_chars8(str); ok {
+		r.s8 = s8
+		r.is8 = true
+		r.str = str
+		r.ok = true
+		return
+	}
+	length := int(jsc.JSStringGetLength(str))
+	chars := jsc.JSStringGetCharactersPtr(str)
+	if chars == nil {
+		jsc.JSStringRelease(str)
+		return
+	}
+	r.s16 = chars[:length]
+	r.str = str
+	r.ok = true
+	return
+}
+
+@(private = "file")
+string_read_len :: proc(r: String_Read) -> int {
+	if r.is8 do return len(r.s8)
+	return len(r.s16)
+}
+
+// js_int_arg reads an integer argument without a C-API call when it is an
+// immediate int32 (the common case for offsets/lengths from the JS layer).
+@(private = "file")
+js_int_arg :: proc(ctx: jsc.JSContextRef, v: jsc.JSValueRef) -> int {
+	if x, ok := jsc.value_int32(ctx, v); ok do return int(x)
+	return int(jsc.JSValueToNumber(ctx, v, nil))
+}
+
+// js_int_value encodes an integer result without a C-API call when possible.
+@(private = "file")
+js_int_value :: proc(ctx: jsc.JSContextRef, v: int) -> jsc.JSValueRef {
+	if v >= -2147483648 && v <= 2147483647 {
+		if r, ok := jsc.make_int32(ctx, i32(v)); ok do return r
+	}
+	return jsc.JSValueMakeNumber(ctx, f64(v))
+}
+
 @(private = "file")
 hex_write :: proc(dst: []byte, src: []byte) {
 	for b, i in src {
@@ -145,6 +215,16 @@ hex_fill :: proc(out: []byte, chars: []$T) {
 	}
 }
 
+@(private = "file")
+hex_decode_from :: proc(ctx: jsc.JSContextRef, chars: []$T) -> jsc.JSValueRef {
+	if len(chars) < 2 do return make_uint8_array(ctx, nil)
+	n := hex_pairs(chars)
+	if n == 0 do return make_uint8_array(ctx, nil)
+	out := make([]byte, n, context.allocator)
+	hex_fill(out, chars)
+	return make_uint8_array(ctx, out)
+}
+
 buffer_hex_decode_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -156,27 +236,18 @@ buffer_hex_decode_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return make_uint8_array(ctx, nil)
 
+	if s8, ok8 := jsc.value_chars8(ctx, arguments[0]); ok8 do return hex_decode_from(ctx, s8)
+	if s16, ok16 := jsc.value_chars16(ctx, arguments[0]); ok16 do return hex_decode_from(ctx, s16)
+
 	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
 	if js_string == nil do return make_uint8_array(ctx, nil)
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length < 2 do return make_uint8_array(ctx, nil)
-
-	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
-		n := hex_pairs(s8)
-		if n == 0 do return make_uint8_array(ctx, nil)
-		out := make([]byte, n, context.allocator)
-		hex_fill(out, s8)
-		return make_uint8_array(ctx, out)
-	}
-
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 do return hex_decode_from(ctx, s8)
 	chars := jsc.JSStringGetCharactersPtr(js_string)
 	if chars == nil do return make_uint8_array(ctx, nil)
-	n := hex_pairs(chars[:length])
-	if n == 0 do return make_uint8_array(ctx, nil)
-	out := make([]byte, n, context.allocator)
-	hex_fill(out, chars[:length])
-	return make_uint8_array(ctx, out)
+	return hex_decode_from(ctx, chars[:length])
 }
 
 // base64_write fills dst (exactly (len(src)+2)/3*4 bytes) with standard-alphabet
@@ -255,21 +326,25 @@ buffer_base64_decode_cb :: proc "c" (
 	if argument_count < 1 do return make_uint8_array(ctx, nil)
 
 	// Same in-place read as hexDecode: base64 input is ASCII by contract.
+	if s8, ok8 := jsc.value_chars8(ctx, arguments[0]); ok8 do return base64_decode_from(ctx, s8)
+	if s16, ok16 := jsc.value_chars16(ctx, arguments[0]); ok16 do return base64_decode_from(ctx, s16)
+
 	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
 	if js_string == nil do return make_uint8_array(ctx, nil)
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
-	if length == 0 || length % 4 != 0 do return make_uint8_array(ctx, nil)
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 do return base64_decode_from(ctx, s8)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return make_uint8_array(ctx, nil)
+	return base64_decode_from(ctx, chars[:length])
+}
 
+@(private = "file")
+base64_decode_from :: proc(ctx: jsc.JSContextRef, chars: []$T) -> jsc.JSValueRef {
+	length := len(chars)
+	if length == 0 || length % 4 != 0 do return make_uint8_array(ctx, nil)
 	out := make([]byte, length / 4 * 3, context.allocator)
-	n := 0
-	okp := false
-	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
-		n, okp = base64_parse(out, s8)
-	} else {
-		chars := jsc.JSStringGetCharactersPtr(js_string)
-		if chars != nil do n, okp = base64_parse(out, chars[:length])
-	}
+	n, okp := base64_parse(out, chars)
 	if !okp {
 		delete(out, context.allocator)
 		return make_uint8_array(ctx, nil)
@@ -662,25 +737,38 @@ buffer_latin1_encode_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return make_uint8_array(ctx, nil)
 
+	// 8-bit storage IS the latin1 byte sequence — one copy, no widen.
+	if s8, ok8 := jsc.value_chars8(ctx, arguments[0]); ok8 {
+		if len(s8) == 0 do return make_uint8_array(ctx, nil)
+		out := make([]byte, len(s8), context.allocator)
+		copy(out, s8)
+		return make_uint8_array(ctx, out)
+	}
+	if s16, ok16 := jsc.value_chars16(ctx, arguments[0]); ok16 {
+		return latin1_bytes_from_units(ctx, s16)
+	}
+
 	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
 	if js_string == nil do return make_uint8_array(ctx, nil)
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length == 0 do return make_uint8_array(ctx, nil)
-
-	out := make([]byte, length, context.allocator)
-	// 8-bit storage IS the latin1 byte sequence — one copy, no widen.
 	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		out := make([]byte, length, context.allocator)
 		copy(out, s8)
 		return make_uint8_array(ctx, out)
 	}
 	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil {
-		delete(out, context.allocator)
-		return make_uint8_array(ctx, nil)
-	}
-	for i in 0 ..< length {
-		out[i] = byte(chars[i] & 0xFF)
+	if chars == nil do return make_uint8_array(ctx, nil)
+	return latin1_bytes_from_units(ctx, chars[:length])
+}
+
+@(private = "file")
+latin1_bytes_from_units :: proc(ctx: jsc.JSContextRef, chars: []jsc.JSChar) -> jsc.JSValueRef {
+	if len(chars) == 0 do return make_uint8_array(ctx, nil)
+	out := make([]byte, len(chars), context.allocator)
+	for u, i in chars {
+		out[i] = byte(u & 0xFF)
 	}
 	return make_uint8_array(ctx, out)
 }
@@ -782,15 +870,27 @@ buffer_utf16le_encode_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return make_uint8_array(ctx, nil)
 
+	// 8-bit storage: each unit is a byte, high byte always 0 — no widen pass.
+	if s8, ok8 := jsc.value_chars8(ctx, arguments[0]); ok8 {
+		if len(s8) == 0 do return make_uint8_array(ctx, nil)
+		out := make([]byte, len(s8) * 2, context.allocator)
+		for b, i in s8 {
+			out[i * 2] = b
+			out[i * 2 + 1] = 0
+		}
+		return make_uint8_array(ctx, out)
+	}
+	if s16, ok16 := jsc.value_chars16(ctx, arguments[0]); ok16 {
+		return utf16le_bytes_from_units(ctx, s16)
+	}
+
 	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
 	if js_string == nil do return make_uint8_array(ctx, nil)
 	defer jsc.JSStringRelease(js_string)
 	length := int(jsc.JSStringGetLength(js_string))
 	if length == 0 do return make_uint8_array(ctx, nil)
-
-	out := make([]byte, length * 2, context.allocator)
-	// 8-bit storage: each unit is a byte, high byte always 0 — no widen pass.
 	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		out := make([]byte, length * 2, context.allocator)
 		for b, i in s8 {
 			out[i * 2] = b
 			out[i * 2 + 1] = 0
@@ -798,12 +898,15 @@ buffer_utf16le_encode_cb :: proc "c" (
 		return make_uint8_array(ctx, out)
 	}
 	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil {
-		delete(out, context.allocator)
-		return make_uint8_array(ctx, nil)
-	}
-	for i in 0 ..< length {
-		u := chars[i]
+	if chars == nil do return make_uint8_array(ctx, nil)
+	return utf16le_bytes_from_units(ctx, chars[:length])
+}
+
+@(private = "file")
+utf16le_bytes_from_units :: proc(ctx: jsc.JSContextRef, chars: []jsc.JSChar) -> jsc.JSValueRef {
+	if len(chars) == 0 do return make_uint8_array(ctx, nil)
+	out := make([]byte, len(chars) * 2, context.allocator)
+	for u, i in chars {
 		out[i * 2] = byte(u & 0xFF)
 		out[i * 2 + 1] = byte(u >> 8)
 	}
@@ -865,40 +968,38 @@ buffer_utf16le_write_into_cb :: proc "c" (
 	target, tok := typed_array_view(ctx, arguments[0])
 	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
 
-	js_string := jsc.JSValueToStringCopy(ctx, arguments[1], nil)
-	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	defer jsc.JSStringRelease(js_string)
-	slen := int(jsc.JSStringGetLength(js_string))
-	if slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	src := read_string_arg(ctx, arguments[1])
+	if !src.ok do return js_int_value(ctx, 0)
+	defer if src.str != nil do jsc.JSStringRelease(src.str)
+	slen := string_read_len(src)
+	if slen == 0 do return js_int_value(ctx, 0)
 
-	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
-	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
+	offset := js_int_arg(ctx, arguments[2])
+	max := js_int_arg(ctx, arguments[3])
 	if offset < 0 do offset = 0
 	if offset > len(target) do offset = len(target)
 	avail := len(target) - offset
 	if max > avail do max = avail
 	// Even byte count only — half a code unit is never written.
 	max = max - (max % 2)
-	if max <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	if max <= 0 do return js_int_value(ctx, 0)
 
 	n_units := max / 2
 	if n_units > slen do n_units = slen
 	dst := target[offset:]
-	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+	if src.is8 {
 		for i in 0 ..< n_units {
-			dst[i * 2] = s8[i]
+			dst[i * 2] = src.s8[i]
 			dst[i * 2 + 1] = 0
 		}
-		return jsc.JSValueMakeNumber(ctx, f64(n_units * 2))
+	} else {
+		for i in 0 ..< n_units {
+			u := src.s16[i]
+			dst[i * 2] = byte(u & 0xFF)
+			dst[i * 2 + 1] = byte(u >> 8)
+		}
 	}
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	for i in 0 ..< n_units {
-		u := chars[i]
-		dst[i * 2] = byte(u & 0xFF)
-		dst[i * 2 + 1] = byte(u >> 8)
-	}
-	return jsc.JSValueMakeNumber(ctx, f64(n_units * 2))
+	return js_int_value(ctx, n_units * 2)
 }
 
 // latin1WriteInto(target, string, offset, maxLength) -> bytesWritten. Copies the
@@ -919,34 +1020,32 @@ buffer_latin1_write_into_cb :: proc "c" (
 	target, tok := typed_array_view(ctx, arguments[0])
 	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
 
-	js_string := jsc.JSValueToStringCopy(ctx, arguments[1], nil)
-	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	defer jsc.JSStringRelease(js_string)
-	slen := int(jsc.JSStringGetLength(js_string))
-	if slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	src := read_string_arg(ctx, arguments[1])
+	if !src.ok do return js_int_value(ctx, 0)
+	defer if src.str != nil do jsc.JSStringRelease(src.str)
+	slen := string_read_len(src)
+	if slen == 0 do return js_int_value(ctx, 0)
 
-	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
-	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
+	offset := js_int_arg(ctx, arguments[2])
+	max := js_int_arg(ctx, arguments[3])
 	if offset < 0 do offset = 0
 	if offset > len(target) do offset = len(target)
 	avail := len(target) - offset
 	n := slen
 	if n > max do n = max
 	if n > avail do n = avail
-	if n <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	if n <= 0 do return js_int_value(ctx, 0)
 
 	dst := target[offset:][:n]
 	// 8-bit storage IS the latin1 byte sequence — straight copy.
-	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
-		copy(dst, s8)
-		return jsc.JSValueMakeNumber(ctx, f64(n))
+	if src.is8 {
+		copy(dst, src.s8)
+	} else {
+		for i in 0 ..< n {
+			dst[i] = byte(src.s16[i] & 0xFF)
+		}
 	}
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	for i in 0 ..< n {
-		dst[i] = byte(chars[i] & 0xFF)
-	}
-	return jsc.JSValueMakeNumber(ctx, f64(n))
+	return js_int_value(ctx, n)
 }
 
 // utf8WriteInto(target, string, offset, maxLength) -> bytesWritten. Encodes the
@@ -967,31 +1066,44 @@ buffer_utf8_write_into_cb :: proc "c" (
 	target, tok := typed_array_view(ctx, arguments[0])
 	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
 
-	js_string := jsc.JSValueToStringCopy(ctx, arguments[1], nil)
-	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	defer jsc.JSStringRelease(js_string)
-	slen := int(jsc.JSStringGetLength(js_string))
-	if slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	src := read_string_arg(ctx, arguments[1])
+	if !src.ok do return js_int_value(ctx, 0)
+	defer if src.str != nil do jsc.JSStringRelease(src.str)
+	slen := string_read_len(src)
+	if slen == 0 do return js_int_value(ctx, 0)
 
-	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
-	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
+	offset := js_int_arg(ctx, arguments[2])
+	max := js_int_arg(ctx, arguments[3])
 	if offset < 0 do offset = 0
 	if offset > len(target) do offset = len(target)
 	avail := len(target) - offset
 	if max > avail do max = avail
-	if max <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	if max <= 0 do return js_int_value(ctx, 0)
 
-	// ASCII 8-bit storage is already UTF-8 — straight capped copy. (Latin-1 high
-	// bytes need 2-byte expansion; that rare case falls back to the widen path.)
-	if s8, ok8 := jsc.string_chars8(js_string); ok8 && bytes_all_ascii(s8) {
-		n := copy(target[offset:][:max], s8)
-		return jsc.JSValueMakeNumber(ctx, f64(n))
+	dst := target[offset:][:max]
+	if src.is8 {
+		// ASCII 8-bit storage is already UTF-8 — straight capped copy. Latin-1
+		// high bytes expand to two UTF-8 bytes each, capped at the boundary.
+		if bytes_all_ascii(src.s8) {
+			return js_int_value(ctx, copy(dst, src.s8))
+		}
+		o := 0
+		for b in src.s8 {
+			if b < 0x80 {
+				if o + 1 > len(dst) do break
+				dst[o] = b
+				o += 1
+			} else {
+				if o + 2 > len(dst) do break
+				dst[o] = 0xC0 | (b >> 6)
+				dst[o + 1] = 0x80 | (b & 0x3F)
+				o += 2
+			}
+		}
+		return js_int_value(ctx, o)
 	}
-
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	n := utf16_js_to_utf8_capped(chars, slen, target[offset:][:max])
-	return jsc.JSValueMakeNumber(ctx, f64(n))
+	n := utf16_js_to_utf8_capped(raw_data(src.s16), slen, dst)
+	return js_int_value(ctx, n)
 }
 
 @(private = "file") B64URL_ALPHABET := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -1069,23 +1181,19 @@ buffer_utf8_byte_length_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return jsc.JSValueMakeNumber(ctx, 0)
 
-	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
-	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	defer jsc.JSStringRelease(js_string)
-	length := int(jsc.JSStringGetLength(js_string))
-	if length == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	src := read_string_arg(ctx, arguments[0])
+	if !src.ok do return js_int_value(ctx, 0)
+	defer if src.str != nil do jsc.JSStringRelease(src.str)
 	// 8-bit storage: no surrogates possible; UTF-8 length is len + one extra
 	// byte per Latin-1 high byte.
-	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
-		n := length
-		for b in s8 {
+	if src.is8 {
+		n := len(src.s8)
+		for b in src.s8 {
 			if b >= 0x80 do n += 1
 		}
-		return jsc.JSValueMakeNumber(ctx, f64(n))
+		return js_int_value(ctx, n)
 	}
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	return jsc.JSValueMakeNumber(ctx, f64(utf16_js_utf8_byte_len(chars, length)))
+	return js_int_value(ctx, utf16_js_utf8_byte_len(raw_data(src.s16), len(src.s16)))
 }
 
 buffer_base64_byte_length_cb :: proc "c" (
@@ -1099,27 +1207,24 @@ buffer_base64_byte_length_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 1 do return jsc.JSValueMakeNumber(ctx, 0)
 
-	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
-	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	defer jsc.JSStringRelease(js_string)
-	length := int(jsc.JSStringGetLength(js_string))
-	if length == 0 do return jsc.JSValueMakeNumber(ctx, 0)
-	len := length
-	// Only the final two characters matter; don't widen the whole string for them.
-	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
-		if s8[len - 1] == '=' {
+	src := read_string_arg(ctx, arguments[0])
+	if !src.ok do return js_int_value(ctx, 0)
+	defer if src.str != nil do jsc.JSStringRelease(src.str)
+	len := string_read_len(src)
+	if len == 0 do return js_int_value(ctx, 0)
+	// Only the final two characters matter.
+	if src.is8 {
+		if src.s8[len - 1] == '=' {
 			len -= 1
-			if len > 0 && s8[len - 1] == '=' do len -= 1
+			if len > 0 && src.s8[len - 1] == '=' do len -= 1
 		}
-		return jsc.JSValueMakeNumber(ctx, f64((len * 3) >> 2))
+	} else {
+		if src.s16[len - 1] == '=' {
+			len -= 1
+			if len > 0 && src.s16[len - 1] == '=' do len -= 1
+		}
 	}
-	chars := jsc.JSStringGetCharactersPtr(js_string)
-	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
-	if chars[len - 1] == '=' {
-		len -= 1
-		if len > 0 && chars[len - 1] == '=' do len -= 1
-	}
-	return jsc.JSValueMakeNumber(ctx, f64((len * 3) >> 2))
+	return js_int_value(ctx, (len * 3) >> 2)
 }
 
 buffer_swap_cb :: proc "c" (
@@ -1161,28 +1266,28 @@ buffer_swap_cb :: proc "c" (
 
 make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
-	inject_native_function(ctx, bindings, "hexEncode", buffer_hex_encode_cb)
-	inject_native_function(ctx, bindings, "hexDecode", buffer_hex_decode_cb)
-	inject_native_function(ctx, bindings, "base64Encode", buffer_base64_encode_cb)
-	inject_native_function(ctx, bindings, "base64Decode", buffer_base64_decode_cb)
-	inject_native_function(ctx, bindings, "base64urlEncode", buffer_base64url_encode_cb)
-	inject_native_function(ctx, bindings, "utf8Encode", buffer_utf8_encode_cb)
-	inject_native_function(ctx, bindings, "utf8Decode", buffer_utf8_decode_cb)
-	inject_native_function(ctx, bindings, "latin1Encode", buffer_latin1_encode_cb)
-	inject_native_function(ctx, bindings, "latin1Decode", buffer_latin1_decode_cb)
-	inject_native_function(ctx, bindings, "asciiDecode", buffer_ascii_decode_cb)
-	inject_native_function(ctx, bindings, "latin1WriteInto", buffer_latin1_write_into_cb)
-	inject_native_function(ctx, bindings, "utf16leEncode", buffer_utf16le_encode_cb)
-	inject_native_function(ctx, bindings, "utf16leDecode", buffer_utf16le_decode_cb)
-	inject_native_function(ctx, bindings, "utf16leWriteInto", buffer_utf16le_write_into_cb)
-	inject_native_function(ctx, bindings, "utf8ByteLength", buffer_utf8_byte_length_cb)
-	inject_native_function(ctx, bindings, "base64ByteLength", buffer_base64_byte_length_cb)
-	inject_native_function(ctx, bindings, "swapInPlace", buffer_swap_cb)
-	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
-	inject_native_function(ctx, bindings, "compare", buffer_compare_cb)
-	inject_native_function(ctx, bindings, "indexOf", buffer_index_of_cb)
-	inject_native_function(ctx, bindings, "isValidUtf8", buffer_is_valid_utf8_cb)
-	inject_native_function(ctx, bindings, "utf8WriteInto", buffer_utf8_write_into_cb)
+	inject_native_function(ctx, bindings, "hexEncode", buffer_hex_encode_cb, buffer_hex_encode_host)
+	inject_native_function(ctx, bindings, "hexDecode", buffer_hex_decode_cb, buffer_hex_decode_host)
+	inject_native_function(ctx, bindings, "base64Encode", buffer_base64_encode_cb, buffer_base64_encode_host)
+	inject_native_function(ctx, bindings, "base64Decode", buffer_base64_decode_cb, buffer_base64_decode_host)
+	inject_native_function(ctx, bindings, "base64urlEncode", buffer_base64url_encode_cb, buffer_base64url_encode_host)
+	inject_native_function(ctx, bindings, "utf8Encode", buffer_utf8_encode_cb, buffer_utf8_encode_host)
+	inject_native_function(ctx, bindings, "utf8Decode", buffer_utf8_decode_cb, buffer_utf8_decode_host)
+	inject_native_function(ctx, bindings, "latin1Encode", buffer_latin1_encode_cb, buffer_latin1_encode_host)
+	inject_native_function(ctx, bindings, "latin1Decode", buffer_latin1_decode_cb, buffer_latin1_decode_host)
+	inject_native_function(ctx, bindings, "asciiDecode", buffer_ascii_decode_cb, buffer_ascii_decode_host)
+	inject_native_function(ctx, bindings, "latin1WriteInto", buffer_latin1_write_into_cb, buffer_latin1_write_into_host)
+	inject_native_function(ctx, bindings, "utf16leEncode", buffer_utf16le_encode_cb, buffer_utf16le_encode_host)
+	inject_native_function(ctx, bindings, "utf16leDecode", buffer_utf16le_decode_cb, buffer_utf16le_decode_host)
+	inject_native_function(ctx, bindings, "utf16leWriteInto", buffer_utf16le_write_into_cb, buffer_utf16le_write_into_host)
+	inject_native_function(ctx, bindings, "utf8ByteLength", buffer_utf8_byte_length_cb, buffer_utf8_byte_length_host)
+	inject_native_function(ctx, bindings, "base64ByteLength", buffer_base64_byte_length_cb, buffer_base64_byte_length_host)
+	inject_native_function(ctx, bindings, "swapInPlace", buffer_swap_cb, buffer_swap_host)
+	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb, buffer_alloc_uninit_host)
+	inject_native_function(ctx, bindings, "compare", buffer_compare_cb, buffer_compare_host)
+	inject_native_function(ctx, bindings, "indexOf", buffer_index_of_cb, buffer_index_of_host)
+	inject_native_function(ctx, bindings, "isValidUtf8", buffer_is_valid_utf8_cb, buffer_is_valid_utf8_host)
+	inject_native_function(ctx, bindings, "utf8WriteInto", buffer_utf8_write_into_cb, buffer_utf8_write_into_host)
 	set_named(ctx, bindings, "maxAllocBytes", jsc.JSValueMakeNumber(ctx, max_buffer_alloc_bytes()))
 	return bindings
 }
