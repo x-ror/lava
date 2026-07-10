@@ -25,6 +25,10 @@
   // script can override (prototype pollution) to corrupt the head or — via a lying
   // allocUnsafe — leak uninitialized memory past the body. See writeLatin1Into / headBytes.
   var P = require('primordials');
+  // Native latin1 write-into (same Odin path as Buffer.write): feature-detected so an
+  // older build still uses the pure-JS loop below.
+  var nativeLatin1WriteInto =
+    typeof native.latin1WriteInto === 'function' ? native.latin1WriteInto : null;
 
   var MAX_HEAD = 64 * 1024; // reject a request head larger than this (431)
 
@@ -54,13 +58,14 @@
 
   // Build Node's lowercased req.headers object from the interleaved [name, value, ...]
   // array the parser returns. Duplicates join with ', ' (Node's behavior for most
-  // headers; set-cookie's array form is out of M2 scope).
+  // headers; set-cookie's array form is out of M2 scope). Names are already
+  // ASCII-lowercased by the native parseRequest bridge — no per-key toLowerCase.
   function buildHeaders(arr) {
     // Null prototype: a header literally named "constructor"/"hasOwnProperty"/etc. must
     // not collide with Object.prototype (which would corrupt the duplicate-merge check).
     var headers = Object.create(null);
     for (var i = 0; i + 1 < arr.length; i += 2) {
-      var k = arr[i].toLowerCase();
+      var k = arr[i];
       var v = arr[i + 1];
       if (headers[k] === undefined) headers[k] = v;
       else headers[k] += ', ' + v;
@@ -120,11 +125,15 @@
   // written separately so we don't memcpy a big payload just to save one syscall.
   var HEAD_COALESCE_MAX = 64 * 1024;
 
-  // writeLatin1Into writes `str`'s latin1 bytes into `dst` starting at `offset`, using only
-  // pristine intrinsics: a typed-array index store (a native operation, not a method, so it
-  // can't be overridden) and the captured StringPrototypeCharCodeAt. Masking to a byte
-  // matches Buffer.from(str, 'latin1') for code points > 0xFF.
+  // writeLatin1Into writes `str`'s latin1 bytes into `dst` starting at `offset`. Prefers
+  // the native codec (GetCharactersPtr + memcpy-class loop) when available; otherwise
+  // pristine charCodeAt stores (not overridable Buffer methods). Masking matches
+  // Buffer.from(str, 'latin1') for code points > 0xFF.
   function writeLatin1Into(dst, str, offset) {
+    if (nativeLatin1WriteInto !== null) {
+      nativeLatin1WriteInto(dst, str, offset, str.length);
+      return;
+    }
     for (var i = 0; i < str.length; i++) {
       dst[offset + i] = P.StringPrototypeCharCodeAt(str, i) & 0xff;
     }

@@ -54,6 +54,9 @@ make_http_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	http_intern_strings() // create the constant result-object JSStringRefs once (idempotent across workers)
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
 	inject_native_function(ctx, bindings, "parseRequest", http_parse_request_cb)
+	// Response-head serialization: same latin1WriteInto as node:buffer (package-local
+	// callback). Avoids a Buffer require + intermediate array on every writeHead/end.
+	inject_native_function(ctx, bindings, "latin1WriteInto", buffer_latin1_write_into_cb)
 	return bindings
 }
 
@@ -92,7 +95,11 @@ http_parse_request_cb :: proc "c" (
 	}
 
 	// Interleaved [name, value, ...]; RFC 7230 obs-fold continuations (empty name) are
-	// merged into the previous value with a single space.
+	// merged into the previous value with a single space. Header NAMES are ASCII-lowered
+	// here so JS buildHeaders can skip String#toLowerCase on every key (Node's
+	// req.headers keys are lowercased). Names are tokens (RFC 7230) so ASCII fold is
+	// correct; values stay raw latin1. Lowercasing MUST copy — name/value slices alias
+	// the request buffer.
 	hdr_list := make([dynamic]string, 0, num * 2, context.temp_allocator)
 	last_val_idx := -1
 	for i in 0 ..< num {
@@ -107,7 +114,7 @@ http_parse_request_cb :: proc "c" (
 			}
 			continue
 		}
-		append(&hdr_list, h.name)
+		append(&hdr_list, http_ascii_lower(h.name))
 		append(&hdr_list, strings.trim_space(h.value))
 		last_val_idx = len(hdr_list) - 1
 	}
@@ -132,41 +139,41 @@ http_parse_request_cb :: proc "c" (
 			ctx,
 			headers_arr,
 			c.uint(i),
-			http_latin1_string(ctx, hdr_list[i]),
+			// Reuse the buffer codec's dense-ASCII / high-byte latin1 string path.
+			latin1_string_from_bytes(ctx, transmute([]byte)hdr_list[i]),
 			nil,
 		)
 	}
 
 	set_named_ref(ctx, result, g_str_state, jsc.JSValueMakeString(ctx, g_str_complete))
 	set_named_ref(ctx, result, g_str_consumed, jsc.JSValueMakeNumber(ctx, f64(consumed)))
-	set_named_ref(ctx, result, g_str_method, http_latin1_string(ctx, method))
-	set_named_ref(ctx, result, g_str_url, http_latin1_string(ctx, path))
+	set_named_ref(ctx, result, g_str_method, latin1_string_from_bytes(ctx, transmute([]byte)method))
+	set_named_ref(ctx, result, g_str_url, latin1_string_from_bytes(ctx, transmute([]byte)path))
 	set_named_ref(ctx, result, g_str_minor, jsc.JSValueMakeNumber(ctx, f64(minor)))
 	set_named_ref(ctx, result, g_str_headers, cast(jsc.JSValueRef)headers_arr)
 	return cast(jsc.JSValueRef)result
 }
 
-// http_latin1_string builds a JS string from HTTP/1 header bytes (latin1 / ISO-8859-1), matching how Node
-// exposes them. Two paths:
-//   - ASCII (every byte 0x01-0x7F — the overwhelming common case): take the UTF-8 path, which yields a
-//     DENSE 8-bit (LChar) StringImpl. JSStringCreateWithCharacters always builds a 2-byte/char (16-bit)
-//     StringImpl even for pure ASCII — wasting half the backing bytes (and a widening temp); ASCII is
-//     byte-identical under UTF-8, so this is JS-observably the same string at half the memory/bandwidth.
-//   - obs-text present (any byte 0x80-0xFF, or a NUL): map each byte to one UTF-16 unit. UTF-8 decoding
-//     would mis-interpret 0x80-0xFF (and truncate at a NUL), corrupting the raw bytes we must preserve.
-http_latin1_string :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef {
-	if len(value) == 0 do return js_string_value(ctx, "")
-	ascii := true
-	for i in 0 ..< len(value) {
-		if value[i] == 0 || value[i] >= 0x80 {
-			ascii = false
+// http_ascii_lower returns an ASCII-lowercased copy of `s` (A-Z → a-z only). HTTP header
+// field-names are tokens; this matches Node's req.headers key fold without a JS pass.
+@(private = "file")
+http_ascii_lower :: proc(s: string) -> string {
+	if len(s) == 0 do return s
+	// Fast path: already lower (common for proxies that normalize).
+	needs := false
+	for i in 0 ..< len(s) {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			needs = true
 			break
 		}
 	}
-	if ascii do return js_string_value(ctx, value) // 8-bit StringImpl via the UTF-8 path
-	units := make([]jsc.JSChar, len(value), context.temp_allocator)
-	for i in 0 ..< len(value) do units[i] = jsc.JSChar(value[i])
-	js_str := jsc.JSStringCreateWithCharacters(raw_data(units), c.size_t(len(value)))
-	defer jsc.JSStringRelease(js_str)
-	return jsc.JSValueMakeString(ctx, js_str)
+	if !needs do return s
+	out := make([]byte, len(s), context.temp_allocator)
+	for i in 0 ..< len(s) {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' do out[i] = c + 32
+		else do out[i] = c
+	}
+	return string(out)
 }
