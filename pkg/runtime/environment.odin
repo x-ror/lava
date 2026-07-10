@@ -530,36 +530,46 @@ js_string_ref_to_utf8_owned :: proc(js_string: jsc.JSStringRef) -> (string, bool
 	if length == 0 do return "", false
 
 	// 8-bit storage read directly (GetCharactersPtr would widen the whole string
-	// to UTF-16 first): ASCII copies verbatim; Latin-1 high bytes expand to two
-	// UTF-8 bytes each, with the exact size known up front.
+	// to UTF-16 first).
 	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
-		if bytes_all_ascii(s8) {
-			buffer := make([]byte, length, context.allocator)
-			copy(buffer, s8)
-			return string(buffer), true
-		}
-		n := length
-		for b in s8 {
-			if b >= 0x80 do n += 1
-		}
-		buffer := make([]byte, n, context.allocator)
-		o := 0
-		for b in s8 {
-			if b < 0x80 {
-				buffer[o] = b
-				o += 1
-			} else {
-				buffer[o] = 0xC0 | (b >> 6)
-				buffer[o + 1] = 0x80 | (b & 0x3F)
-				o += 2
-			}
-		}
-		return string(buffer), true
+		return latin1_to_utf8_owned(s8)
 	}
 
 	chars := jsc.JSStringGetCharactersPtr(js_string)
 	if chars == nil do return "", false
+	return utf16_to_utf8_owned(chars, length)
+}
 
+// latin1_to_utf8_owned copies 8-bit string storage into an owned exact-size
+// UTF-8 buffer: ASCII verbatim, Latin-1 high bytes as two UTF-8 bytes each.
+@(private = "file")
+latin1_to_utf8_owned :: proc(s8: []byte) -> (string, bool) {
+	if bytes_all_ascii(s8) {
+		buffer := make([]byte, len(s8), context.allocator)
+		copy(buffer, s8)
+		return string(buffer), true
+	}
+	n := len(s8)
+	for b in s8 {
+		if b >= 0x80 do n += 1
+	}
+	buffer := make([]byte, n, context.allocator)
+	o := 0
+	for b in s8 {
+		if b < 0x80 {
+			buffer[o] = b
+			o += 1
+		} else {
+			buffer[o] = 0xC0 | (b >> 6)
+			buffer[o + 1] = 0x80 | (b & 0x3F)
+			o += 2
+		}
+	}
+	return string(buffer), true
+}
+
+@(private = "file")
+utf16_to_utf8_owned :: proc(chars: [^]jsc.JSChar, length: int) -> (string, bool) {
 	// Fast path: pure ASCII (paths, headers, small identifiers). Exact-size copy.
 	ascii := true
 	for i in 0 ..< length {
@@ -595,6 +605,17 @@ jsc_value_to_string_or_default :: proc(
 	string,
 	bool,
 ) {
+	// Flat string values resolve with no C-API call; everything else (ropes,
+	// non-strings needing coercion) goes through JSValueToStringCopy.
+	if s8, ok := jsc.value_chars8(ctx, value); ok {
+		if len(s8) == 0 do return "", false
+		return latin1_to_utf8_owned(s8)
+	}
+	if s16, ok := jsc.value_chars16(ctx, value); ok {
+		if len(s16) == 0 do return "", false
+		return utf16_to_utf8_owned(raw_data(s16), len(s16))
+	}
+
 	js_string := jsc.JSValueToStringCopy(ctx, value, nil)
 	if js_string == nil do return "", false
 	defer jsc.JSStringRelease(js_string)

@@ -154,12 +154,16 @@ const BIG = Buffer.poolSize + 4096; // comfortably above the pool, and != poolSi
 
 // --- Pool exhaustion creates a fresh backing store -------------------------
 // Enough small allocations must roll past poolSize and force a new pool, so the
-// backing ArrayBuffer identity changes at least once.
+// backing ArrayBuffer identity changes at least once. The iteration count is
+// derived from poolSize (like every other size here) so the test holds for any
+// pool size a runtime picks.
 {
+  const CHUNK = 64;
+  const ROLLS = Math.ceil(Buffer.poolSize / CHUNK) + 2;
   let recreated = false;
-  let prev = Buffer.allocUnsafe(64).buffer;
-  for (let i = 0; i < 2000 && !recreated; i++) {
-    const cur = Buffer.allocUnsafe(64).buffer;
+  let prev = Buffer.allocUnsafe(CHUNK).buffer;
+  for (let i = 0; i < ROLLS && !recreated; i++) {
+    const cur = Buffer.allocUnsafe(CHUNK).buffer;
     if (cur !== prev) recreated = true;
     prev = cur;
   }

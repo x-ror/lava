@@ -205,6 +205,112 @@ when ODIN_OS == .Linux {
 		return true
 	}
 
+	// --- direct JSString cell reads -------------------------------------------
+	// Reading a string argument through the C API costs a JSValueToStringCopy
+	// (an OpaqueJSString wrapper allocation) per call before string_chars8 can
+	// even look at it. A flat JSString cell holds its StringImpl directly: the
+	// cell type byte identifies strings, and the fiber word is the impl pointer
+	// with low tag bits clear (a rope has them set — ropes fall back to the
+	// C API, which flattens). Offsets are discovered by locating a known impl
+	// pointer inside cells built from strings we constructed, and verified on a
+	// second cell of the other storage width.
+
+	@(private = "file") g_val_checked: bool
+	@(private = "file") g_val_ok: bool
+	@(private = "file") g_string_type: u8
+	@(private = "file") g_fiber_off: uintptr
+
+	@(private = "file")
+	ensure_value_reads :: proc(ctx: JSContextRef) {
+		if g_val_checked do return
+		g_val_checked = true
+		if !g_read_ok do return // needs the probed StringImpl layout
+
+		str8, d8, ok8 := string_alloc8(3)
+		if !ok8 do return
+		defer JSStringRelease(str8)
+		d8[0] = 'q'
+		d8[1] = 'r'
+		d8[2] = 's'
+		impl8 := (^rawptr)(uintptr(str8) + OPAQUE_STRING_IMPL_OFFSET)^
+
+		// The JSString cell created for str8 references the same StringImpl —
+		// find it. (All reads of v happen before any further allocation, so the
+		// unrooted cell cannot be collected under us.)
+		v := JSValueMakeString(ctx, str8)
+		p := uintptr(v)
+		if p == 0 || (u64(p) & VALUE_NOT_CELL_MASK) != 0 do return
+		ty := (^u8)(p + JSCELL_TYPE_OFFSET)^
+		off: uintptr
+		found := false
+		for cand: uintptr = 8; cand <= 32; cand += 8 {
+			if (^rawptr)(p + cand)^ == impl8 {
+				off = cand
+				found = true
+				break
+			}
+		}
+		if !found do return
+
+		// Cross-check on a 16-bit string.
+		str16, d16, ok16 := string_alloc16(2)
+		if !ok16 do return
+		defer JSStringRelease(str16)
+		d16[0] = 0x4F60
+		d16[1] = 0x0021
+		impl16 := (^rawptr)(uintptr(str16) + OPAQUE_STRING_IMPL_OFFSET)^
+		v16 := JSValueMakeString(ctx, str16)
+		p16 := uintptr(v16)
+		if p16 == 0 || (u64(p16) & VALUE_NOT_CELL_MASK) != 0 do return
+		if (^u8)(p16 + JSCELL_TYPE_OFFSET)^ != ty do return
+		if (^rawptr)(p16 + off)^ != impl16 do return
+
+		g_string_type = ty
+		g_fiber_off = off
+		g_val_ok = true
+	}
+
+	// value_string_impl resolves a JS value directly to its flat StringImpl, or
+	// ok=false for non-strings, ropes, and when the probe is unavailable.
+	@(private = "file")
+	value_string_impl :: proc(ctx: JSContextRef, value: JSValueRef) -> (impl: uintptr, ok: bool) {
+		ensure_value_reads(ctx)
+		if !g_val_ok do return 0, false
+		p := uintptr(value)
+		if p == 0 || (u64(p) & VALUE_NOT_CELL_MASK) != 0 do return 0, false
+		if (^u8)(p + JSCELL_TYPE_OFFSET)^ != g_string_type do return 0, false
+		w := (^uintptr)(p + g_fiber_off)^
+		if w == 0 || (w & 7) != 0 do return 0, false // rope or empty fiber
+		return w, true
+	}
+
+	// value_chars8 borrows the 8-bit (Latin-1) storage of a string-typed JS
+	// value with no C-API call at all. ok=false for non-strings, ropes and
+	// 16-bit strings. The slice is valid only while the value is alive (i.e.
+	// for the duration of the native call) and must not be written.
+	value_chars8 :: proc(ctx: JSContextRef, value: JSValueRef) -> (data: []byte, ok: bool) {
+		impl, iok := value_string_impl(ctx, value)
+		if !iok do return nil, false
+		flags := (^u32)(impl + IMPL_FLAGS_OFFSET)^
+		if flags & g_flag_mask != g_flag_val8 do return nil, false
+		length := int((^u32)(impl + IMPL_LENGTH_OFFSET)^)
+		chars := (^[^]byte)(impl + IMPL_DATA_OFFSET)^
+		if chars == nil do return nil, false
+		return chars[:length], true
+	}
+
+	// value_chars16 is value_chars8 for 16-bit storage (UTF-16 code units).
+	value_chars16 :: proc(ctx: JSContextRef, value: JSValueRef) -> (data: []JSChar, ok: bool) {
+		impl, iok := value_string_impl(ctx, value)
+		if !iok do return nil, false
+		flags := (^u32)(impl + IMPL_FLAGS_OFFSET)^
+		if flags & g_flag_mask == g_flag_val8 do return nil, false // 8-bit
+		length := int((^u32)(impl + IMPL_LENGTH_OFFSET)^)
+		chars := (^[^]JSChar)(impl + IMPL_DATA_OFFSET)^
+		if chars == nil do return nil, false
+		return chars[:length], true
+	}
+
 	// string_chars8 returns a read-only view of a JSC string's 8-bit (Latin-1)
 	// storage, or ok=false when the string is 16-bit or the read path is
 	// unavailable. Each byte is one code point U+0000..U+00FF. The view borrows
@@ -220,6 +326,22 @@ when ODIN_OS == .Linux {
 		chars := (^[^]byte)(uintptr(impl) + IMPL_DATA_OFFSET)^
 		if chars == nil do return nil, false
 		return chars[:length], true
+	}
+
+	// wtf_string_impl_from_ascii builds a bare WTF::StringImpl* (refcount 1) from
+	// ASCII text, for passing as `const WTF::String&` to other private-ABI calls
+	// (a String is one StringImpl*). The caller's ref is deliberately never
+	// dereffed — callees take their own refs, so hand this only to bounded,
+	// process-lifetime uses (e.g. host function names).
+	@(private)
+	wtf_string_impl_from_ascii :: proc(s: string) -> (impl: rawptr, ok: bool) {
+		ensure_resolved()
+		if !g_ok || len(s) == 0 do return nil, false
+		span: Wtf_Span8
+		g_create8(&impl, c.size_t(len(s)), &span)
+		if impl == nil || span.data == nil || int(span.size) != len(s) do return nil, false
+		copy(span.data[:len(s)], s)
+		return impl, true
 	}
 
 	// string_alloc8 allocates an n-character 8-bit (Latin-1) JSC string and
@@ -282,6 +404,14 @@ when ODIN_OS == .Linux {
 	}
 
 	string_chars8 :: proc(_: JSStringRef) -> (data: []byte, ok: bool) {
+		return nil, false
+	}
+
+	value_chars8 :: proc(_: JSContextRef, _: JSValueRef) -> (data: []byte, ok: bool) {
+		return nil, false
+	}
+
+	value_chars16 :: proc(_: JSContextRef, _: JSValueRef) -> (data: []JSChar, ok: bool) {
 		return nil, false
 	}
 }

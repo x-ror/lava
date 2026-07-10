@@ -62,29 +62,61 @@ offset it probes whether `BytesPtr == ArrayBuffer base` (gtk bug) or `base+offse
 (fixed JSC) and caches the mode. Probed 2026-07-10 (2.52.3): **BytesPtr still
 returns base**.
 
+## Phase 3 (landed): host-call convention + direct cell reads
+
+The per-call C-API boundary was the next floor and is also gone on the probed
+path:
+
+- **Host functions** (`pkg/jsc/host_function.odin`): buffer natives register via
+  the exported `JSC::JSFunction::create(VM&, …, NativeFunction, …)` under a
+  `JSLockHolder`, called as `EncodedJSValue fn(JSGlobalObject*, CallFrame*)` —
+  no `JSCallbackFunction` trampoline and, critically, no per-call
+  `JSLock::DropAllLocks`/re-lock. On 64-bit a JSValueRef IS the encoded value
+  and JSContextRef IS the JSGlobalObject, so existing callback bodies are
+  reused via a thin frame-slicing dispatch (`buffer_host.odin`). Validated by a
+  functional probe (known args in, recognizable result out) with no NaN-boxing
+  constants assumed. `LAVA_HOSTFN_DEBUG=1` reports probe outcomes.
+- **Direct typed-array views** (`pkg/jsc/private_view.odin`): Uint8Array bytes
+  read straight from the cell (type byte + probed `m_vector`/`m_length`
+  offsets; byteOffset already folded into the pointer, which also sidesteps
+  issue #68 entirely). Probed with three views over known backing stores.
+- **Direct string-value reads** (`private_string.odin`): flat `JSString` cells
+  resolve to their StringImpl via a probed fiber offset — `value_chars8/16`
+  replace `JSValueToStringCopy` + widen on every decode-side native; ropes and
+  non-strings fall back (the C API flattens).
+- **Immediate int32s** (`pkg/jsc/private_value.odin`): argument/result numbers
+  encode/decode against a tag derived from `JSValueMakeNumber`'s own output.
+- **JS-side**: `Buffer.from(string)` fills a pooled allocation via `writeInto`;
+  the allocUnsafe pool refills from the native uninitialized allocator (a
+  `new Uint8Array(poolSize)` refill measured ~100µs on JSC — zeroing + GC-heap
+  churn — vs plain malloc) with a 256 KiB slab; internal constructions use a
+  bare `FastBuffer` subclass, skipping Buffer's argument dispatch.
+
 ## Measured (make bench, lava/node wall-time ratio, 1 KiB)
 
-| bench | before | after |
-|-------|-------:|------:|
-| to-hex | 14.8x | ~9x |
-| to-base64 | 18.5x | ~12x |
-| to-latin1 | 35.8x | ~10x |
-| to-utf16le | 28.5x | ~12x |
-| to-utf8 | 6.2x | ~5x |
-| from-latin1 | ~37x | ~27x |
-| from-utf16le | ~29x | ~21x |
-| from-utf8 | 5.3x | ~4x |
+| bench | session start | after P0+reads | after phase 3 |
+|-------|-------:|------:|------:|
+| to-hex | 14.8x | 9.5x | ~9x |
+| to-base64 | 18.5x | 12.5x | ~10x |
+| to-latin1 | 35.8x | 10.9x | ~10x |
+| to-utf16le | 28.5x | 12.1x | ~12x |
+| to-utf8 | 6.2x | 5.5x | ~5x |
+| from-latin1 | ~37x | 26.5x | **~6x** |
+| from-utf16le | ~29x | 19.8x | **~8x** |
+| from-utf8 | 5.3x | 4.3x | **~3x** |
+| to-hex-tiny | 11.7x | 10.1x | ~8x |
 
-## Remaining floor / follow-up
+Absolute per-op: `buf.write(str, 'latin1')` ≈ 190 ns end-to-end (was ~1.7 µs).
 
-The residual gap is the per-call boundary: C-API callback entry, argument
-JSValueRef marshaling (`JSValueToNumber` per arg), `JSValueToStringCopy`,
-typed-array view resolution — several hundred ns per call vs V8 fast-API's tens.
-Phase 3 lever: register hot codecs via the exported
-`JSC::JSFunction::create(VM&, …, NativeFunction, …)` (host-call convention,
-`CallFrame*` directly, no JSValueRef boxing) — needs vendored headers for the
-PtrTag'd `FunctionPtr` types. SIMD codecs (hex `pshufb`, Muła base64, simdutf
-transcode) become visible only after that floor drops.
+## Remaining gap / follow-up
+
+What's left on the to-* side is `JSValueMakeString`'s `jsStringWithCache`
+(hash + weak-map insert per fresh string) and codec byte work — SIMD (hex
+`pshufb`, Muła base64, simdutf transcode) is now visible and is the next lever.
+On the from-* side, allocation dominates: JSC's ArrayBuffer/typed-array
+construction is ~3–30x V8's, partially amortized by the larger native-backed
+pool. Host-function registration for the http natives is a straight reuse of
+`inject_native_function`'s host parameter.
 
 ## Verify
 
