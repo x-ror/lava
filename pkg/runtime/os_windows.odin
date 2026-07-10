@@ -106,6 +106,11 @@ os_uname :: proc(field: Uname_Field) -> string {
 	return ""
 }
 
+os_process_rss_bytes :: proc() -> u64 {
+	// Working set via GetProcessMemoryInfo would need psapi; 0 until bound.
+	return 0
+}
+
 os_totalmem :: proc() -> u64 {
 	status: windows.MEMORYSTATUSEX
 	status.dwLength = windows.DWORD(size_of(windows.MEMORYSTATUSEX))

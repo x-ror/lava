@@ -700,6 +700,25 @@ process_cwd_cb :: proc "c" (
 	return js_string_value(ctx, dir)
 }
 
+process_memory_usage_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	obj := jsc.JSObjectMake(ctx, nil, nil)
+	rss := f64(os_process_rss_bytes())
+	set_named(ctx, obj, "rss", jsc.JSValueMakeNumber(ctx, rss))
+	set_named(ctx, obj, "heapTotal", jsc.JSValueMakeNumber(ctx, 0))
+	set_named(ctx, obj, "heapUsed", jsc.JSValueMakeNumber(ctx, 0))
+	set_named(ctx, obj, "external", jsc.JSValueMakeNumber(ctx, 0))
+	set_named(ctx, obj, "arrayBuffers", jsc.JSValueMakeNumber(ctx, 0))
+	return cast(jsc.JSValueRef)obj
+}
+
 // --- installation ---
 
 // install_globals wires the Node-like global surface (console, process,
@@ -1146,6 +1165,7 @@ install_process :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
 
 	inject_native_function(ctx, process, "exit", process_exit_cb)
 	inject_native_function(ctx, process, "cwd", process_cwd_cb)
+	inject_native_function(ctx, process, "memoryUsage", process_memory_usage_cb)
 
 	set_named(ctx, global, "process", cast(jsc.JSValueRef)process)
 }
