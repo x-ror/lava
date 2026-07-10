@@ -651,6 +651,108 @@ buffer_ascii_decode_cb :: proc "c" (
 	return latin1_string_from_bytes(ctx, masked)
 }
 
+// utf16leEncode(string) -> Uint8Array. Two LE bytes per UTF-16 code unit
+// (surrogates preserved as-is), matching Buffer.from(str, 'utf16le').
+buffer_utf16le_encode_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return make_uint8_array(ctx, nil)
+
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
+	if js_string == nil do return make_uint8_array(ctx, nil)
+	defer jsc.JSStringRelease(js_string)
+	length := int(jsc.JSStringGetLength(js_string))
+	if length == 0 do return make_uint8_array(ctx, nil)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return make_uint8_array(ctx, nil)
+
+	out := make([]byte, length * 2, context.allocator)
+	for i in 0 ..< length {
+		u := chars[i]
+		out[i * 2] = byte(u & 0xFF)
+		out[i * 2 + 1] = byte(u >> 8)
+	}
+	return make_uint8_array(ctx, out)
+}
+
+// utf16leDecode(u8) -> string. Pairs of little-endian bytes become UTF-16 units;
+// a trailing odd byte is ignored (Node). Built via CreateWithCharacters so
+// unpaired surrogates and NULs are preserved.
+buffer_utf16le_decode_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return js_string_value(ctx, "")
+
+	data, ok := typed_array_view(ctx, arguments[0])
+	if !ok || len(data) < 2 do return js_string_value(ctx, "")
+
+	n := len(data) / 2
+	units := make([]jsc.JSChar, n, context.temp_allocator)
+	for i in 0 ..< n {
+		units[i] = jsc.JSChar(data[i * 2]) | (jsc.JSChar(data[i * 2 + 1]) << 8)
+	}
+	js_str := jsc.JSStringCreateWithCharacters(raw_data(units), c.size_t(n))
+	defer jsc.JSStringRelease(js_str)
+	return jsc.JSValueMakeString(ctx, js_str)
+}
+
+// utf16leWriteInto(target, string, offset, maxLength) -> bytesWritten. Writes
+// LE code units into the caller's buffer; maxLength is in bytes and floored to
+// an even count (Node never writes a half unit).
+buffer_utf16le_write_into_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 4 do return jsc.JSValueMakeNumber(ctx, 0)
+	target, tok := typed_array_view(ctx, arguments[0])
+	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
+
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[1], nil)
+	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
+	defer jsc.JSStringRelease(js_string)
+	slen := int(jsc.JSStringGetLength(js_string))
+	if slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
+
+	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
+	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
+	if offset < 0 do offset = 0
+	if offset > len(target) do offset = len(target)
+	avail := len(target) - offset
+	if max > avail do max = avail
+	// Even byte count only — half a code unit is never written.
+	max = max - (max % 2)
+	if max <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
+
+	n_units := max / 2
+	if n_units > slen do n_units = slen
+	dst := target[offset:]
+	for i in 0 ..< n_units {
+		u := chars[i]
+		dst[i * 2] = byte(u & 0xFF)
+		dst[i * 2 + 1] = byte(u >> 8)
+	}
+	return jsc.JSValueMakeNumber(ctx, f64(n_units * 2))
+}
+
 // latin1WriteInto(target, string, offset, maxLength) -> bytesWritten. Copies the
 // low byte of each UTF-16 code unit of `string` into `target` at `offset`, up to
 // maxLength / remaining space — the in-place form of latin1Encode used by
@@ -744,6 +846,9 @@ make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "latin1Decode", buffer_latin1_decode_cb)
 	inject_native_function(ctx, bindings, "asciiDecode", buffer_ascii_decode_cb)
 	inject_native_function(ctx, bindings, "latin1WriteInto", buffer_latin1_write_into_cb)
+	inject_native_function(ctx, bindings, "utf16leEncode", buffer_utf16le_encode_cb)
+	inject_native_function(ctx, bindings, "utf16leDecode", buffer_utf16le_decode_cb)
+	inject_native_function(ctx, bindings, "utf16leWriteInto", buffer_utf16le_write_into_cb)
 	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
 	inject_native_function(ctx, bindings, "compare", buffer_compare_cb)
 	inject_native_function(ctx, bindings, "indexOf", buffer_index_of_cb)
