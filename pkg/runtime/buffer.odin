@@ -831,13 +831,142 @@ buffer_utf8_write_into_cb :: proc "c" (
 	return jsc.JSValueMakeNumber(ctx, f64(n))
 }
 
-// make_buffer_bindings builds the `native` object handed to js/internal/buffer.js.
+@(private = "file") B64URL_ALPHABET := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+buffer_base64url_encode_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return js_string_value(ctx, "")
+
+	data, ok := typed_array_view(ctx, arguments[0])
+	if !ok || len(data) == 0 do return js_string_value(ctx, "")
+
+	n := len(data)
+	out := make([]byte, (n + 2) / 3 * 4 + 1, context.temp_allocator)
+	di := 0
+	i := 0
+	for ; i + 2 < n; i += 3 {
+		v := u32(data[i]) << 16 | u32(data[i + 1]) << 8 | u32(data[i + 2])
+		out[di] = B64URL_ALPHABET[v >> 18]
+		out[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
+		out[di + 2] = B64URL_ALPHABET[v >> 6 & 0x3F]
+		out[di + 3] = B64URL_ALPHABET[v & 0x3F]
+		di += 4
+	}
+	switch n - i {
+	case 1:
+		v := u32(data[i]) << 16
+		out[di] = B64URL_ALPHABET[v >> 18]
+		out[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
+		di += 2
+	case 2:
+		v := u32(data[i]) << 16 | u32(data[i + 1]) << 8
+		out[di] = B64URL_ALPHABET[v >> 18]
+		out[di + 1] = B64URL_ALPHABET[v >> 12 & 0x3F]
+		out[di + 2] = B64URL_ALPHABET[v >> 6 & 0x3F]
+		di += 3
+	}
+	out[di] = 0
+	return ascii_string_value(ctx, out[:di + 1])
+}
+
+buffer_utf8_byte_length_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return jsc.JSValueMakeNumber(ctx, 0)
+
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
+	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
+	defer jsc.JSStringRelease(js_string)
+	length := int(jsc.JSStringGetLength(js_string))
+	if length == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
+	return jsc.JSValueMakeNumber(ctx, f64(utf16_js_utf8_byte_len(chars, length)))
+}
+
+buffer_base64_byte_length_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 1 do return jsc.JSValueMakeNumber(ctx, 0)
+
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[0], nil)
+	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
+	defer jsc.JSStringRelease(js_string)
+	length := int(jsc.JSStringGetLength(js_string))
+	if length == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
+	len := length
+	if chars[len - 1] == '=' {
+		len -= 1
+		if len > 0 && chars[len - 1] == '=' do len -= 1
+	}
+	return jsc.JSValueMakeNumber(ctx, f64((len * 3) >> 2))
+}
+
+buffer_swap_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 2 do return jsc.JSValueMakeUndefined(ctx)
+	data, ok := typed_array_view(ctx, arguments[0])
+	if !ok do return jsc.JSValueMakeUndefined(ctx)
+	width := int(jsc.JSValueToNumber(ctx, arguments[1], nil))
+	if width != 2 && width != 4 && width != 8 do return jsc.JSValueMakeUndefined(ctx)
+	n := len(data)
+	if n % width != 0 do return jsc.JSValueMakeUndefined(ctx)
+
+	switch width {
+	case 2:
+		for i := 0; i < n; i += 2 {
+			data[i], data[i + 1] = data[i + 1], data[i]
+		}
+	case 4:
+		for i := 0; i < n; i += 4 {
+			data[i], data[i + 3] = data[i + 3], data[i]
+			data[i + 1], data[i + 2] = data[i + 2], data[i + 1]
+		}
+	case 8:
+		for i := 0; i < n; i += 8 {
+			for j in 0 ..< 4 {
+				data[i + j], data[i + 7 - j] = data[i + 7 - j], data[i + j]
+			}
+		}
+	}
+	return jsc.JSValueMakeUndefined(ctx)
+}
+
 make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
 	inject_native_function(ctx, bindings, "hexEncode", buffer_hex_encode_cb)
 	inject_native_function(ctx, bindings, "hexDecode", buffer_hex_decode_cb)
 	inject_native_function(ctx, bindings, "base64Encode", buffer_base64_encode_cb)
 	inject_native_function(ctx, bindings, "base64Decode", buffer_base64_decode_cb)
+	inject_native_function(ctx, bindings, "base64urlEncode", buffer_base64url_encode_cb)
 	inject_native_function(ctx, bindings, "utf8Encode", buffer_utf8_encode_cb)
 	inject_native_function(ctx, bindings, "utf8Decode", buffer_utf8_decode_cb)
 	inject_native_function(ctx, bindings, "latin1Encode", buffer_latin1_encode_cb)
@@ -847,14 +976,14 @@ make_buffer_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	inject_native_function(ctx, bindings, "utf16leEncode", buffer_utf16le_encode_cb)
 	inject_native_function(ctx, bindings, "utf16leDecode", buffer_utf16le_decode_cb)
 	inject_native_function(ctx, bindings, "utf16leWriteInto", buffer_utf16le_write_into_cb)
+	inject_native_function(ctx, bindings, "utf8ByteLength", buffer_utf8_byte_length_cb)
+	inject_native_function(ctx, bindings, "base64ByteLength", buffer_base64_byte_length_cb)
+	inject_native_function(ctx, bindings, "swapInPlace", buffer_swap_cb)
 	inject_native_function(ctx, bindings, "allocUninit", buffer_alloc_uninit_cb)
 	inject_native_function(ctx, bindings, "compare", buffer_compare_cb)
 	inject_native_function(ctx, bindings, "indexOf", buffer_index_of_cb)
 	inject_native_function(ctx, bindings, "isValidUtf8", buffer_is_valid_utf8_cb)
 	inject_native_function(ctx, bindings, "utf8WriteInto", buffer_utf8_write_into_cb)
-	// The practical allocation ceiling; buffer.js reads it as kMaxLength (the
-	// Bun-parity 4 GiB) and enforces it on Buffer paths before `new Buffer(size)`
-	// reaches JSC.
 	set_named(ctx, bindings, "maxAllocBytes", jsc.JSValueMakeNumber(ctx, max_buffer_alloc_bytes()))
 	return bindings
 }
