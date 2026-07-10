@@ -193,6 +193,78 @@ function bytes(s) {
   }
 })();
 
+// 11) Response-head latin1 serialization (native latin1WriteInto path when available):
+//     high-byte values (obs-text 0x80-0xFF) must appear as single raw bytes on the wire,
+//     not UTF-8 multi-byte sequences. Coalesced end() and bare _flushHead both use headBytes.
+(function () {
+  const high = String.fromCharCode(0xe9, 0x80, 0xff); // é, \x80, \xff — each one latin1 byte
+  const s = mockSocket();
+  const res = new http.ServerResponse(s, 'GET', 1);
+  res.setHeader('X-High', high);
+  res.writeHead(200, { 'Content-Length': '0' });
+  res.end();
+  const b = bytes(s);
+  const asLat = b.toString('latin1');
+  check(asLat.indexOf('X-High: ') !== -1, '11: X-High header present');
+  // After "X-High: " the next three bytes must be e9 80 ff, not c3 a9 (UTF-8 é).
+  const needle = Buffer.from('X-High: ', 'latin1');
+  const idx = b.indexOf(needle);
+  check(idx >= 0, '11: locate X-High prefix');
+  if (idx >= 0) {
+    check(b[idx + needle.length] === 0xe9, '11: 0xE9 as single byte (not UTF-8)');
+    check(b[idx + needle.length + 1] === 0x80, '11: 0x80 as single byte');
+    check(b[idx + needle.length + 2] === 0xff, '11: 0xFF as single byte');
+  }
+  check(!b.includes(Buffer.from([0xc3, 0xa9])), '11: no UTF-8 encoding of é in head');
+})();
+
+// 12) Coalesced head+body still latin1-correct for high-byte headers.
+(function () {
+  const high = String.fromCharCode(0xc0, 0xfe);
+  const s = mockSocket();
+  const res = new http.ServerResponse(s, 'GET', 1);
+  res.setHeader('X-Bin', high);
+  res.writeHead(200, { 'Content-Length': '3' });
+  res.end(Buffer.from('abc'));
+  check(s.writes.length === 1, '12: coalesced write');
+  const b = bytes(s);
+  const needle = Buffer.from('X-Bin: ', 'latin1');
+  const idx = b.indexOf(needle);
+  check(idx >= 0, '12: X-Bin present');
+  if (idx >= 0) {
+    check(b[idx + needle.length] === 0xc0 && b[idx + needle.length + 1] === 0xfe, '12: high bytes');
+  }
+  check(b.slice(-3).toString('latin1') === 'abc', '12: body after head');
+})();
+
+// 13) setHeader display name casing is preserved on the wire; lookup is case-insensitive.
+(function () {
+  const s = mockSocket();
+  const res = new http.ServerResponse(s, 'GET', 1);
+  res.setHeader('X-MiXeD-Case', 'v');
+  check(res.getHeader('x-mixed-case') === 'v', '13: getHeader folds case');
+  check(res.hasHeader('X-MIXED-CASE') === true, '13: hasHeader folds case');
+  res.writeHead(200, { 'Content-Length': '0' });
+  res.end();
+  const b = bytes(s).toString('latin1');
+  check(b.indexOf('X-MiXeD-Case: v') !== -1, '13: wire preserves setHeader casing');
+})();
+
+// 14) Invalid header char > U+00FF rejected (would latin1-mask to CR/LF).
+(function () {
+  const s = mockSocket();
+  const res = new http.ServerResponse(s, 'GET', 1);
+  let threw = false;
+  let code = '';
+  try {
+    res.setHeader('X-Bad', 'a\u010d b'); // U+010D masks to CR
+  } catch (e) {
+    threw = true;
+    code = e && e.code;
+  }
+  check(threw && code === 'ERR_INVALID_CHAR', '14: high code point rejected as ERR_INVALID_CHAR');
+})();
+
 if (failures > 0) {
   console.error('response-unit: ' + failures + ' failure(s)');
   process.exit(1);
