@@ -301,6 +301,18 @@ register_entry_module :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State, sour
 }
 
 js_string_value :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef {
+	// NUL-free ASCII (the overwhelming bridge case: property names, headers,
+	// paths) is copied straight into 8-bit string storage with no UTF-8
+	// validation pass. NULs stay excluded so the fast path can never differ from
+	// the fallback's documented truncate-at-NUL behavior.
+	if len(value) > 0 && bytes_all_ascii_no_nul(transmute([]byte)value) {
+		if str, dst, ok := jsc.string_alloc8(len(value)); ok {
+			copy(dst, value)
+			defer jsc.JSStringRelease(str)
+			return jsc.JSValueMakeString(ctx, str)
+		}
+	}
+
 	c_value, err := strings.clone_to_cstring(value, context.temp_allocator)
 	if err != nil do return jsc.JSValueMakeUndefined(ctx)
 
@@ -317,6 +329,15 @@ js_string_value :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef 
 // where a NUL is a legal byte.
 js_string_from_bytes :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValueRef {
 	if len(value) == 0 do return js_string_value(ctx, "")
+	// ASCII (NULs included — this builder's contract preserves them) copies
+	// straight into 8-bit string storage.
+	if bytes_all_ascii(transmute([]byte)value) {
+		if str, dst, ok := jsc.string_alloc8(len(value)); ok {
+			copy(dst, value)
+			defer jsc.JSStringRelease(str)
+			return jsc.JSValueMakeString(ctx, str)
+		}
+	}
 	runes := utf8.string_to_runes(value, context.temp_allocator)
 	// Each rune is at most two UTF-16 code units (a surrogate pair).
 	units := make([]u16, len(runes) * 2, context.temp_allocator)
@@ -507,6 +528,35 @@ js_string_ref_to_utf8_owned :: proc(js_string: jsc.JSStringRef) -> (string, bool
 	if js_string == nil do return "", false
 	length := int(jsc.JSStringGetLength(js_string))
 	if length == 0 do return "", false
+
+	// 8-bit storage read directly (GetCharactersPtr would widen the whole string
+	// to UTF-16 first): ASCII copies verbatim; Latin-1 high bytes expand to two
+	// UTF-8 bytes each, with the exact size known up front.
+	if s8, ok8 := jsc.string_chars8(js_string); ok8 {
+		if bytes_all_ascii(s8) {
+			buffer := make([]byte, length, context.allocator)
+			copy(buffer, s8)
+			return string(buffer), true
+		}
+		n := length
+		for b in s8 {
+			if b >= 0x80 do n += 1
+		}
+		buffer := make([]byte, n, context.allocator)
+		o := 0
+		for b in s8 {
+			if b < 0x80 {
+				buffer[o] = b
+				o += 1
+			} else {
+				buffer[o] = 0xC0 | (b >> 6)
+				buffer[o + 1] = 0x80 | (b & 0x3F)
+				o += 2
+			}
+		}
+		return string(buffer), true
+	}
+
 	chars := jsc.JSStringGetCharactersPtr(js_string)
 	if chars == nil do return "", false
 
