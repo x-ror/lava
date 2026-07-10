@@ -5,54 +5,90 @@ import "core:c"
 import "core:mem"
 import jsc "lava:pkg/jsc"
 
-// Shared JavaScriptCore <-> Odin TypedArray marshalling helpers. These are general
-// purpose — used by the node:crypto, node:buffer, node:fs, node:sqlite and fetch
-// bindings — so they live here rather than in whichever module happened to need
-// them first (historically node:crypto). Everything is package-scoped, so callers
-// reference them unqualified.
+// Shared JavaScriptCore <-> Odin TypedArray marshalling helpers.
+
+// --- BytesPtr offset layout (issue #68) --------------------------------------
+// javascriptcoregtk's JSObjectGetTypedArrayBytesPtr returns the ArrayBuffer base
+// and ignores the view's byteOffset (verified 2026-07-10 on 6.0/2.52.3: BytesPtr
+// points at base, first byte is pool[0] not view[0]). Correct access is always
+// base + byteOffset. We still prefer BytesPtr + ByteOffset (4 C API calls after
+// the type check) over Buffer + ArrayBufferBytesPtr + Offset (5 calls): BytesPtr
+// and ArrayBufferBytesPtr both yield the same base when the bug is present.
+//
+// If a future JSC returns the view start from BytesPtr, adding offset would
+// double-apply. First non-zero-offset view compares BytesPtr to ArrayBuffer base
+// and pins the mode for the process.
+
+@(private = "file")
+BytesPtr_Mode :: enum u8 {
+	Unknown,
+	Base_Plus_Offset, // BytesPtr == ArrayBuffer base (gtk today)
+	View_Start,       // BytesPtr == base + offset (fixed JSC)
+}
+
+@(private = "file")
+g_bytes_ptr_mode: BytesPtr_Mode // written once after first offset view; read thereafter
 
 // typed_array_view borrows the backing store of a TypedArray or DataView as an
-// Odin byte slice. The slice aliases JavaScriptCore-owned memory: valid only
-// for the duration of the native call, never stored or freed. A zero-length
-// array yields an empty slice (ok=true).
-//
-// The data start is computed as the ArrayBuffer's base pointer plus the view's
-// byteOffset rather than JSObjectGetTypedArrayBytesPtr, which on javascriptcoregtk
-// returns the buffer base and ignores the offset (so an offset view — e.g.
-// `buffer.subarray(8)` — was read/written at the wrong position; see issue #68).
-// base + byteOffset is correct regardless of whether a given JSC applies the
-// offset to BytesPtr, so this stays right across backends.
+// Odin byte slice. Valid only for the duration of the native call.
 typed_array_view :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> ([]byte, bool) {
 	if jsc.JSValueGetTypedArrayType(ctx, value, nil) == .None do return nil, false
 	obj := cast(jsc.JSObjectRef)value
 	n := int(jsc.JSObjectGetTypedArrayByteLength(ctx, obj, nil))
 	if n == 0 do return nil, true
-	// Re-verified 2026-07-01: javascriptcoregtk-6.0's BytesPtr STILL returns the
-	// buffer base with the view's byteOffset unapplied (a pooled Buffer decodes the
-	// pool prefix instead of itself), so the 3-call chain below stays mandatory.
-	buffer := jsc.JSObjectGetTypedArrayBuffer(ctx, obj, nil)
-	if buffer == nil do return nil, false
-	base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, buffer, nil)
-	if base == nil do return nil, false
+
+	ptr := jsc.JSObjectGetTypedArrayBytesPtr(ctx, obj, nil)
 	offset := int(jsc.JSObjectGetTypedArrayByteOffset(ctx, obj, nil))
-	return (cast([^]byte)base)[offset:][:n], true
+
+	if ptr == nil {
+		buffer := jsc.JSObjectGetTypedArrayBuffer(ctx, obj, nil)
+		if buffer == nil do return nil, false
+		base := jsc.JSObjectGetArrayBufferBytesPtr(ctx, buffer, nil)
+		if base == nil do return nil, false
+		return (cast([^]byte)base)[offset:][:n], true
+	}
+
+	if offset == 0 {
+		return (cast([^]byte)ptr)[:n], true
+	}
+
+	mode := g_bytes_ptr_mode
+	if mode == .Unknown {
+		buffer := jsc.JSObjectGetTypedArrayBuffer(ctx, obj, nil)
+		base := buffer != nil ? jsc.JSObjectGetArrayBufferBytesPtr(ctx, buffer, nil) : nil
+		if base != nil {
+			if ptr == base {
+				mode = .Base_Plus_Offset
+			} else if ptr == rawptr(uintptr(base) + uintptr(offset)) {
+				mode = .View_Start
+			} else {
+				// Unexpected — use ArrayBuffer base + offset (always correct).
+				return (cast([^]byte)base)[offset:][:n], true
+			}
+			g_bytes_ptr_mode = mode
+		} else {
+			// Cannot probe; assume gtk layout (base + offset).
+			mode = .Base_Plus_Offset
+			g_bytes_ptr_mode = mode
+		}
+	}
+
+	if mode == .View_Start {
+		return (cast([^]byte)ptr)[:n], true
+	}
+	// Base_Plus_Offset (and default): BytesPtr is the buffer base.
+	return (cast([^]byte)ptr)[offset:][:n], true
 }
 
 // jsc_buffer_deallocator frees a heap-allocated (context.allocator) byte slice
-// that was handed to JavaScriptCore as the NoCopy backing of a Uint8Array (see
-// make_uint8_array). JSC invokes it on the array's collection. Used by fs/sqlite
-// for their owned result buffers too.
+// that was handed to JavaScriptCore as the NoCopy backing of a Uint8Array.
 jsc_buffer_deallocator :: proc "c" (bytes: rawptr, deallocator_context: rawptr) {
 	context = runtime.default_context()
 	if bytes != nil do free(bytes)
 }
 
 // make_uint8_array hands a heap-allocated (context.allocator) byte slice to
-// JavaScriptCore as a Uint8Array without copying; jsc_buffer_deallocator frees it
-// when the array is collected. A nil backing pointer (an empty `make`) is
-// substituted with a 1-byte allocation reported as length 0, since JSC rejects a
-// null pointer — decoders can legitimately yield zero bytes (e.g. hex of an
-// invalid first pair).
+// JavaScriptCore as a Uint8Array without copying.
 make_uint8_array :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef {
 	ptr := raw_data(data)
 	n := len(data)
@@ -61,51 +97,16 @@ make_uint8_array :: proc(ctx: jsc.JSContextRef, data: []byte) -> jsc.JSValueRef 
 		ptr = raw_data(pad)
 		n = 0
 	}
-	// make_uint8_nocopy_locked enters the VM (JSLockHolder) around the creation only on
-	// Windows, where that bun-webkit build's typed-array creator does not self-lock and a
-	// GC during the allocation aborts. Stock JavaScriptCore (Linux/macOS) self-locks the
-	// creator, so it is the plain C-API call there. See pkg/jsc/jsc_init.odin.
 	array := jsc.make_uint8_nocopy_locked(ctx, ptr, c.size_t(n), jsc_buffer_deallocator)
 	return cast(jsc.JSValueRef)array
 }
 
-// MAX_UNINIT_ALLOC caps the native uninitialized fast-path. Above it the JS layer
-// falls back to a plain `new Buffer(size)`. The cap exists for safety, not policy:
-// JavaScriptCore's NoCopy typed-array creator RELEASE_ASSERT-aborts the process for
-// byte lengths past an internal limit (empirically between 4 and 8 GiB on the Linux
-// build, and the Windows/macOS JSC builds may differ), whereas the JS typed-array
-// constructor instead throws a catchable RangeError. 2 GiB-1 sits well below any of
-// those abort thresholds, comfortably above any realistic allocUnsafe, and keeps
-// behavior identical across Linux, macOS, and Windows. A request larger than this
-// is rare and simply takes the safe (zero-filled) own-backing path, exactly as
-// before this fast-path existed.
 MAX_UNINIT_ALLOC :: 0x7fff_ffff // 2^31 - 1 bytes
 
-// make_uint8_array_uninit hands JavaScriptCore `size` bytes of freshly allocated,
-// *uninitialized* memory as a NoCopy Uint8Array. It backs the node:buffer unpooled
-// unsafe-allocation paths — large Buffer.allocUnsafe, Buffer.allocUnsafeSlow, and
-// SlowBuffer — for which Node returns memory as-is. A JS `new Uint8Array(size)`
-// cannot reproduce that because every ArrayBuffer is zero-initialized; this
-// deliberately skips the zero-fill (alloc_bytes_non_zeroed, not make), so the bytes
-// hold whatever was previously in the region, like Node's malloc-not-calloc
-// allocator. Ownership matches make_uint8_array exactly: the region comes from
-// context.allocator and jsc_buffer_deallocator frees it once JSC collects the
-// backing ArrayBuffer, so any view kept by the JS layer (the Buffer wrapper, a
-// subarray, …) keeps the memory live for precisely as long as it is reachable —
-// no leak, no use-after-free, no double-free. Returns ok=false for a non-positive
-// or over-cap size, or an allocation failure, letting the caller fall back to a
-// safe zero-filled own-backing Buffer (which still throws for an impossible size,
-// as Node does).
 make_uint8_array_uninit :: proc(ctx: jsc.JSContextRef, size: int) -> (jsc.JSValueRef, bool) {
 	if size <= 0 || size > MAX_UNINIT_ALLOC do return nil, false
 	data, err := mem.alloc_bytes_non_zeroed(size, mem.DEFAULT_ALIGNMENT, context.allocator)
 	if err != nil || len(data) != size do return nil, false
-	// Ownership transfers to JSC the moment we pass the region to the NoCopy creator: JSC
-	// invokes jsc_buffer_deallocator to release it, INCLUDING when creation fails/throws
-	// (JSObjectMakeTypedArrayWithBytesNoCopy calls the bytes deallocator on the failure
-	// path). So we must NOT free it ourselves on a nil return — that double-frees. A nil
-	// here is a rare failure (oversize handled above; otherwise OOM/exception) and the
-	// deallocator has already reclaimed the region.
 	array := jsc.make_uint8_nocopy_locked(
 		ctx,
 		raw_data(data),
