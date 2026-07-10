@@ -40,46 +40,24 @@
   /** @type {((size: number) => Uint8Array|null)|null} */
   var nativeAllocUninit = typeof native.allocUninit === 'function' ? native.allocUninit : null;
 
-  /** @param {string} str @returns {Uint8Array} */
-  function utf8Encode(str) {
-    return utf8EncodeNative(String(str));
-  }
-  /** @param {Uint8Array} bytes @returns {string} */
-  function utf8Decode(bytes) {
-    return utf8DecodeNative(bytes);
-  }
-  /** @param {Uint8Array} bytes @returns {string} */
-  function hexEncode(bytes) {
-    return hexEncodeNative(bytes);
-  }
-  /** @param {string} str @returns {Uint8Array} */
-  function hexDecode(str) {
-    return hexDecodeNative(String(str));
-  }
-  /** @param {Uint8Array} bytes @returns {string} */
-  function base64Encode(bytes) {
-    return base64EncodeNative(bytes);
-  }
-  /** @param {string} str @returns {Uint8Array} */
-  function latin1Encode(str) {
-    return latin1EncodeNative(String(str));
-  }
-  /** @param {Uint8Array} bytes @returns {string} */
-  function latin1Decode(bytes) {
-    return latin1DecodeNative(bytes);
-  }
-  /** @param {Uint8Array} bytes @returns {string} */
-  function asciiDecode(bytes) {
-    return asciiDecodeNative(bytes);
-  }
-  /** @param {string} str @returns {Uint8Array} */
-  function utf16leEncode(str) {
-    return utf16leEncodeNative(String(str));
-  }
-  /** @param {Uint8Array} bytes @returns {string} */
-  function utf16leDecode(bytes) {
-    return utf16leDecodeNative(bytes);
-  }
+  var EMPTY_U8 = new Uint8Array(0);
+  var u8Fill = Uint8Array.prototype.fill;
+
+  /** @type {Object<string, string>} lowercased name → canonical encoding */
+  var ENCODING_ALIASES = {
+    utf8: 'utf8',
+    'utf-8': 'utf8',
+    utf16le: 'utf16le',
+    'utf-16le': 'utf16le',
+    ucs2: 'utf16le',
+    'ucs-2': 'utf16le',
+    binary: 'latin1',
+    latin1: 'latin1',
+    ascii: 'ascii',
+    hex: 'hex',
+    base64: 'base64',
+    base64url: 'base64url',
+  };
 
   var MAX_SAFE = 9007199254740991;
   var MAX_ALLOC_BYTES =
@@ -228,31 +206,15 @@
 
   /** @returns {string} Canonical encoding name (default utf8). */
   function normalizeEncoding(encoding) {
-    encoding = (encoding || 'utf8').toLowerCase();
-    if (encoding === 'utf-8') return 'utf8';
-    if (encoding === 'ucs2' || encoding === 'ucs-2' || encoding === 'utf-16le') return 'utf16le';
-    if (encoding === 'binary') return 'latin1';
-    return encoding;
+    if (encoding === undefined || encoding === null || encoding === '') return 'utf8';
+    var key = String(encoding).toLowerCase();
+    var canon = ENCODING_ALIASES[key];
+    return canon !== undefined ? canon : key;
   }
 
-  /** @returns {boolean} True if encoding is a known Buffer encoding. */
+  /** @returns {boolean} */
   function isEncodingName(encoding) {
-    switch (String(encoding).toLowerCase()) {
-      case 'utf8':
-      case 'utf-8':
-      case 'utf16le':
-      case 'utf-16le':
-      case 'ucs2':
-      case 'ucs-2':
-      case 'latin1':
-      case 'binary':
-      case 'ascii':
-      case 'hex':
-      case 'base64':
-      case 'base64url':
-        return true;
-    }
-    return false;
+    return Object.prototype.hasOwnProperty.call(ENCODING_ALIASES, String(encoding).toLowerCase());
   }
 
   /** Lenient Node base64/base64url normalization before native decode. */
@@ -270,30 +232,31 @@
     return str.replaceAll('+', '-').replaceAll('/', '_').replaceAll(/=+$/g, '');
   }
 
-  /** @returns {Uint8Array} Encode `str` with `encoding` via native codecs. */
+  /** @returns {Uint8Array} */
   function strToBytes(str, encoding) {
     encoding = normalizeEncoding(encoding);
-    if (encoding === 'utf8') return utf8Encode(str);
-    if (encoding === 'utf16le') return utf16leEncode(str);
-    if (encoding === 'hex') return hexDecode(str);
+    str = String(str);
+    if (encoding === 'utf8') return utf8EncodeNative(str);
+    if (encoding === 'utf16le') return utf16leEncodeNative(str);
+    if (encoding === 'hex') return hexDecodeNative(str);
     if (encoding === 'base64' || encoding === 'base64url') {
       var norm = normalizeBase64(str);
-      return norm ? base64DecodeNative(norm) : new Uint8Array(0);
+      return norm ? base64DecodeNative(norm) : EMPTY_U8;
     }
-    if (encoding === 'ascii' || encoding === 'latin1') return latin1Encode(str);
+    if (encoding === 'ascii' || encoding === 'latin1') return latin1EncodeNative(str);
     throw errUnknownEncoding(encoding);
   }
 
-  /** @returns {string} Decode `bytes` with `encoding` via native codecs. */
+  /** @returns {string} */
   function bytesToString(bytes, encoding) {
     encoding = normalizeEncoding(encoding);
-    if (encoding === 'utf8') return utf8Decode(bytes);
-    if (encoding === 'utf16le') return utf16leDecode(bytes);
-    if (encoding === 'hex') return hexEncode(bytes);
-    if (encoding === 'base64') return base64Encode(bytes);
-    if (encoding === 'base64url') return toBase64Url(base64Encode(bytes));
-    if (encoding === 'latin1') return latin1Decode(bytes);
-    if (encoding === 'ascii') return asciiDecode(bytes);
+    if (encoding === 'utf8') return utf8DecodeNative(bytes);
+    if (encoding === 'utf16le') return utf16leDecodeNative(bytes);
+    if (encoding === 'hex') return hexEncodeNative(bytes);
+    if (encoding === 'base64') return base64EncodeNative(bytes);
+    if (encoding === 'base64url') return toBase64Url(base64EncodeNative(bytes));
+    if (encoding === 'latin1') return latin1DecodeNative(bytes);
+    if (encoding === 'ascii') return asciiDecodeNative(bytes);
     throw errUnknownEncoding(encoding);
   }
 
@@ -346,7 +309,7 @@
     return dv;
   }
 
-  /** @returns {-1|0|1} Lexicographic compare (native). */
+  /** @returns {-1|0|1} */
   function compareBytes(a, b) {
     return nativeCompare(a, b);
   }
@@ -427,46 +390,34 @@
     return offset + byteLength;
   }
 
+  var BIG_0 = typeof BigInt === 'function' ? BigInt(0) : null;
+  var BIG_1 = typeof BigInt === 'function' ? BigInt(1) : null;
+  var BIG_MAX_U64 = typeof BigInt === 'function' ? (BIG_1 << BigInt(64)) - BIG_1 : null;
+  var BIG_SIGN_I64 = typeof BigInt === 'function' ? BIG_1 << BigInt(63) : null;
+
   function readBigUInt(buf, offset, littleEndian) {
     offset = checkBounds(buf, offset, 8);
-    var value = BigInt(0);
-    if (littleEndian) {
-      for (var i = 7; i >= 0; i--) value = (value << BigInt(8)) + BigInt(buf[offset + i]);
-    } else {
-      for (var j = 0; j < 8; j++) value = (value << BigInt(8)) + BigInt(buf[offset + j]);
-    }
-    return value;
+    return viewOf(buf).getBigUint64(offset, littleEndian);
   }
 
   function readBigInt(buf, offset, littleEndian) {
-    var value = readBigUInt(buf, offset, littleEndian);
-    var sign = BigInt(1) << BigInt(63);
-    return value >= sign ? value - (BigInt(1) << BigInt(64)) : value;
+    offset = checkBounds(buf, offset, 8);
+    return viewOf(buf).getBigInt64(offset, littleEndian);
   }
 
   function writeBigUInt(buf, value, offset, littleEndian) {
     value = BigInt(value);
-    checkValueInt(value, BigInt(0), (BigInt(1) << BigInt(64)) - BigInt(1), 7);
+    checkValueInt(value, BIG_0, BIG_MAX_U64, 7);
     offset = checkBounds(buf, offset, 8);
-    for (var i = 0; i < 8; i++) {
-      var index = littleEndian ? offset + i : offset + 7 - i;
-      buf[index] = Number(value & BigInt(0xff));
-      value >>= BigInt(8);
-    }
+    viewOf(buf).setBigUint64(offset, value, littleEndian);
     return offset + 8;
   }
 
   function writeBigInt(buf, value, offset, littleEndian) {
     value = BigInt(value);
-    var limit = BigInt(1) << BigInt(63);
-    checkValueInt(value, -limit, limit - BigInt(1), 7);
+    checkValueInt(value, -BIG_SIGN_I64, BIG_SIGN_I64 - BIG_1, 7);
     offset = checkBounds(buf, offset, 8);
-    if (value < 0) value += BigInt(1) << BigInt(64);
-    for (var i = 0; i < 8; i++) {
-      var index = littleEndian ? offset + i : offset + 7 - i;
-      buf[index] = Number(value & BigInt(0xff));
-      value >>= BigInt(8);
-    }
+    viewOf(buf).setBigInt64(offset, value, littleEndian);
     return offset + 8;
   }
 
@@ -539,7 +490,9 @@
       if (sourceEnd > this.length) sourceEnd = this.length;
       if (targetStart >= target.length || sourceStart >= sourceEnd) return 0;
       var len = Math.min(sourceEnd - sourceStart, target.length - targetStart);
-      target.set(this.subarray(sourceStart, sourceStart + len), targetStart);
+      if (len <= 0) return 0;
+      if (sourceStart === 0 && len === this.length) target.set(this, targetStart);
+      else target.set(this.subarray(sourceStart, sourceStart + len), targetStart);
       return len;
     }
 
@@ -570,19 +523,15 @@
       var max = length === undefined ? remaining : toInteger(length, 0);
       if (max > remaining) max = remaining;
       if (max <= 0) return 0;
-      if (enc === 'utf8') return utf8WriteIntoNative(this, String(string), offset, max);
+      string = String(string);
+      if (enc === 'utf8') return utf8WriteIntoNative(this, string, offset, max);
       if (enc === 'latin1' || enc === 'ascii')
-        return latin1WriteIntoNative(this, String(string), offset, max);
-      if (enc === 'utf16le') return utf16leWriteIntoNative(this, String(string), offset, max);
-      var bytes = strToBytes(String(string), enc);
-      length = Math.min(
-        toInteger(length === undefined ? bytes.length : length, bytes.length),
-        bytes.length,
-      );
-      length = Math.min(length, remaining);
-      if (length < 0) length = 0;
-      if (length > 0) this.set(bytes.subarray(0, length), offset);
-      return length;
+        return latin1WriteIntoNative(this, string, offset, max);
+      if (enc === 'utf16le') return utf16leWriteIntoNative(this, string, offset, max);
+      var bytes = strToBytes(string, enc);
+      var n = bytes.length < max ? bytes.length : max;
+      if (n > 0) this.set(n === bytes.length ? bytes : bytes.subarray(0, n), offset);
+      return n;
     }
 
     slice(start, end) {
@@ -596,7 +545,8 @@
 
     equals(other) {
       if (!(other instanceof Uint8Array) || this.length !== other.length) return false;
-      return compareBytes(this, other) === 0;
+      if (this.length === 0) return true;
+      return nativeCompare(this, other) === 0;
     }
 
     compare(target, targetStart, targetEnd, sourceStart, sourceEnd) {
@@ -636,12 +586,17 @@
       else start = validateWriteOffset(+start, K_MAX_LENGTH, 'offset');
       if (end === undefined) end = this.length;
       else end = validateWriteOffset(+end, this.length, 'end');
-      var bytes;
+      if (end <= start) return this;
       if (typeof value === 'number') {
-        bytes = new Uint8Array([value & 0xff]);
-      } else if (typeof value === 'boolean') {
-        bytes = new Uint8Array([value ? 1 : 0]);
-      } else if (value instanceof Uint8Array) {
+        u8Fill.call(this, value & 0xff, start, end);
+        return this;
+      }
+      if (typeof value === 'boolean') {
+        u8Fill.call(this, value ? 1 : 0, start, end);
+        return this;
+      }
+      var bytes;
+      if (value instanceof Uint8Array) {
         if (value.length === 0) throw errInvalidArgValue('value', value);
         bytes = value;
       } else {
@@ -649,10 +604,14 @@
         bytes = strToBytes(str, encoding || 'utf8');
         if (bytes.length === 0) {
           if (str.length !== 0) throw errInvalidArgValue('value', value);
-          bytes = new Uint8Array([0]);
+          u8Fill.call(this, 0, start, end);
+          return this;
         }
       }
-      if (end <= start) return this;
+      if (bytes.length === 1) {
+        u8Fill.call(this, bytes[0], start, end);
+        return this;
+      }
       for (var i = start; i < end; i++) this[i] = bytes[(i - start) % bytes.length];
       return this;
     }
@@ -705,7 +664,7 @@
     }
 
     toJSON() {
-      return { type: 'Buffer', data: Array.prototype.slice.call(this) };
+      return { type: 'Buffer', data: Array.from(this) };
     }
   }
 
@@ -714,18 +673,15 @@
   function inspectBuffer(buf) {
     var max = inspectMaxBytes;
     var shown = buf.length > max ? max : buf.length;
-    var hex = Buffer.prototype.toString
-      .call(buf, 'hex', 0, shown)
-      .replaceAll(/(.{2})/g, '$1 ')
-      .trim();
-    var remaining = buf.length - max;
+    var hex = '';
+    if (shown > 0) {
+      hex = hexEncodeNative(shown === buf.length ? buf : buf.subarray(0, shown))
+        .replaceAll(/(.{2})/g, '$1 ')
+        .trim();
+    }
+    var remaining = buf.length - shown;
     if (remaining > 0)
-      hex +=
-        (hex.length > 0 ? ' ' : '') +
-        '... ' +
-        remaining +
-        ' more byte' +
-        (remaining > 1 ? 's' : '');
+      hex += (hex ? ' ' : '') + '... ' + remaining + ' more byte' + (remaining > 1 ? 's' : '');
     return '<Buffer ' + hex + '>';
   }
 
@@ -1031,6 +987,7 @@
   Buffer.from = function (value, encodingOrOffset, length) {
     if (typeof value === 'string') {
       var bytes = strToBytes(value, encodingOrOffset);
+      if (bytes.length === 0) return allocate(0);
       var b = allocate(bytes.length);
       b.set(bytes);
       return b;
@@ -1101,7 +1058,11 @@
 
   Buffer.byteLength = function (string, encoding) {
     if (typeof string === 'string') {
-      var enc = encoding === undefined || !isEncodingName(encoding) ? 'utf8' : encoding;
+      var enc =
+        encoding === undefined || !isEncodingName(encoding) ? 'utf8' : normalizeEncoding(encoding);
+      // Fixed-width encodings need no full encode pass.
+      if (enc === 'ascii' || enc === 'latin1') return string.length;
+      if (enc === 'utf16le') return string.length * 2;
       return strToBytes(string, enc).length;
     }
     if (
