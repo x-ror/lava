@@ -694,13 +694,10 @@ buffer_latin1_write_into_cb :: proc "c" (
 }
 
 // utf8WriteInto(target, string, offset, maxLength) -> bytesWritten. Encodes the
-// string to UTF-8 (JSC already produced those bytes when the value was read) and
-// copies up to maxLength of them straight into the caller's Buffer at offset —
-// eliminating the throwaway intermediate Uint8Array and the JS copy loop that
-// Buffer.prototype.write previously paid on every utf8 write. Truncation matches
-// the old strToBytes-then-copy path (a multibyte char may be cut at the
-// maxLength / remaining-space boundary); the JS layer computes maxLength so the
-// returned count equals the prior result.
+// JS string's UTF-16 units straight into the caller's Buffer at offset — no
+// intermediate owned string / Uint8Array. Truncation may cut mid-character at
+// the maxLength / remaining-space boundary (Node parity); the JS layer sets
+// maxLength so the returned count matches the prior strToBytes-then-copy path.
 buffer_utf8_write_into_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -713,19 +710,24 @@ buffer_utf8_write_into_cb :: proc "c" (
 	if argument_count < 4 do return jsc.JSValueMakeNumber(ctx, 0)
 	target, tok := typed_array_view(ctx, arguments[0])
 	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
-	str, alloc := jsc_value_to_string_or_default(ctx, arguments[1])
-	defer if alloc do delete(str, context.allocator)
+
+	js_string := jsc.JSValueToStringCopy(ctx, arguments[1], nil)
+	if js_string == nil do return jsc.JSValueMakeNumber(ctx, 0)
+	defer jsc.JSStringRelease(js_string)
+	slen := int(jsc.JSStringGetLength(js_string))
+	if slen == 0 do return jsc.JSValueMakeNumber(ctx, 0)
+	chars := jsc.JSStringGetCharactersPtr(js_string)
+	if chars == nil do return jsc.JSValueMakeNumber(ctx, 0)
+
 	offset := int(jsc.JSValueToNumber(ctx, arguments[2], nil))
 	max := int(jsc.JSValueToNumber(ctx, arguments[3], nil))
 	if offset < 0 do offset = 0
 	if offset > len(target) do offset = len(target)
 	avail := len(target) - offset
-	n := len(str)
-	if n > max do n = max
-	if n > avail do n = avail
-	if n <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
-	src := transmute([]byte)str
-	copy(target[offset:offset + n], src[:n])
+	if max > avail do max = avail
+	if max <= 0 do return jsc.JSValueMakeNumber(ctx, 0)
+
+	n := utf16_js_to_utf8_capped(chars, slen, target[offset:][:max])
 	return jsc.JSValueMakeNumber(ctx, f64(n))
 }
 

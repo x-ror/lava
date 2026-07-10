@@ -446,6 +446,9 @@ js_string_from_string :: proc(value: string) -> jsc.JSStringRef {
 	return jsc.JSStringCreateWithUTF8CString(c_value)
 }
 
+// value_to_string converts a JS value to UTF-8. The bool is is_allocated (caller
+// must delete when true), NOT success: conversion failure returns a static
+// diagnostic with false; empty strings return ("", false).
 value_to_string :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> (string, bool) {
 	exception: jsc.JSValueRef
 	js_string := jsc.JSValueToStringCopy(ctx, value, &exception)
@@ -453,27 +456,5 @@ value_to_string :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> (string
 		return "JavaScript value could not be converted to string", false
 	}
 	defer jsc.JSStringRelease(js_string)
-
-	max_size := int(jsc.JSStringGetMaximumUTF8CStringSize(js_string))
-	if max_size <= 0 {
-		return "", false
-	}
-
-	// Allocate the result buffer directly (one allocation instead of a temp
-	// buffer plus a clone). JSStringGetUTF8CString writes a NUL-terminated
-	// string, so the JS string occupies buffer[:written-1].
-	buffer := make([]byte, max_size, context.allocator)
-	written := int(
-		jsc.JSStringGetUTF8CString(
-			js_string,
-			raw_data(buffer),
-			jsc.JSStringGetMaximumUTF8CStringSize(js_string),
-		),
-	)
-	if written <= 1 {
-		delete(buffer)
-		return "", false
-	}
-
-	return string(buffer[:written - 1]), true
+	return js_string_ref_to_utf8_owned(js_string)
 }
