@@ -35,6 +35,42 @@ const server = http.createServer(opts, (req, res) => {
     res.end('part3');
     return;
   }
+  // /headers-meta — Lava-only bridge probe (headers-bridge.js). Dumps lowercased keys and
+  // selected values so the client can assert native parseRequest ASCII-folds header names
+  // and preserves latin1 values (no UTF-8 re-decode).
+  if (req.url === '/headers-meta') {
+    const keys = Object.keys(req.headers).sort();
+    const pack = (s) =>
+      s === undefined
+        ? ''
+        : Array.from(String(s))
+            .map((c) => c.charCodeAt(0))
+            .join(',');
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(
+      'KEYS=' +
+        keys.join('|') +
+        ' HOST=' +
+        pack(req.headers['host']) +
+        ' XFOO=' +
+        pack(req.headers['x-foo']) +
+        ' XA=' +
+        pack(req.headers['x-a']) +
+        ' METHOD=' +
+        req.method +
+        ' URL=' +
+        req.url,
+    );
+    return;
+  }
+  // /resp-high — set a response header with high latin1 bytes so the wire framing of
+  // headBytes / latin1WriteInto can be checked from a real server (not only mock socket).
+  if (req.url === '/resp-high') {
+    res.setHeader('X-High', String.fromCharCode(0xe9, 0x80, 0xff));
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+    return;
+  }
   // /status/<code> writes a status derived from the (decoded) URL — the status-line
   // injection sink + no-body-status check (run-http-smoke.sh phase 2).
   if (req.url.indexOf('/status/') === 0) {

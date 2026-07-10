@@ -124,7 +124,7 @@ lava_assert "$ROOT_DIR/tests/runtime/http/timeouts.js" timeouts HTTP_SHORT_TIMEO
 # Phase 5 — ServerResponse head/body coalescing unit test. Runs in-process under Lava with a
 # mock socket (no server/client): asserts the single-write fast path, its head+body size
 # bound, the chunked/HEAD/large paths, and that a non-coalescable body never marks the
-# response sent without writing the head.
+# response sent without writing the head. Also covers latin1WriteInto high-byte heads.
 unit_out="$TMP_DIR/response-unit.out"
 if "$LAVA_BIN" run "$ROOT_DIR/tests/runtime/http/response-unit.js" >"$unit_out" 2>&1 &&
 	grep -q 'RESPONSE UNIT OK' "$unit_out"; then
@@ -135,4 +135,8 @@ else
 	exit 1
 fi
 
-printf '%s\n' 'http smoke passed (parity + malformed + keep-alive + timeouts + response-unit)'
+# Phase 6 — header bridge (native lowercase names + latin1 values + response-head bytes).
+# Lava server only: locks parseRequest http_ascii_lower and headBytes/latin1WriteInto.
+lava_assert "$ROOT_DIR/tests/runtime/http/headers-bridge.js" headers-bridge
+
+printf '%s\n' 'http smoke passed (parity + malformed + keep-alive + timeouts + response-unit + headers-bridge)'
