@@ -26,6 +26,7 @@
   var hexDecodeNative = requireNative('hexDecode');
   var base64EncodeNative = requireNative('base64Encode');
   var base64DecodeNative = requireNative('base64Decode');
+  var base64urlEncodeNative = requireNative('base64urlEncode');
   var latin1EncodeNative = requireNative('latin1Encode');
   var latin1DecodeNative = requireNative('latin1Decode');
   var asciiDecodeNative = requireNative('asciiDecode');
@@ -34,6 +35,9 @@
   var utf8WriteIntoNative = requireNative('utf8WriteInto');
   var latin1WriteIntoNative = requireNative('latin1WriteInto');
   var utf16leWriteIntoNative = requireNative('utf16leWriteInto');
+  var utf8ByteLengthNative = requireNative('utf8ByteLength');
+  var base64ByteLengthNative = requireNative('base64ByteLength');
+  var swapInPlaceNative = requireNative('swapInPlace');
   var nativeCompare = requireNative('compare');
   var nativeIndexOf = requireNative('indexOf');
   var nativeIsValidUtf8 = requireNative('isValidUtf8');
@@ -228,10 +232,6 @@
     return str;
   }
 
-  function toBase64Url(str) {
-    return str.replaceAll('+', '-').replaceAll('/', '_').replaceAll(/=+$/g, '');
-  }
-
   /** @returns {Uint8Array} */
   function strToBytes(str, encoding) {
     encoding = normalizeEncoding(encoding);
@@ -254,7 +254,7 @@
     if (encoding === 'utf16le') return utf16leDecodeNative(bytes);
     if (encoding === 'hex') return hexEncodeNative(bytes);
     if (encoding === 'base64') return base64EncodeNative(bytes);
-    if (encoding === 'base64url') return toBase64Url(base64EncodeNative(bytes));
+    if (encoding === 'base64url') return base64urlEncodeNative(bytes);
     if (encoding === 'latin1') return latin1DecodeNative(bytes);
     if (encoding === 'ascii') return asciiDecodeNative(bytes);
     throw errUnknownEncoding(encoding);
@@ -630,36 +630,19 @@
 
     swap16() {
       if (this.length % 2 !== 0) throw errBufferSize(16);
-      for (var i = 0; i < this.length; i += 2) {
-        var a = this[i];
-        this[i] = this[i + 1];
-        this[i + 1] = a;
-      }
+      swapInPlaceNative(this, 2);
       return this;
     }
 
     swap32() {
       if (this.length % 4 !== 0) throw errBufferSize(32);
-      for (var i = 0; i < this.length; i += 4) {
-        var a = this[i],
-          b = this[i + 1];
-        this[i] = this[i + 3];
-        this[i + 1] = this[i + 2];
-        this[i + 2] = b;
-        this[i + 3] = a;
-      }
+      swapInPlaceNative(this, 4);
       return this;
     }
 
     swap64() {
       if (this.length % 8 !== 0) throw errBufferSize(64);
-      for (var i = 0; i < this.length; i += 8) {
-        for (var j = 0; j < 4; j++) {
-          var a = this[i + j];
-          this[i + j] = this[i + 7 - j];
-          this[i + 7 - j] = a;
-        }
-      }
+      swapInPlaceNative(this, 8);
       return this;
     }
 
@@ -1056,13 +1039,21 @@
     return typeof encoding === 'string' && isEncodingName(encoding);
   };
 
+  /**
+   * Byte size of `string` under `encoding` without always allocating the encode.
+   * @param {string|ArrayBufferView|ArrayBuffer} string
+   * @param {string} [encoding='utf8']
+   * @returns {number}
+   */
   Buffer.byteLength = function (string, encoding) {
     if (typeof string === 'string') {
       var enc =
         encoding === undefined || !isEncodingName(encoding) ? 'utf8' : normalizeEncoding(encoding);
-      // Fixed-width encodings need no full encode pass.
       if (enc === 'ascii' || enc === 'latin1') return string.length;
       if (enc === 'utf16le') return string.length * 2;
+      if (enc === 'hex') return string.length >>> 1;
+      if (enc === 'base64' || enc === 'base64url') return base64ByteLengthNative(string);
+      if (enc === 'utf8') return utf8ByteLengthNative(string);
       return strToBytes(string, enc).length;
     }
     if (
