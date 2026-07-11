@@ -30,7 +30,7 @@ jobs:
 
       - uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: "24"
+          node-version: '24'
           cache: true
           run-install: true
 
@@ -38,7 +38,7 @@ jobs:
         uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          llvm-version: "18"
+          llvm-version: '18'
 
       - name: Type-check
         run: make check

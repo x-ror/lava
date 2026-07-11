@@ -13,4 +13,4 @@ updates:
       # One PR per week for all action bumps instead of one per action.
       github-actions:
         patterns:
-          - "*"
+          - '*'

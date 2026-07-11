@@ -41,4 +41,3 @@ APIs (`Bun.gc`, `Bun.concatArrayBuffers`, `bun:test`), detached ArrayBuffer
 features not present in the current Lava runtime, or large Node internal
 harness files. Those stay visible in the report until we either implement the
 required runtime surface or write a focused clean-room equivalent.
-

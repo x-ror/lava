@@ -80,18 +80,18 @@ implementations — no `primordials`, no `internalBinding` coupling.
 ### High priority (the Odin / native part)
 
 - [x] **Promise ↔ event-loop ordering.** JSC drains its own promise microtask
-      queue at every C-API boundary, so `Promise.then` used to run *before*
+      queue at every C-API boundary, so `Promise.then` used to run _before_
       `process.nextTick` (Node is the reverse). `queueMicrotask` lives in a JS shim
       (`js/internal/microtasks.js`) that schedules a JSC microtask, so it shares one
       FIFO with promise jobs. `process.nextTick` keeps Node's **absolute** priority
-      by *not* living in JSC's queue: nextTick callbacks accumulate in a JS-owned
+      by _not_ living in JSC's queue: nextTick callbacks accumulate in a JS-owned
       queue, and native drains it at two checkpoints that recreate Node's
       `do { drain nextTicks; run microtasks } while (nextTicks)` loop on top of
       JSC's auto-drain — checkpoint 1 (`dispatch`) runs every event-loop callback
       and drains nextTicks before returning across the C boundary (so a nextTick
       beats a promise job queued earlier in the same turn); checkpoint 2 re-drains
-      after JSC auto-drains the promise jobs (so a nextTick queued *first inside a
-      microtask* still runs after the microtask queue empties). The top-level turn
+      after JSC auto-drains the promise jobs (so a nextTick queued _first inside a
+      microtask_ still runs after the microtask queue empties). The top-level turn
       gets checkpoint 1 via a drain appended to the entry source. Passes the full
       `01`/`09`/`10` set, including absolute priority — fully portable, no
       `JSC::VM::DrainMicrotaskDelayScope`. See issue #16 and
@@ -165,16 +165,13 @@ implementations — no `primordials`, no `internalBinding` coupling.
       bodies (or closes mid-upload) surfaces as a failed request. Verified by
       `make test-fetch-smoke`.
 - [x] **Event-loop I/O driving** — fetch was the first real `watch_fd` consumer
-      and exposed several gaps, now fixed (`pkg/runtime/eventloop/`):
-      - io_uring `POLL_ADD` mask is written to `poll_events` (was `addr`, so no
-        fd poll ever fired) and SQEs are submitted at arm time (not only at the
-        next `poll`, which a due timer could skip indefinitely).
-      - `run_until_idle` blocks in `poll` when a socket is the only pending work,
-        and advances the virtual clock on a timer-deadline wake so a timer
-        co-pending with I/O is not dropped.
-      - timer delays are floored at 1ms (Node parity), so a 0ms timer cannot
-        busy-spin and starve pending I/O. Settled requests are reclaimed on the
-        next request (bounded retention), not held until teardown.
+      and exposed several gaps, now fixed (`pkg/runtime/eventloop/`): - io_uring `POLL_ADD` mask is written to `poll_events` (was `addr`, so no
+      fd poll ever fired) and SQEs are submitted at arm time (not only at the
+      next `poll`, which a due timer could skip indefinitely). - `run_until_idle` blocks in `poll` when a socket is the only pending work,
+      and advances the virtual clock on a timer-deadline wake so a timer
+      co-pending with I/O is not dropped. - timer delays are floored at 1ms (Node parity), so a 0ms timer cannot
+      busy-spin and starve pending I/O. Settled requests are reclaimed on the
+      next request (bounded retention), not held until teardown.
 
 ### Medium priority (more of the Node surface)
 

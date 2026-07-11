@@ -141,6 +141,8 @@ function check(name, cond, detail) {
   check('method-post', /METHOD=POST\b/.test(body), body);
   check('url-meta', /URL=\/headers-meta\b/.test(body), body);
 
-  console.log(failures === 0 ? 'HTTP HEADERS-BRIDGE OK' : 'HTTP HEADERS-BRIDGE FAILURES ' + failures);
+  console.log(
+    failures === 0 ? 'HTTP HEADERS-BRIDGE OK' : 'HTTP HEADERS-BRIDGE FAILURES ' + failures,
+  );
   process.exit(failures === 0 ? 0 : 1);
 })();

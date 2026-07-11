@@ -16,12 +16,12 @@ Close the Node/Bun gap on Buffer codecs by removing:
 `nm -D libjavascriptcoregtk-6.0.so.1` (2.52.3) exports everything needed — the
 earlier conclusion that this required bun-webkit was wrong:
 
-| Symbol | Use |
-|--------|-----|
-| `WTF::StringImpl::createUninitialized(size_t, span<LChar>&)` | alloc 8-bit string storage, write codec output directly |
-| `WTF::StringImpl::createUninitialized(size_t, span<char16_t>&)` | same, 16-bit |
-| `OpaqueJSString::tryCreate(WTF::String&&)` | wrap the impl as a `JSStringRef` for the public C API |
-| `JSC::JSFunction::create(VM&, …, NativeFunction, …)` | host-call functions (phase 3, landed) — see host_function.odin |
+| Symbol                                                          | Use                                                            |
+| --------------------------------------------------------------- | -------------------------------------------------------------- |
+| `WTF::StringImpl::createUninitialized(size_t, span<LChar>&)`    | alloc 8-bit string storage, write codec output directly        |
+| `WTF::StringImpl::createUninitialized(size_t, span<char16_t>&)` | same, 16-bit                                                   |
+| `OpaqueJSString::tryCreate(WTF::String&&)`                      | wrap the impl as a `JSStringRef` for the public C API          |
+| `JSC::JSFunction::create(VM&, …, NativeFunction, …)`            | host-call functions (phase 3, landed) — see host_function.odin |
 
 ## What is implemented
 
@@ -94,17 +94,17 @@ path:
 
 ## Measured (make bench, lava/node wall-time ratio, 1 KiB)
 
-| bench | session start | after P0+reads | after phase 3 |
-|-------|-------:|------:|------:|
-| to-hex | 14.8x | 9.5x | ~9x |
-| to-base64 | 18.5x | 12.5x | ~10x |
-| to-latin1 | 35.8x | 10.9x | ~10x |
-| to-utf16le | 28.5x | 12.1x | ~12x |
-| to-utf8 | 6.2x | 5.5x | ~5x |
-| from-latin1 | ~37x | 26.5x | **~6x** |
-| from-utf16le | ~29x | 19.8x | **~8x** |
-| from-utf8 | 5.3x | 4.3x | **~3x** |
-| to-hex-tiny | 11.7x | 10.1x | ~8x |
+| bench        | session start | after P0+reads | after phase 3 |
+| ------------ | ------------: | -------------: | ------------: |
+| to-hex       |         14.8x |           9.5x |           ~9x |
+| to-base64    |         18.5x |          12.5x |          ~10x |
+| to-latin1    |         35.8x |          10.9x |          ~10x |
+| to-utf16le   |         28.5x |          12.1x |          ~12x |
+| to-utf8      |          6.2x |           5.5x |           ~5x |
+| from-latin1  |          ~37x |          26.5x |       **~6x** |
+| from-utf16le |          ~29x |          19.8x |       **~8x** |
+| from-utf8    |          5.3x |           4.3x |       **~3x** |
+| to-hex-tiny  |         11.7x |          10.1x |           ~8x |
 
 Absolute per-op: `buf.write(str, 'latin1')` ≈ 190 ns end-to-end (was ~1.7 µs).
 
@@ -116,7 +116,7 @@ Absolute per-op: `buf.write(str, 'latin1')` ≈ 190 ns end-to-end (was ~1.7 µs)
   Muła's u16-lane layout with per-lane vector shifts. utf16le decode/encode/
   writeInto are single memcpys on little-endian hosts. Full-range `toString`
   skips the subarray view (~300 ns/call).
-- `inject_native_function` host-registers *all* natives: one generic trampoline
+- `inject_native_function` host-registers _all_ natives: one generic trampoline
   keys dispatch on the frame's callee slot, functions are pinned + cached per
   (context, callback, name), and callback-set exceptions become real throws via
   the exported `JSC::VM::throwException`.
@@ -127,8 +127,8 @@ HTTP hello 0.75x node req/s (was 0.60x), mem/conn 0.43x node.
 
 ## Remaining gap / follow-up
 
-from-* is dominated by JSC's ArrayBuffer/typed-array construction (~3–30x
-V8's), partially amortized by the larger native-backed pool; to-*'s residual is
+from-_ is dominated by JSC's ArrayBuffer/typed-array construction (~3–30x
+V8's), partially amortized by the larger native-backed pool; to-_'s residual is
 StringImpl allocation + JSString cell + the ~100–200 ns dispatch floor. The
 next perf axis is http per-core profiling — its natives, header strings and
 write paths now all ride the host-call + 8-bit-string fast paths.
