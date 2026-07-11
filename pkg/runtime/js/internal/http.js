@@ -60,11 +60,13 @@
   // array the parser returns. Duplicates join with ', ' (Node's behavior for most
   // headers; set-cookie's array form is out of M2 scope). Names are already
   // ASCII-lowercased by the native parseRequest bridge — no per-key toLowerCase.
-  function buildHeaders(arr) {
+  // buildHeaders folds the [.., name, value, ...] pairs of a parseRequest result
+  // (starting at index `start`) into a headers object.
+  function buildHeaders(arr, start) {
     // Null prototype: a header literally named "constructor"/"hasOwnProperty"/etc. must
     // not collide with Object.prototype (which would corrupt the duplicate-merge check).
     var headers = Object.create(null);
-    for (var i = 0; i + 1 < arr.length; i += 2) {
+    for (var i = start; i + 1 < arr.length; i += 2) {
       var k = arr[i];
       var v = arr[i + 1];
       if (headers[k] === undefined) headers[k] = v;
@@ -234,16 +236,18 @@
     };
   }
 
+  // `parsed` is the flat parseRequest result array:
+  // [0, consumed, method, url, minor, name, value, ...] (see http.odin).
   function IncomingMessage(socket, parsed) {
     EventEmitter.call(this);
     this.socket = socket;
-    this.method = parsed.method;
-    this.url = parsed.url;
+    this.method = parsed[2];
+    this.url = parsed[3];
     this.httpVersionMajor = 1;
-    this.httpVersionMinor = parsed.minor;
-    this.httpVersion = '1.' + parsed.minor;
-    this.rawHeaders = parsed.headers.slice();
-    this.headers = buildHeaders(parsed.headers);
+    this.httpVersionMinor = parsed[4];
+    this.httpVersion = '1.' + parsed[4];
+    this.rawHeaders = parsed.slice(5);
+    this.headers = buildHeaders(parsed, 5);
     this.complete = false;
     this._ended = false;
   }
@@ -476,8 +480,50 @@
   // BOTH the body is fully consumed and the response is finished — either reuse the socket
   // for the next request (keep-alive) or close it. Leftover bytes past a body (a pipelined
   // next request) are carried in `pending`.
+  // Shared empty buffer for the between-requests / no-body states — never written, so one
+  // instance serves every connection (Buffer.alloc(0) per request showed up in profiles).
+  var EMPTY_BUF = Buffer.alloc(0);
+
+  // --- connection-timeout sweeper -------------------------------------------------------
+  // One interval per server walks the live connections' deadline records. Started with the
+  // first connection, stopped with the last, so an idle server schedules nothing.
+  var SWEEP_MS = 100;
+  function sweepRegister(server, st) {
+    var s = server._connSweep || (server._connSweep = { set: new Set(), timer: null });
+    s.set.add(st);
+    if (s.timer === null) {
+      s.timer = setInterval(function () {
+        sweepTick(s);
+      }, SWEEP_MS);
+    }
+  }
+  function sweepUnregister(server, st) {
+    var s = server._connSweep;
+    if (!s) return;
+    s.set.delete(st);
+    if (s.set.size === 0 && s.timer !== null) {
+      clearInterval(s.timer);
+      s.timer = null;
+    }
+  }
+  function sweepTick(s) {
+    var now = Date.now();
+    s.set.forEach(function (st) {
+      if (st.idleAt !== 0 && now >= st.idleAt) {
+        st.idleAt = 0;
+        st.onIdle(); // idle too long between requests — drop it
+      } else if (st.headersAt !== 0 && now >= st.headersAt) {
+        st.headersAt = 0;
+        st.onReq();
+      } else if (st.requestAt !== 0 && now >= st.requestAt) {
+        st.requestAt = 0;
+        st.onReq();
+      }
+    });
+  }
+
   function onConnection(server, socket) {
-    var pending = Buffer.alloc(0);
+    var pending = EMPTY_BUF;
     var lastLen = 0;
     var parsingHead = true;
     var req = null;
@@ -489,33 +535,29 @@
     var peerEnded = false; // peer half-closed (read EOF) — no more requests will arrive
     var closed = false; // socket is being torn down; ignore further input
 
-    // Slowloris / idle defenses (see Server). idleTimer guards the gap before a request;
-    // headersTimer/requestTimer bound how long receiving a request's head / whole body may
-    // take once it has started.
+    // Slowloris / idle defenses (see Server). idleAt guards the gap before a request;
+    // headersAt/requestAt bound how long receiving a request's head / whole body may
+    // take once it has started. These are DEADLINE TIMESTAMPS on a record swept by one
+    // coarse per-server interval (see connSweep), not per-request timers: arming and
+    // clearing them is a field write, where the setTimeout/clearTimeout pairs they
+    // replace were 4 native timer ops per request (~20% of hello-world CPU). Second-scale
+    // defenses lose nothing from ±SWEEP_MS precision.
     var keepAliveMs = server.keepAliveTimeout || 0;
     var headersMs = server.headersTimeout || 0;
     var requestMs = server.requestTimeout || 0;
-    var idleTimer = null;
-    var headersTimer = null;
-    var requestTimer = null;
+    var st = { idleAt: 0, headersAt: 0, requestAt: 0, onIdle: destroyConn, onReq: onReqTimeout };
     var requestActive = false; // a request is currently being received (head or body)
+    sweepRegister(server, st);
 
     function clearReqTimers() {
-      if (headersTimer) {
-        clearTimeout(headersTimer);
-        headersTimer = null;
-      }
-      if (requestTimer) {
-        clearTimeout(requestTimer);
-        requestTimer = null;
-      }
+      st.headersAt = 0;
+      st.requestAt = 0;
     }
+    // Terminal: every caller is tearing the connection down, so leave the sweep set too.
     function clearTimers() {
-      if (idleTimer) {
-        clearTimeout(idleTimer);
-        idleTimer = null;
-      }
+      st.idleAt = 0;
       clearReqTimers();
+      sweepUnregister(server, st);
     }
     function destroyConn() {
       if (closed) return;
@@ -524,15 +566,15 @@
       socket.destroy();
     }
     function armIdle() {
-      if (keepAliveMs > 0)
-        idleTimer = setTimeout(function () {
-          destroyConn(); // idle too long between requests — drop it
-        }, keepAliveMs);
+      if (keepAliveMs > 0) st.idleAt = Date.now() + keepAliveMs;
     }
     function beginRequestTimers() {
       requestActive = true;
-      if (headersMs > 0) headersTimer = setTimeout(onReqTimeout, headersMs);
-      if (requestMs > 0) requestTimer = setTimeout(onReqTimeout, requestMs);
+      if (headersMs > 0 || requestMs > 0) {
+        var now = Date.now();
+        if (headersMs > 0) st.headersAt = now + headersMs;
+        if (requestMs > 0) st.requestAt = now + requestMs;
+      }
     }
     function onReqTimeout() {
       // A slow head or body (slowloris): answer 408 if no response has started, then close.
@@ -597,7 +639,7 @@
 
     // Body fully received: fire req 'end' once, stash any leftover (pipelined) bytes, advance.
     function onBodyComplete(leftover) {
-      pending = leftover && leftover.length ? leftover : Buffer.alloc(0);
+      pending = leftover && leftover.length ? leftover : EMPTY_BUF;
       clearReqTimers(); // the whole request is in; the response is not time-bounded
       if (req && !req._ended) {
         req._ended = true;
@@ -621,28 +663,31 @@
     }
 
     function processHead() {
+      // r = [1] partial | [2] error | [0, consumed, method, url, minor, headers...]
       var r = native.parseRequest(pending, lastLen);
-      if (r.state === 'partial') {
+      var state = r[0];
+      if (state === 1) {
         if (pending.length > MAX_HEAD) fail(431);
         else lastLen = pending.length;
         return;
       }
-      if (r.state === 'error') return fail(400);
-      if (r.consumed > MAX_HEAD) return fail(431);
+      if (state === 2) return fail(400);
+      var consumed = r[1];
+      if (consumed > MAX_HEAD) return fail(431);
 
       parsingHead = false;
       lastLen = 0;
-      if (headersTimer) {
-        clearTimeout(headersTimer); // head received within headersTimeout
-        headersTimer = null;
-      }
+      st.headersAt = 0; // head received within headersTimeout
+
       req = new IncomingMessage(socket, r);
       res = new ServerResponse(socket, req.method, req.httpVersionMinor);
       res._keepAlive = shouldKeepAlive(req); // finalized in _flushHead
       res._onComplete = onResComplete;
 
-      var bodyStart = pending.slice(r.consumed);
-      pending = Buffer.alloc(0);
+      // The common case (a bodyless request, no pipelined next) consumes the whole
+      // buffer — skip the subarray/view work entirely.
+      var bodyStart = consumed < pending.length ? pending.slice(consumed) : EMPTY_BUF;
+      pending = EMPTY_BUF;
 
       // Body framing over untrusted input (smuggling-resistant): reject CL+TE (400), a TE
       // that isn't exactly chunked (501), and a non-DIGIT Content-Length (400). A chunked
@@ -678,11 +723,8 @@
 
     socket.on('data', function (chunk) {
       if (closed) return;
-      // First byte of a request: stop the idle timer and start the head/request timers.
-      if (idleTimer) {
-        clearTimeout(idleTimer);
-        idleTimer = null;
-      }
+      // First byte of a request: stop the idle deadline and start the head/request ones.
+      st.idleAt = 0;
       if (!requestActive) beginRequestTimers();
       if (parsingHead) {
         pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
