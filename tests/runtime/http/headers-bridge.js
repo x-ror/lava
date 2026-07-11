@@ -43,7 +43,8 @@ function check(name, cond, detail) {
 }
 
 (async () => {
-  // 1. Mixed-case request header names fold to lowercase keys (native http_ascii_lower).
+  // 1. Mixed-case request header names fold to lowercase keys (buildHeaders toLowerCase),
+  //    while req.rawHeaders preserves the received case (Node contract).
   //    Wire: Host + Content-Type + X-Foo; body must expose host / content-type / x-foo keys
   //    and values readable via lowercased lookup.
   let buf = await raw(
@@ -54,20 +55,31 @@ function check(name, cond, detail) {
       'Connection: close\r\n\r\n',
   );
   let body = bodyOf(buf);
+  // KEYS= holds only the folded req.headers keys; RAW= (rawHeaders) keeps wire case, so the
+  // lowercasing assertion must look at the KEYS field alone, not the whole body.
+  const fieldOf = (b, name) => {
+    const m = b.match(new RegExp(name + '=([^ ]*)'));
+    return m ? m[1] : '';
+  };
+  const keysField = fieldOf(body, 'KEYS');
+  const rawField = fieldOf(body, 'RAW');
   check('status-200-meta', statusOf(buf) === 200, buf.toString('latin1').slice(0, 40));
   check(
     'keys-lowercased',
-    /KEYS=/.test(body) &&
-      body.indexOf('host') !== -1 &&
-      body.indexOf('content-type') !== -1 &&
-      body.indexOf('x-foo') !== -1 &&
-      !/\bHost\b/.test(body) &&
-      !/\bContent-Type\b/.test(body) &&
-      !/\bX-Foo\b/.test(body),
-    body.slice(0, 120),
+    keysField.indexOf('host') !== -1 &&
+      keysField.indexOf('content-type') !== -1 &&
+      keysField.indexOf('x-foo') !== -1 &&
+      !/[A-Z]/.test(keysField),
+    keysField,
   );
   check('host-value', /HOST=101,120,97,109,112,108,101,46,116,101,115,116\b/.test(body), body); // example.test
   check('x-foo-value', /XFOO=66,97,114\b/.test(body), body); // Bar
+  // rawHeaders keeps the wire case: names appear as sent (Content-Type / X-Foo), not folded.
+  check(
+    'rawheaders-case-preserved',
+    rawField.indexOf('Content-Type|text/plain') !== -1 && rawField.indexOf('X-Foo|Bar') !== -1,
+    rawField,
+  );
 
   // 2. Duplicate headers with different wire casing merge under one lowercased key
   //    (Node: "a, b" join for most headers).

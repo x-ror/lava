@@ -422,25 +422,17 @@
   }
 
   /**
-   * Node-compatible Buffer: Uint8Array subclass with codecs, numerics, and pool.
+   * The concrete Buffer class: a Uint8Array subclass carrying all Buffer methods,
+   * with the DEFAULT (forwarding) constructor so internal construction from a known
+   * (ArrayBuffer, offset, length) or size is as cheap as `new Uint8Array(...)`. The
+   * public `Buffer` (a function, defined just below) shares this exact prototype
+   * object, so `Object.getPrototypeOf(buf) === Buffer.prototype` holds for every
+   * Buffer however it was built — matching Node, where Buffer and FastBuffer are
+   * one prototype. Argument dispatch (string→from, size check) lives in that
+   * function, not here.
    * @extends {Uint8Array}
    */
-  class Buffer extends Uint8Array {
-    /**
-     * @param {number|string|ArrayBuffer|ArrayBufferView|ArrayLike<number>} arg
-     * @param {number|string} [byteOffset]
-     * @param {number} [length]
-     */
-    constructor(arg, byteOffset, length) {
-      if (typeof arg === 'string') {
-        return Buffer.from(arg, byteOffset);
-      }
-      if (typeof arg === 'number' && arg > K_MAX_LENGTH) {
-        throw errOutOfRange('size', '>= 0 && <= ' + K_MAX_LENGTH, arg);
-      }
-      super(arg, byteOffset, length);
-    }
-
+  class FastBuffer extends Uint8Array {
     /**
      * @param {string} [encoding='utf8']
      * @param {number} [start]
@@ -653,6 +645,34 @@
       return { type: 'Buffer', data: Array.from(this) };
     }
   }
+
+  /**
+   * Public Buffer constructor. A function (not a class) so its `.prototype` can be
+   * the very same object as FastBuffer.prototype — that shared identity is what makes
+   * `getPrototypeOf(buf) === Buffer.prototype` true for buffers from every path
+   * (Node's structure). Callable with or without `new`; both yield a FastBuffer.
+   * @param {number|string|ArrayBuffer|ArrayBufferView|ArrayLike<number>} arg
+   * @param {number|string} [encodingOrOffset]
+   * @param {number} [length]
+   * @returns {Buffer}
+   */
+  function Buffer(arg, encodingOrOffset, length) {
+    if (typeof arg === 'string') return Buffer.from(arg, encodingOrOffset);
+    if (typeof arg === 'number') {
+      if (arg > K_MAX_LENGTH) throw errOutOfRange('size', '>= 0 && <= ' + K_MAX_LENGTH, arg);
+      return new FastBuffer(arg); // zero-filled, matching the old `super(number)`
+    }
+    return new FastBuffer(arg, encodingOrOffset, length);
+  }
+  // Share ONE prototype object between the class and the public constructor, and let
+  // Buffer inherit FastBuffer's statics (Symbol.species etc.); own statics below win.
+  Object.setPrototypeOf(Buffer, FastBuffer);
+  Buffer.prototype = FastBuffer.prototype;
+  Object.defineProperty(FastBuffer.prototype, 'constructor', {
+    value: Buffer,
+    writable: true,
+    configurable: true,
+  });
 
   var p = Buffer.prototype;
 
@@ -913,21 +933,6 @@
     get: function () {
       return this.byteOffset;
     },
-  });
-
-  /**
-   * Internal constructor for hot paths (pool slices, decode results): a bare
-   * Uint8Array subclass construction, skipping Buffer's argument dispatch
-   * (~3x faster per instance on JSC). Instances are real Buffers: prototype
-   * chain and .constructor both point at Buffer.
-   * @extends {Uint8Array}
-   */
-  class FastBuffer extends Uint8Array {}
-  Object.setPrototypeOf(FastBuffer.prototype, Buffer.prototype);
-  Object.defineProperty(FastBuffer.prototype, 'constructor', {
-    value: Buffer,
-    writable: true,
-    configurable: true,
   });
 
   var poolBufferSize;

@@ -61,13 +61,14 @@
   // headers; set-cookie's array form is out of M2 scope). Names are already
   // ASCII-lowercased by the native parseRequest bridge — no per-key toLowerCase.
   // buildHeaders folds the [.., name, value, ...] pairs of a parseRequest result
-  // (starting at index `start`) into a headers object.
+  // (starting at index `start`) into a headers object. Names arrive in their received
+  // case (rawHeaders preserves it) and are lowercased here for the req.headers keys.
   function buildHeaders(arr, start) {
     // Null prototype: a header literally named "constructor"/"hasOwnProperty"/etc. must
     // not collide with Object.prototype (which would corrupt the duplicate-merge check).
     var headers = Object.create(null);
     for (var i = start; i + 1 < arr.length; i += 2) {
-      var k = arr[i];
+      var k = arr[i].toLowerCase();
       var v = arr[i + 1];
       if (headers[k] === undefined) headers[k] = v;
       else headers[k] += ', ' + v;
