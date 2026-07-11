@@ -25,11 +25,19 @@ PARSE_ERROR :: 2
 
 make_http_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
-	inject_native_function(ctx, bindings, "parseRequest", http_parse_request_cb)
+	// Both natives are on the per-request hot path, so they take dedicated host
+	// wrappers (no per-call dispatch-table lookup — see buffer_host.odin).
+	inject_native_function(ctx, bindings, "parseRequest", http_parse_request_cb, http_parse_request_host)
 	// Response-head serialization: same latin1WriteInto as node:buffer (package-local
 	// callback). Avoids a Buffer require + intermediate array on every writeHead/end.
-	inject_native_function(ctx, bindings, "latin1WriteInto", buffer_latin1_write_into_cb)
+	inject_native_function(ctx, bindings, "latin1WriteInto", buffer_latin1_write_into_cb, buffer_latin1_write_into_host)
 	return bindings
+}
+
+// http_parse_request_host is the host-call-convention entry point for parseRequest
+// (dedicated wrapper; see buffer_host.odin for why the hot natives bake these in).
+http_parse_request_host :: proc "c" (g: rawptr, cf: [^]u64) -> i64 {
+	return host_dispatch(g, cf, http_parse_request_cb)
 }
 
 @(private = "file")
