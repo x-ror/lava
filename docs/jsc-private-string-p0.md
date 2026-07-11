@@ -21,7 +21,7 @@ earlier conclusion that this required bun-webkit was wrong:
 | `WTF::StringImpl::createUninitialized(size_t, span<LChar>&)` | alloc 8-bit string storage, write codec output directly |
 | `WTF::StringImpl::createUninitialized(size_t, span<char16_t>&)` | same, 16-bit |
 | `OpaqueJSString::tryCreate(WTF::String&&)` | wrap the impl as a `JSStringRef` for the public C API |
-| `JSC::JSFunction::create(VM&, …, NativeFunction, …)` | not yet used — host-call functions, the phase-3 call-floor lever |
+| `JSC::JSFunction::create(VM&, …, NativeFunction, …)` | host-call functions (phase 3, landed) — see host_function.odin |
 
 ## What is implemented
 
