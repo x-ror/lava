@@ -1,5 +1,4 @@
 {
-	"runtime": "lava",
-	"compat": "node"
+  "runtime": "lava",
+  "compat": "node"
 }
-

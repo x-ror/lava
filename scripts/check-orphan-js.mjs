@@ -43,7 +43,9 @@ for (const file of walk(JS_DIR)) {
 }
 
 if (orphans.length > 0) {
-  console.error(`Found ${orphans.length} orphaned runtime JS file(s) — not #load-ed by any .odin source:`);
+  console.error(
+    `Found ${orphans.length} orphaned runtime JS file(s) — not #load-ed by any .odin source:`,
+  );
   for (const o of orphans) console.error(`  pkg/runtime/${o}`);
   process.exit(1);
 }

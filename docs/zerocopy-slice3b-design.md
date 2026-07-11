@@ -37,10 +37,11 @@ Kernel guarantees (per the `io_uring_enter(2)` `IORING_OP_SEND_ZC` text — re-a
 the running kernel; `SEND_ZC` is ≥ 6.0). **The cardinal rule: check `F_MORE`, NOT `res`.** `res` (the
 byte count or `-errno`) and `F_MORE` (whether the pages are pinned and a notification is owed) are
 **independent** — every `(F_MORE, sign-of-res)` combination occurs:
+
 1. **Pinned (`F_MORE` set on the result):** the pages are held; **exactly one** notification CQE
    (`F_NOTIF` set, `F_MORE` clear) follows when they release. This happens whether the result `res` is
-   **≥ 0** (bytes sent, possibly partial) **OR `< 0`** — *an errored request may still have pinned and
-   thus still notifies* (man page: "even failed requests may generate a notification"). The notif is
+   **≥ 0** (bytes sent, possibly partial) **OR `< 0`** — _an errored request may still have pinned and
+   thus still notifies_ (man page: "even failed requests may generate a notification"). The notif is
    strictly **ordered after** the result for the same `user_data`. `F_MORE`+`F_NOTIF` never co-occur.
 2. **Best-effort zerocopy — a send the kernel COPIES is a normal success, not an error.** The kernel
    declines zerocopy for small/unaligned segments, loopback, non-SG NICs (§9 Q5). **Whether a copied
@@ -49,7 +50,7 @@ byte count or `-errno`) and `F_MORE` (whether the pages are pinned and a notific
    KERNEL-VERSION-DEPENDENT** — newer kernels added the `F_MORE`-clear-on-copy optimization; earlier 6.x
    notify regardless. **The §3 state machine is robust to both**: a copy as `(!saw, res>0)` and a copy as
    `(saw=true after a res≥0 result, notif res ignored)` both converge on "advance `off`, drain". So we
-   never assert a CQE *count* for the copied path (§10) — only the outcome. Pre-transmission failures
+   never assert a CQE _count_ for the copied path (§10) — only the outcome. Pre-transmission failures
    (`-EINVAL`, `-EOPNOTSUPP`, `-EBADF`, `-ENOTSOCK`, `-EAGAIN`/`-EINTR` zero-byte, optmem
    `-ENOBUFS`/`-ENOMEM`) are single `F_MORE`-clear CQEs (`res < 0`, never pinned); `res == 0` is a
    zero-byte stall.
@@ -58,10 +59,11 @@ byte count or `-errno`) and `F_MORE` (whether the pages are pinned and a notific
    (`F_MORE` clear, no notif).
 
 **Load-bearing consequences:**
+
 - **Buffer lifetime** is driven by `F_MORE` ALONE: the buffer is freeable **exactly on the first
   `F_MORE`-clear CQE** for the op (the notification, or a single non-pinned CQE), never on a
   `F_MORE`-set result. `F_NOTIF` is informational; the slot lifetime is identical to multishot RECV.
-- **Result classification** is `res`-driven and is the *separate* axis: a `F_MORE`-set result records
+- **Result classification** is `res`-driven and is the _separate_ axis: a `F_MORE`-set result records
   bytes (`res ≥ 0`) or a sticky error (`res < 0`) to act on at the terminal; a `F_MORE`-clear single
   CQE is a success (`res > 0` → advance), a stall (`res == 0`), or an error (`res < 0`). §3 is the
   full two-axis state machine.
@@ -81,10 +83,10 @@ release path, no underflow, no leak.
   alloc-time "exactly one set" assert, the `recv→send→callback` nil-cascade, AND a "release must null
   `send_cb`" footgun). Represent the slot's callback as an Odin
   `union{Op_Completion, Op_Recv_Completion, Op_Send_Completion}` instead: mutual exclusion becomes
-  *structural*, dispatch becomes a `switch` on the variant, and release just clears the union — no
+  _structural_, dispatch becomes a `switch` on the variant, and release just clears the union — no
   assert, no cascade, no per-field null footgun. (Small refactor of the existing 2a/2b slot; recommended
   while adding the third kind. If kept as separate fields, dispatch order is `recv_cb → send_cb →
-  callback`, `uring_op_release_slot` MUST also null `send_cb`, and a debug assert enforces one-set — but
+callback`, `uring_op_release_slot` MUST also null `send_cb`, and a debug assert enforces one-set — but
   the union removes all three obligations.)
 - A ZC CQE never reaches the `recv_cb` path (its `bid := transmute(u32)cqe.flags>>16` BUFFER-select
   read), since a send slot's variant is `Op_Send_Completion`, not recv.
@@ -209,7 +211,7 @@ template's `!closing` envelope. The two **success** entries (`saw` with `zc_err=
 ## 5. Capability + transient fallback (per-op attribution)
 
 - **`zc_ok` is set by an init-time opcode PROBE, in `platform_init` beside `proactor_ok` — NOT coupled
-  to `buf_ring_init`.** `SEND_ZC` is a real *opcode*, so — unlike `RECV_MULTISHOT` (an ioprio flag that
+  to `buf_ring_init`.** `SEND_ZC` is a real _opcode_, so — unlike `RECV_MULTISHOT` (an ioprio flag that
   2b genuinely couldn't probe) — it is probeable exactly like the existing `.RECV`/`.SEND` checks:
   extend `uring_probe_proactor` with `uring_probe_supports(&probe, .SEND_ZC)` and set
   `loop.platform.zc_ok` there. This (a) fixes a hole — `buf_ring_init` is **lazy** and recv-ring-specific
@@ -217,7 +219,7 @@ template's `!closing` envelope. The two **success** entries (`saw` with `zc_err=
   path) would never have seen `zc_ok=true`; and (b) eliminates the `-EINVAL` storm on a 5.x kernel
   (`proactor_ok` true, `SEND_ZC` absent) — every worker would otherwise eat a first-send `-EINVAL`
   before latching off. `zc_ok` lives in `Platform_Loop` like `multishot_ok`; must NOT be left at Odin's
-  `false` default (it is only ever *cleared* by `disable_zc`). The runtime `-EINVAL`/`-EOPNOTSUPP`
+  `false` default (it is only ever _cleared_ by `disable_zc`). The runtime `-EINVAL`/`-EOPNOTSUPP`
   fallback **stays** for the per-socket/protocol case the probe can't see (a specific socket lacking ZC)
   — this is **probe AND runtime fallback**, not either/or.
 - **`force_plain` — the one-shot the fallbacks need.** `net_proactor_submit(conn, force_plain := false)`
@@ -233,7 +235,7 @@ template's `!closing` envelope. The two **success** entries (`saw` with `zc_err=
   via §3's `err<0` branch; `off` is untouched either way so the plain re-send is exact.)
 - **`-ENOBUFS`/`-ENOMEM` (optmem/`RLIMIT_MEMLOCK` pressure)** is **transient, not fatal** — symmetric
   with the recv side's `-ENOBUFS` (which parks, never closes). Routes to `net_proactor_submit(conn,
-  force_plain=true)` (copy-send for THIS op; does NOT latch `zc_ok` off — pressure is transient). Under
+force_plain=true)` (copy-send for THIS op; does NOT latch `zc_ok` off — pressure is transient). Under
   the large-body-to-many/slow-clients workload ZC targets, treating it as fatal would mass-drop
   connections.
 - **Ordering** (in the §3 pseudocode): clear `send_op` → `net_proactor_submit` (re-sets
@@ -280,6 +282,7 @@ template's `!closing` envelope. The two **success** entries (`saw` with `zc_err=
 ## 7. Drain / `want_drain` / `end()` timing + the 2b recv-pause interaction
 
 Moving the full-drain transition from the result to the **notification** (INV-2) shifts timing:
+
 - `'drain'` + read re-arm (`net_proactor_on_drained`) and `end_after_drain` close fire on the terminal
   (one notif RTT later than plain). `end()` after a ≥threshold write closes only after the notif (closing
   on the result would free a pinned buffer — UAF). All three are terminal-`!closing`-only (§3).
@@ -297,7 +300,7 @@ Moving the full-drain transition from the result to the **notification** (INV-2)
   re-arm while `want_drain` is owed).
   - **This also tightens the pre-ZC 2a/1b steady state** (a behavior change beyond ZC, flagged for
     review): today the 2a single-shot, 1b Proactor data, `-EINTR`/`-EAGAIN`, and `-ENOBUFS`
-    (`net_park_or_rearm`) re-arms resume reads as soon as `buffered < HWM` — on a *partial* drain,
+    (`net_park_or_rearm`) re-arms resume reads as soon as `buffered < HWM` — on a _partial_ drain,
     before `'drain'`. After the move they stay paused until **full** drain (Node's
     input-paused-until-`'drain'` semantics — the intent already documented in the 2b `-ECANCELED`
     comment); an improvement, not a regression. `read_paused = buffered >= HWM` is still needed for the
@@ -311,6 +314,7 @@ Moving the full-drain transition from the result to the **notification** (INV-2)
 ---
 
 ## 8. Scope guards
+
 - **`SENDMSG_ZC` is unneeded** (not merely deferred): `pending_writes`/`active_send` are a single
   **contiguous** `[dynamic]byte` (writes concatenate), so there is no iovec to scatter-gather —
   single-buffer `SEND_ZC` suffices under the current and a future owned-buffer model.
@@ -322,6 +326,7 @@ Moving the full-drain transition from the result to the **notification** (INV-2)
 ---
 
 ## 9. Open questions for review
+
 1. **Threshold** — proposal raised to **32–64 KiB** (was 16 KiB): the net break-even is above the raw
    ~10 KiB zerocopy break-even because §4's serialization makes the next write wait one notification RTT
    that a plain copy-SEND would overlap (acute for pipelined keep-alive: a 16 KiB body then the next
@@ -347,14 +352,15 @@ Moving the full-drain transition from the result to the **notification** (INV-2)
 `-EOPNOTSUPP`); a genuine pinned result→notif needs a real NIC, which isn't CI-feasible. So the state
 machine is tested by **direct invocation** and the F_MORE accounting by **reuse of the existing
 multishot machinery**:
+
 - **Net state machine (primary)**: call `net_send_zc_complete(loop, conn, res, more)` directly with
   crafted `(res, more)` tuples — no kernel ZC needed — covering **every `(more, res, saw_result)` cell**
   (next bullet). This is the real correctness test.
 - **Eventloop F_MORE accounting**: it is callback-agnostic (`drain_uring_completions` releases the slot
-  + decrements `active_io_count` only on the `F_MORE`-clear CQE for ANY op), already proven by the
-  multishot-recv test. So SEND_ZC adds only: a unit test that a `send_cb` slot **routes to `send_cb`,
-  never `recv_cb`/`callback`** (dispatch + release-nulls-`send_cb`), plus `submit_send_zc` returning a
-  valid op id + `active_io_count` bookkeeping — NOT a real two-CQE kernel sequence.
+  - decrements `active_io_count` only on the `F_MORE`-clear CQE for ANY op), already proven by the
+    multishot-recv test. So SEND_ZC adds only: a unit test that a `send_cb` slot **routes to `send_cb`,
+    never `recv_cb`/`callback`** (dispatch + release-nulls-`send_cb`), plus `submit_send_zc` returning a
+    valid op id + `active_io_count` bookkeeping — NOT a real two-CQE kernel sequence.
 - **Probe**: `uring_probe_proactor` reports `zc_ok` on a ≥6.0 kernel; a large send then actually submits
   `SEND_ZC` (vs plain below threshold). Forced fallback (`zc_ok=false` → plain). Teardown: an in-flight
   ZC op left **post-result/pre-notif** (crafted) disposed exactly once at destroy → conn freed once
@@ -401,4 +407,4 @@ everywhere" invariant intact.
    it + `-EINVAL`/`-EOPNOTSUPP`/`-ENOBUFS` fallbacks + the §7 `want_drain`-into-`net_maybe_arm_recv` move.
 3. Tests (state-machine direct-invocation cells, buffer-lifetime ASAN incl. cancel-after-result,
    large-body integrity, end-after-write, 2b-window read-pause) + bench (pipelined keep-alive, real NIC)
-   + docs.
+   - docs.

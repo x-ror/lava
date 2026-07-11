@@ -2,8 +2,8 @@
 
 > An architectural overview and forward-looking review of the Lava runtime.
 > Companion to `README.md` (how to build/run) and `ROADMAP.md` (feature status).
-> This document explains *how the pieces fit together*, *why the boundaries are
-> where they are*, and *where the architecture should go next* to become the most
+> This document explains _how the pieces fit together_, _why the boundaries are
+> where they are_, and _where the architecture should go next_ to become the most
 > elegant, fast, and predictable JavaScript runtime we can build.
 
 ---
@@ -19,7 +19,7 @@ than legacy APIs.
 Two design decisions shape the whole system:
 
 1. **JSC is the VM; Odin owns the runtime.** Lava does not embed V8 or write its
-   own interpreter. It drives JSC through its C API and builds the *runtime* — the
+   own interpreter. It drives JSC through its C API and builds the _runtime_ — the
    event loop, module system, timers, I/O, process model — natively in Odin.
 2. **The standard library is layered: native primitives + embedded JS.** Hot or
    unsafe operations (byte codecs, hashing, sockets, the loop) live in Odin; the
@@ -72,14 +72,14 @@ The strongest part of the system, and the right thing to have gotten right first
 
 - **Node-faithful phases.** `run_once` (`loop.odin:619`) runs the canonical order:
   next-tick → microtasks → timers → poll (I/O completions, then block) → check
-  (`setImmediate`) → close. Each phase uses a *sequence limit* so callbacks queued
-  *during* a phase defer to the next iteration — this is what makes ordering
+  (`setImmediate`) → close. Each phase uses a _sequence limit_ so callbacks queued
+  _during_ a phase defer to the next iteration — this is what makes ordering
   deterministic and matchable against Node.
 - **Timers are a binary min-heap** keyed on `(due_ms, seq)` (`timer_heap_*`), so
   ties fire in FIFO order (Node parity) and push/pop are O(log n). Cancelled
   timers are dropped lazily at the root rather than compacted every tick.
 - **Two clocks.** `real_time` mode tracks the monotonic wall clock; the default
-  (used by tests) advances a *logical* clock explicitly. This dual-clock design is
+  (used by tests) advances a _logical_ clock explicitly. This dual-clock design is
   quietly powerful — it is the seed of a future deterministic record/replay mode
   (§6).
 - **Cross-thread completion handoff** mirrors libuv's `uv_async`:
@@ -127,7 +127,7 @@ The JS layer is substantial and high quality: `url.js` (2071 LOC, WHATWG URL),
 - CommonJS is the substrate. `native_require_cb` consults, in order: the module
   cache → JS internal builtins (`require_builtin`) → native `fs` → filesystem
   resolution. Circular requires terminate via a pre-registered partial-exports
-  entry (`__lava_precache`), and a module that throws while loading is *removed*
+  entry (`__lava_precache`), and a module that throws while loading is _removed_
   from the cache so a later require re-runs it (Node parity).
 - `.mjs`/static `import`/`export` are handled by a **source transform**
   (`esm.js`) that rewrites ESM onto the CommonJS `require`, not by JSC's native
@@ -142,7 +142,7 @@ The JS layer is substantial and high quality: `url.js` (2071 LOC, WHATWG URL),
 `fetch_transport.odin` is a platform-agnostic connect→[TLS]→write→read state
 machine; each platform supplies only narrow socket primitives, and TLS is a
 swappable backend (OpenSSL, or a rejecting stub). DNS resolves off-loop on a
-bounded 4-worker pool. Streaming request *and* response bodies are real
+bounded 4-worker pool. Streaming request _and_ response bodies are real
 incremental `ReadableStream`s with backpressure. This is the second-strongest
 subsystem after the loop, and it validates the `post_async` design end to end.
 
@@ -162,15 +162,15 @@ accidentally adopt the wrong allocator.
 
 One allocator hazard is the `proc "c"` boundary: a JSC callback resets `context` to
 `runtime.default_context()` (the heap allocator), so a long-lived string cloned
-*inside* a callback but freed from a teardown proc running under the caller's context
+_inside_ a callback but freed from a teardown proc running under the caller's context
 mismatches if the caller uses a custom allocator (an embedder, or the test runner's
-tracking allocator). The fix is *localized* — each request/job captures the owning
+tracking allocator). The fix is _localized_ — each request/job captures the owning
 `Runtime_State.allocator` at creation and clones **and** frees through it, so the
 alloc/free pair stays matched no matter which context is active at either end. This is
 applied to `module_cache` keys, `fetch` (`Fetch_Request` method/url/host/path +
 `request_bytes` + the struct), `dns` (`Dns_Lookup_Request.hostname` + the struct), and
-the fetch DNS pool (`DNS_Job.host` + the struct). It is deliberately *not* context-based:
-those structs free under *multiple* contexts (e.g. `fetch_reclaim_pending` during normal
+the fetch DNS pool (`DNS_Job.host` + the struct). It is deliberately _not_ context-based:
+those structs free under _multiple_ contexts (e.g. `fetch_reclaim_pending` during normal
 operation vs `fetch_destroy_pending` at teardown; a global DNS pool freeing jobs from
 several runtimes), which a "rebind `context.allocator` at the callback entry" approach
 cannot cover. Dynamic-array fields (`response`/`carry`/`body_out`, `results`) carry their
@@ -193,15 +193,15 @@ remaining blocking ops (async `fs.stat`/`readdir`, `crypto`) onto it is the rest
 
 ### 4.3 The FFI trust boundary — resolved (#159)
 
-The code once carried a *distrust of the FFI boundary*: several sites avoided the
+The code once carried a _distrust of the FFI boundary_: several sites avoided the
 `JSValueIs*` / `JSValueToBoolean` predicates in favor of `JSValueGetType`, with
 comments calling them "unreliable across the FFI" (the sqlite readBigInts / bind
-"heisenbugs" — *a JS `false` came back `true`*).
+"heisenbugs" — _a JS `false` came back `true`_).
 
 **Root cause, now pinned down:** the predicates were historically declared
 `-> b32` (a 4-byte boolean). JSC's C API returns C `_Bool` (1 byte); on SysV-AMD64
 and AArch64 the value sits in the low byte of the return register and the upper
-bytes are *undefined*. Reading 4 bytes picked up that garbage, so a `false` (low
+bytes are _undefined_. Reading 4 bytes picked up that garbage, so a `false` (low
 byte 0, upper bytes nonzero) read back truthy. The bindings already declare these
 `-> bool` (Odin `bool` is 1 byte, reads only the low byte) — the ABI-correct fix —
 and the codebase already trusts `JSValueToBoolean` in dns/fetch/fs/buffer; only one
@@ -259,7 +259,7 @@ itself notes `fs.readFile`'s "read is synchronous for now."
 
 **The good news: the hard part is already built.** `async_begin` / `post_async` /
 `drain_async` is exactly libuv's completion-handoff contract, already proven by the
-DNS pool and the fetch transport. What's missing is a *generic* worker pool that
+DNS pool and the fetch transport. What's missing is a _generic_ worker pool that
 sits on top of it.
 
 **Step 1 — the generic pool — done (`pkg/runtime/eventloop/threadpool.odin`).**
@@ -276,14 +276,15 @@ the async queue is torn down). Covered by deterministic tests in
 in-flight work without leak/hang).
 
 **Remaining.**
+
 - **Step 2 — `fs.readFile`/`writeFile` — done (`fs.odin`).** The blocking read/write
   syscall runs off-loop on the pool (`fs_read_work`/`fs_write_work`, touching only the
-  request). `writeFile` first snapshots its bytes into an owned copy *on the loop thread*
+  request). `writeFile` first snapshots its bytes into an owned copy _on the loop thread_
   (a worker must not read — and JS must not mutate/detach — the live buffer, exactly as
   Node copies into a Buffer), so for a write only the syscall is off-loop, not the
   payload copy; that copy is bounded and still strictly better than master, which ran the
   whole blocking write on-loop. The completion bridges the phase gap the doc
-  flagged: `post_async` drains at the *top* of the tick, but the loop-thread `done`
+  flagged: `post_async` drains at the _top_ of the tick, but the loop-thread `done`
   (`fs_*_pool_done`) re-queues via `queue_io_callback` so the callback still fires in the
   **poll phase** — preserving Node's I/O-before-`setImmediate` ordering (guarded by
   `tests/runtime/eventloop/cases/08-io-before-immediate.js`). Teardown needs no separate
@@ -310,12 +311,12 @@ every "is this change faster?" question is unfalsifiable.
 
 Lava can make HTTP requests but cannot accept them. `node:net` (TCP server/socket)
 and a `node:http` server unlock a whole class of applications and reuse the
-existing transport/loop machinery. This is the highest-leverage *capability* gap.
+existing transport/loop machinery. This is the highest-leverage _capability_ gap.
 
 ### 5.5 [P2] Consolidate primordials in the JS layer — foundation laid
 
 `pkg/runtime/js/internal/primordials.js` is the shared hardened baseline: a frozen
-table of pristine intrinsics (captured statics + *uncurried* prototype methods via
+table of pristine intrinsics (captured statics + _uncurried_ prototype methods via
 the classic `bind.bind(call)`), so `ArrayPrototypePush(arr, x)` is a
 pollution-proof `arr.push(x)`. The loader **eager-loads it first**, before any
 other internal module and before user code, so the captured references are
@@ -327,7 +328,7 @@ This is the JS-layer analog of the native error-intrinsic capture (§4.3/§5.1).
 arrays are copied/spliced via species-free helpers (`arrayClone`/`spliceOne`, array
 literal + index only) so a poisoned `Array[Symbol.species]` cannot reach `emit()`
 either. `cmd/lava/primordials_test.odin` (a Lava-only Odin test — Node's own
-EventEmitter is *not* immune here, so this can't be a Node oracle) proves it stays
+EventEmitter is _not_ immune here, so this can't be a Node oracle) proves it stays
 correct while `Array.prototype.{push,unshift,slice,splice,map}`, `Object.create`,
 and `Array[Symbol.species]` are all overwritten. Remaining modules adopt primordials
 incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
@@ -358,7 +359,7 @@ future follow-up.
 
 ---
 
-## 6. The longer view: what would make Lava *best in class*
+## 6. The longer view: what would make Lava _best in class_
 
 Three differentiators, each a natural extension of architecture that already
 exists rather than a bolt-on:
@@ -384,15 +385,15 @@ foundations as §5.2.
 
 ## 7. Recommended sequence
 
-| # | Work | Class | Rationale |
-|---|------|-------|-----------|
-| 1 | ~~FFI root-cause (#159) + unified `ERR_*` error layer~~ ✓ | P0 | FFI boundary proven (§4.3); `errors.odin` factory in place (§4.4) — foundation of parity tests |
-| 2 | Generic thread pool → async `fs`/`crypto` | P1 | Removes the loop-blocking ceiling; reuses the proven `post_async` primitive |
-| 3 | Benchmark harness + CI perf gate | P1 | Makes "fast" provable instead of asserted |
-| 4 | `node:net` + `node:http` server | P1 | Unlocks server-side applications |
-| 5 | `package.json` `"exports"`; consolidate primordials | P2 | Modern-package compat; uniform pollution safety |
-| 6 | TypeScript/JSX transpile-on-load | Vision | Biggest differentiator vs Node |
-| 7 | `worker_threads`; deterministic record/replay | Vision | Parallelism + a genuinely unique capability |
+| #   | Work                                                      | Class  | Rationale                                                                                      |
+| --- | --------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------- |
+| 1   | ~~FFI root-cause (#159) + unified `ERR_*` error layer~~ ✓ | P0     | FFI boundary proven (§4.3); `errors.odin` factory in place (§4.4) — foundation of parity tests |
+| 2   | Generic thread pool → async `fs`/`crypto`                 | P1     | Removes the loop-blocking ceiling; reuses the proven `post_async` primitive                    |
+| 3   | Benchmark harness + CI perf gate                          | P1     | Makes "fast" provable instead of asserted                                                      |
+| 4   | `node:net` + `node:http` server                           | P1     | Unlocks server-side applications                                                               |
+| 5   | `package.json` `"exports"`; consolidate primordials       | P2     | Modern-package compat; uniform pollution safety                                                |
+| 6   | TypeScript/JSX transpile-on-load                          | Vision | Biggest differentiator vs Node                                                                 |
+| 7   | `worker_threads`; deterministic record/replay             | Vision | Parallelism + a genuinely unique capability                                                    |
 
 ---
 
@@ -401,7 +402,7 @@ foundations as §5.2.
 Lava is, today, a **carefully engineered early-stage runtime** whose core — the
 event loop, the FFI lifetime discipline, the native/JS layering, and the
 oracle-based test methodology — already meets a high bar. The work ahead is not
-rescue work; it is *extension and hardening*: pin down the one boundary the code
+rescue work; it is _extension and hardening_: pin down the one boundary the code
 distrusts, lift blocking work off the loop thread, prove the performance, and then
 reach for the differentiators (TS-first, determinism, capabilities) that the
 existing architecture is unusually well-positioned to deliver.
