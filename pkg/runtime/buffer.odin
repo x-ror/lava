@@ -138,23 +138,6 @@ string_read_len :: proc(r: String_Read) -> int {
 	return len(r.s16)
 }
 
-// js_int_arg reads an integer argument without a C-API call when it is an
-// immediate int32 (the common case for offsets/lengths from the JS layer).
-@(private = "file")
-js_int_arg :: proc(ctx: jsc.JSContextRef, v: jsc.JSValueRef) -> int {
-	if x, ok := jsc.value_int32(ctx, v); ok do return int(x)
-	return int(jsc.JSValueToNumber(ctx, v, nil))
-}
-
-// js_int_value encodes an integer result without a C-API call when possible.
-@(private = "file")
-js_int_value :: proc(ctx: jsc.JSContextRef, v: int) -> jsc.JSValueRef {
-	if v >= -2147483648 && v <= 2147483647 {
-		if r, ok := jsc.make_int32(ctx, i32(v)); ok do return r
-	}
-	return jsc.JSValueMakeNumber(ctx, f64(v))
-}
-
 @(private = "file")
 U8x16 :: #simd[16]u8
 @(private = "file")

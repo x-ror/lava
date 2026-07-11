@@ -51,6 +51,21 @@ host_cell_object :: proc "contextless" (bits: u64) -> jsc.JSObjectRef {
 	return jsc.JSObjectRef(uintptr(bits))
 }
 
+// js_int_arg reads an integer argument without a C-API call when it is an
+// immediate int32 (the common case for offsets/lengths from the JS layer).
+js_int_arg :: proc(ctx: jsc.JSContextRef, v: jsc.JSValueRef) -> int {
+	if x, ok := jsc.value_int32(ctx, v); ok do return int(x)
+	return int(jsc.JSValueToNumber(ctx, v, nil))
+}
+
+// js_int_value encodes an integer result without a C-API call when possible.
+js_int_value :: proc(ctx: jsc.JSContextRef, v: int) -> jsc.JSValueRef {
+	if v >= -2147483648 && v <= 2147483647 {
+		if r, ok := jsc.make_int32(ctx, i32(v)); ok do return r
+	}
+	return jsc.JSValueMakeNumber(ctx, f64(v))
+}
+
 @(private = "file")
 Host_Native_Key :: struct {
 	ctx:  rawptr,
