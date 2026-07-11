@@ -135,8 +135,9 @@ else
 	exit 1
 fi
 
-# Phase 6 — header bridge (native lowercase names + latin1 values + response-head bytes).
-# Lava server only: locks parseRequest http_ascii_lower and headBytes/latin1WriteInto.
+# Phase 6 — header bridge (lowercased req.headers keys + case-preserving rawHeaders +
+# latin1 values + response-head bytes). Lava server only: locks the parseRequest
+# result contract and headBytes/latin1WriteInto.
 lava_assert "$ROOT_DIR/tests/runtime/http/headers-bridge.js" headers-bridge
 
 printf '%s\n' 'http smoke passed (parity + malformed + keep-alive + timeouts + response-unit + headers-bridge)'
