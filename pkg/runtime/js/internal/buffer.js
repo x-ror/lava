@@ -449,12 +449,15 @@
      */
     toString(encoding, start, end) {
       var len = this.length;
-      if (start <= 0) start = 0;
+      if (start === undefined || start <= 0) start = 0;
       else if (start >= len) return '';
       else start |= 0;
       if (end === undefined || end > len) end = len;
       else end |= 0;
       if (end <= start) return '';
+      // Full-range toString (the common case) skips the subarray view: the
+      // codec natives read this buffer's bytes in place either way.
+      if (start === 0 && end === len) return bytesToString(this, encoding || 'utf8');
       return bytesToString(this.subarray(start, end), encoding || 'utf8');
     }
 
