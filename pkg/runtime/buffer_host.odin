@@ -5,8 +5,13 @@ import jsc "lava:pkg/jsc"
 
 // Host-call-convention entry points for the node:buffer natives: dedicated
 // wrappers (no dispatch-table lookup) around the shared host_dispatch in
-// host_natives.odin, which documents the convention. These are the hottest
-// natives in the runtime, hence the baked-in callbacks.
+// host_natives.odin, which documents the convention. Each is a distinct proc "c"
+// so JSC's stored NativeFunction pointer identifies the codec directly, skipping
+// the callee->callback map lookup the generic path (host_native_create) does per
+// call. That lookup is NOT free on these hottest natives: measured +~25ns on
+// Buffer.alloc(16).toString('hex') (110ns -> 135ns, ~20%), so the buffer codecs
+// and the two hot node:http natives keep baked-in wrappers while every colder
+// native (fs/os/crypto/dns/...) uses the generic path to avoid the boilerplate.
 
 buffer_hex_encode_host :: proc "c" (g: rawptr, cf: [^]u64) -> i64 {
 	return host_dispatch(g, cf, buffer_hex_encode_cb)
