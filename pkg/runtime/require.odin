@@ -268,11 +268,13 @@ make_module_not_found :: proc(ctx: jsc.JSContextRef, specifier: string) -> jsc.J
 	)
 }
 
-// inject_native_function attaches a native function to `object`. When a `host`
-// variant is supplied it is registered through JSC's internal host-call
-// convention (jsc.host_function_create — no per-call lock drop or argument
-// re-marshaling); if that path is unavailable, or no variant is given, the
-// portable C-API callback is used.
+// inject_native_function attaches a native function to `object`, preferring
+// JSC's internal host-call convention (no per-call lock drop or argument
+// re-marshaling): an explicitly supplied `host` wrapper is used directly;
+// otherwise the callback goes through the generic callee-keyed trampoline
+// (host_natives.odin), which also caches — repeated injections of the same
+// callback (fs.Stats methods, per-instance handles) share one function object.
+// When the host path is unavailable the portable C-API callback is used.
 inject_native_function :: proc(
 	ctx: jsc.JSContextRef,
 	object: jsc.JSObjectRef,
@@ -289,6 +291,8 @@ inject_native_function :: proc(
 	fn: jsc.JSObjectRef
 	if host != nil {
 		fn, _ = jsc.host_function_create(ctx, name, host, 1)
+	} else {
+		fn = host_native_create(ctx, name, callback)
 	}
 	if fn == nil {
 		fn = jsc.JSObjectMakeFunctionWithCallback(ctx, js_name, callback)

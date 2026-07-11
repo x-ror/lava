@@ -39,8 +39,12 @@ import "core:os"
 Host_Function_Proc :: #type proc "c" (global_object: rawptr, call_frame: [^]u64) -> i64
 
 // CallFrame header slot indices (JSC CallFrame.h / CallFrameSlot), 8 bytes per
-// slot. argumentCountIncludingThis is the low 32 bits of its slot.
+// slot. argumentCountIncludingThis is the low 32 bits of its slot. The callee
+// slot holds the JSFunction cell being invoked — the probe validates it, and
+// the runtime's generic native trampoline keys its dispatch on it.
+CALL_FRAME_CALLEE_SLOT :: 3
 CALL_FRAME_ARGC_SLOT :: 4
+CALL_FRAME_THIS_SLOT :: 5
 CALL_FRAME_FIRST_ARG_SLOT :: 6
 
 when ODIN_OS == .Linux {
@@ -80,12 +84,19 @@ when ODIN_OS == .Linux {
 	@(private = "file")
 	Lock_Dtor_Proc :: #type proc "c" (holder: ^rawptr)
 
+	// JSC::Exception* VM::throwException(JSGlobalObject*, JSValue) — JSValue is
+	// one EncodedJSValue word, passed by value.
+	@(private = "file")
+	Vm_Throw_Proc :: #type proc "c" (vm: rawptr, global: rawptr, value: u64) -> rawptr
+
 	@(private = "file") g_host_checked: bool
 	@(private = "file") g_host_ok: bool
 	@(private = "file") g_host_create: Create_Host_Fn_Proc
 	@(private = "file") g_host_lock_ctor: Lock_Ctor_Proc
 	@(private = "file") g_host_lock_dtor: Lock_Dtor_Proc
+	@(private = "file") g_vm_throw: Vm_Throw_Proc
 	@(private = "file") g_probe_seen: bool
+	@(private = "file") g_probe_callee: rawptr
 
 	// debug_log reports probe outcomes on stderr when LAVA_HOSTFN_DEBUG is set —
 	// the fallback is silent by design, so this is the diagnostic switch.
@@ -102,7 +113,7 @@ when ODIN_OS == .Linux {
 		// Guard the frame reads: if the layout assumption were wrong, the count
 		// almost certainly won't be 3, and we bail before touching "arguments".
 		argc := u32(cf[CALL_FRAME_ARGC_SLOT] & 0xFFFFFFFF)
-		if argc == 3 {
+		if argc == 3 && rawptr(uintptr(cf[CALL_FRAME_CALLEE_SLOT])) == g_probe_callee {
 			a0 := JSValueRef(uintptr(cf[CALL_FRAME_FIRST_ARG_SLOT]))
 			a1 := JSValueRef(uintptr(cf[CALL_FRAME_FIRST_ARG_SLOT + 1]))
 			if JSValueIsNumber(ctx, a0) && JSValueIsString(ctx, a1) &&
@@ -141,13 +152,15 @@ when ODIN_OS == .Linux {
 		pc := host_dlsym(nil, "_ZN3JSC10JSFunction6createERNS_2VMEPNS_14JSGlobalObjectEjRKN3WTF6StringENS5_11FunctionPtrILNS5_6PtrTagE1EFlS4_PNS_9CallFrameEELNS5_18FunctionAttributesE2EEENS_24ImplementationVisibilityENS_9IntrinsicESF_PKNS_6DOMJIT9SignatureE")
 		pl := host_dlsym(nil, "_ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE")
 		pd := host_dlsym(nil, "_ZN3JSC12JSLockHolderD1Ev")
-		if pc == nil || pl == nil || pd == nil {
+		pt := host_dlsym(nil, "_ZN3JSC2VM14throwExceptionEPNS_14JSGlobalObjectENS_7JSValueE")
+		if pc == nil || pl == nil || pd == nil || pt == nil {
 			debug_log("hostfn: dlsym miss")
 			return
 		}
 		g_host_create = transmute(Create_Host_Fn_Proc)pc
 		g_host_lock_ctor = transmute(Lock_Ctor_Proc)pl
 		g_host_lock_dtor = transmute(Lock_Dtor_Proc)pd
+		g_vm_throw = transmute(Vm_Throw_Proc)pt
 
 		// APICast contract: JSContextRef IS the JSGlobalObject cell. It cannot be
 		// checked by comparing against JSContextGetGlobalObject — that returns the
@@ -169,6 +182,7 @@ when ODIN_OS == .Linux {
 			JSValueMakeNumber(ctx, 42),
 			js_probe_string(ctx),
 		}
+		g_probe_callee = rawptr(fn)
 		g_probe_seen = false
 		res := JSObjectCallAsFunction(ctx, fn, nil, 2, &args[0], nil)
 		if !g_probe_seen || res == nil {
@@ -200,8 +214,23 @@ when ODIN_OS == .Linux {
 		function = create_raw(ctx, name, fn, arity)
 		return function, function != nil
 	}
+
+	// host_throw raises `value` as a JS exception from inside a host function —
+	// the equivalent of the C-API callback machinery's *exception handling. The
+	// host function should return the same value (its result is ignored once
+	// the VM has a pending exception). Only meaningful while g_host_ok, i.e.
+	// inside functions created by host_function_create.
+	host_throw :: proc "contextless" (ctx: JSContextRef, value: JSValueRef) {
+		if !g_host_ok || value == nil do return
+		vm := JSContextGetGroup(ctx)
+		if vm == nil do return
+		g_vm_throw(vm, rawptr(ctx), transmute(u64)value)
+	}
 } else {
 	host_function_create :: proc(_: JSContextRef, _: string, _: Host_Function_Proc, _: int) -> (function: JSObjectRef, ok: bool) {
 		return nil, false
+	}
+
+	host_throw :: proc "contextless" (_: JSContextRef, _: JSValueRef) {
 	}
 }

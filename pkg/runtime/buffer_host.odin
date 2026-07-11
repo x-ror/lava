@@ -3,35 +3,10 @@ package lava_runtime
 import "core:c"
 import jsc "lava:pkg/jsc"
 
-// Host-call-convention entry points for the node:buffer natives. Each wrapper
-// adapts JSC's internal calling convention (JSGlobalObject*, CallFrame*) to the
-// existing C-API callback bodies: on 64-bit JSC a call-frame argument slot IS a
-// JSValueRef bit pattern and JSContextRef IS the JSGlobalObject pointer (both
-// facts are verified by jsc.host_function_create's probe before any of these
-// can be reached), so the adaptation is just slicing arguments off the frame.
-// Registering natives this way skips the C-API callback machinery — argument
-// vector marshaling and, above all, the JSLock::DropAllLocks/re-lock mutex
-// round trip that JSCallbackFunction pays on every single call.
-
-@(private = "file")
-host_dispatch :: proc "c" (
-	global: rawptr,
-	cf: [^]u64,
-	cb: jsc.JSObjectCallAsFunctionCallback,
-) -> i64 {
-	ctx := jsc.JSContextRef(global)
-	argc := int(u32(cf[jsc.CALL_FRAME_ARGC_SLOT] & 0xFFFFFFFF)) - 1 // minus `this`
-	if argc < 0 do argc = 0
-	if argc > 8 do argc = 8 // largest native arity is 4
-	args: [8]jsc.JSValueRef
-	for i in 0 ..< argc {
-		args[i] = jsc.JSValueRef(uintptr(cf[jsc.CALL_FRAME_FIRST_ARG_SLOT + i]))
-	}
-	exception: jsc.JSValueRef
-	ret := cb(ctx, nil, nil, c.size_t(argc), &args[0], &exception)
-	if ret == nil do return transmute(i64)jsc.JSValueMakeUndefined(ctx)
-	return transmute(i64)ret
-}
+// Host-call-convention entry points for the node:buffer natives: dedicated
+// wrappers (no dispatch-table lookup) around the shared host_dispatch in
+// host_natives.odin, which documents the convention. These are the hottest
+// natives in the runtime, hence the baked-in callbacks.
 
 buffer_hex_encode_host :: proc "c" (g: rawptr, cf: [^]u64) -> i64 {
 	return host_dispatch(g, cf, buffer_hex_encode_cb)
