@@ -26,7 +26,7 @@ JSCELL_TYPE_OFFSET :: 5
 // (int32/double/undefined/null/booleans) has bits in this mask set. Used only
 // as a conservative pre-filter before dereferencing — a false negative just
 // means the C-API fallback.
-@(private) VALUE_NOT_CELL_MASK :: u64(0xFFFF_0000_0000_0007)
+VALUE_NOT_CELL_MASK :: u64(0xFFFF_0000_0000_0007)
 
 when ODIN_OS == .Linux {
 	@(private = "file") g_view_checked: bool
