@@ -108,15 +108,30 @@ path:
 
 Absolute per-op: `buf.write(str, 'latin1')` ≈ 190 ns end-to-end (was ~1.7 µs).
 
+## Phase 4 (landed): SIMD codecs + host registration for every native
+
+- Portable `core:simd` codecs: hex encode 16 B/step (branchless digit map, two
+  interleave shuffles), hex decode validate+convert 16 chars → 8 B/step with
+  exact scalar fallback at the first invalid lane, base64/base64url encode via
+  Muła's u16-lane layout with per-lane vector shifts. utf16le decode/encode/
+  writeInto are single memcpys on little-endian hosts. Full-range `toString`
+  skips the subarray view (~300 ns/call).
+- `inject_native_function` host-registers *all* natives: one generic trampoline
+  keys dispatch on the frame's callee slot, functions are pinned + cached per
+  (context, callback, name), and callback-set exceptions become real throws via
+  the exported `JSC::VM::throwException`.
+
+End state (lava/node): to-hex ~4.5x, to-base64 ~5x, to-hex-tiny 1.8x
+(94 ns/op), to-latin1/to-utf16le ~5x, from-utf8 2.4x, from-latin1 ~11x.
+HTTP hello 0.75x node req/s (was 0.60x), mem/conn 0.43x node.
+
 ## Remaining gap / follow-up
 
-What's left on the to-* side is `JSValueMakeString`'s `jsStringWithCache`
-(hash + weak-map insert per fresh string) and codec byte work — SIMD (hex
-`pshufb`, Muła base64, simdutf transcode) is now visible and is the next lever.
-On the from-* side, allocation dominates: JSC's ArrayBuffer/typed-array
-construction is ~3–30x V8's, partially amortized by the larger native-backed
-pool. Host-function registration for the http natives is a straight reuse of
-`inject_native_function`'s host parameter.
+from-* is dominated by JSC's ArrayBuffer/typed-array construction (~3–30x
+V8's), partially amortized by the larger native-backed pool; to-*'s residual is
+StringImpl allocation + JSString cell + the ~100–200 ns dispatch floor. The
+next perf axis is http per-core profiling — its natives, header strings and
+write paths now all ride the host-call + 8-bit-string fast paths.
 
 ## Verify
 
