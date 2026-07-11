@@ -60,11 +60,9 @@ http_parse_request_cb :: proc "c" (
 	if res == .Error do return http_parse_status(ctx, PARSE_ERROR)
 
 	// Interleaved [name, value, ...]; RFC 7230 obs-fold continuations (empty name) are
-	// merged into the previous value with a single space. Header NAMES are ASCII-lowered
-	// here so JS buildHeaders can skip String#toLowerCase on every key (Node's
-	// req.headers keys are lowercased). Names are tokens (RFC 7230) so ASCII fold is
-	// correct; values stay raw latin1. Lowercasing MUST copy — name/value slices alias
-	// the request buffer.
+	// merged into the previous value with a single space. NAMES are kept in their
+	// received case: req.rawHeaders must preserve it (Node contract), and the JS layer
+	// lowercases only the req.headers keys. Values stay raw latin1.
 	hdr_list := make([dynamic]string, 0, num * 2, context.temp_allocator)
 	last_val_idx := -1
 	for i in 0 ..< num {
@@ -79,7 +77,7 @@ http_parse_request_cb :: proc "c" (
 			}
 			continue
 		}
-		append(&hdr_list, http_ascii_lower(h.name))
+		append(&hdr_list, h.name)
 		append(&hdr_list, strings.trim_space(h.value))
 		last_val_idx = len(hdr_list) - 1
 	}
@@ -104,28 +102,4 @@ http_parse_request_cb :: proc "c" (
 		vals[5 + i] = latin1_string_from_bytes(ctx, transmute([]byte)hdr_list[i])
 	}
 	return cast(jsc.JSValueRef)jsc.JSObjectMakeArray(ctx, c.size_t(5 + n), &vals[0], nil)
-}
-
-// http_ascii_lower returns an ASCII-lowercased copy of `s` (A-Z → a-z only). HTTP header
-// field-names are tokens; this matches Node's req.headers key fold without a JS pass.
-@(private = "file")
-http_ascii_lower :: proc(s: string) -> string {
-	if len(s) == 0 do return s
-	// Fast path: already lower (common for proxies that normalize).
-	needs := false
-	for i in 0 ..< len(s) {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			needs = true
-			break
-		}
-	}
-	if !needs do return s
-	out := make([]byte, len(s), context.temp_allocator)
-	for i in 0 ..< len(s) {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' do out[i] = c + 32
-		else do out[i] = c
-	}
-	return string(out)
 }

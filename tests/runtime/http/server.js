@@ -36,8 +36,9 @@ const server = http.createServer(opts, (req, res) => {
     return;
   }
   // /headers-meta — Lava-only bridge probe (headers-bridge.js). Dumps lowercased keys and
-  // selected values so the client can assert native parseRequest ASCII-folds header names
-  // and preserves latin1 values (no UTF-8 re-decode).
+  // selected values so the client can assert req.headers keys are folded to lowercase
+  // (buildHeaders) while req.rawHeaders preserves the received wire case (Node contract),
+  // and latin1 values survive (no UTF-8 re-decode).
   if (req.url === '/headers-meta') {
     const keys = Object.keys(req.headers).sort();
     const pack = (s) =>
@@ -50,6 +51,8 @@ const server = http.createServer(opts, (req, res) => {
     res.end(
       'KEYS=' +
         keys.join('|') +
+        ' RAW=' +
+        req.rawHeaders.join('|') +
         ' HOST=' +
         pack(req.headers['host']) +
         ' XFOO=' +
