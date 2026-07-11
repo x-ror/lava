@@ -25,11 +25,18 @@ host_dispatch :: proc "c" (
 	cf: [^]u64,
 	cb: jsc.JSObjectCallAsFunctionCallback,
 ) -> i64 {
+	context = runtime.default_context() // valid allocator for the overflow slice below
 	ctx := jsc.JSContextRef(global)
 	argc := int(u32(cf[jsc.CALL_FRAME_ARGC_SLOT] & 0xFFFFFFFF)) - 1 // minus `this`
 	if argc < 0 do argc = 0
-	if argc > 16 do argc = 16 // widest native today reads arguments[9] (fetch)
-	args: [16]jsc.JSValueRef
+	// Deliver every argument. Fixed stack buffer for the common small case; a
+	// genuinely variadic caller (setTimeout(fn, delay, ...args)) that overflows
+	// it uses a temp slice rather than being silently truncated.
+	stack_args: [16]jsc.JSValueRef
+	args: []jsc.JSValueRef = stack_args[:]
+	if argc > len(stack_args) {
+		args = make([]jsc.JSValueRef, argc, context.temp_allocator)
+	}
 	for i in 0 ..< argc {
 		args[i] = jsc.JSValueRef(uintptr(cf[jsc.CALL_FRAME_FIRST_ARG_SLOT + i]))
 	}
@@ -73,8 +80,15 @@ Host_Native_Key :: struct {
 	name: string,
 }
 
-@(private = "file") g_host_native_fns: map[Host_Native_Key]jsc.JSObjectRef
-@(private = "file") g_host_native_cbs: map[rawptr]jsc.JSObjectCallAsFunctionCallback
+// Thread-local: a JSC context is thread-confined, so a worker's registered
+// functions (JSObjectRefs) and the callee->callback dispatch table belong to
+// that worker's thread. Per-thread maps mean registration and the per-call
+// dispatch lookup never touch another worker's state — no locks on the dispatch
+// path, and no data race when N workers build their bindings concurrently
+// (the failure the removed process-global interning risked). The dispatch
+// callback runs on the ctx-owning thread, so it reads the same thread's table.
+@(private = "file", thread_local) g_host_native_fns: map[Host_Native_Key]jsc.JSObjectRef
+@(private = "file", thread_local) g_host_native_cbs: map[rawptr]jsc.JSObjectCallAsFunctionCallback
 
 @(private = "file")
 generic_native_host_cb :: proc "c" (global: rawptr, cf: [^]u64) -> i64 {

@@ -89,14 +89,18 @@ when ODIN_OS == .Linux {
 	@(private = "file")
 	Vm_Throw_Proc :: #type proc "c" (vm: rawptr, global: rawptr, value: u64) -> rawptr
 
-	@(private = "file") g_host_checked: bool
-	@(private = "file") g_host_ok: bool
-	@(private = "file") g_host_create: Create_Host_Fn_Proc
-	@(private = "file") g_host_lock_ctor: Lock_Ctor_Proc
-	@(private = "file") g_host_lock_dtor: Lock_Dtor_Proc
-	@(private = "file") g_vm_throw: Vm_Throw_Proc
-	@(private = "file") g_probe_seen: bool
-	@(private = "file") g_probe_callee: rawptr
+	// Thread-local: the probe registers and calls a host function on the
+	// calling thread's (thread-confined) context, and g_probe_seen/g_probe_callee
+	// are written by that probe callback on the same thread. Per-thread state
+	// keeps concurrent worker startups from clobbering each other's probe.
+	@(private = "file", thread_local) g_host_checked: bool
+	@(private = "file", thread_local) g_host_ok: bool
+	@(private = "file", thread_local) g_host_create: Create_Host_Fn_Proc
+	@(private = "file", thread_local) g_host_lock_ctor: Lock_Ctor_Proc
+	@(private = "file", thread_local) g_host_lock_dtor: Lock_Dtor_Proc
+	@(private = "file", thread_local) g_vm_throw: Vm_Throw_Proc
+	@(private = "file", thread_local) g_probe_seen: bool
+	@(private = "file", thread_local) g_probe_callee: rawptr
 
 	// debug_log reports probe outcomes on stderr when LAVA_HOSTFN_DEBUG is set —
 	// the fallback is silent by design, so this is the diagnostic switch.

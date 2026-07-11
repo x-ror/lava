@@ -26,8 +26,12 @@ BytesPtr_Mode :: enum u8 {
 	View_Start,       // BytesPtr == base + offset (fixed JSC)
 }
 
-@(private = "file")
-g_bytes_ptr_mode: BytesPtr_Mode // written once after first offset view; read thereafter
+// Thread-local: the gtk-bug mode is a build-global fact, but each worker's JSC
+// context is thread-confined and the mode is latched from a view created on the
+// owning thread; per-thread state avoids a cross-thread read of a half-written
+// global during concurrent worker startup.
+@(private = "file", thread_local)
+g_bytes_ptr_mode: BytesPtr_Mode // written once per thread after first offset view; read thereafter
 
 // typed_array_view borrows the backing store of a TypedArray or DataView as an
 // Odin byte slice. Valid only for the duration of the native call.

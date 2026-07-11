@@ -61,11 +61,16 @@ when ODIN_OS == .Linux {
 	@(private = "file")
 	Try_Create_Proc :: #type proc "c" (sret: ^rawptr, string_impl: ^rawptr) -> rawptr
 
-	@(private = "file") g_checked: bool
-	@(private = "file") g_ok: bool
-	@(private = "file") g_create8: Create_Uninit8_Proc
-	@(private = "file") g_create16: Create_Uninit16_Proc
-	@(private = "file") g_try_create: Try_Create_Proc
+	// Thread-local: a JSC context is thread-confined, so probing must use the
+	// calling thread's context and its results are stored per thread. This
+	// re-derives the (build-global) symbol pointers and layout facts once per
+	// worker thread — cheap, and race-free when workers start concurrently,
+	// versus a shared latch that could be observed half-published.
+	@(private = "file", thread_local) g_checked: bool
+	@(private = "file", thread_local) g_ok: bool
+	@(private = "file", thread_local) g_create8: Create_Uninit8_Proc
+	@(private = "file", thread_local) g_create16: Create_Uninit16_Proc
+	@(private = "file", thread_local) g_try_create: Try_Create_Proc
 
 	// Read-side layout facts, established by probe_read_layout. StringImplShape
 	// has been {u32 refCount; u32 length; T* data; atomic<u32> hashAndFlags} and
@@ -75,9 +80,9 @@ when ODIN_OS == .Linux {
 	// and widths are known exactly (we created them), plus positive/negative
 	// functional checks through the public C API. Any mismatch leaves the read
 	// path disabled while the write path keeps working.
-	@(private = "file") g_read_ok: bool
-	@(private = "file") g_flag_mask: u32
-	@(private = "file") g_flag_val8: u32
+	@(private = "file", thread_local) g_read_ok: bool
+	@(private = "file", thread_local) g_flag_mask: u32
+	@(private = "file", thread_local) g_flag_val8: u32
 
 	@(private = "file") IMPL_LENGTH_OFFSET :: 4
 	@(private = "file") IMPL_DATA_OFFSET :: 8
@@ -177,12 +182,17 @@ when ODIN_OS == .Linux {
 		if (^rawptr)(uintptr(s16) + OPAQUE_STRING_IMPL_OFFSET)^ != impl16 do return false
 
 		// The two impls were created identically except for storage width, and
-		// neither has a cached hash yet, so the flag words differ in exactly the
-		// 8-bit-storage bit(s).
+		// neither has a cached hash yet, so the flag words must differ in exactly
+		// ONE bit: the is-8-bit-storage flag. Require a single-bit difference —
+		// the storage-width flag is immutable and untouched by later hashing, so
+		// a single-bit mask makes value_chars16's "not 8-bit => 16-bit" test sound
+		// for the lifetime of any string. If more than one bit differs, some
+		// other width-correlated state is in play and the read fast path is
+		// unsafe: leave it disabled and fall back to the public C API.
 		f8 := (^u32)(uintptr(impl8) + IMPL_FLAGS_OFFSET)^
 		f16 := (^u32)(uintptr(impl16) + IMPL_FLAGS_OFFSET)^
 		diff := f8 ~ f16
-		if diff == 0 do return false
+		if diff == 0 || (diff & (diff - 1)) != 0 do return false // require exactly one bit
 		g_flag_mask = diff
 		g_flag_val8 = f8 & diff
 
@@ -215,10 +225,10 @@ when ODIN_OS == .Linux {
 	// pointer inside cells built from strings we constructed, and verified on a
 	// second cell of the other storage width.
 
-	@(private = "file") g_val_checked: bool
-	@(private = "file") g_val_ok: bool
-	@(private = "file") g_string_type: u8
-	@(private = "file") g_fiber_off: uintptr
+	@(private = "file", thread_local) g_val_checked: bool
+	@(private = "file", thread_local) g_val_ok: bool
+	@(private = "file", thread_local) g_string_type: u8
+	@(private = "file", thread_local) g_fiber_off: uintptr
 
 	@(private = "file")
 	ensure_value_reads :: proc(ctx: JSContextRef) {

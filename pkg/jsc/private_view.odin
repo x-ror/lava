@@ -28,19 +28,33 @@ JSCELL_TYPE_OFFSET :: 5
 // means the C-API fallback.
 VALUE_NOT_CELL_MASK :: u64(0xFFFF_0000_0000_0007)
 
+// MAX_VIEW_LENGTH bounds a plausible Uint8Array length; a probed length above
+// this can only be a mis-read cell field, so typed_array_bytes rejects it and
+// the C API handles that value instead. Well above any real Buffer (JSC caps
+// typed arrays far below 2^33).
+MAX_VIEW_LENGTH :: 0x1_0000_0000
+
 when ODIN_OS == .Linux {
-	@(private = "file") g_view_checked: bool
-	@(private = "file") g_view_ok: bool
-	@(private = "file") g_view_type: u8
-	@(private = "file") g_vec_off: uintptr
-	@(private = "file") g_len_off: uintptr
-	@(private = "file") g_len_u64: bool
+	// Thread-local: probing must run on the (thread-confined) context that will
+	// later be read, and the cell offsets — though a build-global fact — are
+	// re-derived once per worker thread to avoid a shared latch being seen
+	// half-published during concurrent worker startup.
+	@(private = "file", thread_local) g_view_checked: bool
+	@(private = "file", thread_local) g_view_ok: bool
+	@(private = "file", thread_local) g_view_type: u8
+	@(private = "file", thread_local) g_vec_off: uintptr
+	@(private = "file", thread_local) g_len_off: uintptr
+	@(private = "file", thread_local) g_len_u64: bool
 
 	// Immortal backing stores for the probe views (nil deallocator): distinct
-	// addresses and lengths so field offsets are identified by value.
-	@(private = "file") g_probe_a: [40]byte
-	@(private = "file") g_probe_b: [24]byte
-	@(private = "file") g_probe_c: [56]byte
+	// addresses and lengths so field offsets are identified by value. The `_off`
+	// view (backed by g_probe_d, viewed at a non-zero byteOffset) disambiguates a
+	// genuine 64-bit length from a 32-bit length whose adjacent (zero) field the
+	// wide read would otherwise fold in — see ensure_view.
+	@(private = "file", thread_local) g_probe_a: [40]byte
+	@(private = "file", thread_local) g_probe_b: [24]byte
+	@(private = "file", thread_local) g_probe_c: [56]byte
+	@(private = "file", thread_local) g_probe_d: [64]byte
 
 	@(private = "file")
 	ensure_view :: proc(ctx: JSContextRef) {
@@ -108,6 +122,50 @@ when ODIN_OS == .Linux {
 		}
 		if !len_found do return
 
+		// Disambiguate the width with a view at a NON-ZERO byteOffset. All three
+		// probes above have byteOffset 0, so if m_length is really u32 with an
+		// adjacent u32 byteOffset, a u64 read at len_off equals the length anyway
+		// (0 in the upper half) and len_u64 latches true wrongly. For a real
+		// offset view the wide read would be length | (byteOffset<<32) — a huge
+		// value. Build one (offset 16, length 32 over g_probe_d) and require the
+		// chosen mode to read exactly 32 with m_vector == base+16; downgrade to
+		// u32 (or disable) otherwise.
+		{
+			OFF :: 16
+			LEN :: 32
+			ab := JSObjectMakeArrayBufferWithBytesNoCopy(ctx, &g_probe_d[0], len(g_probe_d), nil, nil, nil)
+			if ab == nil do return
+			JSValueProtect(ctx, JSValueRef(ab))
+			defer JSValueUnprotect(ctx, JSValueRef(ab))
+			global := JSContextGetGlobalObject(ctx)
+			u8_name := JSStringCreateWithUTF8CString("Uint8Array")
+			defer JSStringRelease(u8_name)
+			u8_ctor := JSObjectGetProperty(ctx, global, u8_name, nil)
+			if u8_ctor == nil || !JSValueIsObject(ctx, u8_ctor) do return
+			args := [3]JSValueRef {
+				JSValueRef(ab),
+				JSValueMakeNumber(ctx, f64(OFF)),
+				JSValueMakeNumber(ctx, f64(LEN)),
+			}
+			ov := JSObjectCallAsConstructor(ctx, JSObjectRef(u8_ctor), 3, &args[0], nil)
+			if ov == nil do return
+			JSValueProtect(ctx, JSValueRef(ov))
+			defer JSValueUnprotect(ctx, JSValueRef(ov))
+			pv := uintptr(rawptr(ov))
+			if (^u8)(pv + JSCELL_TYPE_OFFSET)^ != ty do return
+			// m_vector already includes byteOffset.
+			if (^rawptr)(pv + vec_off)^ != rawptr(&g_probe_d[OFF]) do return
+			read := len_u64 ? int((^u64)(pv + len_off)^) : int((^u32)(pv + len_off)^)
+			if read != LEN {
+				// Wide read folded in byteOffset; the field is really u32.
+				if len_u64 && int((^u32)(pv + len_off)^) == LEN {
+					len_u64 = false
+				} else {
+					return
+				}
+			}
+		}
+
 		g_view_type = ty
 		g_vec_off = vec_off
 		g_len_off = len_off
@@ -134,6 +192,10 @@ when ODIN_OS == .Linux {
 			// zeroed length; report those as a valid empty view.
 			return nil, n == 0
 		}
+		// Defense in depth against a mis-probed length field: a real Uint8Array
+		// never exceeds MAX_VIEW_LENGTH, so anything larger means the read is
+		// bogus — fall back to the C API rather than hand out a wild slice.
+		if n > MAX_VIEW_LENGTH do return nil, false
 		return ([^]byte)(vec)[:n], true
 	}
 } else {
