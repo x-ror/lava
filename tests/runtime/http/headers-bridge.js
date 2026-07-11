@@ -1,6 +1,7 @@
 // HTTP header-bridge checks — Lava server only (run-http-smoke.sh phase).
 // Locks the perf/buffer HTTP work:
-//   - parseRequest ASCII-lowercases header NAMES (JS buildHeaders skips toLowerCase)
+//   - req.headers keys are lowercased (JS buildHeaders) while req.rawHeaders
+//     preserves the received wire case (Node contract)
 //   - header VALUES stay latin1 (obs-text 0x80-0xFF as single chars)
 //   - response head serialization writes high latin1 as single bytes on the wire
 // Connects to HTTP_PORT on 127.0.0.1. Exit non-zero on failure.

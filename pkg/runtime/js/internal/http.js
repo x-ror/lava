@@ -56,13 +56,11 @@
     503: 'Service Unavailable',
   };
 
-  // Build Node's lowercased req.headers object from the interleaved [name, value, ...]
-  // array the parser returns. Duplicates join with ', ' (Node's behavior for most
-  // headers; set-cookie's array form is out of M2 scope). Names are already
-  // ASCII-lowercased by the native parseRequest bridge — no per-key toLowerCase.
   // buildHeaders folds the [.., name, value, ...] pairs of a parseRequest result
-  // (starting at index `start`) into a headers object. Names arrive in their received
-  // case (rawHeaders preserves it) and are lowercased here for the req.headers keys.
+  // (starting at index `start`) into Node's req.headers object. Names arrive in
+  // their received case (req.rawHeaders preserves it) and are lowercased here for
+  // the keys. Duplicates join with ', ' (Node's behavior for most headers;
+  // set-cookie's array form is out of M2 scope).
   function buildHeaders(arr, start) {
     // Null prototype: a header literally named "constructor"/"hasOwnProperty"/etc. must
     // not collide with Object.prototype (which would corrupt the duplicate-merge check).
@@ -237,18 +235,28 @@
     };
   }
 
-  // `parsed` is the flat parseRequest result array:
-  // [0, consumed, method, url, minor, name, value, ...] (see http.odin).
+  // Layout of the flat parseRequest result array (mirrors PARSE_* / the vals[]
+  // order in http.odin — keep in sync): [state, consumed, method, url, minor,
+  // name, value, ...]. state: 0 complete, 1 partial, 2 error.
+  var P_STATE = 0;
+  var P_CONSUMED = 1;
+  var P_METHOD = 2;
+  var P_URL = 3;
+  var P_MINOR = 4;
+  var P_HEADERS = 5;
+  var PARSE_COMPLETE = 0;
+  var PARSE_PARTIAL = 1;
+
   function IncomingMessage(socket, parsed) {
     EventEmitter.call(this);
     this.socket = socket;
-    this.method = parsed[2];
-    this.url = parsed[3];
+    this.method = parsed[P_METHOD];
+    this.url = parsed[P_URL];
     this.httpVersionMajor = 1;
-    this.httpVersionMinor = parsed[4];
-    this.httpVersion = '1.' + parsed[4];
-    this.rawHeaders = parsed.slice(5);
-    this.headers = buildHeaders(parsed, 5);
+    this.httpVersionMinor = parsed[P_MINOR];
+    this.httpVersion = '1.' + parsed[P_MINOR];
+    this.rawHeaders = parsed.slice(P_HEADERS);
+    this.headers = buildHeaders(parsed, P_HEADERS);
     this.complete = false;
     this._ended = false;
   }
@@ -664,16 +672,15 @@
     }
 
     function processHead() {
-      // r = [1] partial | [2] error | [0, consumed, method, url, minor, headers...]
       var r = native.parseRequest(pending, lastLen);
-      var state = r[0];
-      if (state === 1) {
+      var state = r[P_STATE];
+      if (state === PARSE_PARTIAL) {
         if (pending.length > MAX_HEAD) fail(431);
         else lastLen = pending.length;
         return;
       }
-      if (state === 2) return fail(400);
-      var consumed = r[1];
+      if (state !== PARSE_COMPLETE) return fail(400);
+      var consumed = r[P_CONSUMED];
       if (consumed > MAX_HEAD) return fail(431);
 
       parsingHead = false;
