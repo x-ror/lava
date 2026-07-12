@@ -263,6 +263,11 @@
   IncomingMessage.prototype = Object.create(EventEmitter.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
 
+  // Hot-path constants: avoid rebuilding the common status line / Connection tokens.
+  var STATUS_LINE_200 = 'HTTP/1.1 200 OK\r\n';
+  var CONN_KEEP_ALIVE = 'Connection: keep-alive\r\n';
+  var CONN_CLOSE = 'Connection: close\r\n';
+
   function ServerResponse(socket, method, httpMinor) {
     EventEmitter.call(this);
     this.socket = socket;
@@ -272,6 +277,11 @@
     this._chunked = false; // emitting Transfer-Encoding: chunked (streamed, unknown length)
     this.finished = false;
     this._headers = {}; // lowercased key -> { name, value }
+    // Cached presence flags — _buildHead used to call hasHeader (toLowerCase) twice per
+    // response for Content-Length / Connection / Transfer-Encoding on the hello path.
+    this._hasContentLength = false;
+    this._hasConnection = false;
+    this._hasTransferEncoding = false;
     // A response to a HEAD request carries headers (incl. Content-Length) but NO body
     // (RFC 7230 §3.3.2). Suppress body writes while keeping the framing.
     this._isHead = method === 'HEAD';
@@ -293,7 +303,11 @@
     checkHeaderName(name);
     var v = String(value);
     checkInvalidChar(v, 'header content [' + name + ']');
-    this._headers[name.toLowerCase()] = { name: name, value: v };
+    var low = name.toLowerCase();
+    this._headers[low] = { name: name, value: v };
+    if (low === 'content-length') this._hasContentLength = true;
+    else if (low === 'connection') this._hasConnection = true;
+    else if (low === 'transfer-encoding') this._hasTransferEncoding = true;
     return this;
   };
   ServerResponse.prototype.getHeader = function (name) {
@@ -301,10 +315,18 @@
     return h ? h.value : undefined;
   };
   ServerResponse.prototype.removeHeader = function (name) {
-    delete this._headers[String(name).toLowerCase()];
+    var low = String(name).toLowerCase();
+    delete this._headers[low];
+    if (low === 'content-length') this._hasContentLength = false;
+    else if (low === 'connection') this._hasConnection = false;
+    else if (low === 'transfer-encoding') this._hasTransferEncoding = false;
   };
   ServerResponse.prototype.hasHeader = function (name) {
-    return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase());
+    var low = String(name).toLowerCase();
+    if (low === 'content-length') return this._hasContentLength;
+    if (low === 'connection') return this._hasConnection;
+    if (low === 'transfer-encoding') return this._hasTransferEncoding;
+    return Object.prototype.hasOwnProperty.call(this._headers, low);
   };
 
   ServerResponse.prototype.writeHead = function (statusCode, statusMessage, headers) {
@@ -332,20 +354,24 @@
     var code = validateStatusCode(this.statusCode);
     var reason = this.statusMessage || STATUS_CODES[code] || '';
     checkInvalidChar(String(reason), 'statusMessage'); // no CRLF in the status line
-    var head = 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
+    // Common hello-world path: 200 with default reason — skip string concat for the line.
+    var head =
+      code === 200 && !this.statusMessage
+        ? STATUS_LINE_200
+        : 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
     // Finalize keep-alive: only possible if the response is self-delimiting (Content-Length,
     // chunked, or a no-body status/HEAD) — otherwise the body ends at connection close, so
     // we must close. A handler-set "Connection: close" also wins.
     var selfDelimited =
       this._chunked ||
-      this.hasHeader('content-length') ||
+      this._hasContentLength ||
       this._isHead ||
       statusHasNoBody(this.statusCode);
     if (!selfDelimited) this._keepAlive = false;
-    if (this.hasHeader('connection')) {
+    if (this._hasConnection) {
       if (/\bclose\b/i.test(this.getHeader('connection'))) this._keepAlive = false;
     } else {
-      head += this._keepAlive ? 'Connection: keep-alive\r\n' : 'Connection: close\r\n';
+      head += this._keepAlive ? CONN_KEEP_ALIVE : CONN_CLOSE;
     }
     for (var key in this._headers) {
       if (!Object.prototype.hasOwnProperty.call(this._headers, key)) continue;
@@ -381,12 +407,12 @@
       if (
         !noBody &&
         this._allowChunked &&
-        !this.hasHeader('content-length') &&
-        !this.hasHeader('transfer-encoding')
+        !this._hasContentLength &&
+        !this._hasTransferEncoding
       ) {
         this._chunked = true;
         this.setHeader('Transfer-Encoding', 'chunked');
-      } else if (this._allowChunked && this.hasHeader('transfer-encoding')) {
+      } else if (this._allowChunked && this._hasTransferEncoding) {
         this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
       this._flushHead();
@@ -419,10 +445,10 @@
     if (!this.headersSent) {
       // No prior write() → we know the full length here, so frame with Content-Length
       // (unless a no-body status, or the caller already chose Transfer-Encoding).
-      if (!this.hasHeader('content-length') && !this.hasHeader('transfer-encoding') && !noBody) {
+      if (!this._hasContentLength && !this._hasTransferEncoding && !noBody) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
-      if (this._allowChunked && this.hasHeader('transfer-encoding')) {
+      if (this._allowChunked && this._hasTransferEncoding) {
         this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
       // Fast path: emit the head and a known, non-chunked body in ONE socket write (one
@@ -718,15 +744,45 @@
         bodyRemaining = parseInt(clStr, 10);
       }
 
-      server.emit('request', req, res);
-      // Deliver body bytes from the head's read on the NEXT tick, so a handler that attaches
-      // 'data'/'end' in process.nextTick (not only synchronously) still sees them. For a
-      // bodyless request this fires 'end' immediately (and surfaces any pipelined leftover).
-      process.nextTick(function () {
-        if (closed) return;
-        if (chunkedDecode) chunkedDecode(bodyStart);
-        else feedBody(bodyStart);
-      });
+      // Capture this request for the deferred body/'end' delivery — keep-alive may
+      // reset `req` before the nextTick runs if the response finishes synchronously.
+      var thisReq = req;
+      // Entity body present only if chunked or Content-Length > 0 (CL:0 is bodyless).
+      var hasEntityBody = chunkedDecode !== null || bodyRemaining > 0;
+
+      if (!hasEntityBody) {
+        // BODYLESS (the hello-world / GET keep-alive hot path): mark the request body
+        // complete *before* emitting 'request' so a synchronous res.end() can call
+        // maybeAdvance() immediately. Previously bodyDone only flipped in a nextTick,
+        // so every keep-alive round-trip paid an extra event-loop turn before the
+        // connection could parse a pipelined or sequential next request — the residual
+        // dispatch cost after the C-API/timer work was removed.
+        //
+        // 'end' still fires on nextTick so handlers that attach listeners there (or in
+        // the request callback after returning) still observe it. leftover bytes from
+        // the same read (pipelined next head) sit in `pending` for maybeAdvance.
+        bodyDone = true;
+        pending = bodyStart.length ? bodyStart : EMPTY_BUF;
+        server.emit('request', req, res);
+        process.nextTick(function () {
+          if (closed) return;
+          if (thisReq && !thisReq._ended) {
+            thisReq._ended = true;
+            thisReq.complete = true;
+            thisReq.emit('end');
+          }
+          maybeAdvance(); // covers res finishing before this tick
+        });
+      } else {
+        server.emit('request', req, res);
+        // Deliver body bytes from the head's read on the NEXT tick, so a handler that
+        // attaches 'data'/'end' in process.nextTick still sees them.
+        process.nextTick(function () {
+          if (closed) return;
+          if (chunkedDecode) chunkedDecode(bodyStart);
+          else feedBody(bodyStart);
+        });
+      }
     }
 
     socket.on('data', function (chunk) {
