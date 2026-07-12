@@ -128,11 +128,12 @@
   }
 
   /**
-   * @param {number} statusCode
+   * @param {*} statusCode may be string after `res.statusCode = '204'`
    * @returns {boolean}
    */
   function statusHasNoBody(statusCode) {
-    return statusCode === 204 || statusCode === 304 || (statusCode >= 100 && statusCode < 200);
+    var code = Number(statusCode);
+    return code === 204 || code === 304 || (code >= 100 && code < 200);
   }
 
   /**
@@ -303,7 +304,6 @@
     // Eager headers (framing needs Connection/CL/TE). rawHeaders sliced on first access —
     // hello-world never reads it (saves a per-request array alloc).
     this._parseResult = parseResult;
-    this._rawHeaders = undefined;
     this.headers = buildHeaders(parseResult, PARSE_HEADERS);
     this.complete = false;
     this._ended = false;
@@ -311,17 +311,28 @@
   IncomingMessage.prototype = Object.create(EventEmitter.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
 
+  // Lazy rawHeaders: first get materializes an own data property (Node shape:
+  // hasOwnProperty / Object.keys include rawHeaders after access).
   Object.defineProperty(IncomingMessage.prototype, 'rawHeaders', {
     configurable: true,
     enumerable: true,
     get: function () {
-      if (this._rawHeaders === undefined) {
-        this._rawHeaders = this._parseResult.slice(PARSE_HEADERS);
-      }
-      return this._rawHeaders;
+      var pairs = this._parseResult.slice(PARSE_HEADERS);
+      Object.defineProperty(this, 'rawHeaders', {
+        value: pairs,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return pairs;
     },
     set: function (value) {
-      this._rawHeaders = value;
+      Object.defineProperty(this, 'rawHeaders', {
+        value: value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
     },
   });
 
@@ -350,7 +361,7 @@
     this._isHead = method === 'HEAD';
     this._allowChunked = httpMinor === undefined || httpMinor >= 1;
     this._keepAlive = false;
-    /** @type {function(): void|null} connection hook after finish */
+    /** @type {((function(): void) | null)} connection hook after finish */
     this._onComplete = null;
   }
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
@@ -651,12 +662,13 @@
 
     // Deferred body/'end' delivery: one reused nextTick callback + parallel arrays
     // (no per-request closure). Pipelined sync processRequestHead can enqueue more
-    // while flush runs; qScheduled stays true until the queue is empty.
+    // while flush runs; deferScheduled stays true until the queue is empty.
     var deferRequests = [];
     var deferBodies = [];
     var deferKinds = []; // 0 = emit end, 1 = Content-Length feed, 2 = chunked feed
     var deferDecoders = [];
     var deferScheduled = false;
+    var deferFlushError = undefined;
     var DEFER_END = 0;
     var DEFER_CONTENT_LENGTH = 1;
     var DEFER_CHUNKED = 2;
@@ -673,28 +685,42 @@
     }
 
     function flushAfterRequest() {
-      var index = 0;
-      while (index < deferRequests.length) {
-        var targetRequest = deferRequests[index];
-        var bodyFromHead = deferBodies[index];
-        var kind = deferKinds[index];
-        var decoder = deferDecoders[index];
-        index++;
-        if (connectionClosed) continue;
-        if (kind === DEFER_END) {
-          emitRequestEnd(targetRequest);
-          maybeAdvance();
-        } else if (kind === DEFER_CHUNKED) {
-          decoder(bodyFromHead);
-        } else {
-          feedContentLengthBody(bodyFromHead);
+      // try/finally: a throw from a user 'end'/'data' listener must not latch
+      // deferScheduled=true forever (which would skip later nextTick arms).
+      deferFlushError = undefined;
+      try {
+        var index = 0;
+        while (index < deferRequests.length) {
+          var targetRequest = deferRequests[index];
+          var bodyFromHead = deferBodies[index];
+          var kind = deferKinds[index];
+          var decoder = deferDecoders[index];
+          index++;
+          if (connectionClosed) continue;
+          try {
+            if (kind === DEFER_END) {
+              emitRequestEnd(targetRequest);
+              maybeAdvance();
+            } else if (kind === DEFER_CHUNKED) {
+              decoder(bodyFromHead);
+            } else {
+              feedContentLengthBody(bodyFromHead);
+            }
+          } catch (err) {
+            // Drain siblings first; rethrow the first error after cleanup.
+            if (deferFlushError === undefined) deferFlushError = err;
+          }
         }
+      } finally {
+        deferRequests.length = 0;
+        deferBodies.length = 0;
+        deferKinds.length = 0;
+        deferDecoders.length = 0;
+        deferScheduled = false;
+        var pendingError = deferFlushError;
+        deferFlushError = undefined;
+        if (pendingError !== undefined) throw pendingError;
       }
-      deferRequests.length = 0;
-      deferBodies.length = 0;
-      deferKinds.length = 0;
-      deferDecoders.length = 0;
-      deferScheduled = false;
     }
 
     function clearReceiveDeadlines() {
