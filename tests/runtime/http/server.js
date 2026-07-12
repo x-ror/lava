@@ -35,6 +35,16 @@ const server = http.createServer(opts, (req, res) => {
     res.end('part3');
     return;
   }
+  // /slow-response — bodyless GET whose handler delays past requestTimeout (400ms under
+  // HTTP_SHORT_TIMEOUTS). requestTimeout must bound *receive* time only; a fully-received
+  // request answered late must still be 200 (Node parity), not 408.
+  if (req.url === '/slow-response' && process.env.HTTP_SHORT_TIMEOUTS) {
+    setTimeout(function () {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': '4' });
+      res.end('late');
+    }, 600);
+    return;
+  }
   // /headers-meta — Lava-only bridge probe (headers-bridge.js). Dumps lowercased keys and
   // selected values so the client can assert req.headers keys are folded to lowercase
   // (buildHeaders) while req.rawHeaders preserves the received wire case (Node contract),

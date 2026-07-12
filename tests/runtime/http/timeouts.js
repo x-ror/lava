@@ -62,6 +62,11 @@ function check(name, cond, detail) {
   r = await probe('GET /fast HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
   check('fast-not-timed-out', r.status === 200, JSON.stringify(r));
 
+  // Bodyless request fully received; handler delays past requestTimeout (400ms).
+  // Must be 200, not 408 — requestTimeout bounds receive time, not response time.
+  r = await probe('GET /slow-response HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+  check('bodyless-slow-handler-200', r.status === 200, JSON.stringify(r));
+
   console.log(failures === 0 ? 'HTTP TIMEOUTS OK' : 'HTTP TIMEOUTS FAILURES ' + failures);
   process.exit(failures === 0 ? 0 : 1);
 })();

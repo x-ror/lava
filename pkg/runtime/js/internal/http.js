@@ -277,11 +277,6 @@
     this._chunked = false; // emitting Transfer-Encoding: chunked (streamed, unknown length)
     this.finished = false;
     this._headers = {}; // lowercased key -> { name, value }
-    // Cached presence flags — _buildHead used to call hasHeader (toLowerCase) twice per
-    // response for Content-Length / Connection / Transfer-Encoding on the hello path.
-    this._hasContentLength = false;
-    this._hasConnection = false;
-    this._hasTransferEncoding = false;
     // A response to a HEAD request carries headers (incl. Content-Length) but NO body
     // (RFC 7230 §3.3.2). Suppress body writes while keeping the framing.
     this._isHead = method === 'HEAD';
@@ -299,15 +294,16 @@
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
 
+  // Keys in _headers are always lowercased; hot paths use fixed keys (no toLowerCase).
+  function headerPresent(res, lowKey) {
+    return Object.prototype.hasOwnProperty.call(res._headers, lowKey);
+  }
+
   ServerResponse.prototype.setHeader = function (name, value) {
     checkHeaderName(name);
     var v = String(value);
     checkInvalidChar(v, 'header content [' + name + ']');
-    var low = name.toLowerCase();
-    this._headers[low] = { name: name, value: v };
-    if (low === 'content-length') this._hasContentLength = true;
-    else if (low === 'connection') this._hasConnection = true;
-    else if (low === 'transfer-encoding') this._hasTransferEncoding = true;
+    this._headers[name.toLowerCase()] = { name: name, value: v };
     return this;
   };
   ServerResponse.prototype.getHeader = function (name) {
@@ -315,18 +311,10 @@
     return h ? h.value : undefined;
   };
   ServerResponse.prototype.removeHeader = function (name) {
-    var low = String(name).toLowerCase();
-    delete this._headers[low];
-    if (low === 'content-length') this._hasContentLength = false;
-    else if (low === 'connection') this._hasConnection = false;
-    else if (low === 'transfer-encoding') this._hasTransferEncoding = false;
+    delete this._headers[String(name).toLowerCase()];
   };
   ServerResponse.prototype.hasHeader = function (name) {
-    var low = String(name).toLowerCase();
-    if (low === 'content-length') return this._hasContentLength;
-    if (low === 'connection') return this._hasConnection;
-    if (low === 'transfer-encoding') return this._hasTransferEncoding;
-    return Object.prototype.hasOwnProperty.call(this._headers, low);
+    return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase());
   };
 
   ServerResponse.prototype.writeHead = function (statusCode, statusMessage, headers) {
@@ -364,12 +352,12 @@
     // we must close. A handler-set "Connection: close" also wins.
     var selfDelimited =
       this._chunked ||
-      this._hasContentLength ||
+      headerPresent(this, 'content-length') ||
       this._isHead ||
       statusHasNoBody(this.statusCode);
     if (!selfDelimited) this._keepAlive = false;
-    if (this._hasConnection) {
-      if (/\bclose\b/i.test(this.getHeader('connection'))) this._keepAlive = false;
+    if (headerPresent(this, 'connection')) {
+      if (/\bclose\b/i.test(this._headers['connection'].value)) this._keepAlive = false;
     } else {
       head += this._keepAlive ? CONN_KEEP_ALIVE : CONN_CLOSE;
     }
@@ -407,13 +395,13 @@
       if (
         !noBody &&
         this._allowChunked &&
-        !this._hasContentLength &&
-        !this._hasTransferEncoding
+        !headerPresent(this, 'content-length') &&
+        !headerPresent(this, 'transfer-encoding')
       ) {
         this._chunked = true;
         this.setHeader('Transfer-Encoding', 'chunked');
-      } else if (this._allowChunked && this._hasTransferEncoding) {
-        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
+      } else if (this._allowChunked && headerPresent(this, 'transfer-encoding')) {
+        this._chunked = /\bchunked\b/i.test(this._headers['transfer-encoding'].value);
       }
       this._flushHead();
     }
@@ -445,11 +433,11 @@
     if (!this.headersSent) {
       // No prior write() → we know the full length here, so frame with Content-Length
       // (unless a no-body status, or the caller already chose Transfer-Encoding).
-      if (!this._hasContentLength && !this._hasTransferEncoding && !noBody) {
+      if (!headerPresent(this, 'content-length') && !headerPresent(this, 'transfer-encoding') && !noBody) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
-      if (this._allowChunked && this._hasTransferEncoding) {
-        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
+      if (this._allowChunked && headerPresent(this, 'transfer-encoding')) {
+        this._chunked = /\bchunked\b/i.test(this._headers['transfer-encoding'].value);
       }
       // Fast path: emit the head and a known, non-chunked body in ONE socket write (one
       // send() instead of two — the response write path was ~33% of CPU on a hello-world
@@ -744,45 +732,43 @@
         bodyRemaining = parseInt(clStr, 10);
       }
 
-      // Capture this request for the deferred body/'end' delivery — keep-alive may
-      // reset `req` before the nextTick runs if the response finishes synchronously.
+      // Capture this request for deferred body/'end' delivery — keep-alive may reset
+      // the outer `req` before nextTick if the response finishes synchronously.
       var thisReq = req;
-      // Entity body present only if chunked or Content-Length > 0 (CL:0 is bodyless).
+      // Entity body only if chunked or Content-Length > 0 (CL:0 is bodyless).
       var hasEntityBody = chunkedDecode !== null || bodyRemaining > 0;
 
+      // BODYLESS (hello-world / GET keep-alive hot path): mark the request fully
+      // received *before* emit('request') so a synchronous res.end() can maybeAdvance
+      // immediately. Previously bodyDone only flipped in nextTick, so every keep-alive
+      // round-trip paid an extra event-loop turn before the next request. clearReqTimers
+      // must run here too — requestTimeout bounds *receive* time, not handler time
+      // (Node parity; without it a slow bodyless handler falsely 408s).
+      //
+      // 'end' / entity body bytes still deliver on nextTick so handlers that attach
+      // listeners there still observe them. Pipelined leftover stays in `pending`.
       if (!hasEntityBody) {
-        // BODYLESS (the hello-world / GET keep-alive hot path): mark the request body
-        // complete *before* emitting 'request' so a synchronous res.end() can call
-        // maybeAdvance() immediately. Previously bodyDone only flipped in a nextTick,
-        // so every keep-alive round-trip paid an extra event-loop turn before the
-        // connection could parse a pipelined or sequential next request — the residual
-        // dispatch cost after the C-API/timer work was removed.
-        //
-        // 'end' still fires on nextTick so handlers that attach listeners there (or in
-        // the request callback after returning) still observe it. leftover bytes from
-        // the same read (pipelined next head) sit in `pending` for maybeAdvance.
         bodyDone = true;
         pending = bodyStart.length ? bodyStart : EMPTY_BUF;
-        server.emit('request', req, res);
-        process.nextTick(function () {
-          if (closed) return;
+        clearReqTimers();
+      }
+
+      server.emit('request', req, res);
+      process.nextTick(function () {
+        if (closed) return;
+        if (!hasEntityBody) {
           if (thisReq && !thisReq._ended) {
             thisReq._ended = true;
             thisReq.complete = true;
             thisReq.emit('end');
           }
-          maybeAdvance(); // covers res finishing before this tick
-        });
-      } else {
-        server.emit('request', req, res);
-        // Deliver body bytes from the head's read on the NEXT tick, so a handler that
-        // attaches 'data'/'end' in process.nextTick still sees them.
-        process.nextTick(function () {
-          if (closed) return;
-          if (chunkedDecode) chunkedDecode(bodyStart);
-          else feedBody(bodyStart);
-        });
-      }
+          maybeAdvance(); // res may have finished before this tick
+        } else if (chunkedDecode) {
+          chunkedDecode(bodyStart);
+        } else {
+          feedBody(bodyStart);
+        }
+      });
     }
 
     socket.on('data', function (chunk) {
