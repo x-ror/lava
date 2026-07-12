@@ -1,0 +1,4 @@
+description = "Finder: duplicate logic vs canonical helpers"
+instructions_file = ".grok/skills/multi-review/angles/finder-reuse.md"
+reasoning_effort = "medium"
+default_capability_mode = "execute"

@@ -1,0 +1,4 @@
+description = "Angle D: Odin/JS/JSC language footguns"
+instructions_file = ".grok/skills/multi-review/angles/d-language.md"
+reasoning_effort = "high"
+default_capability_mode = "read-only"

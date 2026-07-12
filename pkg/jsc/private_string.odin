@@ -233,11 +233,16 @@ when ODIN_OS == .Linux {
 	@(private = "file")
 	ensure_value_reads :: proc(ctx: JSContextRef) {
 		if g_val_checked do return
-		g_val_checked = true
-		if !g_read_ok do return // needs the probed StringImpl layout
+		// Need StringImpl layout from ensure_resolved → probe_read_layout first.
+		ensure_resolved()
+		if !g_read_ok {
+			// Permanent: write path ABI failed. Soft: not yet resolved — retry later.
+			if g_checked do g_val_checked = true
+			return
+		}
 
 		str8, d8, ok8 := string_alloc8(3)
-		if !ok8 do return
+		if !ok8 do return // transient; leave g_val_checked false
 		defer JSStringRelease(str8)
 		d8[0] = 'q'
 		d8[1] = 'r'
@@ -249,7 +254,10 @@ when ODIN_OS == .Linux {
 		// unrooted cell cannot be collected under us.)
 		v := JSValueMakeString(ctx, str8)
 		p := uintptr(v)
-		if p == 0 || (u64(p) & VALUE_NOT_CELL_MASK) != 0 do return
+		if p == 0 || (u64(p) & VALUE_NOT_CELL_MASK) != 0 {
+			g_val_checked = true // layout/value shape wrong
+			return
+		}
 		ty := (^u8)(p + JSCELL_TYPE_OFFSET)^
 		off: uintptr
 		found := false
@@ -260,24 +268,33 @@ when ODIN_OS == .Linux {
 				break
 			}
 		}
-		if !found do return
+		if !found {
+			g_val_checked = true
+			return
+		}
 
 		// Cross-check on a 16-bit string.
 		str16, d16, ok16 := string_alloc16(2)
-		if !ok16 do return
+		if !ok16 do return // transient
 		defer JSStringRelease(str16)
 		d16[0] = 0x4F60
 		d16[1] = 0x0021
 		impl16 := (^rawptr)(uintptr(str16) + OPAQUE_STRING_IMPL_OFFSET)^
 		v16 := JSValueMakeString(ctx, str16)
 		p16 := uintptr(v16)
-		if p16 == 0 || (u64(p16) & VALUE_NOT_CELL_MASK) != 0 do return
-		if (^u8)(p16 + JSCELL_TYPE_OFFSET)^ != ty do return
-		if (^rawptr)(p16 + off)^ != impl16 do return
+		if p16 == 0 || (u64(p16) & VALUE_NOT_CELL_MASK) != 0 {
+			g_val_checked = true
+			return
+		}
+		if (^u8)(p16 + JSCELL_TYPE_OFFSET)^ != ty || (^rawptr)(p16 + off)^ != impl16 {
+			g_val_checked = true
+			return
+		}
 
 		g_string_type = ty
 		g_fiber_off = off
 		g_val_ok = true
+		g_val_checked = true
 	}
 
 	// value_string_impl resolves a JS value directly to its flat StringImpl, or
@@ -356,6 +373,8 @@ when ODIN_OS == .Linux {
 
 	// string_alloc8 allocates an n-character 8-bit (Latin-1) JSC string and
 	// returns its uninitialized storage. Each byte is one character U+0000..U+00FF.
+	// Transient create/tryCreate failures return ok=false for this call only —
+	// g_ok is latched false only by ensure_resolved's self-test (ABI mismatch).
 	string_alloc8 :: proc(n: int) -> (str: JSStringRef, data: []byte, ok: bool) {
 		ensure_resolved()
 		if !g_ok || n <= 0 do return nil, nil, false
@@ -364,7 +383,6 @@ when ODIN_OS == .Linux {
 		span: Wtf_Span8
 		g_create8(&impl, c.size_t(n), &span)
 		if impl == nil || span.data == nil || int(span.size) != n {
-			g_ok = false
 			return nil, nil, false
 		}
 
@@ -372,10 +390,7 @@ when ODIN_OS == .Linux {
 		moved := impl
 		g_try_create(&s, &moved)
 		if s == nil {
-			// Cannot deref the orphaned StringImpl without more private ABI;
-			// this path is unreachable for a non-nil impl, and disabling the
-			// fast path bounds the leak to once per process.
-			g_ok = false
+			// Orphaned StringImpl (no public deref); rare. Fail this call only.
 			return nil, nil, false
 		}
 		return JSStringRef(s), span.data[:n], true
@@ -391,7 +406,6 @@ when ODIN_OS == .Linux {
 		span: Wtf_Span16
 		g_create16(&impl, c.size_t(n), &span)
 		if impl == nil || span.data == nil || int(span.size) != n {
-			g_ok = false
 			return nil, nil, false
 		}
 
@@ -399,7 +413,6 @@ when ODIN_OS == .Linux {
 		moved := impl
 		g_try_create(&s, &moved)
 		if s == nil {
-			g_ok = false
 			return nil, nil, false
 		}
 		return JSStringRef(s), span.data[:n], true
