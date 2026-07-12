@@ -1,15 +1,15 @@
-// node:http — minimal HTTP/1.1 SERVER (M2), modeled on Node's http.Server /
-// IncomingMessage / ServerResponse. Built on node:net (the TCP layer) with the request
-// HEAD parsed by the native picohttpparser bridge (http.odin parseRequest). M2 scope:
-// parse the head, emit 'request' with method/url/headers and a Content-Length request
-// body, and write a response with writeHead/write/end. A streamed response (write()
-// before end(), unknown length) is sent with Transfer-Encoding: chunked; end(body) with
-// a known length uses Content-Length. Keep-alive is supported: a connection is reused
-// for subsequent requests (HTTP/1.1 default; HTTP/1.0 with Connection: keep-alive) when
-// the response is self-delimiting, and closed otherwise. Chunked request bodies are
-// decoded. Slowloris/idle defenses bound time-to-headers, time-to-full-request, and idle
-// keep-alive gaps (server.headersTimeout / requestTimeout / keepAliveTimeout). There is
-// no client (http.request/get) yet — that is a later milestone.
+/**
+ * node:http — minimal HTTP/1.1 server (M2).
+ *
+ * Built on node:net with request heads parsed by the native picohttpparser bridge
+ * (`native.parseRequest`). Supports keep-alive, chunked request/response bodies,
+ * and slowloris/idle timeouts. No client API yet.
+ *
+ * @param {Function} require
+ * @param {{ exports: object }} module
+ * @param {object} exports
+ * @param {{ parseRequest: Function, latin1WriteInto?: Function }} native
+ */
 (function (require, module, exports, native) {
   'use strict';
 
@@ -20,17 +20,13 @@
   var EventEmitter = require('events');
   var Buffer = require('buffer').Buffer;
   var net = require('net');
-  // Pristine intrinsics (captured before any user code) for serializing the response head:
-  // the hot path must not route bytes through public Buffer/Uint8Array methods, which a
-  // script can override (prototype pollution) to corrupt the head or — via a lying
-  // allocUnsafe — leak uninitialized memory past the body. See writeLatin1Into / headBytes.
-  var P = require('primordials');
-  // Native latin1 write-into (same Odin path as Buffer.write): feature-detected so an
-  // older build still uses the pure-JS loop below.
+  /** Pristine intrinsics — response head must not use overridable Buffer methods. */
+  var primordials = require('primordials');
   var nativeLatin1WriteInto =
     typeof native.latin1WriteInto === 'function' ? native.latin1WriteInto : null;
 
-  var MAX_HEAD = 64 * 1024; // reject a request head larger than this (431)
+  /** @const {number} Max request-head size before 431. */
+  var MAX_HEAD_BYTES = 64 * 1024;
 
   var STATUS_CODES = {
     200: 'OK',
@@ -56,267 +52,334 @@
     503: 'Service Unavailable',
   };
 
-  // buildHeaders folds the [.., name, value, ...] pairs of a parseRequest result
-  // (starting at index `start`) into Node's req.headers object. Names arrive in
-  // their received case (req.rawHeaders preserves it) and are lowercased here for
-  // the keys. Duplicates join with ', ' (Node's behavior for most headers;
-  // set-cookie's array form is out of M2 scope).
-  function buildHeaders(arr, start) {
-    // Null prototype: a header literally named "constructor"/"hasOwnProperty"/etc. must
-    // not collide with Object.prototype (which would corrupt the duplicate-merge check).
+  /**
+   * Fold `[name, value, ...]` pairs into a null-prototype headers object.
+   * Names are lowercased; duplicates join with `', '` (Node for most headers).
+   *
+   * @param {Array} parseResult flat parseRequest array
+   * @param {number} headerStart index of first name/value pair
+   * @returns {Object<string, string>}
+   */
+  function buildHeaders(parseResult, headerStart) {
     var headers = Object.create(null);
-    for (var i = start; i + 1 < arr.length; i += 2) {
-      var k = arr[i].toLowerCase();
-      var v = arr[i + 1];
-      if (headers[k] === undefined) headers[k] = v;
-      else headers[k] += ', ' + v;
+    for (var i = headerStart; i + 1 < parseResult.length; i += 2) {
+      var lowerName = parseResult[i].toLowerCase();
+      var value = parseResult[i + 1];
+      if (headers[lowerName] === undefined) headers[lowerName] = value;
+      else headers[lowerName] += ', ' + value;
     }
     return headers;
   }
 
-  // RFC 7230 token (header field-name) and the CR/LF guard for field-values / the status
-  // reason. Reject invalid input rather than concatenating it into the response head —
-  // a value containing CRLF would otherwise split the response (header injection).
-  var TOKEN_RE = /^[\^_`a-zA-Z0-9!#$%&'*+\-.|~]+$/;
-  // A field-value/reason char outside this set is rejected. Crucially this also bans code
-  // points > 0xFF: _flushHead serializes with Buffer.from(head, 'latin1'), which masks
-  // each char to one byte, so e.g. č/Ċ would become CR/LF and reintroduce
-  // response splitting past a naive /[\r\n]/ check. Mirrors Node's checkInvalidHeaderChar
-  // (allow HT, printable ASCII, and the latin1 high range 0x80-0xFF).
-  var INVALID_HEADER_CHAR_RE = /[^\t\x20-\x7e\x80-\xff]/;
-  function checkHeaderName(name) {
-    if (typeof name !== 'string' || name.length === 0 || !TOKEN_RE.test(name)) {
-      var e = new TypeError(
+  /**
+   * RFC 7230 tchar bitmap for field-names (setHeader + chunked trailers).
+   * @type {Uint8Array}
+   */
+  var HTTP_TCHAR = new Uint8Array(128);
+  (function initHttpTchar() {
+    var chars = "!#$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz|~";
+    for (var i = 0; i < chars.length; i++) HTTP_TCHAR[chars.charCodeAt(i)] = 1;
+  })();
+
+  /**
+   * @param {string} value
+   * @returns {boolean}
+   */
+  function isHttpToken(value) {
+    if (typeof value !== 'string' || value.length === 0) return false;
+    for (var i = 0; i < value.length; i++) {
+      var code = value.charCodeAt(i);
+      if (code >= 128 || !HTTP_TCHAR[code]) return false;
+    }
+    return true;
+  }
+
+  /**
+   * @param {*} name
+   * @throws {TypeError} ERR_INVALID_HTTP_TOKEN
+   */
+  function assertHeaderName(name) {
+    if (!isHttpToken(name)) {
+      var err = new TypeError(
         'Header name must be a valid HTTP token [' + JSON.stringify(name) + ']',
       );
-      e.code = 'ERR_INVALID_HTTP_TOKEN';
-      throw e;
-    }
-  }
-  function checkInvalidChar(value, what) {
-    if (INVALID_HEADER_CHAR_RE.test(value)) {
-      var e = new TypeError('Invalid character in ' + what);
-      e.code = 'ERR_INVALID_CHAR';
-      throw e;
+      err.code = 'ERR_INVALID_HTTP_TOKEN';
+      throw err;
     }
   }
 
-  // 204/304 and 1xx carry no message body (RFC 7230 §3.3.2); HEAD responses also omit
-  // the body (but keep Content-Length).
-  function statusHasNoBody(code) {
-    return code === 204 || code === 304 || (code >= 100 && code < 200);
-  }
-  function validateStatusCode(code) {
-    var n = Number(code);
-    if (!Number.isInteger(n) || n < 100 || n > 999) {
-      var e = new RangeError('Invalid status code: ' + JSON.stringify(code));
-      e.code = 'ERR_HTTP_INVALID_STATUS_CODE';
-      throw e;
+  /**
+   * Reject CTL (except HT) and code points above 0xFF (latin1 serialization would mask).
+   *
+   * @param {string} value
+   * @param {string} what label for the error message
+   * @throws {TypeError} ERR_INVALID_CHAR
+   */
+  function assertValidHeaderChar(value, what) {
+    for (var i = 0; i < value.length; i++) {
+      var code = value.charCodeAt(i);
+      if (code === 9 || (code >= 0x20 && code <= 0x7e) || (code >= 0x80 && code <= 0xff)) {
+        continue;
+      }
+      var err = new TypeError('Invalid character in ' + what);
+      err.code = 'ERR_INVALID_CHAR';
+      throw err;
     }
-    return n;
   }
 
-  // Frame a body chunk for Transfer-Encoding: chunked — "<hex-length>\r\n<data>\r\n".
-  // A zero-length chunk is never framed (the caller skips empty writes); the terminating
-  // "0\r\n\r\n" is written explicitly by end().
+  /**
+   * @param {number} statusCode
+   * @returns {boolean}
+   */
+  function statusHasNoBody(statusCode) {
+    return statusCode === 204 || statusCode === 304 || (statusCode >= 100 && statusCode < 200);
+  }
+
+  /**
+   * @param {*} statusCode
+   * @returns {number}
+   * @throws {RangeError} ERR_HTTP_INVALID_STATUS_CODE
+   */
+  function validateStatusCode(statusCode) {
+    var code = Number(statusCode);
+    if (!Number.isInteger(code) || code < 100 || code > 999) {
+      var err = new RangeError('Invalid status code: ' + JSON.stringify(statusCode));
+      err.code = 'ERR_HTTP_INVALID_STATUS_CODE';
+      throw err;
+    }
+    return code;
+  }
+
   var CRLF = Buffer.from('\r\n', 'latin1');
   var LAST_CHUNK = Buffer.from('0\r\n\r\n', 'latin1');
-  // Upper bound for coalescing the response head with end()'s body into a single write: a
-  // small body is concatenated to the head (one send() instead of two), but a large one is
-  // written separately so we don't memcpy a big payload just to save one syscall.
-  var HEAD_COALESCE_MAX = 64 * 1024;
+  /** Max combined head+body size for single-write coalesce. */
+  var HEAD_BODY_COALESCE_MAX = 64 * 1024;
 
-  // writeLatin1Into writes `str`'s latin1 bytes into `dst` starting at `offset`. Prefers
-  // the native codec (GetCharactersPtr + memcpy-class loop) when available; otherwise
-  // pristine charCodeAt stores (not overridable Buffer methods). Masking matches
-  // Buffer.from(str, 'latin1') for code points > 0xFF.
-  function writeLatin1Into(dst, str, offset) {
+  /**
+   * Write `text` as latin1 into `destination` at `offset`.
+   *
+   * @param {Uint8Array} destination
+   * @param {string} text
+   * @param {number} offset
+   */
+  function writeLatin1Into(destination, text, offset) {
     if (nativeLatin1WriteInto !== null) {
-      nativeLatin1WriteInto(dst, str, offset, str.length);
+      nativeLatin1WriteInto(destination, text, offset, text.length);
       return;
     }
-    for (var i = 0; i < str.length; i++) {
-      dst[offset + i] = P.StringPrototypeCharCodeAt(str, i) & 0xff;
+    for (var i = 0; i < text.length; i++) {
+      destination[offset + i] = primordials.StringPrototypeCharCodeAt(text, i) & 0xff;
     }
   }
-  // headBytes serializes a latin1 head string into a fresh, pristine, zero-filled Uint8Array
-  // (the pristine constructor honors the exact length, and the bytes are fully overwritten —
-  // no overridable allocator, no uninitialized-memory disclosure).
-  function headBytes(str) {
-    var out = new P.Uint8Array(str.length);
-    writeLatin1Into(out, str, 0);
-    return out;
-  }
-  function chunkFrame(buf) {
-    return Buffer.concat([Buffer.from(buf.length.toString(16) + '\r\n', 'latin1'), buf, CRLF]);
+
+  /**
+   * @param {string} headText latin1 head string
+   * @returns {Uint8Array}
+   */
+  function encodeHeadBytes(headText) {
+    var bytes = new primordials.Uint8Array(headText.length);
+    writeLatin1Into(bytes, headText, 0);
+    return bytes;
   }
 
-  // Incremental decoder for a Transfer-Encoding: chunked REQUEST body (untrusted input).
-  // feed(bytes) emits decoded data to req via 'data' and, after the terminating zero-length
-  // chunk (+ optional trailers), calls onEnd(leftover) with any bytes past the body (the
-  // next pipelined request, for keep-alive). onError() is called on malformed framing.
-  // Hardened: the chunk-size line is length-bounded, a non-hex / unsafe / whitespace-laden
-  // size is rejected, and data is sliced out incrementally so a huge declared size never
-  // allocates.
-  var MAX_CHUNK_SIZE_LINE = 64 * 1024;
-  function makeChunkedDecoder(req, onError, onEnd) {
-    var buf = Buffer.alloc(0);
-    var state = 'size'; // 'size' | 'data' | 'dataCRLF' | 'trailer'
-    var remaining = 0;
-    var done = false;
+  /**
+   * @param {Buffer|Uint8Array} bodyChunk
+   * @returns {Buffer}
+   */
+  function frameChunkedBody(bodyChunk) {
+    return Buffer.concat([
+      Buffer.from(bodyChunk.length.toString(16) + '\r\n', 'latin1'),
+      bodyChunk,
+      CRLF,
+    ]);
+  }
 
-    function bad() {
-      done = true;
+  /** @const {number} Max chunk-size / trailer line length. */
+  var MAX_CHUNK_LINE_BYTES = 64 * 1024;
+
+  /**
+   * Incremental Transfer-Encoding: chunked request-body decoder.
+   *
+   * @param {IncomingMessage} request
+   * @param {function(): void} onError
+   * @param {function(Buffer): void} onComplete leftover bytes after the body
+   * @returns {function(Buffer|undefined): void} feed
+   */
+  function createChunkedDecoder(request, onError, onComplete) {
+    var buffer = Buffer.alloc(0);
+    var state = 'size';
+    var bytesRemaining = 0;
+    var finished = false;
+
+    function fail() {
+      finished = true;
       onError();
     }
 
     return function feed(incoming) {
-      if (done) return;
-      if (incoming && incoming.length) buf = buf.length ? Buffer.concat([buf, incoming]) : incoming;
+      if (finished) return;
+      if (incoming && incoming.length) {
+        buffer = buffer.length ? Buffer.concat([buffer, incoming]) : incoming;
+      }
       for (;;) {
         if (state === 'size') {
-          var nl = buf.indexOf('\r\n');
-          if (nl < 0) {
-            if (buf.length > MAX_CHUNK_SIZE_LINE) bad();
+          var lineEnd = buffer.indexOf('\r\n');
+          if (lineEnd < 0) {
+            if (buffer.length > MAX_CHUNK_LINE_BYTES) fail();
             return;
           }
-          if (nl > MAX_CHUNK_SIZE_LINE) return bad(); // over-long size line, even with CRLF
-          var line = buf.toString('latin1', 0, nl);
-          // Strict chunk-size grammar: chunk-size = 1*HEXDIG (no surrounding whitespace),
-          // optionally followed by ";" chunk-ext. A lenient parser that accepts "5 ",
-          // " 5", or "5;" (empty ext) could disagree with a frontend proxy on the body
-          // boundary — a smuggling surface — so reject those (Node does too).
-          var semi = line.indexOf(';');
-          var sizePart = semi >= 0 ? line.slice(0, semi) : line;
-          if (!/^[0-9a-fA-F]+$/.test(sizePart)) return bad();
-          if (semi >= 0 && !/^;[^\s;]/.test(line.slice(semi))) return bad(); // ext must start with a token char
-          var size = parseInt(sizePart, 16);
-          if (!Number.isSafeInteger(size) || size < 0) return bad();
-          buf = buf.slice(nl + 2);
-          if (size === 0) state = 'trailer';
+          if (lineEnd > MAX_CHUNK_LINE_BYTES) return fail();
+          var sizeLine = buffer.toString('latin1', 0, lineEnd);
+          var extensionSep = sizeLine.indexOf(';');
+          var sizeToken = extensionSep >= 0 ? sizeLine.slice(0, extensionSep) : sizeLine;
+          if (!/^[0-9a-fA-F]+$/.test(sizeToken)) return fail();
+          if (extensionSep >= 0 && !/^;[^\s;]/.test(sizeLine.slice(extensionSep))) return fail();
+          var chunkSize = parseInt(sizeToken, 16);
+          if (!Number.isSafeInteger(chunkSize) || chunkSize < 0) return fail();
+          buffer = buffer.slice(lineEnd + 2);
+          if (chunkSize === 0) state = 'trailer';
           else {
-            remaining = size;
+            bytesRemaining = chunkSize;
             state = 'data';
           }
         } else if (state === 'data') {
-          if (buf.length === 0) return;
-          var take = buf.length < remaining ? buf.length : remaining;
-          req.emit('data', buf.slice(0, take));
-          buf = buf.slice(take);
-          remaining -= take;
-          if (remaining === 0) state = 'dataCRLF';
+          if (buffer.length === 0) return;
+          var take = buffer.length < bytesRemaining ? buffer.length : bytesRemaining;
+          request.emit('data', buffer.slice(0, take));
+          buffer = buffer.slice(take);
+          bytesRemaining -= take;
+          if (bytesRemaining === 0) state = 'dataCRLF';
         } else if (state === 'dataCRLF') {
-          if (buf.length < 2) return;
-          if (buf[0] !== 13 || buf[1] !== 10) return bad(); // chunk must end in CRLF
-          buf = buf.slice(2);
+          if (buffer.length < 2) return;
+          if (buffer[0] !== 13 || buffer[1] !== 10) return fail();
+          buffer = buffer.slice(2);
           state = 'size';
         } else {
-          // 'trailer': optional trailer header lines, then a blank line (CRLF) ends the body.
-          if (buf.length < 2) return;
-          if (buf[0] === 13 && buf[1] === 10) {
-            buf = buf.slice(2);
-            done = true;
-            return onEnd(buf); // body complete; hand back any pipelined leftover
+          if (buffer.length < 2) return;
+          if (buffer[0] === 13 && buffer[1] === 10) {
+            buffer = buffer.slice(2);
+            finished = true;
+            return onComplete(buffer);
           }
-          var tnl = buf.indexOf('\r\n');
-          if (tnl < 0) {
-            if (buf.length > MAX_CHUNK_SIZE_LINE) bad();
+          var trailerEnd = buffer.indexOf('\r\n');
+          if (trailerEnd < 0) {
+            if (buffer.length > MAX_CHUNK_LINE_BYTES) fail();
             return;
           }
-          if (tnl > MAX_CHUNK_SIZE_LINE) return bad();
-          // A trailer must be a well-formed header field ("token: value"); reject garbage
-          // like "0\r\nBadTrailer\r\n\r\n" instead of treating it as a valid end-of-body.
-          var tline = buf.toString('latin1', 0, tnl);
-          var tc = tline.indexOf(':');
-          if (tc <= 0 || !TOKEN_RE.test(tline.slice(0, tc))) return bad();
-          buf = buf.slice(tnl + 2); // drop the (valid) trailer line; loop for the next / blank line
+          if (trailerEnd > MAX_CHUNK_LINE_BYTES) return fail();
+          var trailerLine = buffer.toString('latin1', 0, trailerEnd);
+          var colon = trailerLine.indexOf(':');
+          if (colon <= 0 || !isHttpToken(trailerLine.slice(0, colon))) return fail();
+          buffer = buffer.slice(trailerEnd + 2);
         }
       }
     };
   }
 
-  // Layout of the flat parseRequest result array (mirrors PARSE_* / the vals[]
-  // order in http.odin — keep in sync): [state, consumed, method, url, minor,
-  // name, value, ...]. state: 0 complete, 1 partial, 2 error.
-  var P_STATE = 0;
-  var P_CONSUMED = 1;
-  var P_METHOD = 2;
-  var P_URL = 3;
-  var P_MINOR = 4;
-  var P_HEADERS = 5;
-  var PARSE_COMPLETE = 0;
-  var PARSE_PARTIAL = 1;
+  // Flat parseRequest layout (mirrors http.odin PARSE_* / vals[]):
+  // [state, consumed, method, url, minor, name, value, ...]
+  var PARSE_STATE = 0;
+  var PARSE_CONSUMED = 1;
+  var PARSE_METHOD = 2;
+  var PARSE_URL = 3;
+  var PARSE_MINOR = 4;
+  var PARSE_HEADERS = 5;
+  var PARSE_OK = 0;
+  var PARSE_NEED_MORE = 1;
 
-  function IncomingMessage(socket, parsed) {
+  /**
+   * @param {net.Socket} socket
+   * @param {Array} parseResult
+   * @constructor
+   */
+  function IncomingMessage(socket, parseResult) {
     EventEmitter.call(this);
     this.socket = socket;
-    this.method = parsed[P_METHOD];
-    this.url = parsed[P_URL];
+    this.method = parseResult[PARSE_METHOD];
+    this.url = parseResult[PARSE_URL];
     this.httpVersionMajor = 1;
-    this.httpVersionMinor = parsed[P_MINOR];
-    this.httpVersion = '1.' + parsed[P_MINOR];
-    this.rawHeaders = parsed.slice(P_HEADERS);
-    this.headers = buildHeaders(parsed, P_HEADERS);
+    this.httpVersionMinor = parseResult[PARSE_MINOR];
+    this.httpVersion = '1.' + parseResult[PARSE_MINOR];
+    this.rawHeaders = parseResult.slice(PARSE_HEADERS);
+    this.headers = buildHeaders(parseResult, PARSE_HEADERS);
     this.complete = false;
     this._ended = false;
   }
   IncomingMessage.prototype = Object.create(EventEmitter.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
 
-  // Hot-path constants: avoid rebuilding the common status line / Connection tokens.
   var STATUS_LINE_200 = 'HTTP/1.1 200 OK\r\n';
-  var CONN_KEEP_ALIVE = 'Connection: keep-alive\r\n';
-  var CONN_CLOSE = 'Connection: close\r\n';
+  var CONNECTION_KEEP_ALIVE = 'Connection: keep-alive\r\n';
+  var CONNECTION_CLOSE = 'Connection: close\r\n';
 
+  /**
+   * @param {net.Socket} socket
+   * @param {string} method
+   * @param {number|undefined} httpMinor
+   * @constructor
+   */
   function ServerResponse(socket, method, httpMinor) {
     EventEmitter.call(this);
     this.socket = socket;
     this.statusCode = 200;
     this.statusMessage = undefined;
     this.headersSent = false;
-    this._chunked = false; // emitting Transfer-Encoding: chunked (streamed, unknown length)
+    this._chunked = false;
     this.finished = false;
-    this._headers = {}; // lowercased key -> { name, value }
-    // A response to a HEAD request carries headers (incl. Content-Length) but NO body
-    // (RFC 7230 §3.3.2). Suppress body writes while keeping the framing.
+    /** @type {Object<string, {name: string, value: string}>} lowercased name → entry */
+    this._headers = Object.create(null);
     this._isHead = method === 'HEAD';
-    // HTTP/1.0 has no Transfer-Encoding: chunked — such a client would read the chunk-size
-    // markers as body. For a 1.0 request, stream raw bytes delimited by the connection
-    // close (we already send Connection: close) instead of chunking. Undefined minor
-    // (direct construction) defaults to allowing chunked (HTTP/1.1).
     this._allowChunked = httpMinor === undefined || httpMinor >= 1;
-    // Tentative keep-alive (from the request); _flushHead finalizes it once the response
-    // framing is known (a non-self-delimiting response can't keep-alive). The connection
-    // reads the finalized value after 'finish' to decide whether to reuse the socket.
     this._keepAlive = false;
-    this._onComplete = null; // connection-supplied: called by end() instead of closing
+    /** @type {function(): void|null} connection hook after finish */
+    this._onComplete = null;
   }
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
 
-  // Keys in _headers are always lowercased; hot paths use fixed keys (no toLowerCase).
-  function headerPresent(res, lowKey) {
-    return Object.prototype.hasOwnProperty.call(res._headers, lowKey);
-  }
-
+  /**
+   * @param {string} name
+   * @param {*} value
+   * @returns {ServerResponse}
+   */
   ServerResponse.prototype.setHeader = function (name, value) {
-    checkHeaderName(name);
-    var v = String(value);
-    checkInvalidChar(v, 'header content [' + name + ']');
-    this._headers[name.toLowerCase()] = { name: name, value: v };
+    assertHeaderName(name);
+    var text = String(value);
+    assertValidHeaderChar(text, 'header content [' + name + ']');
+    this._headers[name.toLowerCase()] = { name: name, value: text };
     return this;
   };
+
+  /**
+   * @param {string} name
+   * @returns {string|undefined}
+   */
   ServerResponse.prototype.getHeader = function (name) {
-    var h = this._headers[String(name).toLowerCase()];
-    return h ? h.value : undefined;
+    var entry = this._headers[String(name).toLowerCase()];
+    return entry ? entry.value : undefined;
   };
+
+  /**
+   * @param {string} name
+   */
   ServerResponse.prototype.removeHeader = function (name) {
     delete this._headers[String(name).toLowerCase()];
   };
+
+  /**
+   * @param {string} name
+   * @returns {boolean}
+   */
   ServerResponse.prototype.hasHeader = function (name) {
-    return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase());
+    return this._headers[String(name).toLowerCase()] !== undefined;
   };
 
+  /**
+   * @param {number} statusCode
+   * @param {string|object} [statusMessage]
+   * @param {object} [headers]
+   * @returns {ServerResponse}
+   */
   ServerResponse.prototype.writeHead = function (statusCode, statusMessage, headers) {
     if (typeof statusMessage === 'object' && statusMessage !== null) {
       headers = statusMessage;
@@ -324,47 +387,46 @@
     }
     this.statusCode = validateStatusCode(statusCode);
     if (statusMessage) this.statusMessage = statusMessage;
-    if (headers)
-      for (var k in headers)
-        if (Object.prototype.hasOwnProperty.call(headers, k)) this.setHeader(k, headers[k]);
+    if (headers) {
+      for (var name in headers) {
+        if (Object.prototype.hasOwnProperty.call(headers, name)) {
+          this.setHeader(name, headers[name]);
+        }
+      }
+    }
     return this;
   };
 
-  // _buildHead serializes the status line + headers (finalizing keep-alive) and returns the
-  // head as a latin1 string. It deliberately does NOT set headersSent or write anything:
-  // the caller flips headersSent only immediately before it actually writes, so a throw or
-  // allocation failure between build and write (e.g. coalescing a body) cannot leave the
-  // response falsely marked as sent and poison error recovery / the keep-alive connection.
+  /**
+   * Serialize status line + headers; finalizes `_keepAlive`. Does not write or set headersSent.
+   *
+   * @returns {string} latin1 head text
+   */
   ServerResponse.prototype._buildHead = function () {
-    // Validate the status code at the single serialization chokepoint — it may have been
-    // set via writeHead OR assigned directly (res.statusCode = ...). Rejects a non-integer
-    // / out-of-range / CRLF-bearing status that would otherwise inject into the status line.
-    var code = validateStatusCode(this.statusCode);
-    var reason = this.statusMessage || STATUS_CODES[code] || '';
-    checkInvalidChar(String(reason), 'statusMessage'); // no CRLF in the status line
-    // Common hello-world path: 200 with default reason — skip string concat for the line.
+    var statusCode = validateStatusCode(this.statusCode);
+    var reason = this.statusMessage || STATUS_CODES[statusCode] || '';
+    assertValidHeaderChar(String(reason), 'statusMessage');
     var head =
-      code === 200 && !this.statusMessage
+      statusCode === 200 && !this.statusMessage
         ? STATUS_LINE_200
-        : 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
-    // Finalize keep-alive: only possible if the response is self-delimiting (Content-Length,
-    // chunked, or a no-body status/HEAD) — otherwise the body ends at connection close, so
-    // we must close. A handler-set "Connection: close" also wins.
+        : 'HTTP/1.1 ' + statusCode + ' ' + reason + '\r\n';
+
     var selfDelimited =
       this._chunked ||
-      headerPresent(this, 'content-length') ||
+      this.hasHeader('content-length') ||
       this._isHead ||
       statusHasNoBody(this.statusCode);
     if (!selfDelimited) this._keepAlive = false;
-    if (headerPresent(this, 'connection')) {
-      if (/\bclose\b/i.test(this._headers['connection'].value)) this._keepAlive = false;
+
+    if (this.hasHeader('connection')) {
+      if (/\bclose\b/i.test(this.getHeader('connection'))) this._keepAlive = false;
     } else {
-      head += this._keepAlive ? CONN_KEEP_ALIVE : CONN_CLOSE;
+      head += this._keepAlive ? CONNECTION_KEEP_ALIVE : CONNECTION_CLOSE;
     }
-    for (var key in this._headers) {
-      if (!Object.prototype.hasOwnProperty.call(this._headers, key)) continue;
-      var h = this._headers[key];
-      head += h.name + ': ' + h.value + '\r\n';
+
+    for (var lowerName in this._headers) {
+      var entry = this._headers[lowerName];
+      head += entry.name + ': ' + entry.value + '\r\n';
     }
     head += '\r\n';
     return head;
@@ -372,53 +434,57 @@
 
   ServerResponse.prototype._flushHead = function () {
     if (this.headersSent) return;
-    // Build the head bytes BEFORE flipping headersSent, so a serialization/allocation failure
-    // can't leave the response marked sent with nothing written.
-    var buf = headBytes(this._buildHead());
+    var headBytes = encodeHeadBytes(this._buildHead());
     this.headersSent = true;
-    this.socket.write(buf);
+    this.socket.write(headBytes);
   };
 
-  ServerResponse.prototype.write = function (chunk, encoding, cb) {
+  /**
+   * @param {string|Buffer|Uint8Array} [chunk]
+   * @param {string|function} [encoding]
+   * @param {function} [callback]
+   * @returns {boolean}
+   */
+  ServerResponse.prototype.write = function (chunk, encoding, callback) {
     if (typeof encoding === 'function') {
-      cb = encoding;
+      callback = encoding;
       encoding = undefined;
     }
-    var noBody = this._isHead || statusHasNoBody(this.statusCode);
+    var omitBody = this._isHead || statusHasNoBody(this.statusCode);
     if (!this.headersSent) {
-      // A write() before end() with no explicit length is a streamed body of unknown
-      // size → frame it with Transfer-Encoding: chunked (self-delimiting; also what
-      // keep-alive will need). end(body) without a prior write still uses Content-Length.
-      // No-body responses (HEAD/204/304/1xx) never get a body or chunked framing; neither
-      // does an HTTP/1.0 client (it would mis-read the chunk markers) — it gets raw,
-      // close-delimited bytes.
       if (
-        !noBody &&
+        !omitBody &&
         this._allowChunked &&
-        !headerPresent(this, 'content-length') &&
-        !headerPresent(this, 'transfer-encoding')
+        !this.hasHeader('content-length') &&
+        !this.hasHeader('transfer-encoding')
       ) {
         this._chunked = true;
         this.setHeader('Transfer-Encoding', 'chunked');
-      } else if (this._allowChunked && headerPresent(this, 'transfer-encoding')) {
-        this._chunked = /\bchunked\b/i.test(this._headers['transfer-encoding'].value);
+      } else if (this._allowChunked && this.hasHeader('transfer-encoding')) {
+        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
       this._flushHead();
     }
-    if (!noBody && chunk && chunk.length) {
-      var b = typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk;
-      this.socket.write(this._chunked ? chunkFrame(b) : b);
+    if (!omitBody && chunk && chunk.length) {
+      var bytes = typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk;
+      this.socket.write(this._chunked ? frameChunkedBody(bytes) : bytes);
     }
-    if (typeof cb === 'function') process.nextTick(cb);
+    if (typeof callback === 'function') process.nextTick(callback);
     return true;
   };
 
-  ServerResponse.prototype.end = function (chunk, encoding, cb) {
+  /**
+   * @param {string|Buffer|Uint8Array|function} [chunk]
+   * @param {string|function} [encoding]
+   * @param {function} [callback]
+   * @returns {ServerResponse}
+   */
+  ServerResponse.prototype.end = function (chunk, encoding, callback) {
     if (typeof chunk === 'function') {
-      cb = chunk;
+      callback = chunk;
       chunk = undefined;
     } else if (typeof encoding === 'function') {
-      cb = encoding;
+      callback = encoding;
       encoding = undefined;
     }
     if (this.finished) return this;
@@ -427,407 +493,404 @@
     if (chunk !== undefined && chunk !== null) {
       body = typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk;
     }
-    // 204/304/1xx carry no body and no Content-Length; HEAD keeps Content-Length but
-    // sends no body; everything else frames by the body length.
-    var noBody = this._isHead || statusHasNoBody(this.statusCode);
+    var omitBody = this._isHead || statusHasNoBody(this.statusCode);
     if (!this.headersSent) {
-      // No prior write() → we know the full length here, so frame with Content-Length
-      // (unless a no-body status, or the caller already chose Transfer-Encoding).
-      if (
-        !headerPresent(this, 'content-length') &&
-        !headerPresent(this, 'transfer-encoding') &&
-        !noBody
-      ) {
+      if (!this.hasHeader('content-length') && !this.hasHeader('transfer-encoding') && !omitBody) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
-      if (this._allowChunked && headerPresent(this, 'transfer-encoding')) {
-        this._chunked = /\bchunked\b/i.test(this._headers['transfer-encoding'].value);
+      if (this._allowChunked && this.hasHeader('transfer-encoding')) {
+        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
       }
-      // Fast path: emit the head and a known, non-chunked body in ONE socket write (one
-      // send() instead of two — the response write path was ~33% of CPU on a hello-world
-      // server, half of it the extra syscall). Conditions:
-      //   - body is a Uint8Array/Buffer (so length == byteLength and the copy below is
-      //     byte-exact; anything else takes the separate path unchanged, never the throwing
-      //     concat), and
-      //   - the COMBINED size (head + body) is within the bound — guarding the head too, so
-      //     a large header can't blow up the merged allocation.
-      // headersSent flips only after the buffer is fully built, so a build/alloc failure
-      // can't leave the response falsely marked sent.
-      var head = this._buildHead();
-      var total = head.length + (body ? body.length : 0); // head is latin1: length == bytes
+
+      var headText = this._buildHead();
+      var totalBytes = headText.length + (body ? body.length : 0);
       if (
-        !noBody &&
+        !omitBody &&
         body &&
         body.length &&
-        body instanceof P.Uint8Array &&
+        body instanceof primordials.Uint8Array &&
         !this._chunked &&
-        total <= HEAD_COALESCE_MAX
+        totalBytes <= HEAD_BODY_COALESCE_MAX
       ) {
-        // Build the combined buffer with pristine ops only (zero-filled Uint8Array, captured
-        // charCodeAt, uncurried set) and fully overwrite all `total` bytes, so a polluted
-        // Buffer.allocUnsafe/write/set can neither corrupt the head nor leak uninitialized
-        // bytes past the body. Then flip headersSent immediately before the write.
-        var out = new P.Uint8Array(total);
-        writeLatin1Into(out, head, 0);
-        P.Uint8ArrayPrototypeSet(out, body, head.length);
+        var combined = new primordials.Uint8Array(totalBytes);
+        writeLatin1Into(combined, headText, 0);
+        primordials.Uint8ArrayPrototypeSet(combined, body, headText.length);
         this.headersSent = true;
-        this.socket.write(out);
-        body = null; // written with the head
+        this.socket.write(combined);
+        body = null;
       } else {
-        var hb = headBytes(head);
         this.headersSent = true;
-        this.socket.write(hb);
+        this.socket.write(encodeHeadBytes(headText));
       }
     }
-    if (!noBody && body && body.length) {
-      this.socket.write(this._chunked ? chunkFrame(body) : body);
+    if (!omitBody && body && body.length) {
+      this.socket.write(this._chunked ? frameChunkedBody(body) : body);
     }
-    // Terminate a chunked body with the zero-length last chunk.
-    if (this._chunked && !noBody) this.socket.write(LAST_CHUNK);
+    if (this._chunked && !omitBody) this.socket.write(LAST_CHUNK);
     this.finished = true;
-    if (typeof cb === 'function') process.nextTick(cb);
+    if (typeof callback === 'function') process.nextTick(callback);
     this.emit('finish');
-    // The connection decides what happens next (reuse the socket on keep-alive, or close);
-    // a directly-constructed response with no connection falls back to closing.
     if (this._onComplete) this._onComplete();
     else this.socket.end();
     return this;
   };
 
-  function shouldKeepAlive(req) {
-    var conn = (req.headers['connection'] || '').toLowerCase();
-    // HTTP/1.1 defaults to keep-alive (unless "close"); HTTP/1.0 defaults to close
-    // (unless "keep-alive"). _flushHead further forces close for a non-self-delimiting
-    // response.
-    if (req.httpVersionMinor >= 1) return !/\bclose\b/.test(conn);
-    return /\bkeep-alive\b/.test(conn);
+  /**
+   * @param {number} httpMinor
+   * @param {string|undefined} connectionHeader
+   * @returns {boolean}
+   */
+  function shouldKeepAlive(httpMinor, connectionHeader) {
+    var connection = (connectionHeader || '').toLowerCase();
+    if (httpMinor >= 1) return !/\bclose\b/.test(connection);
+    return /\bkeep-alive\b/.test(connection);
   }
 
-  // Per-connection request loop: parse a head, emit 'request', feed the body, and — once
-  // BOTH the body is fully consumed and the response is finished — either reuse the socket
-  // for the next request (keep-alive) or close it. Leftover bytes past a body (a pipelined
-  // next request) are carried in `pending`.
-  // Shared empty buffer for the between-requests / no-body states — never written, so one
-  // instance serves every connection (Buffer.alloc(0) per request showed up in profiles).
-  var EMPTY_BUF = Buffer.alloc(0);
+  var EMPTY_BUFFER = Buffer.alloc(0);
+  var DEADLINE_SWEEP_MS = 100;
 
-  // --- connection-timeout sweeper -------------------------------------------------------
-  // One interval per server walks the live connections' deadline records. Started with the
-  // first connection, stopped with the last, so an idle server schedules nothing.
-  var SWEEP_MS = 100;
-  function sweepRegister(server, st) {
-    var s = server._connSweep || (server._connSweep = { set: new Set(), timer: null });
-    s.set.add(st);
-    if (s.timer === null) {
-      s.timer = setInterval(function () {
-        sweepTick(s);
-      }, SWEEP_MS);
+  /**
+   * @param {Server} server
+   * @param {object} deadlines
+   */
+  function registerConnectionDeadlines(server, deadlines) {
+    var sweep = server._connSweep || (server._connSweep = { connections: new Set(), timer: null });
+    sweep.connections.add(deadlines);
+    if (sweep.timer === null) {
+      sweep.timer = setInterval(function () {
+        tickConnectionDeadlines(sweep);
+      }, DEADLINE_SWEEP_MS);
     }
   }
-  function sweepUnregister(server, st) {
-    var s = server._connSweep;
-    if (!s) return;
-    s.set.delete(st);
-    if (s.set.size === 0 && s.timer !== null) {
-      clearInterval(s.timer);
-      s.timer = null;
+
+  /**
+   * @param {Server} server
+   * @param {object} deadlines
+   */
+  function unregisterConnectionDeadlines(server, deadlines) {
+    var sweep = server._connSweep;
+    if (!sweep) return;
+    sweep.connections.delete(deadlines);
+    if (sweep.connections.size === 0 && sweep.timer !== null) {
+      clearInterval(sweep.timer);
+      sweep.timer = null;
     }
   }
-  function sweepTick(s) {
+
+  /**
+   * @param {{ connections: Set, timer: * }} sweep
+   */
+  function tickConnectionDeadlines(sweep) {
     var now = Date.now();
-    s.set.forEach(function (st) {
-      if (st.idleAt !== 0 && now >= st.idleAt) {
-        st.idleAt = 0;
-        st.onIdle(); // idle too long between requests — drop it
-      } else if (st.headersAt !== 0 && now >= st.headersAt) {
-        st.headersAt = 0;
-        st.onReq();
-      } else if (st.requestAt !== 0 && now >= st.requestAt) {
-        st.requestAt = 0;
-        st.onReq();
+    sweep.connections.forEach(function (deadlines) {
+      if (deadlines.idleUntil !== 0 && now >= deadlines.idleUntil) {
+        deadlines.idleUntil = 0;
+        deadlines.onIdleTimeout();
+      } else if (deadlines.headersUntil !== 0 && now >= deadlines.headersUntil) {
+        deadlines.headersUntil = 0;
+        deadlines.onRequestTimeout();
+      } else if (deadlines.requestUntil !== 0 && now >= deadlines.requestUntil) {
+        deadlines.requestUntil = 0;
+        deadlines.onRequestTimeout();
       }
     });
   }
 
+  /**
+   * Per-connection request/response loop.
+   *
+   * @param {Server} server
+   * @param {net.Socket} socket
+   */
   function onConnection(server, socket) {
-    var pending = EMPTY_BUF;
-    var lastLen = 0;
+    var pendingBytes = EMPTY_BUFFER;
+    var partialHeadLength = 0;
     var parsingHead = true;
-    var req = null;
-    var res = null;
-    var bodyRemaining = 0; // Content-Length bytes still owed to req ('data')
-    var chunkedDecode = null; // decoder for a Transfer-Encoding: chunked request body
-    var bodyDone = false; // request body fully received ('end' fired)
-    var resDone = false; // response fully sent ('finish' fired)
-    var peerEnded = false; // peer half-closed (read EOF) — no more requests will arrive
-    var closed = false; // socket is being torn down; ignore further input
+    var request = null;
+    var response = null;
+    var contentLengthRemaining = 0;
+    var chunkedDecoder = null;
+    var requestBodyComplete = false;
+    var responseComplete = false;
+    var peerHalfClosed = false;
+    var connectionClosed = false;
 
-    // Slowloris / idle defenses (see Server). idleAt guards the gap before a request;
-    // headersAt/requestAt bound how long receiving a request's head / whole body may
-    // take once it has started. These are DEADLINE TIMESTAMPS on a record swept by one
-    // coarse per-server interval (see connSweep), not per-request timers: arming and
-    // clearing them is a field write, where the setTimeout/clearTimeout pairs they
-    // replace were 4 native timer ops per request (~20% of hello-world CPU). Second-scale
-    // defenses lose nothing from ±SWEEP_MS precision.
-    var keepAliveMs = server.keepAliveTimeout || 0;
-    var headersMs = server.headersTimeout || 0;
-    var requestMs = server.requestTimeout || 0;
-    var st = { idleAt: 0, headersAt: 0, requestAt: 0, onIdle: destroyConn, onReq: onReqTimeout };
-    var requestActive = false; // a request is currently being received (head or body)
-    sweepRegister(server, st);
+    var keepAliveTimeoutMs = server.keepAliveTimeout || 0;
+    var headersTimeoutMs = server.headersTimeout || 0;
+    var requestTimeoutMs = server.requestTimeout || 0;
+    var deadlines = {
+      idleUntil: 0,
+      headersUntil: 0,
+      requestUntil: 0,
+      onIdleTimeout: destroyConnection,
+      onRequestTimeout: onReceiveTimeout,
+    };
+    var receivingRequest = false;
+    registerConnectionDeadlines(server, deadlines);
 
-    function clearReqTimers() {
-      st.headersAt = 0;
-      st.requestAt = 0;
+    function clearReceiveDeadlines() {
+      deadlines.headersUntil = 0;
+      deadlines.requestUntil = 0;
     }
-    // Terminal: every caller is tearing the connection down, so leave the sweep set too.
-    function clearTimers() {
-      st.idleAt = 0;
-      clearReqTimers();
-      sweepUnregister(server, st);
+
+    function clearAllDeadlines() {
+      deadlines.idleUntil = 0;
+      clearReceiveDeadlines();
+      unregisterConnectionDeadlines(server, deadlines);
     }
-    function destroyConn() {
-      if (closed) return;
-      closed = true;
-      clearTimers();
+
+    function destroyConnection() {
+      if (connectionClosed) return;
+      connectionClosed = true;
+      clearAllDeadlines();
       socket.destroy();
     }
-    function armIdle() {
-      if (keepAliveMs > 0) st.idleAt = Date.now() + keepAliveMs;
-    }
-    function beginRequestTimers() {
-      requestActive = true;
-      if (headersMs > 0 || requestMs > 0) {
-        var now = Date.now();
-        if (headersMs > 0) st.headersAt = now + headersMs;
-        if (requestMs > 0) st.requestAt = now + requestMs;
-      }
-    }
-    function onReqTimeout() {
-      // A slow head or body (slowloris): answer 408 if no response has started, then close.
-      if (closed) return;
-      if (res && res.headersSent) destroyConn();
-      else fail(408);
+
+    function armIdleDeadline() {
+      if (keepAliveTimeoutMs > 0) deadlines.idleUntil = Date.now() + keepAliveTimeoutMs;
     }
 
-    function fail(code) {
-      if (closed) return;
-      closed = true;
-      clearTimers();
-      var reason = STATUS_CODES[code] || 'Error';
+    function beginReceiveDeadlines() {
+      receivingRequest = true;
+      if (headersTimeoutMs > 0 || requestTimeoutMs > 0) {
+        var now = Date.now();
+        if (headersTimeoutMs > 0) deadlines.headersUntil = now + headersTimeoutMs;
+        if (requestTimeoutMs > 0) deadlines.requestUntil = now + requestTimeoutMs;
+      }
+    }
+
+    function onReceiveTimeout() {
+      if (connectionClosed) return;
+      if (response && response.headersSent) destroyConnection();
+      else sendErrorAndClose(408);
+    }
+
+    /**
+     * @param {number} statusCode
+     */
+    function sendErrorAndClose(statusCode) {
+      if (connectionClosed) return;
+      connectionClosed = true;
+      clearAllDeadlines();
+      var reason = STATUS_CODES[statusCode] || 'Error';
       socket.write(
         Buffer.from(
-          'HTTP/1.1 ' + code + ' ' + reason + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+          'HTTP/1.1 ' +
+            statusCode +
+            ' ' +
+            reason +
+            '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
           'latin1',
         ),
       );
       socket.end();
     }
 
-    function resetForNext() {
+    function resetForNextRequest() {
       parsingHead = true;
-      lastLen = 0;
-      req = null;
-      res = null;
-      bodyRemaining = 0;
-      chunkedDecode = null;
-      bodyDone = false;
-      resDone = false;
-      requestActive = false;
+      partialHeadLength = 0;
+      request = null;
+      response = null;
+      contentLengthRemaining = 0;
+      chunkedDecoder = null;
+      requestBodyComplete = false;
+      responseComplete = false;
+      receivingRequest = false;
     }
 
-    // Advance only when the request is fully read AND the response is fully sent. Then keep
-    // the socket for the next request (per the finalized res._keepAlive) or close it.
+    /**
+     * Advance when both request body and response are done (keep-alive or close).
+     */
     function maybeAdvance() {
-      if (closed || !bodyDone || !resDone) return;
-      if (!res._keepAlive) {
-        closed = true;
-        clearTimers();
+      if (connectionClosed || !requestBodyComplete || !responseComplete) return;
+      if (!response._keepAlive) {
+        connectionClosed = true;
+        clearAllDeadlines();
         socket.end();
         return;
       }
-      resetForNext();
-      if (pending.length > 0) {
-        beginRequestTimers(); // a pipelined next request is already buffered
-        processHead();
-      } else if (peerEnded) {
-        // Kept alive, nothing buffered, and the peer already half-closed → no further
-        // request can arrive (net no longer auto-closes on EOF), so close now.
-        destroyConn();
+      resetForNextRequest();
+      if (pendingBytes.length > 0) {
+        beginReceiveDeadlines();
+        processRequestHead();
+      } else if (peerHalfClosed) {
+        destroyConnection();
       } else {
-        armIdle(); // wait for the next request, bounded by keepAliveTimeout
+        armIdleDeadline();
       }
     }
 
-    function onResComplete() {
-      resDone = true;
+    function onResponseComplete() {
+      responseComplete = true;
       maybeAdvance();
     }
 
-    // Body fully received: fire req 'end' once, stash any leftover (pipelined) bytes, advance.
-    function onBodyComplete(leftover) {
-      pending = leftover && leftover.length ? leftover : EMPTY_BUF;
-      clearReqTimers(); // the whole request is in; the response is not time-bounded
-      if (req && !req._ended) {
-        req._ended = true;
-        req.complete = true;
-        req.emit('end');
+    /**
+     * Mark the request fully received (timers off, pipelined leftover stashed).
+     * Does not emit `'end'`.
+     *
+     * @param {Buffer|Uint8Array|undefined} leftover
+     */
+    function markRequestReceived(leftover) {
+      pendingBytes = leftover && leftover.length ? leftover : EMPTY_BUFFER;
+      clearReceiveDeadlines();
+      requestBodyComplete = true;
+    }
+
+    /**
+     * Emit request `'end'` once. Accepts a captured request when outer `request`
+     * was cleared by a synchronous keep-alive advance.
+     *
+     * @param {IncomingMessage|null} [targetRequest]
+     */
+    function emitRequestEnd(targetRequest) {
+      var message = targetRequest || request;
+      if (message && !message._ended) {
+        message._ended = true;
+        message.complete = true;
+        message.emit('end');
       }
-      bodyDone = true;
+    }
+
+    /**
+     * Full body completion: mark received (if needed), emit end, try advance.
+     *
+     * @param {Buffer|Uint8Array|undefined} leftover
+     */
+    function onRequestBodyComplete(leftover) {
+      if (!requestBodyComplete) markRequestReceived(leftover);
+      emitRequestEnd(request);
       maybeAdvance();
     }
 
-    // Content-Length body feed: emit up to bodyRemaining bytes, keep the rest as leftover.
-    function feedBody(buf) {
-      if (!req || req._ended) return;
-      if (bodyRemaining > 0 && buf && buf.length) {
-        var take = buf.length < bodyRemaining ? buf.length : bodyRemaining;
-        req.emit('data', buf.slice(0, take));
-        bodyRemaining -= take;
-        buf = buf.slice(take);
+    /**
+     * @param {Buffer|Uint8Array|undefined} chunk
+     */
+    function feedContentLengthBody(chunk) {
+      if (!request || request._ended) return;
+      if (contentLengthRemaining > 0 && chunk && chunk.length) {
+        var take = chunk.length < contentLengthRemaining ? chunk.length : contentLengthRemaining;
+        request.emit('data', chunk.slice(0, take));
+        contentLengthRemaining -= take;
+        chunk = chunk.slice(take);
       }
-      if (bodyRemaining <= 0) onBodyComplete(buf);
+      if (contentLengthRemaining <= 0) onRequestBodyComplete(chunk);
     }
 
-    function processHead() {
-      var r = native.parseRequest(pending, lastLen);
-      var state = r[P_STATE];
-      if (state === PARSE_PARTIAL) {
-        if (pending.length > MAX_HEAD) fail(431);
-        else lastLen = pending.length;
+    function processRequestHead() {
+      var parseResult = native.parseRequest(pendingBytes, partialHeadLength);
+      var state = parseResult[PARSE_STATE];
+      if (state === PARSE_NEED_MORE) {
+        if (pendingBytes.length > MAX_HEAD_BYTES) sendErrorAndClose(431);
+        else partialHeadLength = pendingBytes.length;
         return;
       }
-      if (state !== PARSE_COMPLETE) return fail(400);
-      var consumed = r[P_CONSUMED];
-      if (consumed > MAX_HEAD) return fail(431);
+      if (state !== PARSE_OK) return sendErrorAndClose(400);
+
+      var consumed = parseResult[PARSE_CONSUMED];
+      if (consumed > MAX_HEAD_BYTES) return sendErrorAndClose(431);
 
       parsingHead = false;
-      lastLen = 0;
-      st.headersAt = 0; // head received within headersTimeout
+      partialHeadLength = 0;
+      deadlines.headersUntil = 0;
 
-      req = new IncomingMessage(socket, r);
-      res = new ServerResponse(socket, req.method, req.httpVersionMinor);
-      res._keepAlive = shouldKeepAlive(req); // finalized in _flushHead
-      res._onComplete = onResComplete;
+      request = new IncomingMessage(socket, parseResult);
+      response = new ServerResponse(socket, request.method, request.httpVersionMinor);
+      response._keepAlive = shouldKeepAlive(
+        request.httpVersionMinor,
+        request.headers['connection'],
+      );
+      response._onComplete = onResponseComplete;
 
-      // The common case (a bodyless request, no pipelined next) consumes the whole
-      // buffer — skip the subarray/view work entirely.
-      var bodyStart = consumed < pending.length ? pending.slice(consumed) : EMPTY_BUF;
-      pending = EMPTY_BUF;
+      var bodyFromHead =
+        consumed < pendingBytes.length ? pendingBytes.slice(consumed) : EMPTY_BUFFER;
+      pendingBytes = EMPTY_BUFFER;
 
-      // Body framing over untrusted input (smuggling-resistant): reject CL+TE (400), a TE
-      // that isn't exactly chunked (501), and a non-DIGIT Content-Length (400). A chunked
-      // decode error destroys the socket if the response already started, else sends 400.
-      var te = req.headers['transfer-encoding'];
-      var clStr = req.headers['content-length'];
-      if (te !== undefined) {
-        if (clStr !== undefined) return fail(400);
-        if (!/^\s*chunked\s*$/i.test(te)) return fail(501);
-        chunkedDecode = makeChunkedDecoder(
-          req,
+      var transferEncoding = request.headers['transfer-encoding'];
+      var contentLengthHeader = request.headers['content-length'];
+      if (transferEncoding !== undefined) {
+        if (contentLengthHeader !== undefined) return sendErrorAndClose(400);
+        if (!/^\s*chunked\s*$/i.test(transferEncoding)) return sendErrorAndClose(501);
+        chunkedDecoder = createChunkedDecoder(
+          request,
           function () {
-            if (res.headersSent) destroyConn();
-            else fail(400);
+            if (response.headersSent) destroyConnection();
+            else sendErrorAndClose(400);
           },
-          onBodyComplete,
+          onRequestBodyComplete,
         );
-      } else if (clStr !== undefined) {
-        if (!/^\d+$/.test(clStr)) return fail(400);
-        bodyRemaining = parseInt(clStr, 10);
+      } else if (contentLengthHeader !== undefined) {
+        if (!/^\d+$/.test(contentLengthHeader)) return sendErrorAndClose(400);
+        contentLengthRemaining = parseInt(contentLengthHeader, 10);
       }
 
-      // Capture this request for deferred body/'end' delivery — keep-alive may reset
-      // the outer `req` before nextTick if the response finishes synchronously.
-      var thisReq = req;
-      // Entity body only if chunked or Content-Length > 0 (CL:0 is bodyless).
-      var hasEntityBody = chunkedDecode !== null || bodyRemaining > 0;
+      var capturedRequest = request;
+      var hasEntityBody = chunkedDecoder !== null || contentLengthRemaining > 0;
 
-      // BODYLESS (hello-world / GET keep-alive hot path): mark the request fully
-      // received *before* emit('request') so a synchronous res.end() can maybeAdvance
-      // immediately. Previously bodyDone only flipped in nextTick, so every keep-alive
-      // round-trip paid an extra event-loop turn before the next request. clearReqTimers
-      // must run here too — requestTimeout bounds *receive* time, not handler time
-      // (Node parity; without it a slow bodyless handler falsely 408s).
-      //
-      // 'end' / entity body bytes still deliver on nextTick so handlers that attach
-      // listeners there still observe them. Pipelined leftover stays in `pending`.
+      // Bodyless: mark receive-complete before 'request' so sync res.end() can reuse
+      // the connection same turn. requestTimeout is receive-only (Node parity).
+      // 'end' still fires on nextTick so deferred listeners observe it.
       if (!hasEntityBody) {
-        bodyDone = true;
-        pending = bodyStart.length ? bodyStart : EMPTY_BUF;
-        clearReqTimers();
+        markRequestReceived(bodyFromHead.length ? bodyFromHead : EMPTY_BUFFER);
       }
 
-      server.emit('request', req, res);
+      server.emit('request', request, response);
       process.nextTick(function () {
-        if (closed) return;
+        if (connectionClosed) return;
         if (!hasEntityBody) {
-          if (thisReq && !thisReq._ended) {
-            thisReq._ended = true;
-            thisReq.complete = true;
-            thisReq.emit('end');
-          }
-          maybeAdvance(); // res may have finished before this tick
-        } else if (chunkedDecode) {
-          chunkedDecode(bodyStart);
+          emitRequestEnd(capturedRequest);
+          maybeAdvance();
+        } else if (chunkedDecoder) {
+          chunkedDecoder(bodyFromHead);
         } else {
-          feedBody(bodyStart);
+          feedContentLengthBody(bodyFromHead);
         }
       });
     }
 
     socket.on('data', function (chunk) {
-      if (closed) return;
-      // First byte of a request: stop the idle deadline and start the head/request ones.
-      st.idleAt = 0;
-      if (!requestActive) beginRequestTimers();
+      if (connectionClosed) return;
+      deadlines.idleUntil = 0;
+      if (!receivingRequest) beginReceiveDeadlines();
       if (parsingHead) {
-        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-        processHead();
-      } else if (bodyDone) {
-        // Body finished but we haven't advanced yet (the response is still being produced):
-        // a pipelined next request must be BUFFERED, not handed to the now-finished body
-        // consumer (which would drop it). It is re-parsed when we advance.
-        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-      } else if (chunkedDecode) {
-        chunkedDecode(chunk);
+        pendingBytes = pendingBytes.length ? Buffer.concat([pendingBytes, chunk]) : chunk;
+        processRequestHead();
+      } else if (requestBodyComplete) {
+        pendingBytes = pendingBytes.length ? Buffer.concat([pendingBytes, chunk]) : chunk;
+      } else if (chunkedDecoder) {
+        chunkedDecoder(chunk);
       } else {
-        feedBody(chunk);
+        feedContentLengthBody(chunk);
       }
     });
 
     socket.on('end', function () {
-      peerEnded = true;
-      // Defer one tick so the scheduled body delivery runs first — a client that writes a
-      // COMPLETE request and immediately half-closes (socket.end(req)) would otherwise race
-      // us into a false 400 before the request is marked complete.
+      peerHalfClosed = true;
       process.nextTick(function () {
-        if (closed) return;
+        if (connectionClosed) return;
         if (parsingHead) {
-          // A partial head that can no longer complete is a bad request; an idle keep-alive
-          // connection the peer is done with just closes (net no longer auto-closes on EOF).
-          if (pending.length > 0) fail(400);
-          else destroyConn();
-        } else if (req && !req._ended) {
-          // Genuinely incomplete body (more bytes were expected) — premature EOF.
-          if (res && res.headersSent) destroyConn();
-          else fail(400);
+          if (pendingBytes.length > 0) sendErrorAndClose(400);
+          else destroyConnection();
+        } else if (request && !request._ended) {
+          if (response && response.headersSent) destroyConnection();
+          else sendErrorAndClose(400);
         }
-        // else: request complete, response in flight → res completion drives the close.
       });
     });
 
     socket.on('error', function () {
-      // peer reset — clear timers and stop processing (the net layer frees the socket)
-      closed = true;
-      clearTimers();
+      connectionClosed = true;
+      clearAllDeadlines();
     });
 
-    // A freshly accepted connection that sends nothing must not pin the socket: bound the
-    // wait for the first request by keepAliveTimeout (the same idle budget reused between
-    // keep-alive requests).
-    armIdle();
+    armIdleDeadline();
   }
 
+  /**
+   * @param {object|function} [options]
+   * @param {function} [requestListener]
+   * @constructor
+   */
   function Server(options, requestListener) {
     if (typeof options === 'function') {
       requestListener = options;
@@ -835,23 +898,20 @@
     }
     EventEmitter.call(this);
     var self = this;
-    // Slowloris / idle-connection defenses (ms; 0 disables). Node's defaults:
-    //   keepAliveTimeout — idle time between requests on a kept-alive connection
-    //   headersTimeout   — time to receive the complete request head
-    //   requestTimeout   — time to receive the entire request (head + body)
     this.keepAliveTimeout = 5000;
     this.headersTimeout = 60000;
     this.requestTimeout = 300000;
-    // Honor timeouts configured at construction (Node's createServer(options) form), not
-    // only post-construction mutation.
     var tlsContext;
     if (options && typeof options === 'object') {
-      if (typeof options.keepAliveTimeout === 'number')
+      if (typeof options.keepAliveTimeout === 'number') {
         this.keepAliveTimeout = options.keepAliveTimeout;
-      if (typeof options.headersTimeout === 'number') this.headersTimeout = options.headersTimeout;
-      if (typeof options.requestTimeout === 'number') this.requestTimeout = options.requestTimeout;
-      // https.createServer threads its built TLS context here; net wraps each connection on it.
-      // The decrypted socket runs the SAME request/response machinery — nothing else changes.
+      }
+      if (typeof options.headersTimeout === 'number') {
+        this.headersTimeout = options.headersTimeout;
+      }
+      if (typeof options.requestTimeout === 'number') {
+        this.requestTimeout = options.requestTimeout;
+      }
       tlsContext = options.tls;
     }
     this._net = net.createServer({ tls: tlsContext }, function (socket) {
@@ -863,8 +923,8 @@
     this._net.on('close', function () {
       self.emit('close');
     });
-    this._net.on('error', function (e) {
-      self.emit('error', e);
+    this._net.on('error', function (err) {
+      self.emit('error', err);
     });
     if (typeof requestListener === 'function') this.on('request', requestListener);
   }
@@ -875,14 +935,19 @@
     this._net.listen.apply(this._net, arguments);
     return this;
   };
-  Server.prototype.close = function (cb) {
-    this._net.close(cb);
+  Server.prototype.close = function (callback) {
+    this._net.close(callback);
     return this;
   };
   Server.prototype.address = function () {
     return this._net.address();
   };
 
+  /**
+   * @param {object|function} [options]
+   * @param {function} [requestListener]
+   * @returns {Server}
+   */
   function createServer(options, requestListener) {
     return new Server(options, requestListener);
   }
