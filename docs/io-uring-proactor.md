@@ -7,9 +7,9 @@ connection of any of Node/Bun/Lava.
 
 ## Where we are today (readiness on io_uring)
 
-`pkg/runtime/eventloop/loop_linux.odin` already has an io*uring backend, but it is used as a
+`pkg/runtime/eventloop/loop_linux.odin` already has an io_uring backend, but it is used as a
 drop-in **epoll**: `platform_watch_fd` submits a one-shot `IORING_OP_POLL_ADD` for `.IN`/`.OUT`
-and re-arms it on each completion (`drain_uring_completions`). The watcher \_callback* then does
+and re-arms it on each completion (`drain_uring_completions`). The watcher *callback* then does
 the actual transfer with raw `linux.recv`/`linux.send` (see `net.odin` `conn_read_cb` /
 `net_flush`). The two sides differ today: the **read** side is a poll→recv pair (POLL_ADD
 completion, then the callback's `recv`), but the **write** side already sends eagerly —
