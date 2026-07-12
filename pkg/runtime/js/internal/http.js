@@ -263,6 +263,11 @@
   IncomingMessage.prototype = Object.create(EventEmitter.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
 
+  // Hot-path constants: avoid rebuilding the common status line / Connection tokens.
+  var STATUS_LINE_200 = 'HTTP/1.1 200 OK\r\n';
+  var CONN_KEEP_ALIVE = 'Connection: keep-alive\r\n';
+  var CONN_CLOSE = 'Connection: close\r\n';
+
   function ServerResponse(socket, method, httpMinor) {
     EventEmitter.call(this);
     this.socket = socket;
@@ -288,6 +293,11 @@
   }
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
+
+  // Keys in _headers are always lowercased; hot paths use fixed keys (no toLowerCase).
+  function headerPresent(res, lowKey) {
+    return Object.prototype.hasOwnProperty.call(res._headers, lowKey);
+  }
 
   ServerResponse.prototype.setHeader = function (name, value) {
     checkHeaderName(name);
@@ -332,20 +342,24 @@
     var code = validateStatusCode(this.statusCode);
     var reason = this.statusMessage || STATUS_CODES[code] || '';
     checkInvalidChar(String(reason), 'statusMessage'); // no CRLF in the status line
-    var head = 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
+    // Common hello-world path: 200 with default reason — skip string concat for the line.
+    var head =
+      code === 200 && !this.statusMessage
+        ? STATUS_LINE_200
+        : 'HTTP/1.1 ' + code + ' ' + reason + '\r\n';
     // Finalize keep-alive: only possible if the response is self-delimiting (Content-Length,
     // chunked, or a no-body status/HEAD) — otherwise the body ends at connection close, so
     // we must close. A handler-set "Connection: close" also wins.
     var selfDelimited =
       this._chunked ||
-      this.hasHeader('content-length') ||
+      headerPresent(this, 'content-length') ||
       this._isHead ||
       statusHasNoBody(this.statusCode);
     if (!selfDelimited) this._keepAlive = false;
-    if (this.hasHeader('connection')) {
-      if (/\bclose\b/i.test(this.getHeader('connection'))) this._keepAlive = false;
+    if (headerPresent(this, 'connection')) {
+      if (/\bclose\b/i.test(this._headers['connection'].value)) this._keepAlive = false;
     } else {
-      head += this._keepAlive ? 'Connection: keep-alive\r\n' : 'Connection: close\r\n';
+      head += this._keepAlive ? CONN_KEEP_ALIVE : CONN_CLOSE;
     }
     for (var key in this._headers) {
       if (!Object.prototype.hasOwnProperty.call(this._headers, key)) continue;
@@ -381,13 +395,13 @@
       if (
         !noBody &&
         this._allowChunked &&
-        !this.hasHeader('content-length') &&
-        !this.hasHeader('transfer-encoding')
+        !headerPresent(this, 'content-length') &&
+        !headerPresent(this, 'transfer-encoding')
       ) {
         this._chunked = true;
         this.setHeader('Transfer-Encoding', 'chunked');
-      } else if (this._allowChunked && this.hasHeader('transfer-encoding')) {
-        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
+      } else if (this._allowChunked && headerPresent(this, 'transfer-encoding')) {
+        this._chunked = /\bchunked\b/i.test(this._headers['transfer-encoding'].value);
       }
       this._flushHead();
     }
@@ -419,11 +433,15 @@
     if (!this.headersSent) {
       // No prior write() → we know the full length here, so frame with Content-Length
       // (unless a no-body status, or the caller already chose Transfer-Encoding).
-      if (!this.hasHeader('content-length') && !this.hasHeader('transfer-encoding') && !noBody) {
+      if (
+        !headerPresent(this, 'content-length') &&
+        !headerPresent(this, 'transfer-encoding') &&
+        !noBody
+      ) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
-      if (this._allowChunked && this.hasHeader('transfer-encoding')) {
-        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
+      if (this._allowChunked && headerPresent(this, 'transfer-encoding')) {
+        this._chunked = /\bchunked\b/i.test(this._headers['transfer-encoding'].value);
       }
       // Fast path: emit the head and a known, non-chunked body in ONE socket write (one
       // send() instead of two — the response write path was ~33% of CPU on a hello-world
@@ -718,14 +736,42 @@
         bodyRemaining = parseInt(clStr, 10);
       }
 
+      // Capture this request for deferred body/'end' delivery — keep-alive may reset
+      // the outer `req` before nextTick if the response finishes synchronously.
+      var thisReq = req;
+      // Entity body only if chunked or Content-Length > 0 (CL:0 is bodyless).
+      var hasEntityBody = chunkedDecode !== null || bodyRemaining > 0;
+
+      // BODYLESS (hello-world / GET keep-alive hot path): mark the request fully
+      // received *before* emit('request') so a synchronous res.end() can maybeAdvance
+      // immediately. Previously bodyDone only flipped in nextTick, so every keep-alive
+      // round-trip paid an extra event-loop turn before the next request. clearReqTimers
+      // must run here too — requestTimeout bounds *receive* time, not handler time
+      // (Node parity; without it a slow bodyless handler falsely 408s).
+      //
+      // 'end' / entity body bytes still deliver on nextTick so handlers that attach
+      // listeners there still observe them. Pipelined leftover stays in `pending`.
+      if (!hasEntityBody) {
+        bodyDone = true;
+        pending = bodyStart.length ? bodyStart : EMPTY_BUF;
+        clearReqTimers();
+      }
+
       server.emit('request', req, res);
-      // Deliver body bytes from the head's read on the NEXT tick, so a handler that attaches
-      // 'data'/'end' in process.nextTick (not only synchronously) still sees them. For a
-      // bodyless request this fires 'end' immediately (and surfaces any pipelined leftover).
       process.nextTick(function () {
         if (closed) return;
-        if (chunkedDecode) chunkedDecode(bodyStart);
-        else feedBody(bodyStart);
+        if (!hasEntityBody) {
+          if (thisReq && !thisReq._ended) {
+            thisReq._ended = true;
+            thisReq.complete = true;
+            thisReq.emit('end');
+          }
+          maybeAdvance(); // res may have finished before this tick
+        } else if (chunkedDecode) {
+          chunkedDecode(bodyStart);
+        } else {
+          feedBody(bodyStart);
+        }
       });
     }
 
