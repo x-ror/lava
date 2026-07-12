@@ -59,7 +59,8 @@ when ODIN_OS == .Linux {
 	@(private = "file")
 	ensure_view :: proc(ctx: JSContextRef) {
 		if g_view_checked do return
-		g_view_checked = true
+		// Soft failures (nil create) leave g_view_checked false so a later call
+		// retries. Layout disagreements after successful allocates latch closed.
 
 		a := JSObjectMakeTypedArrayWithBytesNoCopy(ctx, .Uint8Array, &g_probe_a[0], len(g_probe_a), nil, nil, nil)
 		if a == nil do return
@@ -76,8 +77,10 @@ when ODIN_OS == .Linux {
 
 		pa, pb, pc := uintptr(rawptr(a)), uintptr(rawptr(b)), uintptr(rawptr(cc))
 		ty := (^u8)(pa + JSCELL_TYPE_OFFSET)^
-		if (^u8)(pb + JSCELL_TYPE_OFFSET)^ != ty || (^u8)(pc + JSCELL_TYPE_OFFSET)^ != ty do return
-
+		if (^u8)(pb + JSCELL_TYPE_OFFSET)^ != ty || (^u8)(pc + JSCELL_TYPE_OFFSET)^ != ty {
+			g_view_checked = true
+			return
+		}
 		vec_off: uintptr
 		vec_found := false
 		for cand: uintptr = 8; cand <= 120; cand += 8 {
@@ -89,7 +92,10 @@ when ODIN_OS == .Linux {
 				break
 			}
 		}
-		if !vec_found do return
+		if !vec_found {
+			g_view_checked = true
+			return
+		}
 
 		// Length is size_t on 64-bit JSC builds with large typed arrays, u32 on
 		// older ones — try the wider read first. byteOffset is 0 on all three
@@ -120,8 +126,10 @@ when ODIN_OS == .Linux {
 				}
 			}
 		}
-		if !len_found do return
-
+		if !len_found {
+			g_view_checked = true
+			return
+		}
 		// Disambiguate the width with a view at a NON-ZERO byteOffset. All three
 		// probes above have byteOffset 0, so if m_length is really u32 with an
 		// adjacent u32 byteOffset, a u64 read at len_off equals the length anyway
@@ -134,33 +142,43 @@ when ODIN_OS == .Linux {
 			OFF :: 16
 			LEN :: 32
 			ab := JSObjectMakeArrayBufferWithBytesNoCopy(ctx, &g_probe_d[0], len(g_probe_d), nil, nil, nil)
-			if ab == nil do return
+			if ab == nil do return // soft
 			JSValueProtect(ctx, JSValueRef(ab))
 			defer JSValueUnprotect(ctx, JSValueRef(ab))
 			global := JSContextGetGlobalObject(ctx)
 			u8_name := JSStringCreateWithUTF8CString("Uint8Array")
 			defer JSStringRelease(u8_name)
 			u8_ctor := JSObjectGetProperty(ctx, global, u8_name, nil)
-			if u8_ctor == nil || !JSValueIsObject(ctx, u8_ctor) do return
+			if u8_ctor == nil || !JSValueIsObject(ctx, u8_ctor) {
+				g_view_checked = true
+				return
+			}
 			args := [3]JSValueRef {
 				JSValueRef(ab),
 				JSValueMakeNumber(ctx, f64(OFF)),
 				JSValueMakeNumber(ctx, f64(LEN)),
 			}
 			ov := JSObjectCallAsConstructor(ctx, JSObjectRef(u8_ctor), 3, &args[0], nil)
-			if ov == nil do return
+			if ov == nil do return // soft
 			JSValueProtect(ctx, JSValueRef(ov))
 			defer JSValueUnprotect(ctx, JSValueRef(ov))
 			pv := uintptr(rawptr(ov))
-			if (^u8)(pv + JSCELL_TYPE_OFFSET)^ != ty do return
+			if (^u8)(pv + JSCELL_TYPE_OFFSET)^ != ty {
+				g_view_checked = true
+				return
+			}
 			// m_vector already includes byteOffset.
-			if (^rawptr)(pv + vec_off)^ != rawptr(&g_probe_d[OFF]) do return
+			if (^rawptr)(pv + vec_off)^ != rawptr(&g_probe_d[OFF]) {
+				g_view_checked = true
+				return
+			}
 			read := len_u64 ? int((^u64)(pv + len_off)^) : int((^u32)(pv + len_off)^)
 			if read != LEN {
 				// Wide read folded in byteOffset; the field is really u32.
 				if len_u64 && int((^u32)(pv + len_off)^) == LEN {
 					len_u64 = false
 				} else {
+					g_view_checked = true
 					return
 				}
 			}
@@ -171,6 +189,7 @@ when ODIN_OS == .Linux {
 		g_len_off = len_off
 		g_len_u64 = len_u64
 		g_view_ok = true
+		g_view_checked = true
 	}
 
 	// typed_array_bytes borrows a Uint8Array's bytes straight from the view

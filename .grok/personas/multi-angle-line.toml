@@ -1,0 +1,4 @@
+description = "Angle A: line-by-line local correctness on a diff"
+instructions_file = ".grok/skills/multi-review/angles/a-line.md"
+reasoning_effort = "high"
+default_capability_mode = "read-only"

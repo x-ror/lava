@@ -347,129 +347,9 @@ js_string_from_bytes :: proc(ctx: jsc.JSContextRef, value: string) -> jsc.JSValu
 	return jsc.JSValueMakeString(ctx, js_str)
 }
 
-// --- JS UTF-16 → UTF-8 (exact size) ------------------------------------------
-// JavaScript strings are UTF-16. Converting via JSStringGetMaximumUTF8CStringSize
-// + GetUTF8CString allocates 3n+1 and pays a second size query. These helpers
-// read units in place (GetCharactersPtr) and produce the exact UTF-8 byte count
-// Node/V8 use for Buffer.from(str, 'utf8'): unpaired surrogates → U+FFFD.
+// --- JS string → owned UTF-8 (exact size) ------------------------------------
+// Pure codecs live in pkg/jsc/string_utf8.odin; these wrappers allocate.
 
-// utf16_js_utf8_byte_len returns the exact UTF-8 length of `n` UTF-16 code units.
-utf16_js_utf8_byte_len :: proc "contextless" (chars: [^]jsc.JSChar, n: int) -> int {
-	total := 0
-	i := 0
-	for i < n {
-		u := u32(chars[i])
-		if u < 0x80 {
-			total += 1
-			i += 1
-		} else if u < 0x800 {
-			total += 2
-			i += 1
-		} else if u >= 0xD800 && u <= 0xDBFF {
-			// High surrogate: pair with a following low, else U+FFFD (3 bytes).
-			if i + 1 < n {
-				lo := u32(chars[i + 1])
-				if lo >= 0xDC00 && lo <= 0xDFFF {
-					total += 4 // astral scalar
-					i += 2
-					continue
-				}
-			}
-			total += 3 // unpaired → U+FFFD
-			i += 1
-		} else if u >= 0xDC00 && u <= 0xDFFF {
-			total += 3 // unpaired low → U+FFFD
-			i += 1
-		} else {
-			total += 3 // BMP non-surrogate
-			i += 1
-		}
-	}
-	return total
-}
-
-// utf16_js_to_utf8_capped encodes into `out` stopping before exceeding len(out).
-// May truncate mid-character at the boundary (Node Buffer.write utf8 behavior).
-// Returns bytes written.
-utf16_js_to_utf8_capped :: proc "contextless" (chars: [^]jsc.JSChar, n: int, out: []byte) -> int {
-	cap := len(out)
-	o := 0
-	i := 0
-	for i < n {
-		u := u32(chars[i])
-		need: int
-		// Pre-compute how many bytes this unit (or pair) wants.
-		if u < 0x80 {
-			need = 1
-		} else if u < 0x800 {
-			need = 2
-		} else if u >= 0xD800 && u <= 0xDBFF {
-			if i + 1 < n {
-				lo := u32(chars[i + 1])
-				if lo >= 0xDC00 && lo <= 0xDFFF {
-					need = 4
-				} else {
-					need = 3
-				}
-			} else {
-				need = 3
-			}
-		} else if u >= 0xDC00 && u <= 0xDFFF {
-			need = 3
-		} else {
-			need = 3
-		}
-		if o + need > cap do break
-		// Encode one scalar / replacement using the uncapped helper on a 4-byte window.
-		// Advance i by the whole (paired) code point.
-		if u < 0x80 {
-			out[o] = byte(u)
-			o += 1
-			i += 1
-		} else if u < 0x800 {
-			out[o] = byte(0xC0 | (u >> 6))
-			out[o + 1] = byte(0x80 | (u & 0x3F))
-			o += 2
-			i += 1
-		} else if u >= 0xD800 && u <= 0xDBFF {
-			if i + 1 < n {
-				lo := u32(chars[i + 1])
-				if lo >= 0xDC00 && lo <= 0xDFFF {
-					cp := 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)
-					out[o] = byte(0xF0 | (cp >> 18))
-					out[o + 1] = byte(0x80 | ((cp >> 12) & 0x3F))
-					out[o + 2] = byte(0x80 | ((cp >> 6) & 0x3F))
-					out[o + 3] = byte(0x80 | (cp & 0x3F))
-					o += 4
-					i += 2
-					continue
-				}
-			}
-			out[o] = 0xEF
-			out[o + 1] = 0xBF
-			out[o + 2] = 0xBD
-			o += 3
-			i += 1
-		} else if u >= 0xDC00 && u <= 0xDFFF {
-			out[o] = 0xEF
-			out[o + 1] = 0xBF
-			out[o + 2] = 0xBD
-			o += 3
-			i += 1
-		} else {
-			out[o] = byte(0xE0 | (u >> 12))
-			out[o + 1] = byte(0x80 | ((u >> 6) & 0x3F))
-			out[o + 2] = byte(0x80 | (u & 0x3F))
-			o += 3
-			i += 1
-		}
-	}
-	return o
-}
-
-// js_string_ref_to_utf8_owned copies a JSStringRef into an owned exact-size UTF-8
-// buffer (context.allocator). Returns ("", false) for empty strings (nothing to
-// free). Does not Release the JSStringRef — the caller owns that lifetime.
 js_string_ref_to_utf8_owned :: proc(js_string: jsc.JSStringRef) -> (string, bool) {
 	if js_string == nil do return "", false
 	length := int(jsc.JSStringGetLength(js_string))
@@ -530,12 +410,12 @@ utf16_to_utf8_owned :: proc(chars: [^]jsc.JSChar, length: int) -> (string, bool)
 		return string(buffer), true
 	}
 
-	n := utf16_js_utf8_byte_len(chars, length)
+	n := jsc.utf16_js_utf8_byte_len(chars, length)
 	if n <= 0 do return "", false
 	buffer := make([]byte, n, context.allocator)
 	// Exact-size buffer: the capped writer never truncates here (need always
 	// fits), so it yields the same bytes as an uncapped encode.
-	written := utf16_js_to_utf8_capped(chars, length, buffer)
+	written := jsc.utf16_js_to_utf8_capped(chars, length, buffer)
 	if written != n {
 		delete(buffer, context.allocator)
 		return "", false

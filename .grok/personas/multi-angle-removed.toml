@@ -1,0 +1,4 @@
+description = "Angle B: removed-behavior and API/test contract audit"
+instructions_file = ".grok/skills/multi-review/angles/b-removed.md"
+reasoning_effort = "high"
+default_capability_mode = "execute"
