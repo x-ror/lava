@@ -74,27 +74,45 @@
     return headers;
   }
 
-  // RFC 7230 token (header field-name) and the CR/LF guard for field-values / the status
-  // reason. Reject invalid input rather than concatenating it into the response head —
-  // a value containing CRLF would otherwise split the response (header injection).
+  // RFC 7230 tchar lookup (header field-name). Char-code table instead of a RegExp —
+  // the hello path validates two short names per response; table lookup beats regex
+  // dispatch on short strings. tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" /
+  // "+" / "-" / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+  var TCHAR = new Uint8Array(128);
+  (function fillTchar() {
+    var s = "!#$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz|~";
+    for (var i = 0; i < s.length; i++) TCHAR[s.charCodeAt(i)] = 1;
+  })();
+  // TOKEN_RE kept for the chunked-request trailer grammar (same tchar set).
   var TOKEN_RE = /^[\^_`a-zA-Z0-9!#$%&'*+\-.|~]+$/;
-  // A field-value/reason char outside this set is rejected. Crucially this also bans code
-  // points > 0xFF: _flushHead serializes with Buffer.from(head, 'latin1'), which masks
-  // each char to one byte, so e.g. č/Ċ would become CR/LF and reintroduce
-  // response splitting past a naive /[\r\n]/ check. Mirrors Node's checkInvalidHeaderChar
-  // (allow HT, printable ASCII, and the latin1 high range 0x80-0xFF).
-  var INVALID_HEADER_CHAR_RE = /[^\t\x20-\x7e\x80-\xff]/;
   function checkHeaderName(name) {
-    if (typeof name !== 'string' || name.length === 0 || !TOKEN_RE.test(name)) {
-      var e = new TypeError(
+    if (typeof name !== 'string' || name.length === 0) {
+      var e0 = new TypeError(
         'Header name must be a valid HTTP token [' + JSON.stringify(name) + ']',
       );
-      e.code = 'ERR_INVALID_HTTP_TOKEN';
-      throw e;
+      e0.code = 'ERR_INVALID_HTTP_TOKEN';
+      throw e0;
+    }
+    for (var i = 0; i < name.length; i++) {
+      var c = name.charCodeAt(i);
+      if (c >= 128 || !TCHAR[c]) {
+        var e = new TypeError(
+          'Header name must be a valid HTTP token [' + JSON.stringify(name) + ']',
+        );
+        e.code = 'ERR_INVALID_HTTP_TOKEN';
+        throw e;
+      }
     }
   }
+  // Field-value / status reason: ban CTL (except HT) and code points > 0xFF. Serialization
+  // is latin1 (one byte per code unit); a char > 0xFF would mask into CR/LF and reintroduce
+  // response splitting past a naive /[\r\n]/ check. Mirrors Node's checkInvalidHeaderChar
+  // (allow HT, printable ASCII, and the latin1 high range 0x80-0xFF). Char-code loop so the
+  // common short values ('text/plain', '13') skip RegExp setup.
   function checkInvalidChar(value, what) {
-    if (INVALID_HEADER_CHAR_RE.test(value)) {
+    for (var i = 0; i < value.length; i++) {
+      var c = value.charCodeAt(i);
+      if (c === 9 || (c >= 0x20 && c <= 0x7e) || (c >= 0x80 && c <= 0xff)) continue;
       var e = new TypeError('Invalid character in ' + what);
       e.code = 'ERR_INVALID_CHAR';
       throw e;
@@ -138,14 +156,6 @@
     for (var i = 0; i < str.length; i++) {
       dst[offset + i] = P.StringPrototypeCharCodeAt(str, i) & 0xff;
     }
-  }
-  // headBytes serializes a latin1 head string into a fresh, pristine, zero-filled Uint8Array
-  // (the pristine constructor honors the exact length, and the bytes are fully overwritten —
-  // no overridable allocator, no uninitialized-memory disclosure).
-  function headBytes(str) {
-    var out = new P.Uint8Array(str.length);
-    writeLatin1Into(out, str, 0);
-    return out;
   }
   function chunkFrame(buf) {
     return Buffer.concat([Buffer.from(buf.length.toString(16) + '\r\n', 'latin1'), buf, CRLF]);
@@ -255,13 +265,57 @@
     this.httpVersionMajor = 1;
     this.httpVersionMinor = parsed[P_MINOR];
     this.httpVersion = '1.' + parsed[P_MINOR];
-    this.rawHeaders = parsed.slice(P_HEADERS);
-    this.headers = buildHeaders(parsed, P_HEADERS);
+    // Defer headers/rawHeaders materialization. Hello-world never reads them;
+    // processHead pulls Connection/CL/TE from the flat parse array instead.
+    this._parsed = parsed;
+    this._headersCached = undefined;
+    this._rawHeadersCached = undefined;
     this.complete = false;
     this._ended = false;
   }
   IncomingMessage.prototype = Object.create(EventEmitter.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
+
+  Object.defineProperty(IncomingMessage.prototype, 'headers', {
+    configurable: true,
+    enumerable: true,
+    get: function () {
+      if (this._headersCached === undefined) {
+        this._headersCached = buildHeaders(this._parsed, P_HEADERS);
+      }
+      return this._headersCached;
+    },
+    set: function (v) {
+      this._headersCached = v;
+    },
+  });
+  Object.defineProperty(IncomingMessage.prototype, 'rawHeaders', {
+    configurable: true,
+    enumerable: true,
+    get: function () {
+      if (this._rawHeadersCached === undefined) {
+        this._rawHeadersCached = this._parsed.slice(P_HEADERS);
+      }
+      return this._rawHeadersCached;
+    },
+    set: function (v) {
+      this._rawHeadersCached = v;
+    },
+  });
+
+  // Framing headers only (Connection / Content-Length / Transfer-Encoding), merged
+  // like buildHeaders so duplicate Connection tokens keep Node's keep-alive rules.
+  function findFramingHeaders(parsed) {
+    var te, cl, conn;
+    for (var i = P_HEADERS; i + 1 < parsed.length; i += 2) {
+      var low = parsed[i].toLowerCase();
+      var v = parsed[i + 1];
+      if (low === 'transfer-encoding') te = te === undefined ? v : te + ', ' + v;
+      else if (low === 'content-length') cl = cl === undefined ? v : cl + ', ' + v;
+      else if (low === 'connection') conn = conn === undefined ? v : conn + ', ' + v;
+    }
+    return { te: te, cl: cl, conn: conn };
+  }
 
   // Hot-path constants: avoid rebuilding the common status line / Connection tokens.
   var STATUS_LINE_200 = 'HTTP/1.1 200 OK\r\n';
@@ -276,7 +330,9 @@
     this.headersSent = false;
     this._chunked = false; // emitting Transfer-Encoding: chunked (streamed, unknown length)
     this.finished = false;
-    this._headers = {}; // lowercased key -> { name, value }
+    // Null-prototype map: lowercased key -> { name, value }. Null proto so headerPresent
+    // is a single `!== undefined` (no hasOwnProperty) and for-in needs no own-check.
+    this._headers = Object.create(null);
     // A response to a HEAD request carries headers (incl. Content-Length) but NO body
     // (RFC 7230 §3.3.2). Suppress body writes while keeping the framing.
     this._isHead = method === 'HEAD';
@@ -296,7 +352,7 @@
 
   // Keys in _headers are always lowercased; hot paths use fixed keys (no toLowerCase).
   function headerPresent(res, lowKey) {
-    return Object.prototype.hasOwnProperty.call(res._headers, lowKey);
+    return res._headers[lowKey] !== undefined;
   }
 
   ServerResponse.prototype.setHeader = function (name, value) {
@@ -314,7 +370,7 @@
     delete this._headers[String(name).toLowerCase()];
   };
   ServerResponse.prototype.hasHeader = function (name) {
-    return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase());
+    return this._headers[String(name).toLowerCase()] !== undefined;
   };
 
   ServerResponse.prototype.writeHead = function (statusCode, statusMessage, headers) {
@@ -331,10 +387,9 @@
   };
 
   // _buildHead serializes the status line + headers (finalizing keep-alive) and returns the
-  // head as a latin1 string. It deliberately does NOT set headersSent or write anything:
-  // the caller flips headersSent only immediately before it actually writes, so a throw or
-  // allocation failure between build and write (e.g. coalescing a body) cannot leave the
-  // response falsely marked as sent and poison error recovery / the keep-alive connection.
+  // head as a latin1 string. One bulk string + one latin1WriteInto beats N native writes of
+  // small fragments (FFI floor dominates on the hello-world head). Does NOT set headersSent
+  // or write: the caller flips headersSent only immediately before the actual write.
   ServerResponse.prototype._buildHead = function () {
     // Validate the status code at the single serialization chokepoint — it may have been
     // set via writeHead OR assigned directly (res.statusCode = ...). Rejects a non-integer
@@ -362,13 +417,19 @@
       head += this._keepAlive ? CONN_KEEP_ALIVE : CONN_CLOSE;
     }
     for (var key in this._headers) {
-      if (!Object.prototype.hasOwnProperty.call(this._headers, key)) continue;
       var h = this._headers[key];
       head += h.name + ': ' + h.value + '\r\n';
     }
     head += '\r\n';
     return head;
   };
+
+  // headBytes: pristine zero-filled Uint8Array + bulk latin1 write (no overridable allocator).
+  function headBytes(str) {
+    var out = new P.Uint8Array(str.length);
+    writeLatin1Into(out, str, 0);
+    return out;
+  }
 
   ServerResponse.prototype._flushHead = function () {
     if (this.headersSent) return;
@@ -494,12 +555,15 @@
     return this;
   };
 
-  function shouldKeepAlive(req) {
-    var conn = (req.headers['connection'] || '').toLowerCase();
+  // connValue is the (possibly joined) Connection header value, or undefined.
+  // Does not touch req.headers — processHead passes findFramingHeaders().conn so
+  // the hello path never materializes the full headers object.
+  function shouldKeepAlive(httpMinor, connValue) {
+    var conn = (connValue || '').toLowerCase();
     // HTTP/1.1 defaults to keep-alive (unless "close"); HTTP/1.0 defaults to close
     // (unless "keep-alive"). _flushHead further forces close for a non-self-delimiting
     // response.
-    if (req.httpVersionMinor >= 1) return !/\bclose\b/.test(conn);
+    if (httpMinor >= 1) return !/\bclose\b/.test(conn);
     return /\bkeep-alive\b/.test(conn);
   }
 
@@ -705,9 +769,11 @@
       lastLen = 0;
       st.headersAt = 0; // head received within headersTimeout
 
+      // Framing headers from the flat parse array — does not force req.headers.
+      var framing = findFramingHeaders(r);
       req = new IncomingMessage(socket, r);
       res = new ServerResponse(socket, req.method, req.httpVersionMinor);
-      res._keepAlive = shouldKeepAlive(req); // finalized in _flushHead
+      res._keepAlive = shouldKeepAlive(req.httpVersionMinor, framing.conn); // finalized in _flushHead
       res._onComplete = onResComplete;
 
       // The common case (a bodyless request, no pipelined next) consumes the whole
@@ -718,8 +784,8 @@
       // Body framing over untrusted input (smuggling-resistant): reject CL+TE (400), a TE
       // that isn't exactly chunked (501), and a non-DIGIT Content-Length (400). A chunked
       // decode error destroys the socket if the response already started, else sends 400.
-      var te = req.headers['transfer-encoding'];
-      var clStr = req.headers['content-length'];
+      var te = framing.te;
+      var clStr = framing.cl;
       if (te !== undefined) {
         if (clStr !== undefined) return fail(400);
         if (!/^\s*chunked\s*$/i.test(te)) return fail(501);
