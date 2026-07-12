@@ -128,11 +128,12 @@
   }
 
   /**
-   * @param {number} statusCode
+   * @param {*} statusCode may be string after `res.statusCode = '204'`
    * @returns {boolean}
    */
   function statusHasNoBody(statusCode) {
-    return statusCode === 204 || statusCode === 304 || (statusCode >= 100 && statusCode < 200);
+    var code = Number(statusCode);
+    return code === 204 || code === 304 || (code >= 100 && code < 200);
   }
 
   /**
@@ -300,13 +301,40 @@
     this.httpVersionMajor = 1;
     this.httpVersionMinor = parseResult[PARSE_MINOR];
     this.httpVersion = '1.' + parseResult[PARSE_MINOR];
-    this.rawHeaders = parseResult.slice(PARSE_HEADERS);
+    // Eager headers (framing needs Connection/CL/TE). rawHeaders sliced on first access —
+    // hello-world never reads it (saves a per-request array alloc).
+    this._parseResult = parseResult;
     this.headers = buildHeaders(parseResult, PARSE_HEADERS);
     this.complete = false;
     this._ended = false;
   }
   IncomingMessage.prototype = Object.create(EventEmitter.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
+
+  // Lazy rawHeaders: first get materializes an own data property (Node shape:
+  // hasOwnProperty / Object.keys include rawHeaders after access).
+  Object.defineProperty(IncomingMessage.prototype, 'rawHeaders', {
+    configurable: true,
+    enumerable: true,
+    get: function () {
+      var pairs = this._parseResult.slice(PARSE_HEADERS);
+      Object.defineProperty(this, 'rawHeaders', {
+        value: pairs,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return pairs;
+    },
+    set: function (value) {
+      Object.defineProperty(this, 'rawHeaders', {
+        value: value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    },
+  });
 
   var STATUS_LINE_200 = 'HTTP/1.1 200 OK\r\n';
   var CONNECTION_KEEP_ALIVE = 'Connection: keep-alive\r\n';
@@ -326,12 +354,14 @@
     this.headersSent = false;
     this._chunked = false;
     this.finished = false;
-    /** @type {Object<string, {name: string, value: string}>} lowercased name → entry */
-    this._headers = Object.create(null);
+    /** @type {Object<string, string>} lowercased name → value */
+    this._headerValues = Object.create(null);
+    /** @type {Object<string, string>} lowercased name → wire-case name */
+    this._headerNames = Object.create(null);
     this._isHead = method === 'HEAD';
     this._allowChunked = httpMinor === undefined || httpMinor >= 1;
     this._keepAlive = false;
-    /** @type {function(): void|null} connection hook after finish */
+    /** @type {((function(): void) | null)} connection hook after finish */
     this._onComplete = null;
   }
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
@@ -346,7 +376,9 @@
     assertHeaderName(name);
     var text = String(value);
     assertValidHeaderChar(text, 'header content [' + name + ']');
-    this._headers[name.toLowerCase()] = { name: name, value: text };
+    var lowerName = name.toLowerCase();
+    this._headerValues[lowerName] = text;
+    this._headerNames[lowerName] = name;
     return this;
   };
 
@@ -355,15 +387,16 @@
    * @returns {string|undefined}
    */
   ServerResponse.prototype.getHeader = function (name) {
-    var entry = this._headers[String(name).toLowerCase()];
-    return entry ? entry.value : undefined;
+    return this._headerValues[String(name).toLowerCase()];
   };
 
   /**
    * @param {string} name
    */
   ServerResponse.prototype.removeHeader = function (name) {
-    delete this._headers[String(name).toLowerCase()];
+    var lowerName = String(name).toLowerCase();
+    delete this._headerValues[lowerName];
+    delete this._headerNames[lowerName];
   };
 
   /**
@@ -371,7 +404,7 @@
    * @returns {boolean}
    */
   ServerResponse.prototype.hasHeader = function (name) {
-    return this._headers[String(name).toLowerCase()] !== undefined;
+    return this._headerValues[String(name).toLowerCase()] !== undefined;
   };
 
   /**
@@ -424,9 +457,8 @@
       head += this._keepAlive ? CONNECTION_KEEP_ALIVE : CONNECTION_CLOSE;
     }
 
-    for (var lowerName in this._headers) {
-      var entry = this._headers[lowerName];
-      head += entry.name + ': ' + entry.value + '\r\n';
+    for (var lowerName in this._headerValues) {
+      head += this._headerNames[lowerName] + ': ' + this._headerValues[lowerName] + '\r\n';
     }
     head += '\r\n';
     return head;
@@ -628,6 +660,69 @@
     var receivingRequest = false;
     registerConnectionDeadlines(server, deadlines);
 
+    // Deferred body/'end' delivery: one reused nextTick callback + parallel arrays
+    // (no per-request closure). Pipelined sync processRequestHead can enqueue more
+    // while flush runs; deferScheduled stays true until the queue is empty.
+    var deferRequests = [];
+    var deferBodies = [];
+    var deferKinds = []; // 0 = emit end, 1 = Content-Length feed, 2 = chunked feed
+    var deferDecoders = [];
+    var deferScheduled = false;
+    var deferFlushError = undefined;
+    var DEFER_END = 0;
+    var DEFER_CONTENT_LENGTH = 1;
+    var DEFER_CHUNKED = 2;
+
+    function scheduleAfterRequest(targetRequest, bodyFromHead, kind, decoder) {
+      deferRequests.push(targetRequest);
+      deferBodies.push(bodyFromHead);
+      deferKinds.push(kind);
+      deferDecoders.push(decoder);
+      if (!deferScheduled) {
+        deferScheduled = true;
+        process.nextTick(flushAfterRequest);
+      }
+    }
+
+    function flushAfterRequest() {
+      // try/finally: a throw from a user 'end'/'data' listener must not latch
+      // deferScheduled=true forever (which would skip later nextTick arms).
+      deferFlushError = undefined;
+      try {
+        var index = 0;
+        while (index < deferRequests.length) {
+          var targetRequest = deferRequests[index];
+          var bodyFromHead = deferBodies[index];
+          var kind = deferKinds[index];
+          var decoder = deferDecoders[index];
+          index++;
+          if (connectionClosed) continue;
+          try {
+            if (kind === DEFER_END) {
+              emitRequestEnd(targetRequest);
+              maybeAdvance();
+            } else if (kind === DEFER_CHUNKED) {
+              decoder(bodyFromHead);
+            } else {
+              feedContentLengthBody(bodyFromHead);
+            }
+          } catch (err) {
+            // Drain siblings first; rethrow the first error after cleanup.
+            if (deferFlushError === undefined) deferFlushError = err;
+          }
+        }
+      } finally {
+        deferRequests.length = 0;
+        deferBodies.length = 0;
+        deferKinds.length = 0;
+        deferDecoders.length = 0;
+        deferScheduled = false;
+        var pendingError = deferFlushError;
+        deferFlushError = undefined;
+        if (pendingError !== undefined) throw pendingError;
+      }
+    }
+
     function clearReceiveDeadlines() {
       deadlines.headersUntil = 0;
       deadlines.requestUntil = 0;
@@ -824,28 +919,27 @@
         contentLengthRemaining = parseInt(contentLengthHeader, 10);
       }
 
-      var capturedRequest = request;
       var hasEntityBody = chunkedDecoder !== null || contentLengthRemaining > 0;
+      // Capture before emit: sync res.end() may reset outer `request` via maybeAdvance.
+      var capturedRequest = request;
+      var capturedBody = bodyFromHead;
+      var capturedDecoder = chunkedDecoder;
+      var deferKind = !hasEntityBody
+        ? DEFER_END
+        : chunkedDecoder
+          ? DEFER_CHUNKED
+          : DEFER_CONTENT_LENGTH;
 
       // Bodyless: mark receive-complete before 'request' so sync res.end() can reuse
       // the connection same turn. requestTimeout is receive-only (Node parity).
-      // 'end' still fires on nextTick so deferred listeners observe it.
       if (!hasEntityBody) {
         markRequestReceived(bodyFromHead.length ? bodyFromHead : EMPTY_BUFFER);
       }
 
       server.emit('request', request, response);
-      process.nextTick(function () {
-        if (connectionClosed) return;
-        if (!hasEntityBody) {
-          emitRequestEnd(capturedRequest);
-          maybeAdvance();
-        } else if (chunkedDecoder) {
-          chunkedDecoder(bodyFromHead);
-        } else {
-          feedContentLengthBody(bodyFromHead);
-        }
-      });
+      // After emit so a throwing handler does not leave a stray deferred delivery.
+      // 'end' / entity bytes still on nextTick for listeners attached in the handler.
+      scheduleAfterRequest(capturedRequest, capturedBody, deferKind, capturedDecoder);
     }
 
     socket.on('data', function (chunk) {
