@@ -15,10 +15,10 @@ Also: “run multi-angle review on this PR”, “Fable-style review”.
 
 ## Layout
 
-| Path | Role |
-|------|------|
-| `SKILL.md` | Orchestrator (spawn → merge → triage) |
-| `angles/*.md` | Specialist instructions |
+| Path                    | Role                                                 |
+| ----------------------- | ---------------------------------------------------- |
+| `SKILL.md`              | Orchestrator (spawn → merge → triage)                |
+| `angles/*.md`           | Specialist instructions                              |
 | `../../personas/*.toml` | Persona catalog entries (instructions_file → angles) |
 
 ## Minimal human loop

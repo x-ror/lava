@@ -8,7 +8,7 @@ description: >
   into one triage report. Use when the user runs /multi-review, asks for
   multi-angle review, Fable-style review agents, or high-quality automated
   review of a PR, branch, or local diff.
-argument-hint: "[--local | --branch <name> | --pr <number-or-url>] [--angles a,b,c|all] [--finders reuse,simplify,efficiency,altitude|all] [--post-pending]"
+argument-hint: '[--local | --branch <name> | --pr <number-or-url>] [--angles a,b,c|all] [--finders reuse,simplify,efficiency,altitude|all] [--post-pending]'
 ---
 
 # Multi-Angle Review (Fable-style quality pipeline)
@@ -45,17 +45,17 @@ submit the PR review / merge.
 
 ## Angle / finder map
 
-| ID | Name | Instruction file (relative to this skill) |
-|----|------|-------------------------------------------|
-| a | Line-by-line scan | `angles/a-line.md` |
-| b | Removed-behavior audit | `angles/b-removed.md` |
-| c | Cross-file tracer | `angles/c-tracer.md` |
-| d | Language pitfalls | `angles/d-language.md` |
-| e | Probe / thread-safety | `angles/e-probe.md` |
-| reuse | Reuse finder | `angles/finder-reuse.md` |
-| simplify | Simplification finder | `angles/finder-simplify.md` |
-| efficiency | Efficiency finder | `angles/finder-efficiency.md` |
-| altitude | Altitude / layer finder | `angles/finder-altitude.md` |
+| ID         | Name                    | Instruction file (relative to this skill) |
+| ---------- | ----------------------- | ----------------------------------------- |
+| a          | Line-by-line scan       | `angles/a-line.md`                        |
+| b          | Removed-behavior audit  | `angles/b-removed.md`                     |
+| c          | Cross-file tracer       | `angles/c-tracer.md`                      |
+| d          | Language pitfalls       | `angles/d-language.md`                    |
+| e          | Probe / thread-safety   | `angles/e-probe.md`                       |
+| reuse      | Reuse finder            | `angles/finder-reuse.md`                  |
+| simplify   | Simplification finder   | `angles/finder-simplify.md`               |
+| efficiency | Efficiency finder       | `angles/finder-efficiency.md`             |
+| altitude   | Altitude / layer finder | `angles/finder-altitude.md`               |
 
 Resolve absolute path: directory of this `SKILL.md` + `/angles/...`.
 
@@ -172,21 +172,26 @@ Read every `${agent_out_dir}/*.md`. Build `merge_file`:
 - Failed specialists: ...
 
 ## Severity counts
+
 - P0: N
 - P1: N
 - P2: N
 - nit: N
 
 ## Human action list (minimal)
+
 1. ... only P0/P1, deduped across agents ...
 
 ## Deduped findings
+
 ### [P0] title
+
 - Agents: a, e
 - File: ...
 - ...
 
 ## Per-agent summaries
+
 | ID | Verdict | #Findings |
 ...
 ```
@@ -199,12 +204,12 @@ Read every `${agent_out_dir}/*.md`. Build `merge_file`:
 
 **Triage for "minimal human":**
 
-| Severity | Meaning | Human? |
-|----------|---------|--------|
-| p0 | correctness / safety / data race / wrong API | yes — fix before merge |
-| p1 | structural / maintainability blocker (1k file, wrong layer, poison flag) | yes — fix or explicit waive |
-| p2 | solid improvement | optional same PR |
-| nit | style | ignore unless free |
+| Severity | Meaning                                                                  | Human?                      |
+| -------- | ------------------------------------------------------------------------ | --------------------------- |
+| p0       | correctness / safety / data race / wrong API                             | yes — fix before merge      |
+| p1       | structural / maintainability blocker (1k file, wrong layer, poison flag) | yes — fix or explicit waive |
+| p2       | solid improvement                                                        | optional same PR            |
+| nit      | style                                                                    | ignore unless free          |
 
 ## Step 4 — Optional PENDING GitHub review
 

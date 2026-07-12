@@ -433,7 +433,11 @@
     if (!this.headersSent) {
       // No prior write() → we know the full length here, so frame with Content-Length
       // (unless a no-body status, or the caller already chose Transfer-Encoding).
-      if (!headerPresent(this, 'content-length') && !headerPresent(this, 'transfer-encoding') && !noBody) {
+      if (
+        !headerPresent(this, 'content-length') &&
+        !headerPresent(this, 'transfer-encoding') &&
+        !noBody
+      ) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
       if (this._allowChunked && headerPresent(this, 'transfer-encoding')) {
