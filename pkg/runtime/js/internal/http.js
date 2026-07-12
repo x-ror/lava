@@ -77,8 +77,7 @@
    */
   var HTTP_TCHAR = new Uint8Array(128);
   (function initHttpTchar() {
-    var chars =
-      "!#$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz|~";
+    var chars = "!#$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz|~";
     for (var i = 0; i < chars.length; i++) HTTP_TCHAR[chars.charCodeAt(i)] = 1;
   })();
 
@@ -496,11 +495,7 @@
     }
     var omitBody = this._isHead || statusHasNoBody(this.statusCode);
     if (!this.headersSent) {
-      if (
-        !this.hasHeader('content-length') &&
-        !this.hasHeader('transfer-encoding') &&
-        !omitBody
-      ) {
+      if (!this.hasHeader('content-length') && !this.hasHeader('transfer-encoding') && !omitBody) {
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
       if (this._allowChunked && this.hasHeader('transfer-encoding')) {
@@ -774,8 +769,7 @@
     function feedContentLengthBody(chunk) {
       if (!request || request._ended) return;
       if (contentLengthRemaining > 0 && chunk && chunk.length) {
-        var take =
-          chunk.length < contentLengthRemaining ? chunk.length : contentLengthRemaining;
+        var take = chunk.length < contentLengthRemaining ? chunk.length : contentLengthRemaining;
         request.emit('data', chunk.slice(0, take));
         contentLengthRemaining -= take;
         chunk = chunk.slice(take);
