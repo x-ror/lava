@@ -207,6 +207,9 @@
     StringPrototypeTrim: caller0(StringProto.trim),
     StringPrototypeStartsWith: caller2(StringProto.startsWith),
     StringPrototypeEndsWith: caller2(StringProto.endsWith),
+    StringPrototypeNormalize: caller1(StringProto.normalize),
+    StringPrototypeSubstr: caller2(StringProto.substr),
+    StringPrototypePadStart: caller2(StringProto.padStart),
 
     Uint8ArrayPrototypeSet: caller2(Uint8Array.prototype.set),
   };

@@ -18,6 +18,55 @@
 (function (require, module, _exports) {
   'use strict';
 
+  // --- Pollution-safe intrinsics -------------------------------------------
+  // URL parsing runs on attacker-influenced strings while user code may have
+  // poisoned shared prototypes/globals. Prototype methods route through the
+  // pristine primordials table; free globals and statics are captured HERE, at
+  // module-eval, which the loader runs before any user code — so these bindings
+  // are pristine and cannot be re-pointed later (a poisoned Math.floor, String,
+  // decodeURIComponent, or String.prototype.normalize otherwise silently
+  // substitutes hosts / disables IPv4 normalization; see the URL vector audit).
+  var P = require('primordials');
+  var ArrayPrototypePush = P.ArrayPrototypePush;
+  var ArrayPrototypePop = P.ArrayPrototypePop;
+  var ArrayPrototypeShift = P.ArrayPrototypeShift;
+  var ArrayPrototypeSlice = P.ArrayPrototypeSlice;
+  var ArrayPrototypeSplice = P.ArrayPrototypeSplice;
+  var ArrayPrototypeJoin = P.ArrayPrototypeJoin;
+  var ArrayPrototypeSort = P.ArrayPrototypeSort;
+  var ArrayPrototypeMap = P.ArrayPrototypeMap;
+  var ArrayPrototypeIndexOf = P.ArrayPrototypeIndexOf;
+  var ArrayPrototypeIncludes = P.ArrayPrototypeIncludes;
+  var StringPrototypeSlice = P.StringPrototypeSlice;
+  var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
+  var StringPrototypeCodePointAt = P.StringPrototypeCodePointAt;
+  var StringPrototypeCharAt = P.StringPrototypeCharAt;
+  var StringPrototypeIndexOf = P.StringPrototypeIndexOf;
+  var StringPrototypeReplace = P.StringPrototypeReplace;
+  var StringPrototypeReplaceAll = P.StringPrototypeReplaceAll;
+  var StringPrototypeSplit = P.StringPrototypeSplit;
+  var StringPrototypeToLowerCase = P.StringPrototypeToLowerCase;
+  var StringPrototypeToUpperCase = P.StringPrototypeToUpperCase;
+  var StringPrototypeStartsWith = P.StringPrototypeStartsWith;
+  var StringPrototypeNormalize = P.StringPrototypeNormalize;
+  var StringPrototypeSubstr = P.StringPrototypeSubstr;
+  var ObjectCreate = P.ObjectCreate;
+  var ObjectKeys = P.ObjectKeys;
+  var ObjectDefineProperty = P.ObjectDefineProperty;
+  var ArrayFrom = P.ArrayFrom;
+  // Free globals / statics, captured pristine at module-eval.
+  var StringG = String;
+  var NumberG = Number;
+  var StringFromCharCode = String.fromCharCode;
+  var StringFromCodePoint = String.fromCodePoint;
+  var MathFloor = Math.floor;
+  var MathPow = Math.pow;
+  var parseIntG = parseInt;
+  var decodeURIComponentG = decodeURIComponent;
+  var isFiniteG = isFinite;
+  var TextEncoderG = TextEncoder;
+  var TextDecoderG = TextDecoder;
+
   // TextEncoder/TextDecoder are installed by internal/encoding.js. This module is
   // eagerly instantiated to install the URL/URLSearchParams globals, so the codecs
   // are created lazily (on first parse/serialize) rather than at module-eval time —
@@ -27,14 +76,14 @@
   var decoderInstance = null;
   var fatalDecoderInstance = null;
   function encoder() {
-    return encoderInstance || (encoderInstance = new TextEncoder());
+    return encoderInstance || (encoderInstance = new TextEncoderG());
   }
   function decoder() {
-    return decoderInstance || (decoderInstance = new TextDecoder('utf-8'));
+    return decoderInstance || (decoderInstance = new TextDecoderG('utf-8'));
   }
   function fatalDecoder() {
     return (
-      fatalDecoderInstance || (fatalDecoderInstance = new TextDecoder('utf-8', { fatal: true }))
+      fatalDecoderInstance || (fatalDecoderInstance = new TextDecoderG('utf-8', { fatal: true }))
     );
   }
 
@@ -58,8 +107,8 @@
   function trimC0ControlOrSpace(str) {
     var start = 0;
     var end = str.length;
-    while (start < end && str.charCodeAt(start) <= 0x20) start++;
-    while (end > start && str.charCodeAt(end - 1) <= 0x20) end--;
+    while (start < end && StringPrototypeCharCodeAt(str, start) <= 0x20) start++;
+    while (end > start && StringPrototypeCharCodeAt(str, end - 1) <= 0x20) end--;
     return start === 0 && end === str.length ? str : str.slice(start, end);
   }
   function inFragmentSet(cp) {
@@ -101,7 +150,7 @@
   for (var pctB = 0; pctB < 256; pctB++) {
     var pctHex = pctB.toString(16).toUpperCase();
     PCT[pctB] = '%' + (pctHex.length === 1 ? '0' + pctHex : pctHex);
-    if (pctB < 128) ASCII_CHAR[pctB] = String.fromCharCode(pctB);
+    if (pctB < 128) ASCII_CHAR[pctB] = StringFromCharCode(pctB);
   }
 
   function percentEncodeByte(b) {
@@ -132,17 +181,17 @@
   function utf8PercentEncode(str, inSet) {
     var out = '';
     for (var i = 0; i < str.length; i++) {
-      var cp = str.codePointAt(i);
+      var cp = StringPrototypeCodePointAt(str, i);
       if (cp > 0xffff) i++; // consumed a surrogate pair
       out += percentEncodeCp(cp, inSet);
     }
     return out;
   }
 
-  // One-character string for a code point without the String.fromCodePoint
+  // One-character string for a code point without the StringFromCodePoint
   // host-call for ASCII — the state machine appends to its buffer through this.
   function cpToStr(cp) {
-    return cp < 0x80 ? ASCII_CHAR[cp] : String.fromCodePoint(cp);
+    return cp < 0x80 ? ASCII_CHAR[cp] : StringFromCodePoint(cp);
   }
 
   // Percent-decode a string to its raw byte sequence. Non-%XX characters
@@ -150,20 +199,20 @@
   function percentDecodeBytes(str) {
     var bytes = [];
     for (var i = 0; i < str.length; i++) {
-      var c = str.charCodeAt(i);
+      var c = StringPrototypeCharCodeAt(str, i);
       if (
         c === 0x25 &&
         i + 2 < str.length &&
-        isHexDigit(str.charCodeAt(i + 1)) &&
-        isHexDigit(str.charCodeAt(i + 2))
+        isHexDigit(StringPrototypeCharCodeAt(str, i + 1)) &&
+        isHexDigit(StringPrototypeCharCodeAt(str, i + 2))
       ) {
-        bytes.push(parseInt(str.substr(i + 1, 2), 16));
+        ArrayPrototypePush(bytes, parseIntG(StringPrototypeSubstr(str, i + 1, 2), 16));
         i += 2;
       } else {
-        var cp = str.codePointAt(i);
+        var cp = StringPrototypeCodePointAt(str, i);
         if (cp > 0xffff) i++;
-        var enc = encoder().encode(String.fromCodePoint(cp));
-        for (var k = 0; k < enc.length; k++) bytes.push(enc[k]);
+        var enc = encoder().encode(StringFromCodePoint(cp));
+        for (var k = 0; k < enc.length; k++) ArrayPrototypePush(bytes, enc[k]);
       }
     }
     return new Uint8Array(bytes);
@@ -197,14 +246,14 @@
   var PUNY_INITIAL_N = 128;
 
   function punyAdapt(delta, numPoints, firstTime) {
-    delta = firstTime ? Math.floor(delta / PUNY_DAMP) : delta >> 1;
-    delta += Math.floor(delta / numPoints);
+    delta = firstTime ? MathFloor(delta / PUNY_DAMP) : delta >> 1;
+    delta += MathFloor(delta / numPoints);
     var k = 0;
     while (delta > ((PUNY_BASE - PUNY_TMIN) * PUNY_TMAX) >> 1) {
-      delta = Math.floor(delta / (PUNY_BASE - PUNY_TMIN));
+      delta = MathFloor(delta / (PUNY_BASE - PUNY_TMIN));
       k += PUNY_BASE;
     }
-    return k + Math.floor(((PUNY_BASE - PUNY_TMIN + 1) * delta) / (delta + PUNY_SKEW));
+    return k + MathFloor(((PUNY_BASE - PUNY_TMIN + 1) * delta) / (delta + PUNY_SKEW));
   }
 
   function punyEncodeDigit(d) {
@@ -222,9 +271,9 @@
     var output = [];
     var codePoints = [];
     for (var s = 0; s < input.length; s++) {
-      var cp = input.codePointAt(s);
+      var cp = StringPrototypeCodePointAt(input, s);
       if (cp > 0xffff) s++;
-      codePoints.push(cp);
+      ArrayPrototypePush(codePoints, cp);
     }
     var n = PUNY_INITIAL_N;
     var delta = 0;
@@ -233,12 +282,12 @@
     var i;
     for (i = 0; i < codePoints.length; i++) {
       if (codePoints[i] < 0x80) {
-        output.push(codePoints[i]);
+        ArrayPrototypePush(output, codePoints[i]);
         basicLength++;
       }
     }
     var handled = basicLength;
-    if (basicLength > 0) output.push(0x2d); // '-'
+    if (basicLength > 0) ArrayPrototypePush(output, 0x2d); // '-'
     while (handled < codePoints.length) {
       var m = 0x7fffffff;
       for (i = 0; i < codePoints.length; i++) {
@@ -254,10 +303,10 @@
           for (var k = PUNY_BASE; ; k += PUNY_BASE) {
             var t = k <= bias ? PUNY_TMIN : k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias;
             if (q < t) break;
-            output.push(punyEncodeDigit(t + ((q - t) % (PUNY_BASE - t))));
-            q = Math.floor((q - t) / (PUNY_BASE - t));
+            ArrayPrototypePush(output, punyEncodeDigit(t + ((q - t) % (PUNY_BASE - t))));
+            q = MathFloor((q - t) / (PUNY_BASE - t));
           }
-          output.push(punyEncodeDigit(q));
+          ArrayPrototypePush(output, punyEncodeDigit(q));
           bias = punyAdapt(delta, handled + 1, handled === basicLength);
           delta = 0;
           handled++;
@@ -267,7 +316,7 @@
       n++;
     }
     var str = '';
-    for (i = 0; i < output.length; i++) str += String.fromCharCode(output[i]);
+    for (i = 0; i < output.length; i++) str += StringFromCharCode(output[i]);
     return str;
   }
 
@@ -279,8 +328,8 @@
     var basic = input.lastIndexOf('-');
     if (basic < 0) basic = 0;
     for (var j = 0; j < basic; j++) {
-      if (input.charCodeAt(j) >= 0x80) throw new RangeError('Invalid input');
-      output.push(input.charCodeAt(j));
+      if (StringPrototypeCharCodeAt(input, j) >= 0x80) throw new RangeError('Invalid input');
+      ArrayPrototypePush(output, StringPrototypeCharCodeAt(input, j));
     }
     var index = basic > 0 ? basic + 1 : 0;
     while (index < input.length) {
@@ -288,7 +337,7 @@
       var w = 1;
       for (var k = PUNY_BASE; ; k += PUNY_BASE) {
         if (index >= input.length) throw new RangeError('Invalid input');
-        var digit = punyDecodeDigit(input.charCodeAt(index++));
+        var digit = punyDecodeDigit(StringPrototypeCharCodeAt(input, index++));
         if (digit >= PUNY_BASE) throw new RangeError('Invalid input');
         i += digit * w;
         var t = k <= bias ? PUNY_TMIN : k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias;
@@ -297,19 +346,19 @@
       }
       var outLen = output.length + 1;
       bias = punyAdapt(i - oldi, outLen, oldi === 0);
-      n += Math.floor(i / outLen);
+      n += MathFloor(i / outLen);
       i %= outLen;
-      output.splice(i, 0, n);
+      ArrayPrototypeSplice(output, i, 0, n);
       i++;
     }
     var str = '';
-    for (var o = 0; o < output.length; o++) str += String.fromCodePoint(output[o]);
+    for (var o = 0; o < output.length; o++) str += StringFromCodePoint(output[o]);
     return str;
   }
 
   function hasNonASCII(str) {
     for (var i = 0; i < str.length; i++) {
-      if (str.charCodeAt(i) > 0x7f) return true;
+      if (StringPrototypeCharCodeAt(str, i) > 0x7f) return true;
     }
     return false;
   }
@@ -322,47 +371,49 @@
   function domainToASCII(domain) {
     if (domain === '') return '';
     // IDEOGRAPHIC FULL STOP, FULLWIDTH FULL STOP, HALFWIDTH IDEOGRAPHIC FULL STOP.
-    domain = domain.replaceAll(/[。．｡]/g, '.');
-    var labels = domain.split('.');
+    domain = StringPrototypeReplaceAll(domain, /[。．｡]/g, '.');
+    var labels = StringPrototypeSplit(domain, '.');
     var out = [];
     for (var i = 0; i < labels.length; i++) {
       var label = labels[i];
       if (hasNonASCII(label)) {
-        var mapped = (label.normalize ? label.normalize('NFKC') : label).toLowerCase();
+        var mapped = (
+          label.normalize ? StringPrototypeNormalize(label, 'NFKC') : label
+        ).toLowerCase();
         if (!hasNonASCII(mapped)) {
           // The mapping folded the label to pure ASCII (e.g. fullwidth digits).
-          out.push(mapped);
+          ArrayPrototypePush(out, mapped);
           continue;
         }
         try {
-          out.push('xn--' + punycodeEncode(mapped));
+          ArrayPrototypePush(out, 'xn--' + punycodeEncode(mapped));
         } catch {
           return FAILURE;
         }
       } else {
-        out.push(label.toLowerCase());
+        ArrayPrototypePush(out, StringPrototypeToLowerCase(label));
       }
     }
-    return out.join('.');
+    return ArrayPrototypeJoin(out, '.');
   }
 
   function domainToUnicode(domain) {
     if (domain === '') return '';
-    var labels = domain.split('.');
+    var labels = StringPrototypeSplit(domain, '.');
     var out = [];
     for (var i = 0; i < labels.length; i++) {
       var label = labels[i];
       if (label.slice(0, 4).toLowerCase() === 'xn--') {
         try {
-          out.push(punycodeDecode(label.slice(4)));
+          ArrayPrototypePush(out, punycodeDecode(label.slice(4)));
         } catch {
-          out.push(label);
+          ArrayPrototypePush(out, label);
         }
       } else {
-        out.push(label);
+        ArrayPrototypePush(out, label);
       }
     }
-    return out.join('.');
+    return ArrayPrototypeJoin(out, '.');
   }
 
   // ------------------------------------------------------------------ //
@@ -409,18 +460,18 @@
     if (input === '') return 0;
     var re = radix === 10 ? /^[0-9]+$/ : radix === 16 ? /^[0-9a-fA-F]+$/ : /^[0-7]+$/;
     if (!re.test(input)) return FAILURE;
-    var n = parseInt(input, radix);
-    if (!isFinite(n)) return FAILURE;
+    var n = parseIntG(input, radix);
+    if (!isFiniteG(n)) return FAILURE;
     return n;
   }
 
   function endsInANumber(input) {
-    var parts = input.split('.');
-    if (parts.at(-1) === '') {
+    var parts = StringPrototypeSplit(input, '.');
+    if (parts[parts.length - 1] === '') {
       if (parts.length === 1) return false;
-      parts.pop();
+      ArrayPrototypePop(parts);
     }
-    var last = parts.at(-1);
+    var last = parts[parts.length - 1];
     if (last !== '' && /^[0-9]+$/.test(last)) return true;
     return parseIPv4Number(last) !== FAILURE;
   }
@@ -428,33 +479,33 @@
   function serializeIPv4(n) {
     var out = '';
     for (var i = 1; i <= 4; i++) {
-      out = String(n % 256) + out;
+      out = StringG(n % 256) + out;
       if (i !== 4) out = '.' + out;
-      n = Math.floor(n / 256);
+      n = MathFloor(n / 256);
     }
     return out;
   }
 
   function parseIPv4(input) {
-    var parts = input.split('.');
-    if (parts.at(-1) === '') {
-      if (parts.length > 1) parts.pop();
+    var parts = StringPrototypeSplit(input, '.');
+    if (parts[parts.length - 1] === '') {
+      if (parts.length > 1) ArrayPrototypePop(parts);
     }
     if (parts.length > 4) return FAILURE;
     var numbers = [];
     for (var i = 0; i < parts.length; i++) {
       var n = parseIPv4Number(parts[i]);
       if (n === FAILURE) return FAILURE;
-      numbers.push(n);
+      ArrayPrototypePush(numbers, n);
     }
     for (var j = 0; j < numbers.length; j++) {
       if (numbers[j] > 255 && j !== numbers.length - 1) return FAILURE;
     }
-    if (numbers.at(-1) >= Math.pow(256, 5 - numbers.length)) return FAILURE;
-    var ipv4 = numbers.pop();
+    if (numbers[numbers.length - 1] >= MathPow(256, 5 - numbers.length)) return FAILURE;
+    var ipv4 = ArrayPrototypePop(numbers);
     var counter = 0;
     for (var m = 0; m < numbers.length; m++) {
-      ipv4 += numbers[m] * Math.pow(256, 3 - counter);
+      ipv4 += numbers[m] * MathPow(256, 3 - counter);
       counter++;
     }
     return serializeIPv4(ipv4);
@@ -465,7 +516,8 @@
     var pieceIndex = 0;
     var compress = null;
     var cps = [];
-    for (var s = 0; s < input.length; s++) cps.push(input.charCodeAt(s));
+    for (var s = 0; s < input.length; s++)
+      ArrayPrototypePush(cps, StringPrototypeCharCodeAt(input, s));
     var pointer = 0;
     function c() {
       return pointer < cps.length ? cps[pointer] : -1;
@@ -489,7 +541,7 @@
       var value = 0;
       var length = 0;
       while (length < 4 && isHexDigit(c())) {
-        value = value * 16 + parseInt(String.fromCharCode(c()), 16);
+        value = value * 16 + parseIntG(StringFromCharCode(c()), 16);
         pointer++;
         length++;
       }
@@ -583,7 +635,7 @@
 
   function parseOpaqueHost(input) {
     for (var i = 0; i < input.length; i++) {
-      var cp = input.codePointAt(i);
+      var cp = StringPrototypeCodePointAt(input, i);
       if (cp > 0xffff) i++;
       if (isForbiddenHostCodePoint(cp)) return FAILURE;
     }
@@ -599,7 +651,7 @@
 
   function parseHost(input, isSpecial) {
     if (input[0] === '[') {
-      if (input.at(-1) !== ']') return FAILURE;
+      if (input[input.length - 1] !== ']') return FAILURE;
       return parseIPv6(input.slice(1, -1));
     }
     if (!isSpecial) return parseOpaqueHost(input);
@@ -612,7 +664,7 @@
     var ascii = domainToASCII(domain);
     if (ascii === FAILURE) return FAILURE;
     for (var i = 0; i < ascii.length; i++) {
-      if (isForbiddenDomainCodePoint(ascii.charCodeAt(i))) return FAILURE;
+      if (isForbiddenDomainCodePoint(StringPrototypeCharCodeAt(ascii, i))) return FAILURE;
     }
     if (endsInANumber(ascii)) return parseIPv4(ascii);
     return ascii;
@@ -622,7 +674,13 @@
   // URL record + serialization                                         //
   // ------------------------------------------------------------------ //
 
+  // null prototype: SPECIAL_SCHEMES[scheme] is read for arbitrary schemes, so a
+  // normal object would inherit a poisoned Object.prototype key (e.g.
+  // Object.prototype.foo = 8080 makes the default-port check match and silently
+  // drop a real port). __proto__:null cuts the chain — a non-special scheme reads
+  // undefined, as it must.
   var SPECIAL_SCHEMES = {
+    __proto__: null,
     ftp: 21,
     file: null,
     http: 80,
@@ -636,6 +694,11 @@
   }
 
   function newRecord() {
+    // A plain literal, NOT a null-proto object: this record is accessed only via
+    // fixed, hard-coded field names (url.scheme, url.host, …), never by an
+    // attacker-controlled key, so it is not exposed to prototype-key pollution
+    // and needs no null prototype. (null-proto is reserved for the lookup MAPS
+    // keyed by external strings, e.g. SPECIAL_SCHEMES.)
     return {
       scheme: '',
       username: '',
@@ -664,7 +727,7 @@
   function serializePath(url) {
     if (url.opaque) return url.path;
     if (url.path.length === 0) return '';
-    return '/' + url.path.join('/');
+    return '/' + ArrayPrototypeJoin(url.path, '/');
   }
 
   function serializeHostPort(url) {
@@ -755,21 +818,25 @@
     return isASCIIAlpha(cp) || isASCIIDigit(cp);
   }
   function isSingleDot(seg) {
-    return seg === '.' || seg.toLowerCase() === '%2e';
+    return seg === '.' || StringPrototypeToLowerCase(seg) === '%2e';
   }
   function isDoubleDot(seg) {
-    var l = seg.toLowerCase();
+    var l = StringPrototypeToLowerCase(seg);
     return l === '..' || l === '.%2e' || l === '%2e.' || l === '%2e%2e';
   }
   function isWindowsDriveLetter(s) {
     return (
       s.length === 2 &&
-      isASCIIAlpha(s.charCodeAt(0)) &&
-      (s.charCodeAt(1) === 0x3a || s.charCodeAt(1) === 0x7c)
+      isASCIIAlpha(StringPrototypeCharCodeAt(s, 0)) &&
+      (StringPrototypeCharCodeAt(s, 1) === 0x3a || StringPrototypeCharCodeAt(s, 1) === 0x7c)
     );
   }
   function isNormalizedWindowsDriveLetter(s) {
-    return s.length === 2 && isASCIIAlpha(s.charCodeAt(0)) && s.charCodeAt(1) === 0x3a;
+    return (
+      s.length === 2 &&
+      isASCIIAlpha(StringPrototypeCharCodeAt(s, 0)) &&
+      StringPrototypeCharCodeAt(s, 1) === 0x3a
+    );
   }
   function startsWithWindowsDriveLetter(str, i) {
     var rest = str.slice(i);
@@ -800,16 +867,16 @@
     }
     // Remove all ASCII tab or newline (guarded: almost no real input has them,
     // and replaceAll would re-scan + re-allocate on every parse).
-    if (TAB_NEWLINE_RE.test(input)) input = input.replace(TAB_NEWLINE_RE_G, '');
+    if (TAB_NEWLINE_RE.test(input)) input = StringPrototypeReplace(input, TAB_NEWLINE_RE_G, '');
 
     // Code POINTS as numbers, one pass, surrogate-aware — same iteration as
-    // Array.from(input).map(c => c.codePointAt(0)) without allocating a
+    // ArrayFrom(input).map(c => c.codePointAt(0)) without allocating a
     // single-character string per code point (the old form dominated the whole
     // parse: one string alloc + one codePointAt call per character per read).
     var cps = [];
     for (var ci = 0; ci < input.length; ) {
-      var cc = input.codePointAt(ci);
-      cps.push(cc);
+      var cc = StringPrototypeCodePointAt(input, ci);
+      ArrayPrototypePush(cps, cc);
       ci += cc > 0xffff ? 2 : 1;
     }
     var pointer = 0;
@@ -841,7 +908,7 @@
       switch (state) {
         case SCHEME_START:
           if (isASCIIAlpha(c)) {
-            buffer += String.fromCharCode(c | 0x20);
+            buffer += StringFromCharCode(c | 0x20);
             state = SCHEME;
           } else if (stateOverride === undefined) {
             state = NO_SCHEME;
@@ -853,7 +920,7 @@
 
         case SCHEME:
           if (isASCIIAlphanumeric(c) || c === 0x2b || c === 0x2d || c === 0x2e) {
-            buffer += String.fromCharCode(c >= 0x41 && c <= 0x5a ? c | 0x20 : c);
+            buffer += StringFromCharCode(c >= 0x41 && c <= 0x5a ? c | 0x20 : c);
           } else if (c === 0x3a) {
             if (stateOverride !== undefined) {
               var bufSpecial = isSpecialScheme(buffer);
@@ -942,7 +1009,7 @@
             url.password = base.password;
             url.host = base.host;
             url.port = base.port;
-            url.path = base.path.slice();
+            url.path = ArrayPrototypeSlice(base.path);
             url.query = base.query;
             if (c === 0x3f) {
               url.query = '';
@@ -952,7 +1019,7 @@
               state = FRAGMENT;
             } else if (c !== -1) {
               url.query = null;
-              url.path.pop();
+              ArrayPrototypePop(url.path);
               state = PATH;
               pointer--;
             }
@@ -996,13 +1063,13 @@
             if (atSignSeen) buffer = '%40' + buffer;
             atSignSeen = true;
             for (var bi = 0; bi < buffer.length; bi++) {
-              var bcp = buffer.codePointAt(bi);
+              var bcp = StringPrototypeCodePointAt(buffer, bi);
               if (bcp > 0xffff) bi++;
               if (bcp === 0x3a && !passwordTokenSeen) {
                 passwordTokenSeen = true;
                 continue;
               }
-              var encoded = utf8PercentEncode(String.fromCodePoint(bcp), inUserinfoSet);
+              var encoded = utf8PercentEncode(StringFromCodePoint(bcp), inUserinfoSet);
               if (passwordTokenSeen) url.password += encoded;
               else url.username += encoded;
             }
@@ -1015,7 +1082,7 @@
             (special && c === 0x5c)
           ) {
             if (atSignSeen && buffer === '') return FAILURE;
-            pointer -= Array.from(buffer).length + 1;
+            pointer -= ArrayFrom(buffer).length + 1;
             buffer = '';
             state = HOST;
           } else {
@@ -1066,7 +1133,7 @@
 
         case PORT:
           if (isASCIIDigit(c)) {
-            buffer += String.fromCharCode(c);
+            buffer += StringFromCharCode(c);
           } else if (
             c === -1 ||
             c === 0x2f ||
@@ -1076,7 +1143,7 @@
             stateOverride !== undefined
           ) {
             if (buffer !== '') {
-              var portNum = parseInt(buffer, 10);
+              var portNum = parseIntG(buffer, 10);
               if (portNum > 65535) return FAILURE;
               url.port = portNum === SPECIAL_SCHEMES[url.scheme] ? null : portNum;
               buffer = '';
@@ -1097,7 +1164,7 @@
             state = FILE_SLASH;
           } else if (base !== undefined && base.scheme === 'file') {
             url.host = base.host;
-            url.path = base.path.slice();
+            url.path = ArrayPrototypeSlice(base.path);
             url.query = base.query;
             if (c === 0x3f) {
               url.query = '';
@@ -1131,7 +1198,7 @@
               !startsWithWindowsDriveLetter(input, pointer)
             ) {
               if (isNormalizedWindowsDriveLetter(base.path[0] || '')) {
-                url.path.push(base.path[0]);
+                ArrayPrototypePush(url.path, base.path[0]);
               } else {
                 url.host = base.host;
               }
@@ -1178,7 +1245,7 @@
             state = PATH;
             if (c !== 0x2f) pointer--;
           } else if (stateOverride !== undefined && url.host === null) {
-            url.path.push('');
+            ArrayPrototypePush(url.path, '');
           }
           break;
 
@@ -1191,14 +1258,14 @@
           ) {
             if (isDoubleDot(buffer)) {
               shortenPath(url);
-              if (c !== 0x2f && !(special && c === 0x5c)) url.path.push('');
+              if (c !== 0x2f && !(special && c === 0x5c)) ArrayPrototypePush(url.path, '');
             } else if (isSingleDot(buffer)) {
-              if (c !== 0x2f && !(special && c === 0x5c)) url.path.push('');
+              if (c !== 0x2f && !(special && c === 0x5c)) ArrayPrototypePush(url.path, '');
             } else {
               if (url.scheme === 'file' && url.path.length === 0 && isWindowsDriveLetter(buffer)) {
                 buffer = buffer[0] + ':';
               }
-              url.path.push(buffer);
+              ArrayPrototypePush(url.path, buffer);
             }
             buffer = '';
             if (c === 0x3f) {
@@ -1256,16 +1323,16 @@
     if (url.scheme === 'file' && path.length === 1 && isNormalizedWindowsDriveLetter(path[0])) {
       return;
     }
-    path.pop();
+    ArrayPrototypePop(path);
   }
 
   function parseURLOrThrow(input, base) {
     var baseRecord;
     if (base !== undefined && base !== null) {
-      baseRecord = basicURLParse(String(base));
+      baseRecord = basicURLParse(StringG(base));
       if (baseRecord === FAILURE) throw invalidURL(base);
     }
-    var record = basicURLParse(String(input), baseRecord);
+    var record = basicURLParse(StringG(input), baseRecord);
     if (record === FAILURE) throw invalidURL(input);
     return record;
   }
@@ -1273,7 +1340,7 @@
   function invalidURL(input) {
     var err = new TypeError('Invalid URL');
     err.code = 'ERR_INVALID_URL';
-    err.input = String(input);
+    err.input = StringG(input);
     return err;
   }
 
@@ -1313,14 +1380,14 @@
     for (var i = 0; i < bytes.length; i++) {
       var b = bytes[i];
       if (b === 0x20) out += '+';
-      else if (isFormUrlencodedSafe(b)) out += String.fromCharCode(b);
+      else if (isFormUrlencodedSafe(b)) out += StringFromCharCode(b);
       else out += percentEncodeByte(b);
     }
     return out;
   }
 
   function formUrlencodedParse(input) {
-    var sequences = input === '' ? [] : input.split('&');
+    var sequences = input === '' ? [] : StringPrototypeSplit(input, '&');
     var output = [];
     for (var i = 0; i < sequences.length; i++) {
       var bytes = sequences[i];
@@ -1334,9 +1401,9 @@
         name = bytes.slice(0, eq);
         value = bytes.slice(eq + 1);
       }
-      name = percentDecode(name.replaceAll('+', ' '));
-      value = percentDecode(value.replaceAll('+', ' '));
-      output.push([name, value]);
+      name = percentDecode(StringPrototypeReplaceAll(name, '+', ' '));
+      value = percentDecode(StringPrototypeReplaceAll(value, '+', ' '));
+      ArrayPrototypePush(output, [name, value]);
     }
     return output;
   }
@@ -1365,7 +1432,8 @@
     if (typeof init === 'object' || typeof init === 'function') {
       if (init instanceof URLSearchParams) {
         var src = init[kList];
-        for (var i = 0; i < src.length; i++) this[kList].push([src[i][0], src[i][1]]);
+        for (var i = 0; i < src.length; i++)
+          ArrayPrototypePush(this[kList], [src[i][0], src[i][1]]);
         return;
       }
       if (typeof init[Symbol.iterator] === 'function') {
@@ -1375,19 +1443,19 @@
             throw new TypeError('The provided value cannot be converted to a sequence.');
           }
           var arr = [];
-          for (var v of pair) arr.push(v);
+          for (var v of pair) ArrayPrototypePush(arr, v);
           if (arr.length !== 2) {
             throw new TypeError('Each query pair must be an iterable [name, value] tuple');
           }
-          this[kList].push([toUSVString(arr[0]), toUSVString(arr[1])]);
+          ArrayPrototypePush(this[kList], [toUSVString(arr[0]), toUSVString(arr[1])]);
           idx++;
         }
         return;
       }
       // Record of string -> string.
-      var keys = Object.keys(init);
+      var keys = ObjectKeys(init);
       for (var k = 0; k < keys.length; k++) {
-        this[kList].push([toUSVString(keys[k]), toUSVString(init[keys[k]])]);
+        ArrayPrototypePush(this[kList], [toUSVString(keys[k]), toUSVString(init[keys[k]])]);
       }
       return;
     }
@@ -1401,18 +1469,18 @@
   // U+FFFD (per WHATWG). The fast path skips strings with no surrogate at all.
   var SURROGATE_PAIR_OR_LONE = /([\uD800-\uDBFF])([\uDC00-\uDFFF])?|([\uDC00-\uDFFF])/g;
   function toUSVString(value) {
-    var str = typeof value === 'string' ? value : String(value);
+    var str = typeof value === 'string' ? value : StringG(value);
     // Quick reject: no surrogate code unit means it is already a USVString.
     var hasSurrogate = false;
     for (var i = 0; i < str.length; i++) {
-      var c = str.charCodeAt(i);
+      var c = StringPrototypeCharCodeAt(str, i);
       if (c >= 0xd800 && c <= 0xdfff) {
         hasSurrogate = true;
         break;
       }
     }
     if (!hasSurrogate) return str;
-    return str.replace(SURROGATE_PAIR_OR_LONE, function (match, high, low, lone) {
+    return StringPrototypeReplace(str, SURROGATE_PAIR_OR_LONE, function (match, high, low, lone) {
       if (lone !== undefined) return '\uFFFD'; // lone low surrogate
       if (low === undefined) return '\uFFFD'; // lone high surrogate
       return match; // valid pair, keep as-is
@@ -1426,19 +1494,19 @@
     urlObj._url.query = serialized === '' ? null : serialized;
   }
 
-  Object.defineProperty(URLSearchParams.prototype, 'append', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'append', {
     configurable: true,
     writable: true,
     value: function append(name, value) {
       if (arguments.length < 2) {
         throw new TypeError('The "name" and "value" arguments must be specified');
       }
-      this[kList].push([toUSVString(name), toUSVString(value)]);
+      ArrayPrototypePush(this[kList], [toUSVString(name), toUSVString(value)]);
       spUpdate(this);
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'delete', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'delete', {
     configurable: true,
     writable: true,
     value: function del(name) {
@@ -1447,18 +1515,18 @@
       if (arguments.length > 1 && arguments[1] !== undefined) {
         var val = toUSVString(arguments[1]);
         for (var i = list.length - 1; i >= 0; i--) {
-          if (list[i][0] === n && list[i][1] === val) list.splice(i, 1);
+          if (list[i][0] === n && list[i][1] === val) ArrayPrototypeSplice(list, i, 1);
         }
       } else {
         for (var j = list.length - 1; j >= 0; j--) {
-          if (list[j][0] === n) list.splice(j, 1);
+          if (list[j][0] === n) ArrayPrototypeSplice(list, j, 1);
         }
       }
       spUpdate(this);
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'get', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'get', {
     configurable: true,
     writable: true,
     value: function get(name) {
@@ -1471,7 +1539,7 @@
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'getAll', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'getAll', {
     configurable: true,
     writable: true,
     value: function getAll(name) {
@@ -1479,13 +1547,13 @@
       var list = this[kList];
       var out = [];
       for (var i = 0; i < list.length; i++) {
-        if (list[i][0] === n) out.push(list[i][1]);
+        if (list[i][0] === n) ArrayPrototypePush(out, list[i][1]);
       }
       return out;
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'has', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'has', {
     configurable: true,
     writable: true,
     value: function has(name) {
@@ -1505,7 +1573,7 @@
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'set', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'set', {
     configurable: true,
     writable: true,
     value: function set(name, value) {
@@ -1520,7 +1588,7 @@
       for (var i = 0; i < list.length; ) {
         if (list[i][0] === n) {
           if (found) {
-            list.splice(i, 1);
+            ArrayPrototypeSplice(list, i, 1);
             continue;
           }
           list[i][1] = v;
@@ -1528,24 +1596,24 @@
         }
         i++;
       }
-      if (!found) list.push([n, v]);
+      if (!found) ArrayPrototypePush(list, [n, v]);
       spUpdate(this);
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'sort', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'sort', {
     configurable: true,
     writable: true,
     value: function sort() {
       // Stable sort by code units of the name only.
-      this[kList].sort(function (a, b) {
+      ArrayPrototypeSort(this[kList], function (a, b) {
         return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
       });
       spUpdate(this);
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'forEach', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'forEach', {
     configurable: true,
     writable: true,
     value: function forEach(callback, thisArg) {
@@ -1560,34 +1628,34 @@
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'keys', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'keys', {
     configurable: true,
     writable: true,
     value: function keys() {
       return makeSearchParamsIterator(this, 'key');
     },
   });
-  Object.defineProperty(URLSearchParams.prototype, 'values', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'values', {
     configurable: true,
     writable: true,
     value: function values() {
       return makeSearchParamsIterator(this, 'value');
     },
   });
-  Object.defineProperty(URLSearchParams.prototype, 'entries', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'entries', {
     configurable: true,
     writable: true,
     value: function entries() {
       return makeSearchParamsIterator(this, 'key+value');
     },
   });
-  Object.defineProperty(URLSearchParams.prototype, Symbol.iterator, {
+  ObjectDefineProperty(URLSearchParams.prototype, Symbol.iterator, {
     configurable: true,
     writable: true,
     value: URLSearchParams.prototype.entries,
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'size', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'size', {
     configurable: true,
     enumerable: true,
     get: function size() {
@@ -1595,7 +1663,7 @@
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, 'toString', {
+  ObjectDefineProperty(URLSearchParams.prototype, 'toString', {
     configurable: true,
     writable: true,
     value: function toString() {
@@ -1603,7 +1671,7 @@
     },
   });
 
-  Object.defineProperty(URLSearchParams.prototype, Symbol.toStringTag, {
+  ObjectDefineProperty(URLSearchParams.prototype, Symbol.toStringTag, {
     configurable: true,
     value: 'URLSearchParams',
   });
@@ -1628,7 +1696,7 @@
     iterator[Symbol.iterator] = function () {
       return this;
     };
-    Object.defineProperty(iterator, Symbol.toStringTag, {
+    ObjectDefineProperty(iterator, Symbol.toStringTag, {
       configurable: true,
       value: 'URLSearchParams Iterator',
     });
@@ -1637,7 +1705,7 @@
 
   // Build a URLSearchParams bound to a URL record (no constructor side effects).
   function newBoundSearchParams(urlObj) {
-    var sp = Object.create(URLSearchParams.prototype);
+    var sp = ObjectCreate(URLSearchParams.prototype);
     sp[kList] = urlObj._url.query === null ? [] : formUrlencodedParse(urlObj._url.query);
     sp[kURLObject] = urlObj;
     return sp;
@@ -1668,14 +1736,14 @@
     }
   }
 
-  Object.defineProperty(URL.prototype, '_url', {
+  ObjectDefineProperty(URL.prototype, '_url', {
     configurable: true,
     get: function () {
       return this[kRecord];
     },
   });
 
-  Object.defineProperty(URL.prototype, 'href', {
+  ObjectDefineProperty(URL.prototype, 'href', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1689,7 +1757,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'origin', {
+  ObjectDefineProperty(URL.prototype, 'origin', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1697,7 +1765,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'protocol', {
+  ObjectDefineProperty(URL.prototype, 'protocol', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1708,7 +1776,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'username', {
+  ObjectDefineProperty(URL.prototype, 'username', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1721,7 +1789,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'password', {
+  ObjectDefineProperty(URL.prototype, 'password', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1734,7 +1802,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'host', {
+  ObjectDefineProperty(URL.prototype, 'host', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1747,7 +1815,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'hostname', {
+  ObjectDefineProperty(URL.prototype, 'hostname', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1760,11 +1828,11 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'port', {
+  ObjectDefineProperty(URL.prototype, 'port', {
     configurable: true,
     enumerable: true,
     get: function () {
-      return this[kRecord].port === null ? '' : String(this[kRecord].port);
+      return this[kRecord].port === null ? '' : StringG(this[kRecord].port);
     },
     set: function (value) {
       var url = this[kRecord];
@@ -1778,7 +1846,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'pathname', {
+  ObjectDefineProperty(URL.prototype, 'pathname', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1792,7 +1860,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'search', {
+  ObjectDefineProperty(URL.prototype, 'search', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1814,7 +1882,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'searchParams', {
+  ObjectDefineProperty(URL.prototype, 'searchParams', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1825,7 +1893,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'hash', {
+  ObjectDefineProperty(URL.prototype, 'hash', {
     configurable: true,
     enumerable: true,
     get: function () {
@@ -1845,7 +1913,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'toString', {
+  ObjectDefineProperty(URL.prototype, 'toString', {
     configurable: true,
     writable: true,
     value: function toString() {
@@ -1853,7 +1921,7 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, 'toJSON', {
+  ObjectDefineProperty(URL.prototype, 'toJSON', {
     configurable: true,
     writable: true,
     value: function toJSON() {
@@ -1861,13 +1929,13 @@
     },
   });
 
-  Object.defineProperty(URL.prototype, Symbol.toStringTag, {
+  ObjectDefineProperty(URL.prototype, Symbol.toStringTag, {
     configurable: true,
     value: 'URL',
   });
 
   // canParse / parse statics (Node 19+/22+).
-  Object.defineProperty(URL, 'canParse', {
+  ObjectDefineProperty(URL, 'canParse', {
     configurable: true,
     writable: true,
     value: function canParse(input, base) {
@@ -1883,7 +1951,7 @@
     },
   });
 
-  Object.defineProperty(URL, 'parse', {
+  ObjectDefineProperty(URL, 'parse', {
     configurable: true,
     writable: true,
     value: function parse(input, base) {
@@ -1930,7 +1998,7 @@
       host = slash === -1 ? rest : rest.slice(0, slash);
       rest = slash === -1 ? '/' : rest.slice(slash);
     }
-    var isLocalhost = host.toLowerCase() === 'localhost';
+    var isLocalhost = StringPrototypeToLowerCase(host) === 'localhost';
     var hash = rest.indexOf('#');
     if (hash !== -1) rest = rest.slice(0, hash);
     var query = rest.indexOf('?');
@@ -1942,12 +2010,12 @@
     }
 
     if (isWindows) {
-      var winPath = decodeURIComponent(rest.replaceAll('/', '\\'));
+      var winPath = decodeURIComponentG(StringPrototypeReplaceAll(rest, '/', '\\'));
       if (host !== '' && !isLocalhost) {
         return '\\\\' + host + winPath;
       }
-      var letter = winPath.charCodeAt(1) | 0x20;
-      if (letter < 97 || letter > 122 || winPath.charAt(2) !== ':') {
+      var letter = StringPrototypeCharCodeAt(winPath, 1) | 0x20;
+      if (letter < 97 || letter > 122 || StringPrototypeCharAt(winPath, 2) !== ':') {
         var pathErr = new TypeError('File URL path must be absolute');
         pathErr.code = 'ERR_INVALID_FILE_URL_PATH';
         throw pathErr;
@@ -1962,7 +2030,7 @@
       hostErr.code = 'ERR_INVALID_FILE_URL_HOST';
       throw hostErr;
     }
-    return decodeURIComponent(rest);
+    return decodeURIComponentG(rest);
   }
 
   function pathToFileURL(filepath) {
@@ -1975,9 +2043,9 @@
     var resolved = path.resolve(input);
     // path.resolve drops a trailing separator; Node preserves it on the URL, so
     // re-append a '/' when the original path ended in one and resolve removed it.
-    var lastChar = input.charCodeAt(input.length - 1);
+    var lastChar = StringPrototypeCharCodeAt(input, input.length - 1);
     var endedWithSep = lastChar === 0x2f || (isWindows && lastChar === 0x5c);
-    if (endedWithSep && resolved.at(-1) !== path.sep) resolved += '/';
+    if (endedWithSep && resolved[resolved.length - 1] !== path.sep) resolved += '/';
     var url = new URL('file://');
     // Percent-encode the path's special characters, then assign as pathname so the
     // URL machinery normalizes it. We encode %, #, ? and (on POSIX) backslash so
@@ -1990,7 +2058,7 @@
       .replaceAll('	', '%09');
     if (isWindows) {
       // Normalize separators for the file URL; UNC paths keep the host.
-      encoded = encoded.replaceAll('\\', '/');
+      encoded = StringPrototypeReplaceAll(encoded, '\\', '/');
       if (encoded.slice(0, 2) === '//') {
         // UNC \\server\share -> file://server/share
         var withoutLead = encoded.slice(2);
@@ -2000,7 +2068,7 @@
         url.pathname = slash === -1 ? '/' : withoutLead.slice(slash);
         return url;
       }
-      url.pathname = '/' + encoded.replace(/^\/+/, '');
+      url.pathname = '/' + StringPrototypeReplace(encoded, /^\/+/, '');
     } else {
       url.pathname = encoded;
     }
@@ -2011,12 +2079,12 @@
     // Mirror Node's `{ __proto__: null, ...url, <standard fields> }`: own
     // enumerable properties (e.g. request options a caller attached to the URL)
     // are copied first, then the standard http.request fields are layered on top.
-    var options = Object.create(null);
-    var ownKeys = Object.keys(url);
+    var options = ObjectCreate(null);
+    var ownKeys = ObjectKeys(url);
     for (var i = 0; i < ownKeys.length; i++) options[ownKeys[i]] = url[ownKeys[i]];
     options.protocol = url.protocol;
     options.hostname =
-      typeof url.hostname === 'string' && url.hostname.startsWith('[')
+      typeof url.hostname === 'string' && StringPrototypeStartsWith(url.hostname, '[')
         ? url.hostname.slice(1, -1)
         : url.hostname;
     options.hash = url.hash;
@@ -2024,9 +2092,9 @@
     options.pathname = url.pathname;
     options.path = '' + (url.pathname || '') + (url.search || '');
     options.href = url.href;
-    if (url.port !== '') options.port = Number(url.port);
+    if (url.port !== '') options.port = NumberG(url.port);
     if (url.username || url.password) {
-      options.auth = decodeURIComponent(url.username) + ':' + decodeURIComponent(url.password);
+      options.auth = decodeURIComponentG(url.username) + ':' + decodeURIComponentG(url.password);
     }
     return options;
   }
@@ -2065,9 +2133,9 @@
   // everything up to the first authority terminator (/ \ ? #). Returns the parsed
   // host string, or FAILURE for an invalid domain.
   function hostFromDomainArg(domain) {
-    var input = String(domain).replaceAll(/[\t\n\r]/g, '');
+    var input = StringG(domain).replaceAll(/[\t\n\r]/g, '');
     for (var i = 0; i < input.length; i++) {
-      var c = input.charCodeAt(i);
+      var c = StringPrototypeCharCodeAt(input, i);
       if (c === 0x2f || c === 0x5c || c === 0x3f || c === 0x23) {
         input = input.slice(0, i);
         break;
