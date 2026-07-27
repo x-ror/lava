@@ -4,6 +4,11 @@ name: AI review
 # to the run summary. Advisory only — never add it to required checks. An LLM verdict
 # or an API outage must not red a PR that CI says is green.
 #
+# The pipeline it runs is master's, not the PR's: the action restores .claude/ and
+# CLAUDE.md from origin/master because the PR head is untrusted. See the "Flag a no-op
+# review" step at the bottom, which exists because that makes a silent zero-turn run
+# possible.
+#
 # This job runs NO gates. ci.yml already executes make check / check-js / build / test /
 # test-lava and every routed smoke on the same commit; re-running them here would double
 # CI minutes and — the real objection — would execute the PR's own Makefile, scripts and
@@ -99,6 +104,7 @@ jobs:
       # nothing that requires a build. Provisioning JSC/Odin/LLVM here would cost minutes
       # per run to reproduce a result ci.yml already has.
       - name: Run /pr-gate
+        id: review
         if: env.HAS_CLAUDE_CREDENTIAL == 'true'
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
@@ -138,3 +144,53 @@ jobs:
             --model claude-sonnet-5
             --max-turns 40
             --allowedTools "Read,Grep,Glob,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git merge-base:*),Bash(git blame:*),Bash(rg:*),Bash(wc:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*)"
+
+      # A review that does nothing must not read as a review that found nothing.
+      # `continue-on-error` above keeps a failed review from redding the PR, which also
+      # means a zero-turn run reports success — the check is green and no one looks.
+      #
+      # Zero turns almost always means the prompt resolved to nothing. The usual cause is
+      # structural rather than a typo: the action restores .claude/ and CLAUDE.md from
+      # origin/master because the PR head is untrusted (it keeps the PR's copies in
+      # .claude-pr/, unexecuted), so a skill that exists only on the PR branch is simply
+      # absent at run time. A PR that adds or edits the pipeline is therefore reviewed by
+      # master's pipeline, and the very first one — which introduces it — is reviewed by
+      # nothing at all.
+      - name: Flag a no-op review
+        if: always() && env.HAS_CLAUDE_CREDENTIAL == 'true'
+        env:
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        run: |
+          read -r turns cost < <(node -e '
+            const fs = require("fs");
+            let msgs = [];
+            try {
+              const raw = fs.readFileSync(process.argv[1], "utf8");
+              try {
+                const parsed = JSON.parse(raw);
+                msgs = Array.isArray(parsed) ? parsed : [parsed];
+              } catch {
+                msgs = raw.split("\n").filter(Boolean).flatMap(l => {
+                  try { return [JSON.parse(l)]; } catch { return []; }
+                });
+              }
+            } catch {}
+            const r = [...msgs].reverse().find(m => m && m.type === "result");
+            console.log(`${r ? r.num_turns : "unknown"} ${r ? r.total_cost_usd : "unknown"}`);
+          ' "$EXECUTION_FILE" 2>/dev/null || echo "unknown unknown")
+
+          if [ "$turns" = "0" ] || [ "$turns" = "unknown" ]; then
+            echo "::warning title=AI review did not run::The review made $turns turns — no diff was examined. The check is green because the job is advisory, not because the code was reviewed."
+            {
+              printf '%s\n' '## AI review did not run'
+              printf '%s\n' ''
+              printf '%s\n' "Turns: \`$turns\`. Cost: \`$cost\`. Nothing was reviewed."
+              printf '%s\n' ''
+              printf '%s\n' 'The action restores `.claude/` and `CLAUDE.md` from `origin/master` because the'
+              printf '%s\n' 'PR head is untrusted, so a skill present only on this branch does not exist at'
+              printf '%s\n' 'run time. Expected while the pipeline itself is being added; if master already'
+              printf '%s\n' 'carries `.claude/skills/pr-gate/`, this is a real failure — read the step log.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' "AI review ran: $turns turns, cost $cost." >> "$GITHUB_STEP_SUMMARY"
+          fi
