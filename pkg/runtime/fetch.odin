@@ -462,12 +462,15 @@ fetch_request_cb :: proc "c" (
 	req.allocator = alloc
 	req.ctx = ctx
 	req.loop = loop
-	req.on_response = on_response
-	req.on_error = on_error
-	req.on_chunk = on_chunk
-	req.on_end = on_end
+	// Every JS handle the request retains across loop turns goes through
+	// js_root_set/js_root_clear (js_root.odin) — the protect and its release are
+	// paired by the slot, not by hand at each site.
+	js_root_set(ctx, &req.on_response, on_response)
+	js_root_set(ctx, &req.on_error, on_error)
+	js_root_set(ctx, &req.on_chunk, on_chunk)
+	js_root_set(ctx, &req.on_end, on_end)
 	req.body_streaming = stream_body
-	req.on_body_drain = on_body_drain
+	js_root_set(ctx, &req.on_body_drain, on_body_drain)
 	req.body_len = -1
 	req.method = strings.clone(method, alloc)
 	req.url = strings.clone(url, alloc)
@@ -489,21 +492,13 @@ fetch_request_cb :: proc "c" (
 		alloc,
 	)
 
-	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_response)
-	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_error)
-	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_chunk)
-	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_end)
-	if on_body_drain != nil do jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)on_body_drain)
-
 	// Build and GC-protect the cancel / resume handles before starting the
 	// transport so the JS caller can cancel or resume even if the request settles
 	// synchronously.
 	cancel_fn := jsc.JSObjectMake(ctx, fetch_get_cancel_class(), req)
-	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)cancel_fn)
-	req.cancel_fn = cancel_fn
+	js_root_set(ctx, &req.cancel_fn, cancel_fn)
 	resume_fn := jsc.JSObjectMake(ctx, fetch_get_resume_class(), req)
-	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)resume_fn)
-	req.resume_fn = resume_fn
+	js_root_set(ctx, &req.resume_fn, resume_fn)
 	// The streaming request-body channel: push/end callables backed by this req.
 	// Keep local handles (like cancel/resume): a synchronous settle below clears
 	// req.push_body_fn/end_body_fn, but the JSObjects stay valid (and become inert
@@ -512,11 +507,9 @@ fetch_request_cb :: proc "c" (
 	push_fn, end_fn: jsc.JSObjectRef
 	if stream_body {
 		push_fn = jsc.JSObjectMake(ctx, fetch_get_push_class(), req)
-		jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)push_fn)
-		req.push_body_fn = push_fn
+		js_root_set(ctx, &req.push_body_fn, push_fn)
 		end_fn = jsc.JSObjectMake(ctx, fetch_get_end_class(), req)
-		jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)end_fn)
-		req.end_body_fn = end_fn
+		js_root_set(ctx, &req.end_body_fn, end_fn)
 	}
 	if state != nil do fetch_track_active(state, req)
 
@@ -1020,59 +1013,26 @@ fetch_request_finish :: proc(req: ^Fetch_Request) {
 		req.has_fd = false
 	}
 
-	if req.on_response != nil {
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.on_response)
-		req.on_response = nil
-	}
-	if req.on_error != nil {
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.on_error)
-		req.on_error = nil
-	}
-	if req.on_chunk != nil {
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.on_chunk)
-		req.on_chunk = nil
-	}
-	if req.on_end != nil {
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.on_end)
-		req.on_end = nil
-	}
-	if req.cancel_fn != nil {
-		// The JS body stream retains these handles (via Response.body) long after
-		// the request settles, so clear the back-pointer before the request is
-		// freed: a later cancel()/pull() then reads a nil private and no-ops rather
-		// than dereferencing freed memory. Unprotect drops our GC root; JS keeps the
-		// object alive as long as it is reachable.
-		jsc.JSObjectSetPrivate(req.cancel_fn, nil)
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.cancel_fn)
-		req.cancel_fn = nil
-	}
-	if req.resume_fn != nil {
-		jsc.JSObjectSetPrivate(req.resume_fn, nil)
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.resume_fn)
-		req.resume_fn = nil
-	}
+	js_root_clear(req.ctx, &req.on_response)
+	js_root_clear(req.ctx, &req.on_error)
+	js_root_clear(req.ctx, &req.on_chunk)
+	js_root_clear(req.ctx, &req.on_end)
+	// The JS body stream retains cancel/resume (via Response.body) long after the
+	// request settles, so sever the private back-pointer BEFORE dropping the GC
+	// root: a later cancel()/pull() then reads a nil private and no-ops rather
+	// than dereferencing freed memory. JS keeps the object alive while reachable.
+	js_root_clear_private(req.ctx, &req.cancel_fn)
+	js_root_clear_private(req.ctx, &req.resume_fn)
 	// Release the body-write phase loop hold if it is still held — i.e. the request
 	// settled mid-upload, before the terminator went out. Idempotent with the release
 	// on the normal completion path in fetch_pump_body.
 	fetch_body_release_loop(req)
 
 	// Drop the streaming request-body channel's GC roots. As with cancel/resume, the
-	// JS pump may still hold pushBody/endBody after the request settles, so clear the
-	// back-pointer first: a later call then reads a nil private and no-ops.
-	if req.on_body_drain != nil {
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.on_body_drain)
-		req.on_body_drain = nil
-	}
-	if req.push_body_fn != nil {
-		jsc.JSObjectSetPrivate(req.push_body_fn, nil)
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.push_body_fn)
-		req.push_body_fn = nil
-	}
-	if req.end_body_fn != nil {
-		jsc.JSObjectSetPrivate(req.end_body_fn, nil)
-		jsc.JSValueUnprotect(req.ctx, cast(jsc.JSValueRef)req.end_body_fn)
-		req.end_body_fn = nil
-	}
+	// JS pump may still hold pushBody/endBody after the request settles.
+	js_root_clear(req.ctx, &req.on_body_drain)
+	js_root_clear_private(req.ctx, &req.push_body_fn)
+	js_root_clear_private(req.ctx, &req.end_body_fn)
 
 	if state := get_state_from_ctx(req.ctx); state != nil {
 		append(&state.pending_free, req)
