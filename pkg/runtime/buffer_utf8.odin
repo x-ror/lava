@@ -214,9 +214,8 @@ buffer_utf8_write_into_cb :: proc "c" (
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
 	if argument_count < 4 do return jsc.JSValueMakeNumber(ctx, 0)
-	target, tok := typed_array_view(ctx, arguments[0])
-	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
-
+	// Re-entrancy hazard: the target view must be acquired after every argument
+	// coercion — see the note in buffer_utf16le_write_into_cb (buffer.odin).
 	src := read_string_arg(ctx, arguments[1])
 	if !src.ok do return js_int_value(ctx, 0)
 	defer if src.str != nil do jsc.JSStringRelease(src.str)
@@ -225,6 +224,9 @@ buffer_utf8_write_into_cb :: proc "c" (
 
 	offset := js_int_arg(ctx, arguments[2])
 	max := js_int_arg(ctx, arguments[3])
+
+	target, tok := typed_array_view(ctx, arguments[0])
+	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
 	if offset < 0 do offset = 0
 	if offset > len(target) do offset = len(target)
 	avail := len(target) - offset

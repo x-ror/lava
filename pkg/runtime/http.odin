@@ -58,9 +58,11 @@ http_parse_request_cb :: proc "c" (
 	context = runtime.default_context()
 	if argument_count < 2 do return http_parse_status(ctx, PARSE_ERROR)
 	args := arguments[:int(argument_count)]
+	// js_int_arg can run JS (valueOf) — read it before borrowing the view; see
+	// the note in buffer_utf16le_write_into_cb (buffer.odin).
+	last_len := js_int_arg(ctx, args[1])
 	view, ok := typed_array_view(ctx, args[0])
 	if !ok do return http_parse_status(ctx, PARSE_ERROR)
-	last_len := js_int_arg(ctx, args[1])
 
 	hdrs: [pico.MAX_HEADERS]pico.Header
 	consumed, minor, num, method, path, res := pico.parse_request(view, last_len, hdrs[:])

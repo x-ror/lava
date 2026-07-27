@@ -342,14 +342,16 @@ buffer_index_of_cb :: proc "c" (
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
 	if argument_count < 4 do return js_int_value(ctx, -1)
+	// js_int_arg can run JS (valueOf) — read it before borrowing the views; see
+	// the note in buffer_utf16le_write_into_cb.
+	start := js_int_arg(ctx, arguments[2])
+	forward := jsc.JSValueToBoolean(ctx, arguments[3])
 	hay, hok := typed_array_view(ctx, arguments[0])
 	needle, nok := typed_array_view(ctx, arguments[1])
 	if !hok || !nok do return js_int_value(ctx, -1)
 	nlen := len(needle)
 	hlen := len(hay)
 	if nlen == 0 || nlen > hlen do return js_int_value(ctx, -1)
-	start := js_int_arg(ctx, arguments[2])
-	forward := jsc.JSValueToBoolean(ctx, arguments[3])
 	if forward {
 		s := start
 		if s < 0 do s = 0
@@ -582,9 +584,12 @@ buffer_utf16le_write_into_cb :: proc "c" (
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
 	if argument_count < 4 do return jsc.JSValueMakeNumber(ctx, 0)
-	target, tok := typed_array_view(ctx, arguments[0])
-	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
-
+	// Argument-read order is load-bearing: read_string_arg / js_int_arg can run
+	// arbitrary JS (toString/valueOf on a non-primitive), which may detach or
+	// resize the target's ArrayBuffer. The borrowed target view must therefore be
+	// acquired LAST, with no JS-reachable call between it and the write. (String
+	// borrows are immune: string storage is immutable and pinned by the retained
+	// ref / the live argument.)
 	src := read_string_arg(ctx, arguments[1])
 	if !src.ok do return js_int_value(ctx, 0)
 	defer if src.str != nil do jsc.JSStringRelease(src.str)
@@ -593,6 +598,9 @@ buffer_utf16le_write_into_cb :: proc "c" (
 
 	offset := js_int_arg(ctx, arguments[2])
 	max := js_int_arg(ctx, arguments[3])
+
+	target, tok := typed_array_view(ctx, arguments[0])
+	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
 	if offset < 0 do offset = 0
 	if offset > len(target) do offset = len(target)
 	avail := len(target) - offset
@@ -638,9 +646,8 @@ buffer_latin1_write_into_cb :: proc "c" (
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
 	if argument_count < 4 do return jsc.JSValueMakeNumber(ctx, 0)
-	target, tok := typed_array_view(ctx, arguments[0])
-	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
-
+	// Re-entrancy hazard: the target view must be acquired after every argument
+	// coercion — see the note in buffer_utf16le_write_into_cb.
 	src := read_string_arg(ctx, arguments[1])
 	if !src.ok do return js_int_value(ctx, 0)
 	defer if src.str != nil do jsc.JSStringRelease(src.str)
@@ -649,6 +656,9 @@ buffer_latin1_write_into_cb :: proc "c" (
 
 	offset := js_int_arg(ctx, arguments[2])
 	max := js_int_arg(ctx, arguments[3])
+
+	target, tok := typed_array_view(ctx, arguments[0])
+	if !tok do return jsc.JSValueMakeNumber(ctx, 0)
 	if offset < 0 do offset = 0
 	if offset > len(target) do offset = len(target)
 	avail := len(target) - offset
@@ -750,10 +760,12 @@ buffer_swap_cb :: proc "c" (
 ) -> jsc.JSValueRef {
 	context = runtime.default_context()
 	if argument_count < 2 do return jsc.JSValueMakeUndefined(ctx)
-	data, ok := typed_array_view(ctx, arguments[0])
-	if !ok do return jsc.JSValueMakeUndefined(ctx)
+	// js_int_arg can run JS (valueOf) — read it before borrowing the view; see
+	// the note in buffer_utf16le_write_into_cb.
 	width := js_int_arg(ctx, arguments[1])
 	if width != 2 && width != 4 && width != 8 do return jsc.JSValueMakeUndefined(ctx)
+	data, ok := typed_array_view(ctx, arguments[0])
+	if !ok do return jsc.JSValueMakeUndefined(ctx)
 	n := len(data)
 	if n % width != 0 do return jsc.JSValueMakeUndefined(ctx)
 
