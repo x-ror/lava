@@ -1,7 +1,7 @@
 {
   "abort.js": 6,
   "assert.js": 11,
-  "buffer.js": 24,
+  "buffer.js": 22,
   "console.js": 0,
   "crypto.js": 17,
   "diagnostics_channel.js": 4,

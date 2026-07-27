@@ -54,7 +54,9 @@ Tracked against the `tests/node-compat/cases` oracle. Every case in
 Built-ins now live as embedded JS factories under `pkg/runtime/js/internal/`,
 wired by a small loader (`loader.js`) that native `require()` consults before
 the filesystem (`require_builtin` in `globals.odin`). Minimal, original
-implementations — no `primordials`, no `internalBinding` coupling.
+implementations — a small internal `primordials` table for pollution hardening
+(§5.5 of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), no `internalBinding`
+coupling.
 
 - [x] **internal module loader** — lazy, cached, `node:`-prefix aware, eager for
       modules that install globals (Buffer, fetch).
@@ -205,6 +207,14 @@ implementations — no `primordials`, no `internalBinding` coupling.
       forwards them to the callback (Node parity).
 - [ ] **Stack-trace line numbers are off by one** — the CommonJS wrapper
       prepends a line but `JSEvaluateScript` starts at line 1.
+- [ ] **Prototype-pollution hardening of the embedded JS layer** — `primordials.js`
+      plus the `make check-primordials` ratchet over
+      `tests/node-compat/pollution-baseline.json`. Done: `events.js`,
+      `dns_promises.js`, `encoding.js` (0), and the encoding-name path of
+      `buffer.js`. Remaining: `url.js` (45 — the type-ambiguous
+      `slice`/`indexOf`/`includes` sites, plus its percent-decode byte arrays,
+      which are still plain arrays and so reachable via an `Array.prototype[0]`
+      accessor), `buffer.js` (22), `path.js` (158), `esm.js` (78), `util.js` (48).
 - [x] **Real wall-clock timers** — fixed: in `real_time` mode the loop tracks the
       monotonic wall clock (`sync_real_clock` / `real_now_ms` in
       `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a

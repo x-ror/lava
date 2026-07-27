@@ -127,6 +127,19 @@ front-end fails CI.
   code that can poison prototypes. `make check-primordials` is a **ratchet**: a
   hardened file (baseline 0) rejects any new pollutable call. `UPDATE=1` only to
   *lower* a baseline.
+- The ratchet only counts Array/String prototype **method** calls. Three vector
+  classes are invisible to it and are on you: (a) `f.apply(…)`/`f.call(…)` on an
+  uncaptured function — use `ReflectApply`; (b) free globals and statics
+  (`String`, `ArrayBuffer.isView`, `Buffer.from`, `Buffer.prototype.toString`) —
+  capture at module-eval, which the loader runs before user code; (c) any object
+  literal indexed by a caller-supplied key (label/scheme/header/encoding tables)
+  — give it `__proto__: null`. Baseline 0 means "no counted call left", not
+  "hardened".
+- Pick the primordial by **arity**. `callerN` (`ArrayPrototypePush`) carries an
+  `arguments` switch and belongs at cold call sites; per-element loops use the
+  fixed-arity wrappers (`ArrayPrototypePush1`/`Push2`) or plain indexed writes
+  into a preallocated null-prototype array. Getting this wrong cost 1.43x on the
+  TextDecoder JS path.
 - Nothing transient lands on `globalThis`; natives arrive as the factory's fourth
   argument.
 - Errors are Node-shaped coded errors (`ERR_INVALID_ARG_TYPE`, `ERR_OUT_OF_RANGE`)

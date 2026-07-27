@@ -18,34 +18,59 @@
   // poisoned Function.prototype.apply replaced the text of every decoded
   // string — `new URL('http://über.example/')` silently became `http://a/`.
   // ReflectApply (a captured static) closes it.
+  //
+  // The decoders do NOT route their accumulator through a push primordial at
+  // all — see the note on pushCodePoint. Routing those per-code-unit loops
+  // through the variadic ArrayPrototypePush measured 1.43x on the JS decode
+  // path (callerN's arguments switch is ~7x a direct call).
   var P = require('primordials');
-  var ArrayPrototypePush = P.ArrayPrototypePush;
+  var ArrayG = P.Array;
+  var ObjectSetPrototypeOf = P.ObjectSetPrototypeOf;
   var ArrayPrototypeSlice = P.ArrayPrototypeSlice;
   var StringPrototypeSlice = P.StringPrototypeSlice;
   var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
   var StringPrototypeCodePointAt = P.StringPrototypeCodePointAt;
-  var StringPrototypeTrim = P.StringPrototypeTrim;
   var StringPrototypeToLowerCase = P.StringPrototypeToLowerCase;
   var ObjectDefineProperty = P.ObjectDefineProperty;
+  var ObjectFreeze = P.ObjectFreeze;
   var ReflectApply = P.ReflectApply;
   var TypeErrorG = P.TypeError;
   var RangeErrorG = P.RangeError;
   var Uint8ArrayG = P.Uint8Array;
+  var ArrayBufferG = P.ArrayBuffer;
+  var ArrayBufferIsView = P.ArrayBufferIsView;
   // Free globals / statics, captured pristine at module-eval.
   var StringG = String;
   var StringFromCharCode = String.fromCharCode;
-  var ArrayBufferG = ArrayBuffer;
-  var ArrayBufferIsView = ArrayBuffer.isView;
 
+  // Buffer carries the utf-8 fast path and all of TextEncoder.encode, so its
+  // methods are hardening-relevant exactly like String.fromCharCode: read live
+  // off the (user-reachable) Buffer global, a replaced `Buffer.from` or
+  // `Buffer.prototype.toString` rewrote every encoded/decoded string. Captured
+  // here; invoked through a fixed-arity `.call` closure, the same shape and the
+  // same residual as the primordials wrappers.
   var bufferModule = require('buffer');
   var Buffer = bufferModule.Buffer;
+  var BufferFrom = Buffer.from;
+  var BufferProtoToString = Buffer.prototype.toString;
+  function bufferToStringUtf8(buf) {
+    return BufferProtoToString.call(buf, 'utf8');
+  }
+
+  // Shared, frozen, null-prototype default options — the object is only ever
+  // read, so one instance serves every construction. Mirrors Node's kEmptyObject
+  // (a single frozen null-prototype object, not a per-call literal): an omitted
+  // `options` must not inherit fatal/ignoreBOM from a poisoned Object.prototype.
+  var kEmptyObject = ObjectFreeze({ __proto__: null });
 
   // Only labels Lava can service are listed; unknown labels throw like Node.
   // Null-prototype because the keys come from the caller: with Object.prototype
   // in the chain, `new TextDecoder('constructor')` resolved to Object and
   // `new TextDecoder('__proto__')` to Object.prototype instead of throwing
   // RangeError, and any `Object.prototype.<label>` a script sets became a
-  // forged encoding. Node's table is a null-prototype Map lookup in C++.
+  // forged encoding. Node reaches the same end with a SafeMap in
+  // lib/internal/encoding.js — Map keys never consult a prototype chain — and a
+  // null-prototype object literal is the cheap equivalent for a static table.
   var LABELS = {
     __proto__: null,
     'utf-8': 'utf-8',
@@ -74,6 +99,12 @@
     ascii: 'windows-1252',
     'us-ascii': 'windows-1252',
     'ansi_x3.4-1968': 'windows-1252',
+    // WHATWG windows-1252 labels Node accepts and Lava used to reject. Pure
+    // table parity — no new codec.
+    'iso-ir-100': 'windows-1252',
+    'iso_8859-1': 'windows-1252',
+    'iso_8859-1:1987': 'windows-1252',
+    csisolatin1: 'windows-1252',
   };
 
   // windows-1252 code points for bytes 0x80-0x9F (others equal the byte value).
@@ -82,10 +113,22 @@
     8216, 8217, 8220, 8221, 8226, 8211, 8212, 732, 8482, 353, 8250, 339, 157, 382, 376,
   ];
 
-  function normalizeLabel(label) {
+  // WHATWG "get an encoding" strips leading/trailing ASCII whitespace only —
+  // TAB/LF/FF/CR/SPACE, notably NOT vertical tab. String.prototype.trim also
+  // strips Unicode whitespace, so it used to accept labels Node rejects
+  // (' utf-8', '　utf-8'); Node carries its own trimAsciiWhitespace for
+  // exactly this reason. Takes an already-coerced string.
+  function isAsciiWhitespace(c) {
+    return c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d || c === 0x20;
+  }
+  function normalizeLabel(text) {
+    var i = 0,
+      j = text.length;
+    while (i < j && isAsciiWhitespace(StringPrototypeCharCodeAt(text, i))) i++;
+    while (j > i && isAsciiWhitespace(StringPrototypeCharCodeAt(text, j - 1))) j--;
     return LABELS[
       StringPrototypeToLowerCase(
-        StringPrototypeTrim(StringG(label === undefined ? 'utf-8' : label)),
+        i === 0 && j === text.length ? text : StringPrototypeSlice(text, i, j),
       )
     ];
   }
@@ -111,7 +154,7 @@
   });
 
   TextEncoder.prototype.encode = function (input) {
-    return new Uint8ArrayG(Buffer.from(input === undefined ? '' : StringG(input), 'utf8'));
+    return new Uint8ArrayG(BufferFrom(input === undefined ? '' : StringG(input), 'utf8'));
   };
 
   function encodeCodePoint(cp, dest, offset) {
@@ -144,9 +187,20 @@
     var read = 0,
       written = 0,
       capacity = dest.length;
+    // Surrogate pairing is done by hand off charCodeAt rather than by
+    // codePointAt: the ASCII/BMP case (the overwhelming majority of input) then
+    // costs a single primordial call and no branch on a >0xffff result, and the
+    // astral case pays a second call it would otherwise pay inside codePointAt.
     for (var i = 0; i < source.length; ) {
-      var cp = StringPrototypeCodePointAt(source, i);
-      var units = cp > 0xffff ? 2 : 1;
+      var cp = StringPrototypeCharCodeAt(source, i);
+      var units = 1;
+      if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < source.length) {
+        var lo = StringPrototypeCharCodeAt(source, i + 1);
+        if (lo >= 0xdc00 && lo <= 0xdfff) {
+          cp = (cp - 0xd800) * 0x400 + (lo - 0xdc00) + 0x10000;
+          units = 2;
+        }
+      }
       if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
       var size = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
       if (written + size > capacity) break;
@@ -193,13 +247,27 @@
     return e;
   }
 
-  function pushCodePoint(units, cp) {
+  // The code-unit accumulator is a PREALLOCATED, NULL-PROTOTYPE array written by
+  // index, not a growing array written by push. Two reasons, both load-bearing:
+  //   * a plain array inherits Array.prototype, and `Set(units, "0", v)` walks
+  //     that chain — an accessor installed at Array.prototype[0] intercepted
+  //     every stored code unit and fed the getter's value back to the string
+  //     builder, which is a strictly weaker primitive than replacing push. This
+  //     is the per-hot-array null prototype primordials.js assigns to the
+  //     consuming module. It also drops Array.prototype.constructor out of
+  //     reach, so the chunk slice can no longer be steered by Symbol.species.
+  //   * it is faster than push through any wrapper: the accumulator writes are
+  //     the per-code-unit inner loop of every non-fast-path decode.
+  // Each emitter takes the write index and returns the next one.
+  function pushCodePoint(units, n, cp) {
     if (cp <= 0xffff) {
-      ArrayPrototypePush(units, cp);
-      return;
+      units[n] = cp;
+      return n + 1;
     }
     cp -= 0x10000;
-    ArrayPrototypePush(units, 0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    units[n] = 0xd800 + (cp >> 10);
+    units[n + 1] = 0xdc00 + (cp & 0x3ff);
+    return n + 2;
   }
 
   // fromCharCode applied to the whole array blows the call stack past ~64k args,
@@ -220,11 +288,12 @@
   // incomplete trailing sequence is held across calls and only flushed (to one
   // U+FFFD, or an error when fatal) on the final, non-streaming call.
   function decodeUtf8(s, bytes, isFinal, fatal, units) {
+    var n = 0;
     for (var i = 0; i < bytes.length; ) {
       var b = bytes[i];
       if (s.needed === 0) {
         if (b <= 0x7f) {
-          ArrayPrototypePush(units, b);
+          units[n++] = b;
           i++;
         } else if (b >= 0xc2 && b <= 0xdf) {
           s.needed = 1;
@@ -244,7 +313,7 @@
           i++;
         } else {
           if (fatal) throw fatalErr('utf-8');
-          ArrayPrototypePush(units, 0xfffd);
+          units[n++] = 0xfffd;
           i++;
         }
       } else if (b < s.lower || b > s.upper) {
@@ -254,7 +323,7 @@
         s.lower = 0x80;
         s.upper = 0xbf;
         if (fatal) throw fatalErr('utf-8');
-        ArrayPrototypePush(units, 0xfffd); // re-process b: do not advance i
+        units[n++] = 0xfffd; // re-process b: do not advance i
       } else {
         s.lower = 0x80;
         s.upper = 0xbf;
@@ -262,7 +331,7 @@
         s.seen++;
         i++;
         if (s.seen === s.needed) {
-          pushCodePoint(units, s.cp);
+          n = pushCodePoint(units, n, s.cp);
           s.cp = 0;
           s.needed = 0;
           s.seen = 0;
@@ -276,49 +345,53 @@
       s.lower = 0x80;
       s.upper = 0xbf;
       if (fatal) throw fatalErr('utf-8');
-      ArrayPrototypePush(units, 0xfffd);
+      units[n++] = 0xfffd;
     }
+    return n;
   }
 
   // Emit one UTF-16 code unit, pairing surrogates and replacing lone ones with
   // U+FFFD (or throwing when fatal) — WHATWG behavior that differs from
   // Buffer.toString('utf16le'), which passes lone surrogates through verbatim.
-  function pushU16(s, units, u, fatal) {
+  function pushU16(s, units, n, u, fatal) {
     if (s.hs >= 0) {
       if (u >= 0xdc00 && u <= 0xdfff) {
-        ArrayPrototypePush(units, s.hs, u);
+        units[n] = s.hs;
+        units[n + 1] = u;
         s.hs = -1;
-        return;
+        return n + 2;
       }
       s.hs = -1;
       if (fatal) throw fatalErr('utf-16le');
-      ArrayPrototypePush(units, 0xfffd);
-      pushU16(s, units, u, fatal); // re-process u as a fresh unit
+      units[n++] = 0xfffd;
+      return pushU16(s, units, n, u, fatal); // re-process u as a fresh unit
     } else if (u >= 0xd800 && u <= 0xdbff) {
       s.hs = u; // hold the high surrogate for its low half (possibly next chunk)
     } else if (u >= 0xdc00 && u <= 0xdfff) {
       if (fatal) throw fatalErr('utf-16le');
-      ArrayPrototypePush(units, 0xfffd);
+      units[n++] = 0xfffd;
     } else {
-      ArrayPrototypePush(units, u);
+      units[n++] = u;
     }
+    return n;
   }
 
   function decodeUtf16le(s, bytes, isFinal, fatal, units) {
     var i = 0;
+    var n = 0;
     if (s.pend >= 0 && bytes.length > 0) {
-      pushU16(s, units, s.pend | (bytes[0] << 8), fatal);
+      n = pushU16(s, units, n, s.pend | (bytes[0] << 8), fatal);
       s.pend = -1;
       i = 1;
     }
     for (; i + 2 <= bytes.length; i += 2) {
-      pushU16(s, units, bytes[i] | (bytes[i + 1] << 8), fatal);
+      n = pushU16(s, units, n, bytes[i] | (bytes[i + 1] << 8), fatal);
     }
     if (i < bytes.length) {
       // one trailing byte in this chunk
       if (isFinal) {
         if (fatal) throw fatalErr('utf-16le');
-        ArrayPrototypePush(units, 0xfffd);
+        units[n++] = 0xfffd;
       } else {
         s.pend = bytes[i];
       }
@@ -327,38 +400,53 @@
       if (s.hs >= 0) {
         s.hs = -1;
         if (fatal) throw fatalErr('utf-16le');
-        ArrayPrototypePush(units, 0xfffd);
+        units[n++] = 0xfffd;
       }
       if (s.pend >= 0) {
         s.pend = -1;
         if (fatal) throw fatalErr('utf-16le');
-        ArrayPrototypePush(units, 0xfffd);
+        units[n++] = 0xfffd;
       }
     }
+    return n;
   }
 
   function decodeWin1252Units(bytes, units) {
     for (var i = 0; i < bytes.length; i++) {
       var b = bytes[i];
-      ArrayPrototypePush(units, b >= 0x80 && b <= 0x9f ? WIN1252_HIGH[b - 0x80] : b);
+      units[i] = b >= 0x80 && b <= 0x9f ? WIN1252_HIGH[b - 0x80] : b;
     }
+    return bytes.length;
   }
 
   function TextDecoder(label, options) {
     if (!(this instanceof TextDecoder))
       throw new TypeErrorG("Constructor TextDecoder requires 'new'");
-    var enc = normalizeLabel(label);
-    if (enc === undefined)
-      throw new RangeErrorG("The encoding label provided ('" + label + "') is invalid.");
-    // Null-prototype default so an omitted `options` cannot inherit fatal /
-    // ignoreBOM from a poisoned Object.prototype — Node defaults to its
-    // null-prototype kEmptyObject here for the same reason. An options object
-    // the caller passes is read as-is, which is also what Node does.
-    options = options || { __proto__: null };
-    ObjectDefineProperty(this, '_enc', { value: enc });
-    ObjectDefineProperty(this, '_fatal', { value: !!options.fatal });
-    ObjectDefineProperty(this, '_ignoreBOM', { value: !!options.ignoreBOM });
-    ObjectDefineProperty(this, '_state', { value: newDecoderState() });
+    // Coerce ONCE: building the message from `label` again would run a
+    // caller-supplied toString/Symbol.toPrimitive a second time, so the thrown
+    // error could name a label that was never looked up. Node coerces once too.
+    var text = label === undefined ? 'utf-8' : StringG(label);
+    var enc = normalizeLabel(text);
+    if (enc === undefined) {
+      var labelErr = new RangeErrorG('The "' + text + '" encoding is not supported');
+      labelErr.code = 'ERR_ENCODING_NOT_SUPPORTED';
+      throw labelErr;
+    }
+    // An omitted `options` must not inherit fatal/ignoreBOM from a poisoned
+    // Object.prototype, hence the shared null-prototype kEmptyObject. An options
+    // object the caller passes is read as-is — also what Node does, except that
+    // Node first validateObject()s it (ERR_INVALID_ARG_TYPE for a non-object,
+    // non-null); Lava does not yet, so a scalar options argument is ignored here.
+    options = options || kEmptyObject;
+    // `__proto__: null` on the descriptors: ToPropertyDescriptor reads get/set/
+    // writable/enumerable with HasProperty, which walks the prototype chain, so
+    // a poisoned `Object.prototype.get` (reachable from a JSON merge gadget,
+    // {"__proto__":{"get":1}}) otherwise turns every one of these into a
+    // TypeError and takes new URL() down with it. Node's internals do the same.
+    ObjectDefineProperty(this, '_enc', { __proto__: null, value: enc });
+    ObjectDefineProperty(this, '_fatal', { __proto__: null, value: !!options.fatal });
+    ObjectDefineProperty(this, '_ignoreBOM', { __proto__: null, value: !!options.ignoreBOM });
+    ObjectDefineProperty(this, '_state', { __proto__: null, value: newDecoderState() });
   }
   ObjectDefineProperty(TextDecoder.prototype, 'encoding', {
     get: function () {
@@ -399,8 +487,8 @@
       ) {
         off = 3;
       }
-      return Buffer.from(bytes.buffer, bytes.byteOffset + off, bytes.byteLength - off).toString(
-        'utf8',
+      return bufferToStringUtf8(
+        BufferFrom(bytes.buffer, bytes.byteOffset + off, bytes.byteLength - off),
       );
     }
     // WHATWG: a non-streaming decode starts a fresh run (reset decoder + BOM
@@ -409,14 +497,19 @@
     s.doNotFlush = stream;
     var isFinal = !stream;
 
-    var units = [];
+    // Upper bound on emitted code units: utf-8 and windows-1252 emit at most one
+    // per input byte (a 4-byte sequence yields a surrogate PAIR from 4 bytes),
+    // utf-16le at most one per two, and a final flush adds at most two more.
+    var units = ObjectSetPrototypeOf(new ArrayG(bytes.length + 4), null);
+    var count;
     if (this._enc === 'windows-1252') {
-      decodeWin1252Units(bytes, units);
+      count = decodeWin1252Units(bytes, units);
     } else if (this._enc === 'utf-8') {
-      decodeUtf8(s, bytes, isFinal, this._fatal, units);
+      count = decodeUtf8(s, bytes, isFinal, this._fatal, units);
     } else {
-      decodeUtf16le(s, bytes, isFinal, this._fatal, units);
+      count = decodeUtf16le(s, bytes, isFinal, this._fatal, units);
     }
+    units.length = count;
     var result = unitsToString(units);
     // Strip the BOM once, at the first output of the (possibly chunked) stream.
     if (!s.bomChecked && result.length > 0) {

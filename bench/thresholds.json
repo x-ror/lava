@@ -17,6 +17,15 @@
     "buffer-from-utf16le": 12.0,
     "require-builtin-events": 2.0,
     "require-builtin-util": 2.0,
-    "fs-write-read-64k": 3.0
+    "fs-write-read-64k": 3.0,
+    "//encoding": "Added 2026-07-27 with bench/micro/encoding.js. The absolute ratios are high because everything except decode-utf8-fastpath is a pure-JS codec against Node's native ICU/C++ one; the caps exist to catch a REGRESSION, not to claim parity. Headroom is ~1.4x of observed rather than the 1.5-2x above, because the regression these are here to catch (a per-code-unit wrapper on the accumulator) measured 1.43x and must trip the gate.",
+    "decode-utf8-fastpath": 6.5,
+    "decode-utf8-fatal": 26.0,
+    "decode-utf16le": 35.0,
+    "decode-win1252": 11.5,
+    "decode-utf8-stream": 17.0,
+    "encode-utf8": 3.5,
+    "encode-into": 3.5,
+    "new-textdecoder": 14.0
   }
 }

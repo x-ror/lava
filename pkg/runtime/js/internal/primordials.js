@@ -132,6 +132,7 @@
     TypeError: TypeError,
     RangeError: RangeError,
     Uint8Array: Uint8Array,
+    ArrayBuffer: ArrayBuffer,
 
     // --- Object statics ---
     ObjectCreate: Object.create,
@@ -154,6 +155,7 @@
     ArrayIsArray: Array.isArray,
     ArrayFrom: Array.from,
     ArrayOf: Array.of,
+    ArrayBufferIsView: ArrayBuffer.isView,
     ReflectApply: Reflect.apply,
     ReflectOwnKeys: Reflect.ownKeys,
     ReflectGetPrototypeOf: Reflect.getPrototypeOf,
@@ -178,6 +180,13 @@
 
     // --- Array.prototype.* (ArrayPrototypePush(arr, x)) ---
     ArrayPrototypePush: callerN(ArrayProto.push),
+    // Fixed-arity push. callerN's arguments switch is ~7x a direct call, which is
+    // fine for the cold call sites it was written for but not in a per-element
+    // codec loop: routing encoding.js's decoders through callerN cost 1.43x on
+    // the JS decode path (median of 16 paired launches). These two are the same
+    // captured method on the same `.call` route — identical immunity, ~1.02-1.04x.
+    ArrayPrototypePush1: caller1(ArrayProto.push),
+    ArrayPrototypePush2: caller2(ArrayProto.push),
     ArrayPrototypePop: caller0(ArrayProto.pop),
     ArrayPrototypeShift: caller0(ArrayProto.shift),
     ArrayPrototypeUnshift: callerN(ArrayProto.unshift),

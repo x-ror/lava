@@ -36,8 +36,56 @@ assert.equal(
   2,
 );
 
+// WHATWG label handling: ASCII whitespace is stripped, other Unicode whitespace
+// is not (Node has its own ASCII-only trim for exactly this), and the remaining
+// windows-1252 aliases resolve.
+assert.equal(new TextDecoder(' \t utf-8 \r\n').encoding, 'utf-8');
+assert.throws(() => new TextDecoder(' utf-8'), RangeError);
+assert.throws(() => new TextDecoder('　utf-8'), RangeError);
+assert.throws(() => new TextDecoder('utf-8'), RangeError);
+for (const label of ['iso-ir-100', 'iso_8859-1', 'iso_8859-1:1987', 'csisolatin1'])
+  assert.equal(new TextDecoder(label).encoding, 'windows-1252');
+
+// A label object is coerced exactly once, and the error names what was coerced.
+{
+  let calls = 0;
+  assert.throws(
+    () =>
+      new TextDecoder({
+        toString() {
+          calls++;
+          return 'zz-bogus';
+        },
+      }),
+    { name: 'RangeError', code: 'ERR_ENCODING_NOT_SUPPORTED' },
+  );
+  assert.equal(calls, 1);
+}
+
+// Inputs larger than the 0x2000-code-unit chunk of the string builder: the
+// decoder assembles the result in slices, so the seams must be invisible.
+for (const n of [8191, 8192, 8193, 16384, 16385]) {
+  const latin = new Uint8Array(n);
+  for (let i = 0; i < n; i++) latin[i] = 0x41 + (i % 26);
+  const out = new TextDecoder('windows-1252').decode(latin);
+  assert.equal(out.length, n);
+  assert.equal(out.charCodeAt(0), 0x41);
+  assert.equal(out.charCodeAt(n - 1), 0x41 + ((n - 1) % 26));
+
+  const u16 = new Uint8Array(n * 2);
+  for (let i = 0; i < n; i++) u16[i * 2] = 0x41 + (i % 26);
+  const out16 = new TextDecoder('utf-16le').decode(u16);
+  assert.equal(out16.length, n);
+  assert.equal(out16.charCodeAt(n - 1), 0x41 + ((n - 1) % 26));
+}
+
 // error modes
 assert.throws(() => new TextDecoder('made-up'), RangeError);
+assert.throws(() => new TextDecoder('made-up'), {
+  name: 'RangeError',
+  code: 'ERR_ENCODING_NOT_SUPPORTED',
+  message: 'The "made-up" encoding is not supported',
+});
 assert.throws(
   () => new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xff])),
   TypeError,
