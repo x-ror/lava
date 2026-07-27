@@ -60,12 +60,28 @@
   req('structured_clone');
   req('crypto');
 
-  // primordials and parse_args are internal-only: internal factories require() them
-  // through `req` above, but they must NOT be reachable through the public resolver
-  // native require() consults — Node has no such builtins (require('node:primordials')
-  // is ERR_UNKNOWN_BUILTIN_MODULE; util.parseArgs is the public surface for parse_args),
-  // and a user package with either name must not be shadowed. publicReq hides them.
-  var INTERNAL_ONLY = { primordials: true, parse_args: true, parse_env: true, mime: true };
+  // Internal-only modules: internal factories require() them through `req` above,
+  // but they must NOT be reachable through the public resolver native require()
+  // consults, and publicReq hides them. Two reasons a name lands here:
+  //   1. It has no Node builtin at all — require('node:primordials') is
+  //      ERR_UNKNOWN_BUILTIN_MODULE; util.parseArgs / util.MIMEType are the public
+  //      surfaces for parse_args / mime.
+  //   2. Its user-facing API is a GLOBAL, not a module — fetch, AbortController,
+  //      TextEncoder/TextDecoder, and structuredClone are installed on globalThis
+  //      by the eager loads above. `encoding` in particular is a real npm package
+  //      (a transitive dep of node-fetch), so answering require('encoding') from
+  //      here would shadow it and break the ecosystem. Hiding the specifier leaves
+  //      the globals intact while letting the filesystem resolver find the package.
+  var INTERNAL_ONLY = {
+    primordials: true,
+    parse_args: true,
+    parse_env: true,
+    mime: true,
+    fetch: true,
+    abort: true,
+    encoding: true,
+    structured_clone: true,
+  };
   function publicReq(name) {
     if (INTERNAL_ONLY[normalize(name)]) return undefined;
     return req(name);
