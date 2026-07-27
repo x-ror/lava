@@ -212,17 +212,19 @@ crypto_pbkdf2_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
-	password, pw_ok := typed_array_view(ctx, arguments[1])
-	salt, salt_ok := typed_array_view(ctx, arguments[2])
-	if !pw_ok || !salt_ok {
-		if exception != nil do exception^ = make_js_error(ctx, "pbkdf2 expects Uint8Array password and salt")
-		return jsc.JSValueMakeUndefined(ctx)
-	}
-
+	// JSValueToNumber can run JS (valueOf) — read the numbers before borrowing
+	// the views; see the note in buffer_utf16le_write_into_cb (buffer.odin).
 	iterations := u32(jsc.JSValueToNumber(ctx, arguments[3], nil))
 	keylen := int(jsc.JSValueToNumber(ctx, arguments[4], nil))
 	if iterations == 0 || keylen <= 0 {
 		if exception != nil do exception^ = make_js_error(ctx, "pbkdf2 requires positive iterations and keylen")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	password, pw_ok := typed_array_view(ctx, arguments[1])
+	salt, salt_ok := typed_array_view(ctx, arguments[2])
+	if !pw_ok || !salt_ok {
+		if exception != nil do exception^ = make_js_error(ctx, "pbkdf2 expects Uint8Array password and salt")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
@@ -254,18 +256,20 @@ crypto_hkdf_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
+	// JSValueToNumber can run JS (valueOf) — read it before borrowing the views;
+	// see the note in buffer_utf16le_write_into_cb (buffer.odin).
+	keylen := int(jsc.JSValueToNumber(ctx, arguments[4], nil))
+	hash_len := hash.DIGEST_SIZES[algo]
+	if keylen < 0 || keylen > 255 * hash_len {
+		if exception != nil do exception^ = make_js_error(ctx, "Invalid key length")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
 	ikm, ikm_ok := typed_array_view(ctx, arguments[1])
 	salt, salt_ok := typed_array_view(ctx, arguments[2])
 	info, info_ok := typed_array_view(ctx, arguments[3])
 	if !ikm_ok || !salt_ok || !info_ok {
 		if exception != nil do exception^ = make_js_error(ctx, "hkdf expects Uint8Array ikm, salt, and info")
-		return jsc.JSValueMakeUndefined(ctx)
-	}
-
-	keylen := int(jsc.JSValueToNumber(ctx, arguments[4], nil))
-	hash_len := hash.DIGEST_SIZES[algo]
-	if keylen < 0 || keylen > 255 * hash_len {
-		if exception != nil do exception^ = make_js_error(ctx, "Invalid key length")
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 

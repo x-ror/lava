@@ -96,11 +96,20 @@
     if (typeof listener !== 'function') {
       throw new TypeError('The "listener" argument must be of type function');
     }
-    return addListener(this, type, onceWrap(this, type, listener), false);
+    // Route through this.on (not the internal addListener): Node does the same,
+    // and subclasses that override on() to observe listener registration —
+    // node:stream Readable arms flow/'readable' plumbing there — must see
+    // once() registrations too.
+    this.on(type, onceWrap(this, type, listener));
+    return this;
   };
 
   EventEmitter.prototype.prependOnceListener = function (type, listener) {
-    return addListener(this, type, onceWrap(this, type, listener), true);
+    if (typeof listener !== 'function') {
+      throw new TypeError('The "listener" argument must be of type function');
+    }
+    this.prependListener(type, onceWrap(this, type, listener));
+    return this;
   };
 
   EventEmitter.prototype.removeListener = function (type, listener) {

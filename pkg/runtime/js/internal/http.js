@@ -363,6 +363,19 @@
     this._keepAlive = false;
     /** @type {((function(): void) | null)} connection hook after finish */
     this._onComplete = null;
+    // Forward the socket's 'drain' to this response for the lifetime of the
+    // response, so res.write() === false + res.once('drain', ...) is a real
+    // backpressure contract (the native layer owes a 'drain' whenever a write
+    // buffered past the HWM). Removed in end() — on a keep-alive connection the
+    // next response gets its own forwarder on the same socket.
+    var self = this;
+    this._drainForwarder = null;
+    if (socket && typeof socket.on === 'function') {
+      this._drainForwarder = function () {
+        self.emit('drain');
+      };
+      socket.on('drain', this._drainForwarder);
+    }
   }
   ServerResponse.prototype = Object.create(EventEmitter.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
@@ -497,12 +510,17 @@
       }
       this._flushHead();
     }
+    var ok = true;
     if (!omitBody && chunk && chunk.length) {
       var bytes = typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk;
-      this.socket.write(this._chunked ? frameChunkedBody(bytes) : bytes);
+      // The socket's return value IS the backpressure signal: false means the
+      // native write buffer crossed its high-water mark and a 'drain' is owed
+      // (forwarded to this response by _drainForwarder). Swallowing it here
+      // would let a fast handler buffer without bound against a slow client.
+      ok = this.socket.write(this._chunked ? frameChunkedBody(bytes) : bytes);
     }
     if (typeof callback === 'function') process.nextTick(callback);
-    return true;
+    return ok;
   };
 
   /**
@@ -560,6 +578,10 @@
     }
     if (this._chunked && !omitBody) this.socket.write(LAST_CHUNK);
     this.finished = true;
+    if (this._drainForwarder && typeof this.socket.removeListener === 'function') {
+      this.socket.removeListener('drain', this._drainForwarder);
+      this._drainForwarder = null;
+    }
     if (typeof callback === 'function') process.nextTick(callback);
     this.emit('finish');
     if (this._onComplete) this._onComplete();

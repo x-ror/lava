@@ -78,3 +78,23 @@ else
 	printf '%s\n' 'net smoke FAILED: lava server output differs from node server' >&2
 	exit 1
 fi
+
+# Client-socket parity (net.connect): one self-contained script — an echo server
+# plus a net.connect client plus an ECONNREFUSED case — run under BOTH runtimes;
+# the stdouts must match ('ok' sentinel guards against a double early-exit).
+CONNECT="$ROOT_DIR/tests/runtime/net/connect-parity.js"
+"$NODE_BIN" "$CONNECT" >"$TMP_DIR/node-connect.out" 2>&1 || true
+"$LAVA_BIN" run "$CONNECT" >"$TMP_DIR/lava-connect.out" 2>&1 || true
+for who in node lava; do
+	if ! grep -q '^ok$' "$TMP_DIR/$who-connect.out"; then
+		printf '%s\n' "net smoke FAILED: connect parity did not reach 'ok' under $who" >&2
+		cat "$TMP_DIR/$who-connect.out" >&2 || true
+		exit 1
+	fi
+done
+if diff -u "$TMP_DIR/node-connect.out" "$TMP_DIR/lava-connect.out"; then
+	printf '%s\n' 'net smoke passed (net.connect parity)'
+else
+	printf '%s\n' 'net smoke FAILED: net.connect parity output differs' >&2
+	exit 1
+fi
