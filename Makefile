@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-primordials check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -42,6 +42,7 @@ help:
 	@printf '%s\n' '  make fix-js             Auto-fix JavaScript formatting/lint issues with Vite+'
 	@printf '%s\n' '  make check-md           Markdown lint over the repo docs (markdownlint-cli2)'
 	@printf '%s\n' '  make fix-md             Auto-fix markdown lint issues'
+	@printf '%s\n' '  make check-actions      actionlint over .github/workflows'
 	@printf '%s\n' '  make check-primordials  Prototype-pollution ratchet over embedded JS (UPDATE=1 to rebaseline)'
 	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
 	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
@@ -135,6 +136,12 @@ check-md:
 
 fix-md:
 	vp run md:fix
+
+# actionlint (WASM build, no Go toolchain) over .github/workflows. Catches the semantic
+# mistakes a YAML parse cannot: contexts used where they are not available, bad `needs`,
+# shellcheck errors inside `run:` blocks.
+check-actions:
+	vp run actions:check
 
 # Prototype-pollution ratchet over the embedded runtime JS (also part of check-js).
 # Run with UPDATE=1 to rewrite the baseline after hardening a module.

@@ -26,6 +26,9 @@ new CI step if it should be enforced.
 primordials ratchet.
 `make check-md` whenever any `.md` changed — markdownlint over the repo's own docs
 (config and the rationale for its two disabled rules: `.markdownlint-cli2.jsonc`).
+`make check-actions` whenever any `.github/workflows/*.yml` changed — actionlint
+catches what a YAML parse cannot: a context used where it is not available, a bad
+`needs`, shellcheck errors inside `run:`.
 
 ## By path
 

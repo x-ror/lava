@@ -37,15 +37,17 @@ what [reference/gates.md](reference/gates.md) routes for the changed paths:
 
 1. `make check` — always
 2. `make check-js` — if any JS changed
-3. `make build`
-4. `make test` (and `make test-lava` unless `--quick`)
-5. the routed per-path smokes and benches
+3. `make check-md` — if any `.md` changed
+4. `make check-actions` — if any `.github/workflows/*.yml` changed
+5. `make build`
+6. `make test` (and `make test-lava` unless `--quick`)
+7. the routed per-path smokes and benches
 
 Capture real output. If `make check` or `make build` fails, stop and report —
 verdict is **BLOCK** with the compiler output; do not spawn specialists.
 A later gate failing is a finding, not a stop: record it and continue.
 
-With `--quick`, run steps 1–3 only and mark the untested gates explicitly as
+With `--quick`, run steps 1–5 only and mark the untested gates explicitly as
 "not run" in the report. Never let "not run" read as "passed".
 
 With `--review-only`, skip this step entirely — run no `make` target and no build

@@ -33,6 +33,8 @@ changed paths require. Networking smokes run on both backends. -->
 
 - [ ] `make check`
 - [ ] `make check-js` (if JS changed)
+- [ ] `make check-md` (if any `.md` changed)
+- [ ] `make check-actions` (if a workflow changed)
 - [ ] `make build`
 - [ ] `make test` / `make test-lava`
 - [ ] routed smokes: <!-- list -->
