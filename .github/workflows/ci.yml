@@ -46,6 +46,12 @@ jobs:
       - name: JavaScript lint and format
         run: make check-js
 
+      - name: Markdown lint
+        run: make check-md
+
+      - name: Workflow lint
+        run: make check-actions
+
       - name: Build
         run: make build
 

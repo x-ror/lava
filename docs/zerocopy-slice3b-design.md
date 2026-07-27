@@ -129,7 +129,7 @@ buffer decision in `if !conn.closing`, and call `net_op_finished` LAST and uncon
 submit choke point `net_proactor_submit`** (§4), so EVERY submission (initial, tail, rotation, fallback)
 clears them; never stale-carried.
 
-```
+```text
 net_send_zc_complete(loop, conn, res, more):
   # ---- INTERMEDIATE: result CQE, pages PINNED, notif owed. INV-1: RECORD ONLY, then return. ----
   if more:

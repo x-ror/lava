@@ -31,7 +31,7 @@ Two design decisions shape the whole system:
 
 ## 2. System overview
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │  cmd/lava (CLI)                          main.odin                     │
 │  parses argv → builds an eventloop.Loop → calls runtime.eval/run_file  │

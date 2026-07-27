@@ -1,0 +1,38 @@
+// Markdown lint for the repo's own documentation. Runs as `make check-md`, and as its own
+// CI step, so a violation is caught before the commit rather than by a reviewer.
+//
+// Only two rules are disabled, each because it is wrong for this repo rather than merely
+// inconvenient. Everything else is on: if a rule fires, fix the markdown.
+{
+  "globs": ["**/*.md"],
+
+  "ignores": [
+    "node_modules",
+    // Vendored upstream Node documentation — not ours to reformat.
+    "reference/node-doc-api",
+    // Build outputs and the ignored Windows dependency cache.
+    "bin",
+    "build",
+    ".deps"
+  ],
+
+  "config": {
+    // MD013 (line-length): 798 hits at the 80-column default. Prose here is wrapped to
+    // ~80 by hand, but tables, code fences and long URLs legitimately exceed it and
+    // cannot be wrapped without breaking the construct. Enforcing it would mean either
+    // mangling every table or burying real findings under noise.
+    "MD013": false,
+
+    // MD041 (first-line-heading): agent and skill definitions open with YAML frontmatter
+    // followed by the system prompt, and the PR template opens with an HTML comment.
+    // Neither may start with an H1 — the frontmatter and the comment are the contract.
+    "MD041": false,
+
+    // MD024 (no-duplicate-heading) stays on, but scoped to siblings. The design docs
+    // repeat a per-phase heading under each slice on purpose — e.g. "Safety invariants
+    // (verification checklist)" appears under both Slice 1b and Slice 2 in
+    // docs/io-uring-proactor.md. Those are different checklists under different parents,
+    // not a copy-paste slip, and flattening them would lose the parallel structure.
+    "MD024": { "siblings_only": true }
+  }
+}

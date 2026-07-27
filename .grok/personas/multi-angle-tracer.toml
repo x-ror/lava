@@ -1,4 +1,0 @@
-description = "Angle C: cross-file wiring and contract tracer"
-instructions_file = ".grok/skills/multi-review/angles/c-tracer.md"
-reasoning_effort = "high"
-default_capability_mode = "execute"

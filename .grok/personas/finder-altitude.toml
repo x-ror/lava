@@ -1,4 +1,0 @@
-description = "Finder: layer ownership and file-size altitude"
-instructions_file = ".grok/skills/multi-review/angles/finder-altitude.md"
-reasoning_effort = "medium"
-default_capability_mode = "read-only"
