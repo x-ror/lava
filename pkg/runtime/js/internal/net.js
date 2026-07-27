@@ -1,9 +1,10 @@
-// node:net — minimal TCP server + socket (M1), modeled on Node's net.Server /
-// net.Socket. Backed by the native reactor primitives in pkg/runtime/net.odin
+// node:net — TCP server + socket, modeled on Node's net.Server / net.Socket.
+// Backed by the native reactor primitives in pkg/runtime/net.odin
 // (make_net_bindings): a connection is addressed by an integer id; the native side
 // pushes data/end/close/error into the per-connection handlers this module registers
-// via native.startConnection once the Socket exists. Client sockets (net.connect),
-// IPC/Unix sockets, and true half-close are out of scope for M1.
+// via native.startConnection once the Socket exists. Client sockets (net.connect)
+// share that machinery via armSocket. IPC/Unix sockets, DNS hosts in connect(),
+// and true half-close remain out of scope.
 (function (require, module, exports, native) {
   'use strict';
 
@@ -128,19 +129,12 @@
   // ticks again (after we return) — there is no "data before the user's handler" window.
   // Arming first means on_close/on_end ARE registered if a 'connection' handler closes the
   // socket synchronously (socket.destroy()/end()), so its 'close'/'end' still fire.
-  Server.prototype._onConnection = function (id) {
-    var self = this;
-    var socket = new Socket(id);
-    socket.encrypted = !!this._tlsContext; // before 'connection' fires, so handlers see it
-    // Track the socket so server.close() can wait for it (Node fires the server 'close'
-    // event only after the last live connection ends).
-    this._sockets.add(socket);
-    socket.once('close', function () {
-      self._sockets.delete(socket);
-      if (self._closing && self._sockets.size === 0) self._maybeEmitClose();
-    });
+  // armSocket registers the native per-connection handlers for a Socket —
+  // shared by the accept path (Server._onConnection) and the client path
+  // (connect), so both socket kinds ride the same proactor/readiness machinery.
+  function armSocket(socket) {
     native.startConnection(
-      id,
+      socket._id,
       function (u8) {
         socket.emit('data', asBuffer(u8));
       },
@@ -164,6 +158,20 @@
         socket.emit('drain');
       },
     );
+  }
+
+  Server.prototype._onConnection = function (id) {
+    var self = this;
+    var socket = new Socket(id);
+    socket.encrypted = !!this._tlsContext; // before 'connection' fires, so handlers see it
+    // Track the socket so server.close() can wait for it (Node fires the server 'close'
+    // event only after the last live connection ends).
+    this._sockets.add(socket);
+    socket.once('close', function () {
+      self._sockets.delete(socket);
+      if (self._closing && self._sockets.size === 0) self._maybeEmitClose();
+    });
+    armSocket(socket);
     this.emit('connection', socket);
   };
 
@@ -257,5 +265,67 @@
     return new Server(options, connectionListener);
   }
 
-  module.exports = { createServer: createServer, Server: Server, Socket: Socket };
+  // connect(options[, connectListener]) / connect(port[, host][, connectListener])
+  // Outbound client socket. The native side registers the connection immediately
+  // (so destroy() works mid-connect) and resolves the non-blocking connect via a
+  // writability watcher; on success the socket is armed through the SAME
+  // startConnection path accepted sockets use. Host policy matches listen:
+  // numeric IPv4 or 'localhost'.
+  function connect(a, b, c) {
+    var options, cb;
+    if (a !== null && typeof a === 'object') {
+      options = a;
+      cb = b;
+    } else {
+      options = { port: a };
+      if (typeof b === 'string') {
+        options.host = b;
+        cb = c;
+      } else {
+        cb = b;
+      }
+    }
+    var socket = new Socket(0);
+    socket.connecting = true;
+    if (typeof cb === 'function') socket.once('connect', cb);
+    var port = options.port >>> 0;
+    var host = options.host || '127.0.0.1';
+    var id;
+    try {
+      id = native.connect(
+        port,
+        host,
+        function () {
+          socket.connecting = false;
+          armSocket(socket);
+          socket.emit('connect');
+        },
+        function (msg) {
+          // The native side has already closed the connection; surface the
+          // Node-shaped error (code = first token after "connect ").
+          socket.connecting = false;
+          var e = new Error(String(msg));
+          var m = /^connect ([A-Z]+)/.exec(String(msg));
+          if (m) e.code = m[1];
+          socket.emit('error', e);
+          socket._onClose(true);
+        },
+      );
+    } catch (e) {
+      process.nextTick(function () {
+        socket.emit('error', e);
+      });
+      return socket;
+    }
+    socket._id = id;
+    return socket;
+  }
+
+  module.exports = {
+    createServer: createServer,
+    Server: Server,
+    Socket: Socket,
+    connect: connect,
+    createConnection: connect,
+  };
 });

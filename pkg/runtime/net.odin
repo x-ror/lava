@@ -3,6 +3,7 @@ package lava_runtime
 
 import "base:runtime"
 import "core:c"
+import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:strconv"
@@ -126,6 +127,11 @@ Net_Connection :: struct {
 	on_close:            jsc.JSObjectRef,
 	on_error:            jsc.JSObjectRef,
 	on_drain:            jsc.JSObjectRef, // proactor: fired when the outbound buffer empties
+	// Outbound connect (net.connect): fired exactly once when the non-blocking
+	// connect resolves successfully; unprotected + nil'd right after. Zero on
+	// accepted (server) connections.
+	on_connect:          jsc.JSObjectRef,
+	connect_label:       string, // "host:port" for connect error messages; freed with the conn
 	handlers_set:        bool,
 	// Pending outbound bytes not yet accepted by the kernel send buffer. Bound to the
 	// default heap on first append (a proc "c" runs under runtime.default_context); the
@@ -178,6 +184,7 @@ Net_Connection :: struct {
 make_net_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
 	bindings := jsc.JSObjectMake(ctx, nil, nil)
 	inject_native_function(ctx, bindings, "listen", net_listen_cb)
+	inject_native_function(ctx, bindings, "connect", net_connect_cb)
 	inject_native_function(ctx, bindings, "startConnection", net_start_cb)
 	inject_native_function(ctx, bindings, "write", net_write_cb)
 	inject_native_function(ctx, bindings, "end", net_end_cb)
@@ -418,6 +425,174 @@ net_tls_handshake_timeout :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	if conn.closing || !conn.tls_handshaking do return
 	net_emit_error(conn, "tls handshake timeout")
 	net_close_conn(conn, true)
+}
+
+// --- outbound connect (net.connect) ------------------------------------------
+
+// net_connect_errno_name maps the SO_ERROR of a failed connect to Node's error
+// code vocabulary (err.code / the first token after "connect " in the message).
+@(private = "file")
+net_connect_errno_name :: proc(errno: i32) -> string {
+	#partial switch linux.Errno(errno) {
+	case .ECONNREFUSED:
+		return "ECONNREFUSED"
+	case .ETIMEDOUT:
+		return "ETIMEDOUT"
+	case .EHOSTUNREACH:
+		return "EHOSTUNREACH"
+	case .ENETUNREACH:
+		return "ENETUNREACH"
+	case .EADDRNOTAVAIL:
+		return "EADDRNOTAVAIL"
+	case .EADDRINUSE:
+		return "EADDRINUSE"
+	case .EACCES:
+		return "EACCES"
+	case:
+		return "EIO"
+	}
+}
+
+// net_connect_io_cb resolves a pending non-blocking connect: the fd polls
+// writable once the handshake finishes (success AND failure both surface this
+// way — SO_ERROR distinguishes them). One-shot: the watcher is released before
+// any JS runs, so startConnection can arm reads on the same fd. Loop thread.
+net_connect_io_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
+	context = runtime.default_context()
+	conn := cast(^Net_Connection)user_data
+	if conn == nil || conn.closing do return
+	eventloop.unwatch_fd(loop, &conn.watcher)
+
+	soerr: i32 = 0
+	// getsockopt_base directly: the _sock overload's where-clause tests the
+	// POINTEE type (a core:sys/linux quirk in this Odin build), so ^i32 never
+	// matches it.
+	_, _ = linux.getsockopt_base(
+		linux.Fd(conn.fd),
+		cast(int)linux.SOL_SOCKET,
+		linux.Socket_Option.ERROR,
+		&soerr,
+	)
+	if soerr == 0 {
+		fn := conn.on_connect
+		conn.on_connect = nil
+		net_emit(conn.ctx, fn, nil, 0)
+		net_unprotect(conn.ctx, fn)
+		return
+	}
+	net_emit_error(
+		conn,
+		fmt.tprintf("connect %s %s", net_connect_errno_name(soerr), conn.connect_label),
+	)
+	net_close_conn(conn, true)
+}
+
+// net_connect_cb(port, host, onConnected, onError) -> connId. Creates a
+// non-blocking IPv4 socket and starts connect(); the connection is registered
+// up front (so close() works mid-connect) and watched for writability until the
+// connect resolves. On success JS registers its data handlers through the SAME
+// startConnection the accept path uses, so client sockets get the full
+// proactor/readiness read machinery for free. Same host policy as listen:
+// numeric IPv4 or "localhost" (DNS integration is a later milestone).
+net_connect_cb :: proc "c" (
+	ctx: jsc.JSContextRef,
+	function: jsc.JSObjectRef,
+	this_object: jsc.JSObjectRef,
+	argument_count: c.size_t,
+	arguments: [^]jsc.JSValueRef,
+	exception: ^jsc.JSValueRef,
+) -> jsc.JSValueRef {
+	context = runtime.default_context()
+	if argument_count < 4 {
+		if exception != nil do exception^ = make_js_error(ctx, "net.connect requires (port, host, onConnected, onError)")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	args := arguments[:int(argument_count)]
+	port := int(jsc.JSValueToNumber(ctx, args[0], nil))
+	host, host_alloc := jsc_value_to_string_or_default(ctx, args[1])
+	defer if host_alloc do delete(host, context.allocator)
+	on_connected := callback_arg(ctx, args[2])
+	on_error := callback_arg(ctx, args[3])
+	if on_connected == nil || on_error == nil {
+		if exception != nil do exception^ = make_js_error(ctx, "net.connect: onConnected and onError must be functions")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	loop := get_loop_from_ctx(ctx)
+	state := get_state_from_ctx(ctx)
+	if loop == nil || state == nil {
+		if exception != nil do exception^ = make_js_error(ctx, "net: no event loop is bound to this context")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+
+	// Same policy as net.listen: numeric IPv4 or "localhost" only — never fall
+	// back to a wildcard or a resolver silently.
+	ip4 := net.IP4_Address{127, 0, 0, 1}
+	if len(host) > 0 {
+		resolved := false
+		if parsed := net.parse_address(host); parsed != nil {
+			#partial switch a in parsed {
+			case net.IP4_Address:
+				ip4 = a
+				resolved = true
+			}
+		} else if host == "localhost" {
+			resolved = true
+		}
+		if !resolved {
+			if exception != nil do exception^ = make_js_error(ctx, "net.connect: unsupported host (only numeric IPv4 and 'localhost' are supported)")
+			return jsc.JSValueMakeUndefined(ctx)
+		}
+	}
+
+	cfd, sock_err := linux.socket(.INET, .STREAM, {.NONBLOCK}, .TCP)
+	if sock_err != .NONE {
+		if exception != nil do exception^ = make_js_error(ctx, "net.connect: could not create socket")
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	nodelay: i32 = 1
+	_ = linux.setsockopt(cfd, linux.SOL_TCP, linux.Socket_TCP_Option.NODELAY, &nodelay)
+
+	addr := linux.Sock_Addr_In {
+		sin_family = .INET,
+		sin_port   = u16be(u16(port)),
+		sin_addr   = transmute([4]u8)ip4,
+	}
+
+	conn := new(Net_Connection)
+	conn.ctx = ctx
+	conn.loop = loop
+	conn.fd = uintptr(cfd)
+	conn.id = state.next_net_id
+	state.next_net_id += 1
+	state.net_conns[conn.id] = conn
+	conn.on_connect = on_connected
+	conn.on_error = on_error
+	net_protect(ctx, conn.on_connect)
+	net_protect(ctx, conn.on_error)
+	conn.connect_label = fmt.aprintf("%s:%d", host, port)
+
+	// EINPROGRESS is the normal non-blocking path; an immediate .NONE (loopback
+	// can connect synchronously) still resolves through the writability watcher
+	// so JS always receives onConnected AFTER it has the connection id.
+	conn_err := linux.connect(cfd, &addr)
+	if conn_err != .NONE && conn_err != .EINPROGRESS && conn_err != .EAGAIN {
+		// Synchronous failure (e.g. ENETUNREACH). The error must still be
+		// delivered asynchronously — JS attaches listeners after this returns —
+		// so leave delivery to the watcher: a failed socket polls writable with
+		// SO_ERROR set. If even the watcher can't register, fall through below.
+	}
+	conn.watcher = eventloop.IO_Watcher {
+		fd        = conn.fd,
+		mode      = .Write,
+		callback  = net_connect_io_cb,
+		user_data = conn,
+	}
+	if !eventloop.watch_fd(loop, &conn.watcher) {
+		net_emit_error(conn, "net.connect: could not register connection with the event loop")
+		net_close_conn(conn, true)
+		return jsc.JSValueMakeUndefined(ctx)
+	}
+	return jsc.JSValueMakeNumber(ctx, f64(conn.id))
 }
 
 // --- per-connection handler registration + reads ----------------------------
@@ -1096,6 +1271,8 @@ net_maybe_free :: proc(conn: ^Net_Connection) {
 	net_unprotect(conn.ctx, conn.on_close)
 	net_unprotect(conn.ctx, conn.on_error)
 	net_unprotect(conn.ctx, conn.on_drain)
+	net_unprotect(conn.ctx, conn.on_connect) // closed mid-connect: the success cb never fired
+	delete(conn.connect_label)
 	delete(conn.recv_buf)
 	// M1/M2 (kernel-side UAF): a SEND_ZC whose pages the kernel may STILL hold pinned — its notification
 	// never fired, so we reached here via the eventloop.destroy dispose path (the disposer drove inflight
@@ -1456,8 +1633,9 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 	net_unprotect(conn.ctx, conn.on_close)
 	net_unprotect(conn.ctx, conn.on_error)
 	net_unprotect(conn.ctx, conn.on_drain) // net.js always registers onDrain, even on readiness
-	conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain =
-		nil, nil, nil, nil, nil
+	net_unprotect(conn.ctx, conn.on_connect) // closed mid-connect: the success cb never fired
+	conn.on_data, conn.on_end, conn.on_close, conn.on_error, conn.on_drain, conn.on_connect =
+		nil, nil, nil, nil, nil, nil
 
 	if state := get_state_from_ctx(conn.ctx); state != nil {
 		delete_key(&state.net_conns, conn.id)
@@ -1470,6 +1648,7 @@ net_close_conn :: proc(conn: ^Net_Connection, had_error: bool) {
 net_conn_free_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	context = runtime.default_context() // free with the same heap net_accept_cb/proc"c" allocated under
 	conn := cast(^Net_Connection)user_data
+	delete(conn.connect_label)
 	delete(conn.write_queue)
 	tls_server_free_conn(conn) // free SSL/BIOs + cancel handshake timer (no-op on a plaintext conn)
 	free(conn)
