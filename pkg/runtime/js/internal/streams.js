@@ -32,6 +32,18 @@
 
   function noop() {}
 
+  // Pollution-proof queue shift: index moves + .length only, so an overridden
+  // Array.prototype.shift/push cannot reach the stream queues (module appends
+  // use `arr[arr.length] = v` for the same reason).
+  function shiftFirst(arr) {
+    var n = arr.length;
+    if (n === 0) return undefined;
+    var first = arr[0];
+    for (var i = 1; i < n; i++) arr[i - 1] = arr[i];
+    arr.length = n - 1;
+    return first;
+  }
+
   function newPromise(executor) {
     return new Promise(executor);
   }
@@ -94,13 +106,18 @@
       return this._items.length - this._head;
     }
     push(item) {
-      this._items.push(item);
+      this._items[this._items.length] = item;
     }
     shift() {
       var item = this._items[this._head];
       this._head++;
       if (this._head > 64 && this._head * 2 >= this._items.length) {
-        this._items = this._items.slice(this._head);
+        // Compact without Array.prototype.slice (pollution-proof): copy the live
+        // tail into a fresh array by index.
+        var compacted = [];
+        for (var i = this._head; i < this._items.length; i++)
+          compacted[compacted.length] = this._items[i];
+        this._items = compacted;
         this._head = 0;
       }
       return item;
@@ -115,6 +132,9 @@
     container._queueTotalSize = 0;
   }
   function dequeueValue(container) {
+    // _queue is a SimpleQueue: its shift() is a class method, already immune to
+    // Array.prototype pollution (only _readRequests/_writeRequests are plain
+    // arrays that need shiftFirst).
     var pair = container._queue.shift();
     container._queueTotalSize -= pair.size;
     if (container._queueTotalSize < 0) container._queueTotalSize = 0;
@@ -124,6 +144,8 @@
     if (typeof size !== 'number' || size !== size || size === Infinity || size < 0) {
       throw new RangeError('Invalid chunk size');
     }
+    // _queue is a SimpleQueue — its push() is a pollution-immune class method,
+    // and an index write would bypass its head-cursor bookkeeping.
     container._queue.push({ value: value, size: size });
     container._queueTotalSize += size;
   }
@@ -347,10 +369,10 @@
   }
 
   function readableStreamAddReadRequest(stream, readRequest) {
-    stream._reader._readRequests.push(readRequest);
+    stream._reader._readRequests[stream._reader._readRequests.length] = readRequest;
   }
   function readableStreamFulfillReadRequest(stream, chunk, done) {
-    var readRequest = stream._reader._readRequests.shift();
+    var readRequest = shiftFirst(stream._reader._readRequests);
     if (done) readRequest.closeSteps();
     else readRequest.chunkSteps(chunk);
   }
@@ -979,7 +1001,7 @@
 
   function writableStreamAddWriteRequest(stream) {
     var deferred = newDeferred();
-    stream._writeRequests.push(deferred);
+    stream._writeRequests[stream._writeRequests.length] = deferred;
     return deferred.promise;
   }
 
@@ -1077,7 +1099,7 @@
     stream._closeRequest = undefined;
   }
   function writableStreamMarkFirstWriteRequestInFlight(stream) {
-    stream._inFlightWriteRequest = stream._writeRequests.shift();
+    stream._inFlightWriteRequest = shiftFirst(stream._writeRequests);
   }
   function writableStreamRejectCloseAndClosedPromiseIfNeeded(stream) {
     if (stream._closeRequest !== undefined) {
@@ -1471,24 +1493,22 @@
           signal.reason !== undefined ? signal.reason : new DOMExceptionLike('AbortError');
         var actions = [];
         if (!preventAbort) {
-          actions.push(function () {
+          actions[actions.length] = function () {
             if (dest._state === 'writable') return writableStreamAbort(dest, error);
             return promiseResolvedWith(undefined);
-          });
+          };
         }
         if (!preventCancel) {
-          actions.push(function () {
+          actions[actions.length] = function () {
             if (source._state === 'readable') return readableStreamCancel(source, error);
             return promiseResolvedWith(undefined);
-          });
+          };
         }
         shutdownWithAction(
           function () {
-            return Promise.all(
-              actions.map(function (a) {
-                return a();
-              }),
-            );
+            var pending = [];
+            for (var ai = 0; ai < actions.length; ai++) pending[ai] = actions[ai]();
+            return Promise.all(pending);
           },
           true,
           error,

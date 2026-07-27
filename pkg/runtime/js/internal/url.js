@@ -157,13 +157,13 @@
         isHexDigit(str.charCodeAt(i + 1)) &&
         isHexDigit(str.charCodeAt(i + 2))
       ) {
-        bytes.push(parseInt(str.substr(i + 1, 2), 16));
+        bytes[bytes.length] = parseInt(str.substr(i + 1, 2), 16);
         i += 2;
       } else {
         var cp = str.codePointAt(i);
         if (cp > 0xffff) i++;
         var enc = encoder().encode(String.fromCodePoint(cp));
-        for (var k = 0; k < enc.length; k++) bytes.push(enc[k]);
+        for (var k = 0; k < enc.length; k++) bytes[bytes.length] = enc[k];
       }
     }
     return new Uint8Array(bytes);
@@ -224,7 +224,7 @@
     for (var s = 0; s < input.length; s++) {
       var cp = input.codePointAt(s);
       if (cp > 0xffff) s++;
-      codePoints.push(cp);
+      codePoints[codePoints.length] = cp;
     }
     var n = PUNY_INITIAL_N;
     var delta = 0;
@@ -233,12 +233,12 @@
     var i;
     for (i = 0; i < codePoints.length; i++) {
       if (codePoints[i] < 0x80) {
-        output.push(codePoints[i]);
+        output[output.length] = codePoints[i];
         basicLength++;
       }
     }
     var handled = basicLength;
-    if (basicLength > 0) output.push(0x2d); // '-'
+    if (basicLength > 0) output[output.length] = 0x2d; // '-'
     while (handled < codePoints.length) {
       var m = 0x7fffffff;
       for (i = 0; i < codePoints.length; i++) {
@@ -254,10 +254,10 @@
           for (var k = PUNY_BASE; ; k += PUNY_BASE) {
             var t = k <= bias ? PUNY_TMIN : k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias;
             if (q < t) break;
-            output.push(punyEncodeDigit(t + ((q - t) % (PUNY_BASE - t))));
+            output[output.length] = punyEncodeDigit(t + ((q - t) % (PUNY_BASE - t)));
             q = Math.floor((q - t) / (PUNY_BASE - t));
           }
-          output.push(punyEncodeDigit(q));
+          output[output.length] = punyEncodeDigit(q);
           bias = punyAdapt(delta, handled + 1, handled === basicLength);
           delta = 0;
           handled++;
@@ -280,7 +280,7 @@
     if (basic < 0) basic = 0;
     for (var j = 0; j < basic; j++) {
       if (input.charCodeAt(j) >= 0x80) throw new RangeError('Invalid input');
-      output.push(input.charCodeAt(j));
+      output[output.length] = input.charCodeAt(j);
     }
     var index = basic > 0 ? basic + 1 : 0;
     while (index < input.length) {
@@ -299,7 +299,7 @@
       bias = punyAdapt(i - oldi, outLen, oldi === 0);
       n += Math.floor(i / outLen);
       i %= outLen;
-      output.splice(i, 0, n);
+      arrInsertAt(output, i, n);
       i++;
     }
     var str = '';
@@ -331,19 +331,19 @@
         var mapped = (label.normalize ? label.normalize('NFKC') : label).toLowerCase();
         if (!hasNonASCII(mapped)) {
           // The mapping folded the label to pure ASCII (e.g. fullwidth digits).
-          out.push(mapped);
+          out[out.length] = mapped;
           continue;
         }
         try {
-          out.push('xn--' + punycodeEncode(mapped));
+          out[out.length] = 'xn--' + punycodeEncode(mapped);
         } catch {
           return FAILURE;
         }
       } else {
-        out.push(label.toLowerCase());
+        out[out.length] = label.toLowerCase();
       }
     }
-    return out.join('.');
+    return arrJoin(out, '.');
   }
 
   function domainToUnicode(domain) {
@@ -354,15 +354,15 @@
       var label = labels[i];
       if (label.slice(0, 4).toLowerCase() === 'xn--') {
         try {
-          out.push(punycodeDecode(label.slice(4)));
+          out[out.length] = punycodeDecode(label.slice(4));
         } catch {
-          out.push(label);
+          out[out.length] = label;
         }
       } else {
-        out.push(label);
+        out[out.length] = label;
       }
     }
-    return out.join('.');
+    return arrJoin(out, '.');
   }
 
   // ------------------------------------------------------------------ //
@@ -418,7 +418,7 @@
     var parts = input.split('.');
     if (parts.at(-1) === '') {
       if (parts.length === 1) return false;
-      parts.pop();
+      arrPop(parts);
     }
     var last = parts.at(-1);
     if (last !== '' && /^[0-9]+$/.test(last)) return true;
@@ -438,20 +438,20 @@
   function parseIPv4(input) {
     var parts = input.split('.');
     if (parts.at(-1) === '') {
-      if (parts.length > 1) parts.pop();
+      if (parts.length > 1) arrPop(parts);
     }
     if (parts.length > 4) return FAILURE;
     var numbers = [];
     for (var i = 0; i < parts.length; i++) {
       var n = parseIPv4Number(parts[i]);
       if (n === FAILURE) return FAILURE;
-      numbers.push(n);
+      numbers[numbers.length] = n;
     }
     for (var j = 0; j < numbers.length; j++) {
       if (numbers[j] > 255 && j !== numbers.length - 1) return FAILURE;
     }
     if (numbers.at(-1) >= Math.pow(256, 5 - numbers.length)) return FAILURE;
-    var ipv4 = numbers.pop();
+    var ipv4 = arrPop(numbers);
     var counter = 0;
     for (var m = 0; m < numbers.length; m++) {
       ipv4 += numbers[m] * Math.pow(256, 3 - counter);
@@ -465,7 +465,7 @@
     var pieceIndex = 0;
     var compress = null;
     var cps = [];
-    for (var s = 0; s < input.length; s++) cps.push(input.charCodeAt(s));
+    for (var s = 0; s < input.length; s++) cps[cps.length] = input.charCodeAt(s);
     var pointer = 0;
     function c() {
       return pointer < cps.length ? cps[pointer] : -1;
@@ -664,7 +664,7 @@
   function serializePath(url) {
     if (url.opaque) return url.path;
     if (url.path.length === 0) return '';
-    return '/' + url.path.join('/');
+    return '/' + arrJoin(url.path, '/');
   }
 
   function serializeHostPort(url) {
@@ -790,6 +790,35 @@
   var TAB_NEWLINE_RE = /[\t\n\r]/;
   var TAB_NEWLINE_RE_G = /[\t\n\r]/g;
 
+  // Pollution-proof array internals: index writes + .length only — no
+  // Array.prototype methods, no @@species (the events.js arrayClone/spliceOne
+  // idiom). A user overriding Array.prototype.push/pop/join/splice must not be
+  // able to reach — or break — URL parsing; module code appends with
+  // `arr[arr.length] = v` and uses these helpers for the rest.
+  function arrPop(arr) {
+    var n = arr.length;
+    if (n === 0) return undefined;
+    var v = arr[n - 1];
+    arr.length = n - 1;
+    return v;
+  }
+  function arrJoin(arr, sep) {
+    var out = '';
+    for (var i = 0; i < arr.length; i++) {
+      if (i > 0) out += sep;
+      out += arr[i];
+    }
+    return out;
+  }
+  function arrRemoveAt(arr, idx) {
+    for (var i = idx + 1; i < arr.length; i++) arr[i - 1] = arr[i];
+    arr.length = arr.length - 1;
+  }
+  function arrInsertAt(arr, idx, v) {
+    for (var i = arr.length; i > idx; i--) arr[i] = arr[i - 1];
+    arr[idx] = v;
+  }
+
   // Returns a url record on success, or FAILURE. `base` is a url record or
   // undefined; `url`/`stateOverride` drive the setter path.
   function basicURLParse(input, base, url, stateOverride) {
@@ -809,7 +838,7 @@
     var cps = [];
     for (var ci = 0; ci < input.length; ) {
       var cc = input.codePointAt(ci);
-      cps.push(cc);
+      cps[cps.length] = cc;
       ci += cc > 0xffff ? 2 : 1;
     }
     var pointer = 0;
@@ -952,7 +981,7 @@
               state = FRAGMENT;
             } else if (c !== -1) {
               url.query = null;
-              url.path.pop();
+              arrPop(url.path);
               state = PATH;
               pointer--;
             }
@@ -1131,7 +1160,7 @@
               !startsWithWindowsDriveLetter(input, pointer)
             ) {
               if (isNormalizedWindowsDriveLetter(base.path[0] || '')) {
-                url.path.push(base.path[0]);
+                url.path[url.path.length] = base.path[0];
               } else {
                 url.host = base.host;
               }
@@ -1178,7 +1207,7 @@
             state = PATH;
             if (c !== 0x2f) pointer--;
           } else if (stateOverride !== undefined && url.host === null) {
-            url.path.push('');
+            url.path[url.path.length] = '';
           }
           break;
 
@@ -1191,14 +1220,14 @@
           ) {
             if (isDoubleDot(buffer)) {
               shortenPath(url);
-              if (c !== 0x2f && !(special && c === 0x5c)) url.path.push('');
+              if (c !== 0x2f && !(special && c === 0x5c)) url.path[url.path.length] = '';
             } else if (isSingleDot(buffer)) {
-              if (c !== 0x2f && !(special && c === 0x5c)) url.path.push('');
+              if (c !== 0x2f && !(special && c === 0x5c)) url.path[url.path.length] = '';
             } else {
               if (url.scheme === 'file' && url.path.length === 0 && isWindowsDriveLetter(buffer)) {
                 buffer = buffer[0] + ':';
               }
-              url.path.push(buffer);
+              url.path[url.path.length] = buffer;
             }
             buffer = '';
             if (c === 0x3f) {
@@ -1256,7 +1285,7 @@
     if (url.scheme === 'file' && path.length === 1 && isNormalizedWindowsDriveLetter(path[0])) {
       return;
     }
-    path.pop();
+    arrPop(path);
   }
 
   function parseURLOrThrow(input, base) {
@@ -1336,7 +1365,7 @@
       }
       name = percentDecode(name.replaceAll('+', ' '));
       value = percentDecode(value.replaceAll('+', ' '));
-      output.push([name, value]);
+      output[output.length] = [name, value];
     }
     return output;
   }
@@ -1365,7 +1394,8 @@
     if (typeof init === 'object' || typeof init === 'function') {
       if (init instanceof URLSearchParams) {
         var src = init[kList];
-        for (var i = 0; i < src.length; i++) this[kList].push([src[i][0], src[i][1]]);
+        for (var i = 0; i < src.length; i++)
+          this[kList][this[kList].length] = [src[i][0], src[i][1]];
         return;
       }
       if (typeof init[Symbol.iterator] === 'function') {
@@ -1375,11 +1405,11 @@
             throw new TypeError('The provided value cannot be converted to a sequence.');
           }
           var arr = [];
-          for (var v of pair) arr.push(v);
+          for (var v of pair) arr[arr.length] = v;
           if (arr.length !== 2) {
             throw new TypeError('Each query pair must be an iterable [name, value] tuple');
           }
-          this[kList].push([toUSVString(arr[0]), toUSVString(arr[1])]);
+          this[kList][this[kList].length] = [toUSVString(arr[0]), toUSVString(arr[1])];
           idx++;
         }
         return;
@@ -1387,7 +1417,7 @@
       // Record of string -> string.
       var keys = Object.keys(init);
       for (var k = 0; k < keys.length; k++) {
-        this[kList].push([toUSVString(keys[k]), toUSVString(init[keys[k]])]);
+        this[kList][this[kList].length] = [toUSVString(keys[k]), toUSVString(init[keys[k]])];
       }
       return;
     }
@@ -1433,7 +1463,7 @@
       if (arguments.length < 2) {
         throw new TypeError('The "name" and "value" arguments must be specified');
       }
-      this[kList].push([toUSVString(name), toUSVString(value)]);
+      this[kList][this[kList].length] = [toUSVString(name), toUSVString(value)];
       spUpdate(this);
     },
   });
@@ -1447,11 +1477,11 @@
       if (arguments.length > 1 && arguments[1] !== undefined) {
         var val = toUSVString(arguments[1]);
         for (var i = list.length - 1; i >= 0; i--) {
-          if (list[i][0] === n && list[i][1] === val) list.splice(i, 1);
+          if (list[i][0] === n && list[i][1] === val) arrRemoveAt(list, i);
         }
       } else {
         for (var j = list.length - 1; j >= 0; j--) {
-          if (list[j][0] === n) list.splice(j, 1);
+          if (list[j][0] === n) arrRemoveAt(list, j);
         }
       }
       spUpdate(this);
@@ -1479,7 +1509,7 @@
       var list = this[kList];
       var out = [];
       for (var i = 0; i < list.length; i++) {
-        if (list[i][0] === n) out.push(list[i][1]);
+        if (list[i][0] === n) out[out.length] = list[i][1];
       }
       return out;
     },
@@ -1520,7 +1550,7 @@
       for (var i = 0; i < list.length; ) {
         if (list[i][0] === n) {
           if (found) {
-            list.splice(i, 1);
+            arrRemoveAt(list, i);
             continue;
           }
           list[i][1] = v;
@@ -1528,7 +1558,7 @@
         }
         i++;
       }
-      if (!found) list.push([n, v]);
+      if (!found) list[list.length] = [n, v];
       spUpdate(this);
     },
   });
@@ -1538,9 +1568,17 @@
     writable: true,
     value: function sort() {
       // Stable sort by code units of the name only.
-      this[kList].sort(function (a, b) {
-        return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
-      });
+      // Stable insertion sort by name (code units), Array.prototype-free.
+      var lst = this[kList];
+      for (var si = 1; si < lst.length; si++) {
+        var item = lst[si];
+        var sj = si - 1;
+        while (sj >= 0 && lst[sj][0] > item[0]) {
+          lst[sj + 1] = lst[sj];
+          sj--;
+        }
+        lst[sj + 1] = item;
+      }
       spUpdate(this);
     },
   });
