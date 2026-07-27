@@ -951,6 +951,8 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"buffer", INTERNAL_BUFFER},
 		{"crypto", INTERNAL_CRYPTO},
 		{"stream/web", INTERNAL_STREAMS},
+		{"stream", INTERNAL_STREAM},
+		{"stream/promises", INTERNAL_STREAM_PROMISES},
 		{"fetch", INTERNAL_FETCH},
 		{"abort", INTERNAL_ABORT},
 		{"timers/promises", INTERNAL_TIMERS_PROMISES},
@@ -1244,6 +1246,8 @@ INTERNAL_ASSERT :: #load("js/internal/assert.js", string)
 INTERNAL_BUFFER :: #load("js/internal/buffer.js", string)
 INTERNAL_CRYPTO :: #load("js/internal/crypto.js", string)
 INTERNAL_STREAMS :: #load("js/internal/streams.js", string)
+INTERNAL_STREAM :: #load("js/internal/stream.js", string)
+INTERNAL_STREAM_PROMISES :: #load("js/internal/stream_promises.js", string)
 INTERNAL_FETCH :: #load("js/internal/fetch.js", string)
 INTERNAL_ABORT :: #load("js/internal/abort.js", string)
 INTERNAL_TIMERS_PROMISES :: #load("js/internal/timers_promises.js", string)
