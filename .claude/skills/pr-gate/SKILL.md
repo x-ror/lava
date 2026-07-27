@@ -48,13 +48,16 @@ A later gate failing is a finding, not a stop: record it and continue.
 With `--quick`, run steps 1–3 only and mark the untested gates explicitly as
 "not run" in the report. Never let "not run" read as "passed".
 
-With `--review-only`, skip this step entirely: run no mechanical gate, and report
-every one as `DELEGATED` — the environment is expected to lack the toolchain
-(Odin, JavaScriptCore, SQLite, OpenSSL) and something else is running them. This
-is the mode for a CI job that reviews alongside the existing build job. Do **not**
-emit a SHIP verdict from this mode: the review gates are yours to judge, the
-mechanical ones are not, so the verdict is at most `SHIP-AFTER (review gates only)`
-and must name where the mechanical results live.
+With `--review-only`, skip this step entirely — run no `make` target and no build
+of any kind. The environment is expected to lack the toolchain (Odin, LLVM,
+JavaScriptCore, SQLite, OpenSSL, vite-plus) and a separate CI job is running the
+gates on the same commit. Read that job's result instead of reproducing it:
+`gh pr checks <n>` gives a conclusion per check. Record each routed gate as
+`DELEGATED (CI: <check> — success | failure | pending)`. Never wait on a pending
+check, and never infer a conclusion you did not read — a job triggered by the same
+event as CI will usually observe CI still in flight, and "pending" is the honest
+answer there. Verdict rules for this mode are in
+[reference/scoring.md](reference/scoring.md).
 
 ## Step 3 — fan out specialists
 
@@ -75,6 +78,9 @@ and the mechanical-gate results.
 | `odin-sdk-scout` | the diff hand-rolls a parser, codec, hash, container, socket dance, or time/number/string conversion — ask it whether `core:`/`vendor:`/an already-linked C library already does it |
 
 Specialists are read-only: instruct each explicitly not to modify repo sources.
+In `--review-only` mode, also tell every specialist that the toolchain is absent —
+read-only analysis only, no `make`, no `odin`, no build, no test or bench run.
+They have Bash and will otherwise try to build and report the failure as a finding.
 If one fails or returns nothing, record it as `failed` and continue — a missing
 specialist is reported, never silently dropped.
 

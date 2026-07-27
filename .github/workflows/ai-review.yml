@@ -1,0 +1,109 @@
+name: AI review
+
+# Runs /pr-gate (.claude/skills/pr-gate) against the PR diff and writes the scorecard
+# to the run summary. Advisory only — never add it to required checks. An LLM verdict
+# or an API outage must not red a PR that CI says is green.
+#
+# This job runs NO gates. ci.yml already executes make check / check-js / build / test /
+# test-lava and every routed smoke on the same commit; re-running them here would double
+# CI minutes and — the real objection — would execute the PR's own Makefile, scripts and
+# Odin/JS inside the one job that holds a credential. /pr-gate --review-only skips its
+# mechanical step and reads ci.yml's conclusions via `gh pr checks` instead.
+#
+# Dormant until a credential exists: with neither secret set (including every fork PR,
+# where secrets are never passed) the guarded steps skip and the job reports success.
+# `secrets` is not available in `if:` at either job or step level, so the boolean is
+# computed in the job-level `env:` block, which can read it. Note a step's own `env:` is
+# NOT in scope for that same step's `if:` — the bridge must live at job level.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to review
+        required: true
+        type: string
+
+# Distinct prefix from ci.yml's `ci-...`: concurrency groups are repo-scoped, so reusing
+# it would make this job and CI cancel each other on the same ref.
+concurrency:
+  group: ai-review-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  review:
+    name: /pr-gate (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Fork PRs get no secrets, so the run would be a no-op anyway — skip the runner
+    # entirely. Drafts and the weekly dependabot bump are not worth the tokens.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]')
+
+    permissions:
+      contents: read
+      pull-requests: read
+
+    env:
+      # Only a boolean reaches the job environment — never the credential itself.
+      HAS_CLAUDE_CREDENTIAL: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+
+    steps:
+      - name: Report dormant (no credential configured)
+        if: env.HAS_CLAUDE_CREDENTIAL != 'true'
+        run: |
+          {
+            printf '%s\n' '## AI review skipped'
+            printf '%s\n' ''
+            printf '%s\n' 'Neither `CLAUDE_CODE_OAUTH_TOKEN` nor `ANTHROPIC_API_KEY` is set, so'
+            printf '%s\n' 'no review ran. This is not a failure — CI is the gate that matters.'
+            printf '%s\n' ''
+            printf '%s\n' 'To enable: run `claude setup-token` locally (Claude Pro/Max subscription;'
+            printf '%s\n' 'no API key needed) and store the result as the repository secret'
+            printf '%s\n' '`CLAUDE_CODE_OAUTH_TOKEN`. An `ANTHROPIC_API_KEY` secret works too and'
+            printf '%s\n' 'is billed as API usage instead.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Full history: --branch mode needs `git merge-base origin/master HEAD`, and the
+      # specialists' allowlist expects git log/blame to work. A shallow clone breaks both.
+      - name: Checkout
+        if: env.HAS_CLAUDE_CREDENTIAL == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # No toolchain steps on purpose: no apt-get, no setup-odin, no setup-vp. The
+      # specialists are read-only and need the source tree, the diff and git history —
+      # nothing that requires a build. Provisioning JSC/Odin/LLVM here would cost minutes
+      # per run to reproduce a result ci.yml already has.
+      - name: Run /pr-gate
+        if: env.HAS_CLAUDE_CREDENTIAL == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        env:
+          # `gh pr view/diff/checks` inside the skill authenticate with this.
+          GH_TOKEN: ${{ github.token }}
+        with:
+          # Whichever is configured is used; an unset secret is an empty string and is
+          # ignored. OAuth covers a Pro/Max subscription, the API key is billed usage.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Explicit --pr: the default (--local) diffs the working tree, which on a
+          # pull_request checkout of the merge commit is empty, and the skill would stop
+          # with "nothing to review".
+          prompt: /pr-gate --pr ${{ env.PR_NUMBER }} --review-only
+          # Task must be allowed — the skill's value is the parallel specialist fan-out.
+          # Bash is restricted to read-only git/gh/rg; no --dangerously-skip-permissions
+          # in a job that holds a credential.
+          claude_args: >-
+            --max-turns 40
+            --allowedTools "Read,Grep,Glob,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git merge-base:*),Bash(git blame:*),Bash(rg:*),Bash(wc:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*)"

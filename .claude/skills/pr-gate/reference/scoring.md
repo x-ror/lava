@@ -70,6 +70,15 @@ P0/P1 list. Never report SHIP while a mechanical gate (`make check`,
 `make check-js`, `make test`, the routed smokes) is failing or was not run.
 
 When the mechanical gates are **delegated** (`--review-only`, e.g. a CI job that
-reviews alongside the build job), the ceiling is `SHIP-AFTER (review gates only)`
-and the report must say where the mechanical results live. A review that never ran
-`make check` cannot clear a change to merge on its own.
+reviews alongside the build job), grade them from the conclusion you actually read
+off the other job — never from the fact that it exists:
+
+| CI conclusion on the same SHA | Counts as | Verdict effect |
+| ----------------------------- | --------- | -------------- |
+| success | PASS | SHIP is available if no P0 survives |
+| pending / not yet reported | neither | Ceiling is `SHIP-AFTER` — say the gates are still running |
+| failure | FAIL | `BLOCK`, naming the failed check |
+
+"Same SHA" is load-bearing: a green check from an earlier push says nothing about
+this diff. If you cannot tie the conclusion to the commit under review, treat it as
+pending. Always name where the mechanical results live.

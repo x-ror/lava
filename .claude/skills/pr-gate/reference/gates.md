@@ -3,6 +3,14 @@
 Source of truth is the `Makefile` and `.github/workflows/ci.yml`. If they
 disagree with this table, they win — and fix this table.
 
+**Who runs these.** On a PR, `ci.yml`'s Linux job executes the always-block plus
+every routed smoke, on both I/O backends. `.github/workflows/ai-review.yml` runs
+`/pr-gate --review-only`, which executes none of them and reads that job's
+conclusions instead. Four routed targets are **not** in CI —
+`make bun-buffer-tests`, `make api-surface`, `make test-compat-lava-strict`, and
+`make bench-gate` — so a diff that routes to one of those needs a local run, or a
+new CI step if it should be enforced.
+
 ## Always
 
 | Command | Covers |
