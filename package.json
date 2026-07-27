@@ -1,9 +1,10 @@
 {
   "private": true,
   "scripts": {
-    "js:check": "vp fmt 'pkg/runtime/js/**/*.js' 'tests/**/*.js' 'tests/**/*.mjs' 'tests/**/*.cjs' 'scripts/**/*.js' 'bench/**/*.js' 'bench/**/*.mjs' --check && vp lint pkg/runtime/js tests scripts bench && bun run js:deadcode",
+    "js:check": "vp fmt 'pkg/runtime/js/**/*.js' 'tests/**/*.js' 'tests/**/*.mjs' 'tests/**/*.cjs' 'scripts/**/*.js' 'bench/**/*.js' 'bench/**/*.mjs' --check && vp lint pkg/runtime/js tests scripts bench && bun run js:deadcode && bun run js:primordials",
     "js:fix": "vp lint pkg/runtime/js tests scripts bench --fix && vp fmt 'pkg/runtime/js/**/*.js' 'tests/**/*.js' 'tests/**/*.mjs' 'tests/**/*.cjs' 'scripts/**/*.js' 'bench/**/*.js' 'bench/**/*.mjs' --write",
-    "js:deadcode": "bun run scripts/check-orphan-js.mjs"
+    "js:deadcode": "bun run scripts/check-orphan-js.mjs",
+    "js:primordials": "bun run scripts/check-primordials.mjs"
   },
   "devDependencies": {
     "vite-plus": "^0.1.24"
