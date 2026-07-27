@@ -7,7 +7,7 @@
   "diagnostics_channel.js": 4,
   "dns.js": 10,
   "dns_promises.js": 0,
-  "encoding.js": 20,
+  "encoding.js": 0,
   "esm.js": 78,
   "events.js": 0,
   "fetch.js": 20,

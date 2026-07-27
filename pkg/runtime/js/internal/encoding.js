@@ -4,11 +4,50 @@
 (function (require, module, _exports) {
   'use strict';
 
+  // --- Pollution-safe intrinsics -------------------------------------------
+  // TextDecoder decodes attacker-controlled bytes, and url.js routes every
+  // percent-decode and host-decode through it (percentDecode /
+  // percentDecodeHostStrict), so this module inherits url's threat model: it
+  // must be correct while user code has poisoned a shared prototype or replaced
+  // a global — hardening url.js alone left this hole open. Prototype methods route
+  // through the pristine primordials table; free globals and statics are
+  // captured HERE, at module-eval, which the loader runs before any user code.
+  //
+  // The sharpest vector was `String.fromCharCode.apply(null, units)` in
+  // unitsToString: `apply` is read off Function.prototype at call time, so a
+  // poisoned Function.prototype.apply replaced the text of every decoded
+  // string — `new URL('http://über.example/')` silently became `http://a/`.
+  // ReflectApply (a captured static) closes it.
+  var P = require('primordials');
+  var ArrayPrototypePush = P.ArrayPrototypePush;
+  var ArrayPrototypeSlice = P.ArrayPrototypeSlice;
+  var StringPrototypeSlice = P.StringPrototypeSlice;
+  var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
+  var StringPrototypeCodePointAt = P.StringPrototypeCodePointAt;
+  var StringPrototypeTrim = P.StringPrototypeTrim;
+  var StringPrototypeToLowerCase = P.StringPrototypeToLowerCase;
+  var ObjectDefineProperty = P.ObjectDefineProperty;
+  var ReflectApply = P.ReflectApply;
+  var TypeErrorG = P.TypeError;
+  var RangeErrorG = P.RangeError;
+  var Uint8ArrayG = P.Uint8Array;
+  // Free globals / statics, captured pristine at module-eval.
+  var StringG = String;
+  var StringFromCharCode = String.fromCharCode;
+  var ArrayBufferG = ArrayBuffer;
+  var ArrayBufferIsView = ArrayBuffer.isView;
+
   var bufferModule = require('buffer');
   var Buffer = bufferModule.Buffer;
 
   // Only labels Lava can service are listed; unknown labels throw like Node.
+  // Null-prototype because the keys come from the caller: with Object.prototype
+  // in the chain, `new TextDecoder('constructor')` resolved to Object and
+  // `new TextDecoder('__proto__')` to Object.prototype instead of throwing
+  // RangeError, and any `Object.prototype.<label>` a script sets became a
+  // forged encoding. Node's table is a null-prototype Map lookup in C++.
   var LABELS = {
+    __proto__: null,
     'utf-8': 'utf-8',
     utf8: 'utf-8',
     'unicode-1-1-utf-8': 'utf-8',
@@ -45,26 +84,26 @@
 
   function normalizeLabel(label) {
     return LABELS[
-      String(label === undefined ? 'utf-8' : label)
-        .trim()
-        .toLowerCase()
+      StringPrototypeToLowerCase(
+        StringPrototypeTrim(StringG(label === undefined ? 'utf-8' : label)),
+      )
     ];
   }
 
   function toBytes(input, who) {
-    if (input === undefined) return new Uint8Array(0);
-    if (input instanceof Uint8Array) return input;
-    if (input instanceof ArrayBuffer) return new Uint8Array(input);
-    if (ArrayBuffer.isView(input))
-      return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-    throw new TypeError('The "' + who + '" argument must be an instance of ArrayBuffer or a view');
+    if (input === undefined) return new Uint8ArrayG(0);
+    if (input instanceof Uint8ArrayG) return input;
+    if (input instanceof ArrayBufferG) return new Uint8ArrayG(input);
+    if (ArrayBufferIsView(input))
+      return new Uint8ArrayG(input.buffer, input.byteOffset, input.byteLength);
+    throw new TypeErrorG('The "' + who + '" argument must be an instance of ArrayBuffer or a view');
   }
 
   function TextEncoder() {
     if (!(this instanceof TextEncoder))
-      throw new TypeError("Constructor TextEncoder requires 'new'");
+      throw new TypeErrorG("Constructor TextEncoder requires 'new'");
   }
-  Object.defineProperty(TextEncoder.prototype, 'encoding', {
+  ObjectDefineProperty(TextEncoder.prototype, 'encoding', {
     get: function () {
       return 'utf-8';
     },
@@ -72,7 +111,7 @@
   });
 
   TextEncoder.prototype.encode = function (input) {
-    return new Uint8Array(Buffer.from(input === undefined ? '' : String(input), 'utf8'));
+    return new Uint8ArrayG(Buffer.from(input === undefined ? '' : StringG(input), 'utf8'));
   };
 
   function encodeCodePoint(cp, dest, offset) {
@@ -99,14 +138,14 @@
   }
 
   TextEncoder.prototype.encodeInto = function (source, dest) {
-    if (!(dest instanceof Uint8Array))
-      throw new TypeError('The "dest" argument must be an instance of Uint8Array');
-    source = String(source);
+    if (!(dest instanceof Uint8ArrayG))
+      throw new TypeErrorG('The "dest" argument must be an instance of Uint8Array');
+    source = StringG(source);
     var read = 0,
       written = 0,
       capacity = dest.length;
     for (var i = 0; i < source.length; ) {
-      var cp = source.codePointAt(i);
+      var cp = StringPrototypeCodePointAt(source, i);
       var units = cp > 0xffff ? 2 : 1;
       if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
       var size = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
@@ -149,27 +188,27 @@
   }
 
   function fatalErr(enc) {
-    var e = new TypeError('The encoded data was not valid for encoding ' + enc);
+    var e = new TypeErrorG('The encoded data was not valid for encoding ' + enc);
     e.code = 'ERR_ENCODING_INVALID_ENCODED_DATA';
     return e;
   }
 
   function pushCodePoint(units, cp) {
     if (cp <= 0xffff) {
-      units.push(cp);
+      ArrayPrototypePush(units, cp);
       return;
     }
     cp -= 0x10000;
-    units.push(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    ArrayPrototypePush(units, 0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
   }
 
-  // String.fromCharCode.apply blows the call stack past ~64k args, so build the
-  // result in fixed chunks.
+  // fromCharCode applied to the whole array blows the call stack past ~64k args,
+  // so build the result in fixed chunks.
   function unitsToString(units) {
-    if (units.length <= 0x2000) return String.fromCharCode.apply(null, units);
+    if (units.length <= 0x2000) return ReflectApply(StringFromCharCode, null, units);
     var out = '';
     for (var i = 0; i < units.length; i += 0x2000) {
-      out += String.fromCharCode.apply(null, units.slice(i, i + 0x2000));
+      out += ReflectApply(StringFromCharCode, null, ArrayPrototypeSlice(units, i, i + 0x2000));
     }
     return out;
   }
@@ -185,7 +224,7 @@
       var b = bytes[i];
       if (s.needed === 0) {
         if (b <= 0x7f) {
-          units.push(b);
+          ArrayPrototypePush(units, b);
           i++;
         } else if (b >= 0xc2 && b <= 0xdf) {
           s.needed = 1;
@@ -205,7 +244,7 @@
           i++;
         } else {
           if (fatal) throw fatalErr('utf-8');
-          units.push(0xfffd);
+          ArrayPrototypePush(units, 0xfffd);
           i++;
         }
       } else if (b < s.lower || b > s.upper) {
@@ -215,7 +254,7 @@
         s.lower = 0x80;
         s.upper = 0xbf;
         if (fatal) throw fatalErr('utf-8');
-        units.push(0xfffd); // re-process b: do not advance i
+        ArrayPrototypePush(units, 0xfffd); // re-process b: do not advance i
       } else {
         s.lower = 0x80;
         s.upper = 0xbf;
@@ -237,7 +276,7 @@
       s.lower = 0x80;
       s.upper = 0xbf;
       if (fatal) throw fatalErr('utf-8');
-      units.push(0xfffd);
+      ArrayPrototypePush(units, 0xfffd);
     }
   }
 
@@ -247,21 +286,21 @@
   function pushU16(s, units, u, fatal) {
     if (s.hs >= 0) {
       if (u >= 0xdc00 && u <= 0xdfff) {
-        units.push(s.hs, u);
+        ArrayPrototypePush(units, s.hs, u);
         s.hs = -1;
         return;
       }
       s.hs = -1;
       if (fatal) throw fatalErr('utf-16le');
-      units.push(0xfffd);
+      ArrayPrototypePush(units, 0xfffd);
       pushU16(s, units, u, fatal); // re-process u as a fresh unit
     } else if (u >= 0xd800 && u <= 0xdbff) {
       s.hs = u; // hold the high surrogate for its low half (possibly next chunk)
     } else if (u >= 0xdc00 && u <= 0xdfff) {
       if (fatal) throw fatalErr('utf-16le');
-      units.push(0xfffd);
+      ArrayPrototypePush(units, 0xfffd);
     } else {
-      units.push(u);
+      ArrayPrototypePush(units, u);
     }
   }
 
@@ -279,7 +318,7 @@
       // one trailing byte in this chunk
       if (isFinal) {
         if (fatal) throw fatalErr('utf-16le');
-        units.push(0xfffd);
+        ArrayPrototypePush(units, 0xfffd);
       } else {
         s.pend = bytes[i];
       }
@@ -288,12 +327,12 @@
       if (s.hs >= 0) {
         s.hs = -1;
         if (fatal) throw fatalErr('utf-16le');
-        units.push(0xfffd);
+        ArrayPrototypePush(units, 0xfffd);
       }
       if (s.pend >= 0) {
         s.pend = -1;
         if (fatal) throw fatalErr('utf-16le');
-        units.push(0xfffd);
+        ArrayPrototypePush(units, 0xfffd);
       }
     }
   }
@@ -301,35 +340,39 @@
   function decodeWin1252Units(bytes, units) {
     for (var i = 0; i < bytes.length; i++) {
       var b = bytes[i];
-      units.push(b >= 0x80 && b <= 0x9f ? WIN1252_HIGH[b - 0x80] : b);
+      ArrayPrototypePush(units, b >= 0x80 && b <= 0x9f ? WIN1252_HIGH[b - 0x80] : b);
     }
   }
 
   function TextDecoder(label, options) {
     if (!(this instanceof TextDecoder))
-      throw new TypeError("Constructor TextDecoder requires 'new'");
+      throw new TypeErrorG("Constructor TextDecoder requires 'new'");
     var enc = normalizeLabel(label);
     if (enc === undefined)
-      throw new RangeError("The encoding label provided ('" + label + "') is invalid.");
-    options = options || {};
-    Object.defineProperty(this, '_enc', { value: enc });
-    Object.defineProperty(this, '_fatal', { value: !!options.fatal });
-    Object.defineProperty(this, '_ignoreBOM', { value: !!options.ignoreBOM });
-    Object.defineProperty(this, '_state', { value: newDecoderState() });
+      throw new RangeErrorG("The encoding label provided ('" + label + "') is invalid.");
+    // Null-prototype default so an omitted `options` cannot inherit fatal /
+    // ignoreBOM from a poisoned Object.prototype — Node defaults to its
+    // null-prototype kEmptyObject here for the same reason. An options object
+    // the caller passes is read as-is, which is also what Node does.
+    options = options || { __proto__: null };
+    ObjectDefineProperty(this, '_enc', { value: enc });
+    ObjectDefineProperty(this, '_fatal', { value: !!options.fatal });
+    ObjectDefineProperty(this, '_ignoreBOM', { value: !!options.ignoreBOM });
+    ObjectDefineProperty(this, '_state', { value: newDecoderState() });
   }
-  Object.defineProperty(TextDecoder.prototype, 'encoding', {
+  ObjectDefineProperty(TextDecoder.prototype, 'encoding', {
     get: function () {
       return this._enc;
     },
     configurable: true,
   });
-  Object.defineProperty(TextDecoder.prototype, 'fatal', {
+  ObjectDefineProperty(TextDecoder.prototype, 'fatal', {
     get: function () {
       return this._fatal;
     },
     configurable: true,
   });
-  Object.defineProperty(TextDecoder.prototype, 'ignoreBOM', {
+  ObjectDefineProperty(TextDecoder.prototype, 'ignoreBOM', {
     get: function () {
       return this._ignoreBOM;
     },
@@ -378,7 +421,10 @@
     // Strip the BOM once, at the first output of the (possibly chunked) stream.
     if (!s.bomChecked && result.length > 0) {
       s.bomChecked = true;
-      if (!this._ignoreBOM && result.charCodeAt(0) === 0xfeff) result = result.slice(1);
+      // `result` is a string here — StringPrototypeSlice, not the array slice
+      // used for the code-unit chunks in unitsToString.
+      if (!this._ignoreBOM && StringPrototypeCharCodeAt(result, 0) === 0xfeff)
+        result = StringPrototypeSlice(result, 1);
     }
     return result;
   };
