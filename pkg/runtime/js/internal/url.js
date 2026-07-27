@@ -94,9 +94,36 @@
     );
   }
 
+  // Precomputed per-byte artifacts for the hot per-character encode path:
+  // PCT[b] is '%XX', ASCII_CHAR[b] the one-character string. Built once.
+  var PCT = new Array(256);
+  var ASCII_CHAR = new Array(128);
+  for (var pctB = 0; pctB < 256; pctB++) {
+    var pctHex = pctB.toString(16).toUpperCase();
+    PCT[pctB] = '%' + (pctHex.length === 1 ? '0' + pctHex : pctHex);
+    if (pctB < 128) ASCII_CHAR[pctB] = String.fromCharCode(pctB);
+  }
+
   function percentEncodeByte(b) {
-    var hex = b.toString(16).toUpperCase();
-    return '%' + (hex.length === 1 ? '0' + hex : hex);
+    return PCT[b];
+  }
+
+  // Encode ONE code point against `inSet` without round-tripping through a
+  // string or TextEncoder. The parser's state machine calls this once per
+  // character of userinfo/path/query/fragment, so it is the hottest loop in
+  // the whole parse; every set encodes all non-ASCII (> 0x7E), so the UTF-8
+  // bytes are hand-rolled from the code point.
+  function percentEncodeCp(cp, inSet) {
+    if (cp < 0x80) return inSet(cp) ? PCT[cp] : ASCII_CHAR[cp];
+    if (cp < 0x800) return PCT[0xc0 | (cp >> 6)] + PCT[0x80 | (cp & 0x3f)];
+    if (cp < 0x10000)
+      return PCT[0xe0 | (cp >> 12)] + PCT[0x80 | ((cp >> 6) & 0x3f)] + PCT[0x80 | (cp & 0x3f)];
+    return (
+      PCT[0xf0 | (cp >> 18)] +
+      PCT[0x80 | ((cp >> 12) & 0x3f)] +
+      PCT[0x80 | ((cp >> 6) & 0x3f)] +
+      PCT[0x80 | (cp & 0x3f)]
+    );
   }
 
   // UTF-8 percent-encode a string: code points in `inSet` (or any non-ASCII, since
@@ -107,14 +134,15 @@
     for (var i = 0; i < str.length; i++) {
       var cp = str.codePointAt(i);
       if (cp > 0xffff) i++; // consumed a surrogate pair
-      if (inSet(cp)) {
-        var bytes = encoder().encode(String.fromCodePoint(cp));
-        for (var b = 0; b < bytes.length; b++) out += percentEncodeByte(bytes[b]);
-      } else {
-        out += String.fromCodePoint(cp);
-      }
+      out += percentEncodeCp(cp, inSet);
     }
     return out;
+  }
+
+  // One-character string for a code point without the String.fromCodePoint
+  // host-call for ASCII — the state machine appends to its buffer through this.
+  function cpToStr(cp) {
+    return cp < 0x80 ? ASCII_CHAR[cp] : String.fromCodePoint(cp);
   }
 
   // Percent-decode a string to its raw byte sequence. Non-%XX characters
@@ -562,12 +590,23 @@
     return utf8PercentEncode(input, inC0ControlSet);
   }
 
+  // A host that is already a lowercase ASCII domain — no percent escapes, no
+  // uppercase (IDNA maps case), no Unicode, no punycode label to expand —
+  // percent-decodes and IDNA-maps to itself. This is nearly every real-world
+  // URL, and it skips the per-parse percentDecode → TextDecoder → domainToASCII
+  // round-trip that otherwise dominates host parsing.
+  var SIMPLE_HOST_RE = /^[a-z0-9._-]+$/;
+
   function parseHost(input, isSpecial) {
     if (input[0] === '[') {
       if (input.at(-1) !== ']') return FAILURE;
       return parseIPv6(input.slice(1, -1));
     }
     if (!isSpecial) return parseOpaqueHost(input);
+    if (SIMPLE_HOST_RE.test(input) && input.indexOf('xn--') === -1) {
+      if (endsInANumber(input)) return parseIPv4(input);
+      return input;
+    }
     var domain = percentDecodeHostStrict(input);
     if (domain === FAILURE) return FAILURE;
     var ascii = domainToASCII(domain);
@@ -745,6 +784,12 @@
     );
   }
 
+  // Hoisted: a non-global regex for the cheap has-any test (a /g regex is
+  // stateful via lastIndex and unsafe to share for .test) and a global one for
+  // the actual strip.
+  var TAB_NEWLINE_RE = /[\t\n\r]/;
+  var TAB_NEWLINE_RE_G = /[\t\n\r]/g;
+
   // Returns a url record on success, or FAILURE. `base` is a url record or
   // undefined; `url`/`stateOverride` drive the setter path.
   function basicURLParse(input, base, url, stateOverride) {
@@ -753,10 +798,20 @@
       // Remove leading/trailing C0 control or space (only when not a setter).
       input = trimC0ControlOrSpace(input);
     }
-    // Remove all ASCII tab or newline.
-    input = input.replaceAll(/[\t\n\r]/g, '');
+    // Remove all ASCII tab or newline (guarded: almost no real input has them,
+    // and replaceAll would re-scan + re-allocate on every parse).
+    if (TAB_NEWLINE_RE.test(input)) input = input.replace(TAB_NEWLINE_RE_G, '');
 
-    var cps = Array.from(input);
+    // Code POINTS as numbers, one pass, surrogate-aware — same iteration as
+    // Array.from(input).map(c => c.codePointAt(0)) without allocating a
+    // single-character string per code point (the old form dominated the whole
+    // parse: one string alloc + one codePointAt call per character per read).
+    var cps = [];
+    for (var ci = 0; ci < input.length; ) {
+      var cc = input.codePointAt(ci);
+      cps.push(cc);
+      ci += cc > 0xffff ? 2 : 1;
+    }
     var pointer = 0;
     // The hostname override runs the HOST state but is flagged via stateOverride
     // so the HOST case knows to stop before a port.
@@ -773,12 +828,12 @@
     var special = recordIsSpecial(url);
 
     function cp(idx) {
-      return idx < cps.length ? cps[idx].codePointAt(0) : -1;
+      return idx < cps.length ? cps[idx] : -1;
     }
     function remaining(n) {
       // The code point n positions past the current pointer (n === 0 is the
       // character immediately following the one being processed).
-      return pointer + 1 + n < cps.length ? cps[pointer + 1 + n].codePointAt(0) : -1;
+      return pointer + 1 + n < cps.length ? cps[pointer + 1 + n] : -1;
     }
 
     for (; pointer <= cps.length; pointer++) {
@@ -964,7 +1019,7 @@
             buffer = '';
             state = HOST;
           } else {
-            buffer += String.fromCodePoint(c);
+            buffer += cpToStr(c);
           }
           break;
 
@@ -1005,7 +1060,7 @@
           } else {
             if (c === 0x5b) insideBrackets = true;
             else if (c === 0x5d) insideBrackets = false;
-            buffer += String.fromCodePoint(c);
+            buffer += cpToStr(c);
           }
           break;
 
@@ -1105,7 +1160,7 @@
               state = PATH_START;
             }
           } else {
-            buffer += String.fromCodePoint(c);
+            buffer += cpToStr(c);
           }
           break;
 
@@ -1154,7 +1209,7 @@
               state = FRAGMENT;
             }
           } else {
-            buffer += utf8PercentEncode(String.fromCodePoint(c), inPathSet);
+            buffer += percentEncodeCp(c, inPathSet);
           }
           break;
 
@@ -1166,7 +1221,7 @@
             url.fragment = '';
             state = FRAGMENT;
           } else if (c !== -1) {
-            url.path += utf8PercentEncode(String.fromCodePoint(c), inC0ControlSet);
+            url.path += percentEncodeCp(c, inC0ControlSet);
           }
           break;
 
@@ -1180,13 +1235,13 @@
               state = FRAGMENT;
             }
           } else if (c !== -1) {
-            buffer += String.fromCodePoint(c);
+            buffer += cpToStr(c);
           }
           break;
 
         case FRAGMENT:
           if (c !== -1) {
-            url.fragment += utf8PercentEncode(String.fromCodePoint(c), inFragmentSet);
+            url.fragment += percentEncodeCp(c, inFragmentSet);
           }
           break;
       }
