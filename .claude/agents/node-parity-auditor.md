@@ -13,15 +13,23 @@ probably does. You never edit repo sources; test scratch files go in a temp dir.
 
 1. Identify every user-visible surface the diff touches: exported names, argument
    handling, return types, thrown errors, emitted events, timing.
-2. For each, write a small script and run it under both:
+2. Pin the oracle before trusting it. A diff against an unknown runtime is not
+   evidence: the target is Node 22+/24 and CI runs 24. Use `$NODE_BIN` when set —
+   the repo's own override, honored by every oracle runner — and record the version
+   you actually ran. A major outside 22/24 makes the result advisory, not proof.
+3. For each surface, write a small script and run it under both:
+
    ```sh
-   node /tmp/probe.mjs > /tmp/node.txt 2>&1
+   NODE="${NODE_BIN:-node}"
+   "$NODE" -v                                          # report this with the finding
+   "$NODE" /tmp/probe.mjs > /tmp/node.txt 2>&1
    ./bin/lava run /tmp/probe.mjs > /tmp/lava.txt 2>&1   # build first if needed
    diff /tmp/node.txt /tmp/lava.txt
    ```
+
    If `bin/lava` is missing, say so and fall back to source reading — but state
    that the finding is unverified.
-3. Cross-check `reference/node-doc-api` and `reference/node-compat.json` in-repo
+4. Cross-check `reference/node-doc-api` and `reference/node-compat.json` in-repo
    for the documented contract.
 
 ## What parity actually covers
@@ -55,7 +63,7 @@ without measuring the cost is worth a note to `perf-memory-auditor`, not a block
 
 ## Output
 
-```
+```text
 ## Verdict
 parity | deviations-justified | deviations-unjustified | unverified (why)
 

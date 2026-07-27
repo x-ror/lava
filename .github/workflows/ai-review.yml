@@ -51,6 +51,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # `gh pr checks` reads the CI conclusions --review-only delegates to; without
+      # this the rollup query is not accessible and every gate reads as unknown.
+      checks: read
 
     env:
       # Only a boolean reaches the job environment — never the credential itself.
@@ -80,6 +83,16 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # The workspace is then handed to an LLM agent. actions/checkout otherwise
+          # leaves the job token in .git/config, where anything that reads the tree can
+          # find it — the point of the restricted --allowedTools list is defeated if the
+          # credential is sitting in a file.
+          persist-credentials: false
+          # On workflow_dispatch the default ref is the branch the run was dispatched
+          # from, which need not be the PR named in `pr` — the agent would read one tree
+          # and diff another. Empty on pull_request, where checkout's own default (the
+          # merge ref) is already right.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/merge', inputs.pr) || '' }}
 
       # No toolchain steps on purpose: no apt-get, no setup-odin, no setup-vp. The
       # specialists are read-only and need the source tree, the diff and git history —

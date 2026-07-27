@@ -59,7 +59,7 @@ is a Code-quality **P1** with the concrete deletion named.
 
 ## Verdict
 
-```
+```text
 SHIP        — no P0; P1s either fixed or explicitly waived
 SHIP-AFTER  — P0 count is small and each has a concrete named fix
 BLOCK       — P0 with no clear fix, or a mechanical gate is red
@@ -73,11 +73,16 @@ When the mechanical gates are **delegated** (`--review-only`, e.g. a CI job that
 reviews alongside the build job), grade them from the conclusion you actually read
 off the other job — never from the fact that it exists:
 
-| CI conclusion on the same SHA | Counts as | Verdict effect |
-| ----------------------------- | --------- | -------------- |
-| success | PASS | SHIP is available if no P0 survives |
-| pending / not yet reported | neither | Ceiling is `SHIP-AFTER` — say the gates are still running |
-| failure | FAIL | `BLOCK`, naming the failed check |
+| State of the routed gate | Counts as | Verdict effect |
+| ------------------------ | --------- | -------------- |
+| CI check succeeded on this SHA | PASS | SHIP is available if no P0 survives |
+| CI check pending / not yet reported | neither | Ceiling is `SHIP-AFTER` — say the gates are still running |
+| CI check failed | FAIL | `BLOCK`, naming the failed check |
+| **No CI check covers it** | `NOT RUN` | Ceiling is `SHIP-AFTER` — name the gate and say it must be run locally or wired into CI |
+
+The last row is the one that is easy to get wrong: `gates.md` routes several targets
+CI does not execute, and calling those `DELEGATED` would report an unrun gate as
+someone else's PASS.
 
 "Same SHA" is load-bearing: a green check from an earlier push says nothing about
 this diff. If you cannot tie the conclusion to the commit under review, treat it as

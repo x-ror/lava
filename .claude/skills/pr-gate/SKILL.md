@@ -51,12 +51,22 @@ With `--quick`, run steps 1–3 only and mark the untested gates explicitly as
 With `--review-only`, skip this step entirely — run no `make` target and no build
 of any kind. The environment is expected to lack the toolchain (Odin, LLVM,
 JavaScriptCore, SQLite, OpenSSL, vite-plus) and a separate CI job is running the
-gates on the same commit. Read that job's result instead of reproducing it:
-`gh pr checks <n>` gives a conclusion per check. Record each routed gate as
-`DELEGATED (CI: <check> — success | failure | pending)`. Never wait on a pending
-check, and never infer a conclusion you did not read — a job triggered by the same
-event as CI will usually observe CI still in flight, and "pending" is the honest
-answer there. Verdict rules for this mode are in
+gates on the same commit. This mode requires a target that resolves to an exact
+SHA — `--pr <n>` or `--branch <name>`; it is meaningless with `--local`.
+
+Read that job's result instead of reproducing it: `gh pr checks <n>` gives a
+conclusion per check. Then, for **every** gate the changed paths route to, decide
+which of two states it is in:
+
+- A CI check covers it → `DELEGATED (CI: <check> — success | failure | pending)`.
+- No CI check covers it → `NOT RUN`. Not every routed target is in CI:
+  [reference/gates.md](reference/gates.md) names the ones that are not. A gate
+  nothing executed is not delegated — it is missing, and it blocks `SHIP` exactly
+  as a skipped gate does in the normal mode.
+
+Never wait on a pending check, and never infer a conclusion you did not read — a
+job triggered by the same event as CI will usually observe CI still in flight, and
+"pending" is the honest answer there. Verdict rules for this mode are in
 [reference/scoring.md](reference/scoring.md).
 
 ## Step 3 — fan out specialists
@@ -96,7 +106,7 @@ specialist is reported, never silently dropped.
 
 ## Step 5 — report
 
-```
+```text
 PR gate — <target>
 
 Criterion 1 · Node parity   : A|B|C|F  — one line

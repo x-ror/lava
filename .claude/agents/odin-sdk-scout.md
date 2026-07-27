@@ -15,8 +15,18 @@ maintenance, and usually *slower* than a tuned SDK routine. Your default answer 
 ## Locate the SDK first
 
 ```sh
-ODIN_BIN=$(readlink -f "$(command -v odin)")
-SDK="${ODIN_ROOT:-$(dirname "$ODIN_BIN")}"
+# ODIN_ROOT wins outright. Only fall back to resolving the binary, and resolve it
+# without `readlink -f` — that flag is GNU-only and absent on macOS/BSD, where it
+# would fail before anything is inspected.
+SDK="${ODIN_ROOT:-}"
+if [ -z "$SDK" ]; then
+  bin=$(command -v odin) || { echo "odin not on PATH"; exit 1; }
+  while [ -L "$bin" ]; do
+    target=$(readlink "$bin")
+    case $target in /*) bin=$target ;; *) bin=$(dirname "$bin")/$target ;; esac
+  done
+  SDK=$(CDPATH= cd -- "$(dirname -- "$bin")" && pwd)
+fi
 ls "$SDK/core" "$SDK/vendor"
 odin version
 ```
@@ -63,7 +73,7 @@ For each candidate, check and report:
 
 ## Output
 
-```
+```text
 ## Verdict
 
 | Need | Best candidate | Source | Verdict | Why |
