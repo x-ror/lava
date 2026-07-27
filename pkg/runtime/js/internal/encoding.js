@@ -340,6 +340,26 @@
     var bytes = toBytes(input, 'input');
     var stream = !!(options && options.stream);
     var s = this._state;
+    // Fast path: a fresh, non-streaming, non-fatal utf-8 decode IS Buffer's
+    // native utf8 decoder (invalid sequences -> U+FFFD), ~60x the per-unit JS
+    // loop below. The BOM is stripped at the byte level (same result as
+    // stripping U+FEFF from the output). Streaming, fatal, and runs chained
+    // onto leftover streaming state still take the stateful JS decoder.
+    if (this._enc === 'utf-8' && !this._fatal && !stream && !s.doNotFlush) {
+      var off = 0;
+      if (
+        !this._ignoreBOM &&
+        bytes.length >= 3 &&
+        bytes[0] === 0xef &&
+        bytes[1] === 0xbb &&
+        bytes[2] === 0xbf
+      ) {
+        off = 3;
+      }
+      return Buffer.from(bytes.buffer, bytes.byteOffset + off, bytes.byteLength - off).toString(
+        'utf8',
+      );
+    }
     // WHATWG: a non-streaming decode starts a fresh run (reset decoder + BOM
     // window); a streaming decode chains from the previous call's leftover state.
     if (!s.doNotFlush) resetDecoderState(s);
