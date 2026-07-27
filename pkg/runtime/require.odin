@@ -194,6 +194,13 @@ native_require_cb :: proc "c" (
 		value := eval_source_value(ctx, wrapped, resolved, exception)
 		if exception == nil || exception^ == nil {
 			module_cache_put(ctx, state, resolved, value)
+		} else {
+			// The ESM wrapper calls __lava_precache BEFORE the body runs (so an
+			// import cycle resolves), so a body that throws leaves an empty partial
+			// namespace in the cache. Drop it — exactly as the CommonJS path below
+			// does — so a later import re-runs the module instead of silently
+			// succeeding with broken (empty) exports.
+			module_cache_remove(ctx, state, resolved)
 		}
 		return value
 	}
