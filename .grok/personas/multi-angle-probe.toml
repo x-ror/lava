@@ -1,4 +1,0 @@
-description = "Angle E: private ABI probe and thread-safety"
-instructions_file = ".grok/skills/multi-review/angles/e-probe.md"
-reasoning_effort = "high"
-default_capability_mode = "execute"

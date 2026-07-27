@@ -1,4 +1,0 @@
-description = "Finder: hot-path efficiency and allocation"
-instructions_file = ".grok/skills/multi-review/angles/finder-efficiency.md"
-reasoning_effort = "medium"
-default_capability_mode = "execute"

@@ -1,1 +1,57 @@
-{}
+{
+  "permissions": {
+    "allow": [
+      "Bash(make check)",
+      "Bash(make check-cli)",
+      "Bash(make check-runtime)",
+      "Bash(make check-js)",
+      "Bash(make check-primordials)",
+      "Bash(make check-jsc)",
+      "Bash(make check-native)",
+      "Bash(make fmt)",
+      "Bash(make build)",
+      "Bash(make native-deps)",
+      "Bash(make test:*)",
+      "Bash(make bench:*)",
+      "Bash(make api-surface)",
+      "Bash(make bun-buffer-tests)",
+      "Bash(make bun-buffer-report)",
+      "Bash(make vendor-bun-report)",
+      "Bash(make help)",
+      "Bash(odin check:*)",
+      "Bash(odin test:*)",
+      "Bash(odin build:*)",
+      "Bash(odin version)",
+      "Bash(odin strip-semicolon:*)",
+      "Bash(node:*)",
+      "Bash(bun run js:*)",
+      "Bash(vp run:*)",
+      "Bash(./bin/lava:*)",
+      "Bash(./scripts/run-:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git merge-base:*)",
+      "Bash(git blame:*)",
+      "Bash(git stash list)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(rg:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(pkg-config:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr review:*)"
+    ]
+  }
+}
