@@ -104,6 +104,13 @@ jobs:
           # Task must be allowed — the skill's value is the parallel specialist fan-out.
           # Bash is restricted to read-only git/gh/rg; no --dangerously-skip-permissions
           # in a job that holds a credential.
+          #
+          # --model is pinned rather than left to the action's default: a review job whose
+          # model can drift between action releases gives non-comparable verdicts run to
+          # run. Every agent in .claude/agents is `model: inherit`, so this one flag also
+          # sets the model for all 7-9 specialists the fan-out spawns. Override per agent
+          # with a `model:` line in that agent's frontmatter.
           claude_args: >-
+            --model claude-sonnet-5
             --max-turns 40
             --allowedTools "Read,Grep,Glob,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git merge-base:*),Bash(git blame:*),Bash(rg:*),Bash(wc:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*)"
