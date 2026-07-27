@@ -51,7 +51,7 @@ to ship, because the diff shows what arrived and hides what left.
 
 ## Output
 
-```
+```text
 ## Verdict
 clean | issues | blocker-risk — 1-3 sentences.
 

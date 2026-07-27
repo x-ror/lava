@@ -26,7 +26,7 @@ exploit tooling, and never touch systems outside this repo.
 
 ## Checklist
 
-**Native input handling**
+### Native input handling
 
 - Length/offset from the wire used without bounds validation, or validated in a
   different type width than it is used (`i32` check, `int` use; signed/unsigned mix).
@@ -36,7 +36,7 @@ exploit tooling, and never touch systems outside this repo.
 - A parser that trusts a terminator exists (unterminated header, missing CRLF).
 - Error path that frees twice or leaves a partially-initialized struct live.
 
-**Resource exhaustion (DoS)**
+### Resource exhaustion (DoS)
 
 - Unbounded buffer growth from a single connection (header size, body size,
   chunk count, pending-request queue depth).
@@ -44,7 +44,7 @@ exploit tooling, and never touch systems outside this repo.
 - Unbounded worker or job queue; per-connection allocation with no cap.
 - Quadratic parsing on attacker-controlled input.
 
-**TLS / crypto**
+### TLS / crypto
 
 - Certificate verification disabled, hostname verification skipped, or an error
   from the verify callback swallowed.
@@ -54,7 +54,7 @@ exploit tooling, and never touch systems outside this repo.
 - Reused nonce/IV; a KDF with the wrong iteration/parameter default vs Node.
 - Any hand-rolled crypto primitive at all — `core:crypto/*` or OpenSSL exists.
 
-**Embedded JS**
+### Embedded JS
 
 - New pollutable prototype calls in a hardened file (`make check-primordials`
   ratchet). Run it; a baseline that *rose* is a finding.
@@ -63,13 +63,13 @@ exploit tooling, and never touch systems outside this repo.
 - URL/host parsing that normalizes through a pollutable method (`.at`,
   `.normalize`) — the two known URL vectors in this codebase.
 
-**Paths and modules**
+### Paths and modules
 
 - A joined path that is not re-validated against the intended root after
   normalization; `..` surviving normalization; symlink resolution changing the root.
 - Resolution that consults an attacker-writable location earlier than expected.
 
-**Secrets**
+### Secrets
 
 - Credentials, tokens, keys, or full env dumps in logs, error messages, or a
   thrown `message`.
@@ -84,7 +84,7 @@ noise.
 
 ## Output
 
-```
+```text
 ## Verdict
 clean | issues | blocker-risk
 

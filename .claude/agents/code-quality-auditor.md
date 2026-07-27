@@ -60,7 +60,7 @@ Ask of each structural change: *is there a version of this with zero new concept
 
 ## Output
 
-```
+```text
 ## Verdict
 clean | issues | needs-restructure
 

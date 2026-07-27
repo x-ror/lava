@@ -324,9 +324,10 @@ two external: 6 + 3C/7M). The hard-won shape:
   `F_MORE` threaded through three layers AND a backpressure-disarm; higher risk; separate later PR.
   Several 2b concerns below (overshoot, capability probe) are settled here but verified at 2b time.
 
-### ABI (define ourselves; `core:sys/linux` exposes opcodes/flags/CQE bits + `io_uring_register`,
+### ABI (define ourselves)
 
-NOT these structs — as with `Uring_Probe` in 1a)
+`core:sys/linux` exposes opcodes/flags/CQE bits + `io_uring_register`, NOT these
+structs — as with `Uring_Probe` in 1a.
 
 - `Uring_Buf_Reg` (40 B, `#assert(size_of == 40)`): `ring_addr: u64, ring_entries: u32, bgid: u16,
 flags: u16, resv: [3]u64` in EXACTLY this order. **Zero-initialize**: `flags = 0` = the

@@ -70,6 +70,7 @@ Use the `odin-sdk-scout` agent for this search — it reads the real SDK source.
 ```sh
 make check            # Odin type-check (incl. windows/darwin cross-target front-end)
 make check-js         # vp fmt + lint + orphan-JS + primordials ratchet
+make check-md         # markdownlint over the repo's docs (make fix-md auto-fixes)
 make build            # ./scripts/build.sh → bin/lava
 make test             # Odin unit tests + oracle suites
 make test-lava        # every oracle suite compared node-vs-Lava

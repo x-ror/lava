@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-primordials check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-primordials check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -40,6 +40,8 @@ help:
 	@printf '%s\n' '  make check-runtime      Type-check runtime packages'
 	@printf '%s\n' '  make check-js           Run Vite+ lint and formatting checks for JavaScript'
 	@printf '%s\n' '  make fix-js             Auto-fix JavaScript formatting/lint issues with Vite+'
+	@printf '%s\n' '  make check-md           Markdown lint over the repo docs (markdownlint-cli2)'
+	@printf '%s\n' '  make fix-md             Auto-fix markdown lint issues'
 	@printf '%s\n' '  make check-primordials  Prototype-pollution ratchet over embedded JS (UPDATE=1 to rebaseline)'
 	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
 	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
@@ -125,6 +127,14 @@ check-js:
 
 fix-js:
 	vp run js:fix
+
+# Markdown lint over the repo's own docs (config + rationale for the two disabled rules:
+# .markdownlint-cli2.jsonc). Catches MD040 and friends locally instead of in review.
+check-md:
+	vp run md:check
+
+fix-md:
+	vp run md:fix
 
 # Prototype-pollution ratchet over the embedded runtime JS (also part of check-js).
 # Run with UPDATE=1 to rewrite the baseline after hardening a module.

@@ -107,7 +107,7 @@ TLS itself is OpenSSL via `pkg/runtime/tls.odin`; do not build a TLS stack.
 role in the JS loader or a future TS transform. `core:rexcode` is a machine-code
 encoder/decoder for many ISAs; relevant only if Lava ever emits native code.
 
-## vendor:
+## The `vendor:` collection
 
 `$SDK/vendor` ships bindings for third-party C libraries — `zlib`, `curl`,
 `libc`, `sdl2/3`, `stb`, `lua`, `miniaudio`, `raylib`, `wgpu`, `vulkan`, `x11`,

@@ -51,7 +51,7 @@ assertion breaks).
 
 ## Output
 
-```
+```text
 ## Verdict
 covered | gaps | uncovered
 

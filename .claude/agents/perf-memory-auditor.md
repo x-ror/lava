@@ -26,7 +26,7 @@ make bench-gate       # enforces bench/thresholds.json caps
 
 ## What to look for
 
-**Allocation on the hot path**
+### Allocation on the hot path
 
 - A per-request/per-connection/per-call allocation that could be pooled, reused,
   stack-held, or written into a caller-provided buffer.
@@ -35,7 +35,7 @@ make bench-gate       # enforces bench/thresholds.json caps
   round-trips and Buffer↔string conversions.
 - A string built to be parsed immediately (format-then-scan).
 
-**FFI and JS↔native crossings**
+### FFI and JS↔native crossings
 
 - N calls where one bulk call exists. This codebase deliberately batches: the
   `NATIVE_BYTEOP_MIN` threshold, dedicated `*_host` wrappers for **measured** hot
@@ -45,7 +45,7 @@ make bench-gate       # enforces bench/thresholds.json caps
 - A map lookup per call where a direct dispatch was the point of the design (or the
   reverse).
 
-**Algorithmic**
+### Algorithmic
 
 - O(n²) on a request path (repeated scan, nested search over headers/params).
 - Re-scanning bytes that were already validated (double UTF-8 validation is the
@@ -53,13 +53,13 @@ make bench-gate       # enforces bench/thresholds.json caps
 - Per-request timer churn where a sweep/deadline design exists — the HTTP server
   moved from per-request timers to a deadline sweeper precisely for this.
 
-**Memory**
+### Memory
 
 - Per-connection footprint: buffers sized for the worst case on every connection.
 - A cache or pool with no bound.
 - Retention: a protected `JSValueRef` or a request struct held past its use.
 
-**Regressions in the harness**
+### Regressions in the harness
 
 - `bench/thresholds.json` caps loosened — must come with a stated reason.
 - A benchmark deleted or narrowed.
@@ -73,7 +73,7 @@ block.
 
 ## Output
 
-```
+```text
 ## Verdict
 improves | neutral | regresses | unproven (no measurement available)
 

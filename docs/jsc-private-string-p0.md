@@ -127,8 +127,8 @@ HTTP hello 0.75x node req/s (was 0.60x), mem/conn 0.43x node.
 
 ## Remaining gap / follow-up
 
-from-_ is dominated by JSC's ArrayBuffer/typed-array construction (~3–30x
-V8's), partially amortized by the larger native-backed pool; to-_'s residual is
+`from-_` is dominated by JSC's ArrayBuffer/typed-array construction (~3–30x
+V8's), partially amortized by the larger native-backed pool; `to-_`'s residual is
 StringImpl allocation + JSString cell + the ~100–200 ns dispatch floor. The
 next perf axis is http per-core profiling — its natives, header strings and
 write paths now all ride the host-call + 8-bit-string fast paths.

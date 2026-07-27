@@ -54,7 +54,7 @@ by the diff.
 
 ## Output
 
-```
+```text
 ## Verdict
 current | stale | undocumented
 

@@ -24,6 +24,8 @@ new CI step if it should be enforced.
 `make check-js` whenever any `.js`/`.mjs`/`.cjs` under `pkg/runtime/js`, `tests`,
 `scripts`, or `bench` changed — it runs format, lint, orphan-JS detection, and the
 primordials ratchet.
+`make check-md` whenever any `.md` changed — markdownlint over the repo's own docs
+(config and the rationale for its two disabled rules: `.markdownlint-cli2.jsonc`).
 
 ## By path
 
