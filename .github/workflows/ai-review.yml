@@ -93,6 +93,17 @@ jobs:
           # `gh pr view/diff/checks` inside the skill authenticate with this.
           GH_TOKEN: ${{ github.token }}
         with:
+          # Without this the action tries to mint a Claude GitHub App installation token,
+          # which needs an OIDC exchange and therefore `id-token: write` (plus the App
+          # installed on the repo) — it fails with "Unable to get
+          # ACTIONS_ID_TOKEN_REQUEST_URL env variable" otherwise. Passing a token sets
+          # OVERRIDE_GITHUB_TOKEN, which setupGitHubToken returns before reaching the OIDC
+          # path. The built-in GITHUB_TOKEN is the right one here: this job only reads the
+          # PR and writes the run summary, so it needs no App identity and no
+          # token-minting privilege. (The action's docs steer you to a custom App instead
+          # — that guidance is for comment-posting/tag mode, where the comment author
+          # identity matters. It does not apply to a read-only automation run.)
+          github_token: ${{ github.token }}
           # Whichever is configured is used; an unset secret is an empty string and is
           # ignored. OAuth covers a Pro/Max subscription, the API key is billed usage.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
