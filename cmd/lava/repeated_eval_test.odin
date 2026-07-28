@@ -1,8 +1,8 @@
 #+build linux, darwin
 package main
 
-import "core:strings"
 import "core:testing"
+import jsc "lava:pkg/jsc"
 import lava "lava:pkg/runtime"
 import eventloop "lava:pkg/runtime/eventloop"
 
@@ -19,7 +19,9 @@ import eventloop "lava:pkg/runtime/eventloop"
 // resolving to an unrelated function of the new VM ("TypeError: Map operation
 // called on non-Map object" out of buffer.js createPool), and under the test
 // runner escalated to a segfault or a tracking-allocator bad free. Each eval below
-// must therefore report a clean status AND leave no diagnostic on stderr; the
+// must therefore report a clean status and a zero exit code (the loader failure
+// itself goes to stderr, not into Result.message, so the script below is what
+// turns it into an observable failure); the
 // script itself exercises the pooled allocUnsafe path that first showed the bug.
 REPEATED_EVAL_SOURCE :: `
 'use strict';
@@ -34,6 +36,19 @@ if (new URL('http://%C3%BCber.example/').hostname !== 'xn--ber-goa.example')
 
 @(test)
 repeated_eval_stays_correct :: proc(t: ^testing.T) {
+	// The registry only holds entries when the private-ABI host-call path resolved.
+	// If the probe ever misses (a JSC upgrade renaming the mangled symbol it
+	// dlsyms), nothing is cached, nothing can go stale, and this whole test passes
+	// on unfixed code. Assert the precondition so a green run means something.
+	{
+		gctx := jsc.JSGlobalContextCreate(nil)
+		defer if gctx != nil do jsc.JSGlobalContextRelease(gctx)
+		testing.expect(
+			t,
+			gctx != nil && jsc.host_calls_active(jsc.JSContextRef(gctx)),
+			"private-ABI host-call path inactive — nothing is cached, so this test cannot observe the defect it pins",
+		)
+	}
 	// 12 is comfortably past the 3rd-4th eval where address reuse first bit.
 	for i in 0 ..< 12 {
 		loop := eventloop.init()
@@ -50,12 +65,5 @@ repeated_eval_stays_correct :: proc(t: ^testing.T) {
 			result.message,
 		)
 		testing.expectf(t, result.exit_code == 0, "eval #%d exit code=%d (want 0)", i, result.exit_code)
-		testing.expectf(
-			t,
-			!strings.contains(result.message, "Map operation"),
-			"eval #%d hit the stale host-native cache: %q",
-			i,
-			result.message,
-		)
 	}
 }

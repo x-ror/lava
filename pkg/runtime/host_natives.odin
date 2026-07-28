@@ -97,8 +97,37 @@ Host_Native_Key :: struct {
 // and the new VM's object at that address is called instead (observed: the
 // `allocUninit` binding resolving to Map.prototype.values, plus segfaults and
 // tracking-allocator bad frees, from the 3rd-4th eval in one process).
+//
+// The BACKING of both maps is bound explicitly to a process-lifetime allocator,
+// never implicitly to the ambient one. Odin binds a zero-valued map's allocator
+// on its first grow (base/runtime/dynamic_map_internal.odin: `if
+// m.allocator.procedure == nil { m.allocator = context.allocator }`), and the
+// first insert happens inside setup_module_environment under the CALLER's
+// context. These tables are thread-lived and never deleted, so an implicit bind
+// captures an allocator that dies long before they do: under the Odin test
+// runner (a per-test tracking allocator over a rollback stack that is
+// free_all'd between tests) or an embedder's per-eval arena, every later insert
+// writes through a reclaimed backing and corrupts whatever now occupies it.
+// Same rule Runtime_State.module_cache already follows (globals.odin).
 @(private = "file", thread_local) g_host_native_fns: map[Host_Native_Key]jsc.JSObjectRef
 @(private = "file", thread_local) g_host_native_cbs: map[rawptr]jsc.JSObjectCallAsFunctionCallback
+@(private = "file", thread_local) g_host_tables_bound: bool
+
+// bind_host_tables gives both tables a backing allocator that outlives them,
+// before anything can insert. runtime.default_allocator() is the only lifetime
+// that matches a thread-lived table: state.allocator dies with the eval, and the
+// ambient one is whatever the caller happened to install.
+@(private = "file")
+bind_host_tables :: proc() {
+	if g_host_tables_bound do return
+	g_host_tables_bound = true
+	g_host_native_fns = make(map[Host_Native_Key]jsc.JSObjectRef, 64, runtime.default_allocator())
+	g_host_native_cbs = make(
+		map[rawptr]jsc.JSObjectCallAsFunctionCallback,
+		64,
+		runtime.default_allocator(),
+	)
+}
 
 @(private = "file")
 generic_native_host_cb :: proc "c" (global: rawptr, cf: [^]u64) -> i64 {
@@ -117,11 +146,14 @@ host_native_create :: proc(
 	cb: jsc.JSObjectCallAsFunctionCallback,
 ) -> jsc.JSObjectRef {
 	key := Host_Native_Key{rawptr(ctx), transmute(rawptr)cb, name}
+	// Lookup first: the hit path is hot (measured ~60k hits per 20k fs.statSync,
+	// three per Stats instance) and must not pay for anything below it.
 	if fn, hit := g_host_native_fns[key]; hit do return fn
 
 	fn, ok := jsc.host_function_create(ctx, name, generic_native_host_cb, 1)
 	if !ok || fn == nil do return nil
 	jsc.JSValueProtect(ctx, jsc.JSValueRef(fn))
+	bind_host_tables()
 	// Clone through the Runtime_State's allocator, not the ambient one: this runs
 	// from inject_native_function, which is reachable both from ordinary eval-time
 	// setup AND from inside native_require_cb (a proc "c" whose context is reset to
@@ -131,8 +163,8 @@ host_native_create :: proc(
 	if state := get_state_from_ctx(ctx); state != nil do alloc = state.allocator
 	cloned, clone_err := strings.clone(name, alloc)
 	if clone_err != nil {
-		// Raw unprotect on purpose, unlike the sweep below: this rolls back the
-		// protect taken two lines up, mid-run and with the context fully healthy.
+		// Raw unprotect on purpose, unlike the sweep below: a mid-run rollback of
+		// the protect taken above, with the context fully healthy.
 		// unprotect_before_eval_exit's Windows carve-out is about FINAL teardown
 		// racing the VM's GC/JIT workers; using it here would leak a root instead.
 		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))

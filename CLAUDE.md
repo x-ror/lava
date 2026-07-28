@@ -99,7 +99,17 @@ front-end fails CI.
   Anything crossing a loop turn must not live in `context.temp_allocator`.
 - **JSC lifetimes.** Every `JSValueProtect` has exactly one `Unprotect`, on fire
   **or** on cancel, never both. Every `JSStringCreate*` has a `JSStringRelease`.
-  Never hold an unrooted `JSValueRef` across an allocation that can GC.
+  Never hold an unrooted `JSValueRef` across an allocation that can GC. A cache
+  keyed by a JSC handle (context, object, string) must be swept when that handle
+  dies — JSC recycles addresses, so a surviving entry silently resolves to an
+  object in the *next* VM. Sweep from `destroy_runtime_state`, while the context
+  is still alive. Pinned by `cmd/lava/repeated_eval_test.odin`.
+- **Bind map/array backing explicitly.** A container that outlives the call must
+  be `make`d with the owning allocator, never left to bind implicitly: Odin binds
+  a zero-valued map's allocator on its first grow, capturing whatever ambient
+  allocator happened to be live. A thread-lived table that adopts a per-eval
+  arena writes through reclaimed memory once that arena is reset. Pinned by
+  `cmd/lava/host_native_alloc_test.odin`.
 - **FFI ABI.** JSC C API `_Bool` returns must be declared `-> bool` (1 byte), not
   `b32` — the historic "predicates are unreliable" bug. Pinned by
   `cmd/lava/jsc_predicates_test.odin`.
