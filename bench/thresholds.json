@@ -23,6 +23,7 @@
     "decode-utf8-fatal": 26.0,
     "decode-utf16le": 35.0,
     "decode-win1252": 11.5,
+    "decode-chunked": 23.0,
     "decode-utf8-stream": 17.0,
     "encode-utf8": 3.5,
     "encode-into": 3.5,

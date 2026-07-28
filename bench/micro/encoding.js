@@ -14,7 +14,14 @@
 const { bench } = require('../lib/harness');
 
 const text = 'Lorem ipsum dolor sit amet, cönsectetur adipiscing élit — 你好世界 😀 ';
-const big = text.repeat(60); // ~3.9k code units, over the 0x2000 chunk boundary
+// ~3.96k code units: a realistic body, and BELOW unitsToString's 0x2000 chunk,
+// so these measure the decode loops themselves on a representative payload.
+const big = text.repeat(60);
+// ~8.7k code units: above the chunk boundary, so `decode-chunked` below is the
+// only bench that takes the slice+apply branch. Kept separate because the JS
+// decoders scale worse than Node's native ones, so folding a large input into
+// every bench would double the ratios and say nothing extra about a regression.
+const huge = text.repeat(132);
 
 const u8 = new TextEncoder().encode(big);
 const u16 = (() => {
@@ -29,6 +36,10 @@ const u16 = (() => {
 const latin = new Uint8Array(4096);
 for (let i = 0; i < latin.length; i++) latin[i] = i & 0xff;
 
+// windows-1252 bytes past the 0x2000 chunk boundary (one byte -> one code unit).
+const latinHuge = new Uint8Array(huge.length);
+for (let i = 0; i < latinHuge.length; i++) latinHuge[i] = i & 0xff;
+
 const decUtf8 = new TextDecoder();
 const decUtf8Fatal = new TextDecoder('utf-8', { fatal: true });
 const dec16 = new TextDecoder('utf-16le');
@@ -40,6 +51,7 @@ bench('decode-utf8-fastpath', () => decUtf8.decode(u8), { iterations: 20000 });
 bench('decode-utf8-fatal', () => decUtf8Fatal.decode(u8), { iterations: 2000 });
 bench('decode-utf16le', () => dec16.decode(u16), { iterations: 2000 });
 bench('decode-win1252', () => dec1252.decode(latin), { iterations: 2000 });
+bench('decode-chunked', () => dec1252.decode(latinHuge), { iterations: 2000 });
 bench(
   'decode-utf8-stream',
   () => {

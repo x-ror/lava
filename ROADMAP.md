@@ -207,6 +207,19 @@ coupling.
       forwards them to the callback (Node parity).
 - [ ] **Stack-trace line numbers are off by one** — the CommonJS wrapper
       prepends a line but `JSEvaluateScript` starts at line 1.
+- [ ] **Repeated `lava.eval` in one process degrades** — the 3rd-4th `eval`
+      (each a fresh `JSGlobalContextCreate`) intermittently fails loader init
+      with `TypeError: Map operation called on non-Map object`, and under the
+      Odin test runner escalates to `Signal caught: Segmentation_Fault` or
+      `panic: Tracking allocator error: Bad free of pointer`. Not a thread race:
+      a single-threaded runner reproduces it 100%, while one-thread-per-test
+      never does — the trigger is several `eval`s sharing a thread. Reproduce
+      with a test proc that loops `eventloop.init()` + `lava.eval` 12 times.
+      Pre-existing (reproduces on 9dede5e). Suspect the `thread_local` private-ABI
+      probe state in `pkg/jsc/private_string.odin` surviving a context teardown.
+      Until it is fixed, keep the number of `lava.eval` call sites in
+      `cmd/lava/*_test.odin` low — that is why the encoding pollution assertions
+      share `primordials_test.odin`'s script instead of adding a 5th eval.
 - [ ] **Prototype-pollution hardening of the embedded JS layer** — `primordials.js`
       plus the `make check-primordials` ratchet over
       `tests/node-compat/pollution-baseline.json`. Done: `events.js`,

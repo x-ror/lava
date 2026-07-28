@@ -133,13 +133,44 @@
     ];
   }
 
-  function toBytes(input, who) {
+  // Node's ERR_INVALID_ARG_TYPE "Received …" tail. buffer.js carries the same
+  // shape as a file-private helper, and there is no shared errors module to
+  // host it — exporting it from buffer.js would leak into the surface of
+  // require('buffer'), so this stays a deliberate second, minimal copy.
+  function describeReceived(v) {
+    if (v === null) return 'null';
+    var t = typeof v;
+    if (t === 'undefined') return 'undefined';
+    if (t === 'string') {
+      var s = v.length > 28 ? StringPrototypeSlice(v, 0, 25) + '...' : v;
+      return "type string ('" + s + "')";
+    }
+    if (t === 'number' || t === 'boolean') return 'type ' + t + ' (' + v + ')';
+    if (t === 'bigint') return 'type bigint (' + v + 'n)';
+    if (t === 'symbol') return 'type symbol (' + v.toString() + ')';
+    var ctor = v.constructor && v.constructor.name;
+    return 'an instance of ' + (ctor || 'Object');
+  }
+
+  function errInvalidArgType(message) {
+    var e = new TypeErrorG(message);
+    e.code = 'ERR_INVALID_ARG_TYPE';
+    return e;
+  }
+
+  function toBytes(input) {
     if (input === undefined) return new Uint8ArrayG(0);
     if (input instanceof Uint8ArrayG) return input;
     if (input instanceof ArrayBufferG) return new Uint8ArrayG(input);
     if (ArrayBufferIsView(input))
       return new Uint8ArrayG(input.buffer, input.byteOffset, input.byteLength);
-    throw new TypeErrorG('The "' + who + '" argument must be an instance of ArrayBuffer or a view');
+    // Node names this argument "list" and appends no "Received" tail here,
+    // unlike its other ERR_INVALID_ARG_TYPE messages. SharedArrayBuffer is in
+    // the text because Node's is; Lava does not implement it, so that arm is
+    // unreachable and the wording is parity-only.
+    throw errInvalidArgType(
+      'The "list" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView.',
+    );
   }
 
   function TextEncoder() {
@@ -182,7 +213,9 @@
 
   TextEncoder.prototype.encodeInto = function (source, dest) {
     if (!(dest instanceof Uint8ArrayG))
-      throw new TypeErrorG('The "dest" argument must be an instance of Uint8Array');
+      throw errInvalidArgType(
+        'The "dest" argument must be an instance of Uint8Array. Received ' + describeReceived(dest),
+      );
     source = StringG(source);
     var read = 0,
       written = 0,
@@ -468,7 +501,7 @@
   });
 
   TextDecoder.prototype.decode = function (input, options) {
-    var bytes = toBytes(input, 'input');
+    var bytes = toBytes(input);
     var stream = !!(options && options.stream);
     var s = this._state;
     // Fast path: a fresh, non-streaming, non-fatal utf-8 decode IS Buffer's
