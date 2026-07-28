@@ -1,4 +1,6 @@
-#+build linux, darwin
+// Linux-only: host_function_create is stubbed off Linux, so nothing is ever
+// registered and neither allocator rule below has anything to observe.
+#+build linux
 package main
 
 import "core:mem"
@@ -36,6 +38,16 @@ eval_host_native_names_use_consistent_allocator :: proc(t: ^testing.T) {
 	loop := eventloop.init()
 	// eval CONSUMES the loop on every path; do not destroy it here.
 	result := lava.eval("require('node:fs'); 0", "<host-native-alloc-test>", &loop, false)
+	// Without this the allocator assertions below pass vacuously: a failed eval
+	// registers no natives, so no name is ever cloned and nothing can mismatch.
+	testing.expectf(
+		t,
+		result.status == .Ok && result.exit_code == 0,
+		"eval did not reach the host-native path: status=%v exit=%d message=%q",
+		result.status,
+		result.exit_code,
+		result.message,
+	)
 	lava.result_destroy(&result)
 
 	testing.expectf(
@@ -62,6 +74,14 @@ host_native_tables_are_not_charged_to_the_eval_allocator :: proc(t: ^testing.T) 
 
 	loop := eventloop.init()
 	result := lava.eval("require('node:fs'); 0", "<host-native-binding-test>", &loop, false)
+	testing.expectf(
+		t,
+		result.status == .Ok && result.exit_code == 0,
+		"eval did not reach the host-native path: status=%v exit=%d message=%q",
+		result.status,
+		result.exit_code,
+		result.message,
+	)
 	lava.result_destroy(&result)
 
 	stray := 0

@@ -1,4 +1,7 @@
-#+build linux, darwin
+// Linux-only by mechanism, not by convenience: the private-ABI host-call path is
+// compiled only for Linux (pkg/jsc/host_function.odin), so off Linux the registry
+// this pins is permanently empty and the defect cannot occur.
+#+build linux
 package main
 
 import "core:testing"
