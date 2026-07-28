@@ -85,6 +85,9 @@ jobs:
         if: github.event_name == 'pull_request' && env.HAS_CLAUDE_CREDENTIAL == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          # No actions/checkout in this job, so gh can't infer the repo from a local
+          # clone — tell it explicitly, else `gh pr comment` dies on "not a git repository".
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPLY: ${{ steps.gen.outputs.reply }}
         run: |
