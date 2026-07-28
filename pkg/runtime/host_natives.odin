@@ -132,8 +132,21 @@ bind_host_tables :: proc() {
 @(private = "file")
 generic_native_host_cb :: proc "c" (global: rawptr, cf: [^]u64) -> i64 {
 	context = runtime.default_context()
+	ctx := jsc.JSContextRef(global)
 	cb, found := g_host_native_cbs[rawptr(uintptr(cf[jsc.CALL_FRAME_CALLEE_SLOT]))]
-	if !found do return transmute(i64)jsc.JSValueMakeUndefined(jsc.JSContextRef(global))
+	if !found {
+		// FAIL CLOSED. Returning undefined here is silently wrong, not merely
+		// unhelpful: several natives write through a caller-supplied buffer and
+		// signal nothing on return. crypto.js's randomBytes does
+		// `var buf = Buffer.alloc(size); native.randomFill(buf); return buf;` —
+		// Buffer.alloc zeroes, the result is ignored, so a no-op randomFill hands
+		// back n zero bytes that the caller treats as CSPRNG output. A miss means
+		// our own registry is inconsistent, so raise it rather than let any caller
+		// proceed on a fabricated value.
+		exception := make_js_error(ctx, "lava: host native dispatch failed (unregistered callee)")
+		jsc.host_throw(ctx, exception)
+		return transmute(i64)exception
+	}
 	return host_dispatch(global, cf, cb)
 }
 
@@ -157,10 +170,16 @@ host_native_create :: proc(
 	// Clone through the Runtime_State's allocator, not the ambient one: this runs
 	// from inject_native_function, which is reachable both from ordinary eval-time
 	// setup AND from inside native_require_cb (a proc "c" whose context is reset to
-	// runtime.default_context()). The sweep frees through the same state allocator,
-	// so the two must not be picked up from whatever context happened to be live.
-	alloc := context.allocator
-	if state := get_state_from_ctx(ctx); state != nil do alloc = state.allocator
+	// runtime.default_context()). The sweep frees through that same state
+	// allocator, so the two must be SYMMETRIC — no ambient fallback. Without a
+	// state there is nothing that will ever free this entry, so decline to cache
+	// and let the caller take the C-API path (it already handles a nil return).
+	state := get_state_from_ctx(ctx)
+	if state == nil {
+		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
+		return nil
+	}
+	alloc := state.allocator
 	cloned, clone_err := strings.clone(name, alloc)
 	if clone_err != nil {
 		// Raw unprotect on purpose, unlike the sweep below: a mid-run rollback of
@@ -171,8 +190,24 @@ host_native_create :: proc(
 		return nil
 	}
 	key.name = cloned // outlive the caller's (possibly temp) string
-	g_host_native_fns[key] = fn
-	g_host_native_cbs[rawptr(fn)] = cb
+	// CHECKED inserts. A bare `m[k] = v` discards the allocator error, and a half
+	// -inserted pair is worse than no cache: an entry in cbs that fns does not
+	// know about is unreachable from the sweep (it walks fns keys), so it would
+	// outlive its context keyed by a dead cell address — the exact stale-dispatch
+	// state this registry was fixed to prevent. Either both land or neither does.
+	// map_insert returns the stored value's pointer, nil when the insert could not
+	// be made — the only failure signal this Odin's public map API exposes.
+	if map_insert(&g_host_native_fns, key, fn) == nil {
+		delete(cloned, alloc)
+		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
+		return nil
+	}
+	if map_insert(&g_host_native_cbs, rawptr(fn), cb) == nil {
+		delete_key(&g_host_native_fns, key)
+		delete(cloned, alloc)
+		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
+		return nil
+	}
 	return fn
 }
 
@@ -181,13 +216,26 @@ host_native_create :: proc(
 // JSGlobalContextCreate can reuse the address — destroy_runtime_state is that
 // point. `alloc` is the Runtime_State allocator the names were cloned through.
 host_natives_release_context :: proc(ctx: jsc.JSContextRef, alloc: mem.Allocator) {
-	if len(g_host_native_fns) == 0 do return
-	// Collect first: deleting from a map while ranging over it is not defined.
-	doomed := make([dynamic]Host_Native_Key, 0, len(g_host_native_fns), context.temp_allocator)
-	for key in g_host_native_fns {
-		if key.ctx == rawptr(ctx) do append(&doomed, key)
-	}
-	for key in doomed {
+	// ALLOCATION-FREE on purpose. The previous shape collected the doomed keys into
+	// a temp dynamic array first; both `make` and `append` can fail and both
+	// discard their error, so an allocation failure would silently leave live
+	// entries keyed by a dead context — reintroducing, with no diagnostic, the
+	// exact use-after-free this sweep exists to prevent. Deleting from a map while
+	// ranging over it is undefined, so instead: find ONE victim, break out, delete
+	// it, repeat until none is left. O(n^2) in this context's entry count (~68 at
+	// teardown, so a few thousand comparisons once per eval) and it cannot fail.
+	for {
+		victim: Host_Native_Key
+		found := false
+		for key in g_host_native_fns {
+			if key.ctx == rawptr(ctx) {
+				victim = key
+				found = true
+				break
+			}
+		}
+		if !found do break
+		key := victim
 		fn := g_host_native_fns[key]
 		// Through the shared helper, NOT a raw JSValueUnprotect: it skips the
 		// unprotect on Windows on purpose (final teardown races the VM's GC/JIT
