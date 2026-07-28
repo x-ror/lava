@@ -234,11 +234,18 @@ when ODIN_OS == .Linux {
 	// host function should return the same value (its result is ignored once
 	// the VM has a pending exception). Only meaningful while g_host_ok, i.e.
 	// inside functions created by host_function_create.
-	host_throw :: proc "contextless" (ctx: JSContextRef, value: JSValueRef) {
-		if !g_host_ok || value == nil do return
+	// Returns whether the exception was actually raised. Callers MUST check: every
+	// guard below is a silent no-op, and a caller that returns `value` anyway hands
+	// an Error object back as an ordinary result — the fail-open shape this exists
+	// to prevent. The !g_host_ok guard is not hypothetical: the only deterministic
+	// way to reach a dispatch miss is a thread whose registry is empty, which is
+	// exactly a thread where ensure_host never ran, i.e. g_host_ok == false.
+	host_throw :: proc "contextless" (ctx: JSContextRef, value: JSValueRef) -> bool {
+		if !g_host_ok || value == nil do return false
 		vm := JSContextGetGroup(ctx)
-		if vm == nil do return
+		if vm == nil do return false
 		g_vm_throw(vm, rawptr(ctx), transmute(u64)value)
+		return true
 	}
 } else {
 	host_function_create :: proc(_: JSContextRef, _: string, _: Host_Function_Proc, _: int) -> (function: JSObjectRef, ok: bool) {
@@ -251,6 +258,8 @@ when ODIN_OS == .Linux {
 		return false
 	}
 
-	host_throw :: proc "contextless" (_: JSContextRef, _: JSValueRef) {
+	// Honest stub: there is no private-ABI throw off Linux, so this never raises.
+	host_throw :: proc "contextless" (_: JSContextRef, _: JSValueRef) -> bool {
+		return false
 	}
 }

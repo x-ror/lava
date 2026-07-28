@@ -46,7 +46,11 @@ host_dispatch :: proc "c" (
 	exception: jsc.JSValueRef
 	ret := cb(ctx, callee, this, c.size_t(argc), &args[0], &exception)
 	if exception != nil {
-		jsc.host_throw(ctx, exception)
+		// Same rule as host_dispatch_miss: never return a value we know is not an
+		// exception. Here g_host_ok is implied (we got here via a table hit, so
+		// registration ran on this thread), but the check costs nothing and keeps
+		// the two sites from drifting.
+		if !jsc.host_throw(ctx, exception) do return transmute(i64)jsc.JSValueMakeUndefined(ctx)
 		return transmute(i64)exception
 	}
 	if ret == nil do return transmute(i64)jsc.JSValueMakeUndefined(ctx)
@@ -131,23 +135,41 @@ bind_host_tables :: proc() {
 
 @(private = "file")
 generic_native_host_cb :: proc "c" (global: rawptr, cf: [^]u64) -> i64 {
-	context = runtime.default_context()
-	ctx := jsc.JSContextRef(global)
+	// NO `context =` here on purpose. make_js_error takes an implicit context, and
+	// LLVM materialises runtime.default_context() in the ENTRY block — 16 extra
+	// instructions and a 152-byte frame paid on every dispatch (102,963 of them for
+	// bench/micro/encoding.js, zero misses). Keeping the cold path in its own
+	// #force_no_inline proc restores the previous codegen instruction-for-instruction.
 	cb, found := g_host_native_cbs[rawptr(uintptr(cf[jsc.CALL_FRAME_CALLEE_SLOT]))]
-	if !found {
-		// FAIL CLOSED. Returning undefined here is silently wrong, not merely
-		// unhelpful: several natives write through a caller-supplied buffer and
-		// signal nothing on return. crypto.js's randomBytes does
-		// `var buf = Buffer.alloc(size); native.randomFill(buf); return buf;` —
-		// Buffer.alloc zeroes, the result is ignored, so a no-op randomFill hands
-		// back n zero bytes that the caller treats as CSPRNG output. A miss means
-		// our own registry is inconsistent, so raise it rather than let any caller
-		// proceed on a fabricated value.
-		exception := make_js_error(ctx, "lava: host native dispatch failed (unregistered callee)")
-		jsc.host_throw(ctx, exception)
-		return transmute(i64)exception
-	}
+	if !found do return host_dispatch_miss(jsc.JSContextRef(global))
 	return host_dispatch(global, cf, cb)
+}
+
+// host_dispatch_miss FAILS CLOSED. Returning undefined here is silently wrong,
+// not merely unhelpful: several natives write through a caller-supplied buffer
+// and signal nothing on return. crypto.js does
+// `var buf = Buffer.alloc(size); native.randomFill(buf); return buf;` — alloc
+// zeroes, the result is ignored — so a no-op randomFill hands back n zero bytes
+// that the caller treats as CSPRNG output. randomFillSync, getRandomValues and
+// randomUUID share the shape; getRandomValues is worst, leaving the CALLER's
+// array untouched rather than zeroed. buffer.js's fromString would return
+// uninitialized pool memory. A miss means our own registry is inconsistent.
+@(private = "file")
+host_dispatch_miss :: #force_no_inline proc "c" (ctx: jsc.JSContextRef) -> i64 {
+	context = runtime.default_context()
+	exception := make_js_error(ctx, "lava: host native dispatch failed (unregistered callee)")
+	// Both guards matter, and neither is theoretical. make_js_error can return nil
+	// under OOM; returning it would hand JSC the EMPTY JSValue with no pending
+	// exception, which is its TDZ sentinel and isCell()-true — a segfault or a
+	// bogus "cannot access before initialization" leaking into JS. And host_throw
+	// no-ops when the private-ABI path never resolved on this thread — which is
+	// precisely the deterministic miss case — so without the check the Error
+	// object would be returned as an ordinary VALUE and we would be fail-open
+	// again. Undefined is the honest answer when we cannot raise: wrong, but not
+	// a crash and not a forged success.
+	if exception == nil do return transmute(i64)jsc.JSValueMakeUndefined(ctx)
+	if !jsc.host_throw(ctx, exception) do return transmute(i64)jsc.JSValueMakeUndefined(ctx)
+	return transmute(i64)exception
 }
 
 // host_native_create returns a host-registered function for `cb` (creating and
@@ -195,8 +217,9 @@ host_native_create :: proc(
 	// know about is unreachable from the sweep (it walks fns keys), so it would
 	// outlive its context keyed by a dead cell address — the exact stale-dispatch
 	// state this registry was fixed to prevent. Either both land or neither does.
-	// map_insert returns the stored value's pointer, nil when the insert could not
-	// be made — the only failure signal this Odin's public map API exposes.
+	// map_insert returns the stored value's pointer, nil exactly when the grow
+	// allocation failed (base/runtime/dynamic_map_internal.odin). map_entry is the
+	// alternative and returns a typed Allocator_Error; nil is sufficient here.
 	if map_insert(&g_host_native_fns, key, fn) == nil {
 		delete(cloned, alloc)
 		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
@@ -216,27 +239,16 @@ host_native_create :: proc(
 // JSGlobalContextCreate can reuse the address — destroy_runtime_state is that
 // point. `alloc` is the Runtime_State allocator the names were cloned through.
 host_natives_release_context :: proc(ctx: jsc.JSContextRef, alloc: mem.Allocator) {
-	// ALLOCATION-FREE on purpose. The previous shape collected the doomed keys into
-	// a temp dynamic array first; both `make` and `append` can fail and both
-	// discard their error, so an allocation failure would silently leave live
-	// entries keyed by a dead context — reintroducing, with no diagnostic, the
-	// exact use-after-free this sweep exists to prevent. Deleting from a map while
-	// ranging over it is undefined, so instead: find ONE victim, break out, delete
-	// it, repeat until none is left. O(n^2) in this context's entry count (~68 at
-	// teardown, so a few thousand comparisons once per eval) and it cannot fail.
-	for {
-		victim: Host_Native_Key
-		found := false
-		for key in g_host_native_fns {
-			if key.ctx == rawptr(ctx) {
-				victim = key
-				found = true
-				break
-			}
-		}
-		if !found do break
-		key := victim
-		fn := g_host_native_fns[key]
+	// Single pass, allocation-free. Odin documents `delete_key` as safe DURING map
+	// iteration (base/runtime/core_builtin.odin: "It is safe to use `delete_key`
+	// while iterating a map") — erase is tombstone-only and relocates nothing;
+	// only INSERTING during a range is unsafe, and this loop never inserts. An
+	// earlier revision of this sweep collected the victims into a temp [dynamic]
+	// first, whose make/append errors were discarded, so an allocation failure
+	// would silently leave live entries keyed by a dead context — the exact
+	// use-after-free this sweep exists to prevent, with no diagnostic.
+	for key, fn in g_host_native_fns {
+		if key.ctx != rawptr(ctx) do continue
 		// Through the shared helper, NOT a raw JSValueUnprotect: it skips the
 		// unprotect on Windows on purpose (final teardown races the VM's GC/JIT
 		// workers and exits 127; the VM is intentionally leaked there anyway).
@@ -245,6 +257,8 @@ host_natives_release_context :: proc(ctx: jsc.JSContextRef, alloc: mem.Allocator
 		unprotect_before_eval_exit(ctx, jsc.JSValueRef(fn))
 		delete_key(&g_host_native_cbs, rawptr(fn))
 		delete_key(&g_host_native_fns, key)
+		// After the erase: the key copy is ours, but the map must not be asked to
+		// hash a freed string.
 		delete(key.name, alloc)
 	}
 }
