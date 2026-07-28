@@ -131,6 +131,10 @@ host_native_create :: proc(
 	if state := get_state_from_ctx(ctx); state != nil do alloc = state.allocator
 	cloned, clone_err := strings.clone(name, alloc)
 	if clone_err != nil {
+		// Raw unprotect on purpose, unlike the sweep below: this rolls back the
+		// protect taken two lines up, mid-run and with the context fully healthy.
+		// unprotect_before_eval_exit's Windows carve-out is about FINAL teardown
+		// racing the VM's GC/JIT workers; using it here would leak a root instead.
 		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
 		return nil
 	}
@@ -153,7 +157,12 @@ host_natives_release_context :: proc(ctx: jsc.JSContextRef, alloc: mem.Allocator
 	}
 	for key in doomed {
 		fn := g_host_native_fns[key]
-		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
+		// Through the shared helper, NOT a raw JSValueUnprotect: it skips the
+		// unprotect on Windows on purpose (final teardown races the VM's GC/JIT
+		// workers and exits 127; the VM is intentionally leaked there anyway).
+		// Dropping the table entries and the owned names is still correct on
+		// every platform — only the root release is Windows-conditional.
+		unprotect_before_eval_exit(ctx, jsc.JSValueRef(fn))
 		delete_key(&g_host_native_cbs, rawptr(fn))
 		delete_key(&g_host_native_fns, key)
 		delete(key.name, alloc)
