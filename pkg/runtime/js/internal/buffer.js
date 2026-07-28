@@ -47,8 +47,25 @@
   var EMPTY_U8 = new Uint8Array(0);
   var u8Fill = Uint8Array.prototype.fill;
 
-  /** @type {Object<string, string>} lowercased name → canonical encoding */
+  // Encoding-name resolution is hardened ahead of the rest of this module because
+  // internal/encoding.js routes TextEncoder.encode and the TextDecoder utf-8 fast
+  // path through Buffer: a replaced `String` global or a poisoned
+  // `String.prototype.toLowerCase` reached a hardened TextDecoder through here and
+  // turned a valid decode into `Unknown encoding: …`. The rest of buffer.js is not
+  // yet converted (see tests/node-compat/pollution-baseline.json).
+  var P = require('primordials');
+  var StringG = String;
+  var StringPrototypeToLowerCase = P.StringPrototypeToLowerCase;
+  var ObjectPrototypeHasOwnProperty = P.ObjectPrototypeHasOwnProperty;
+
+  /**
+   * @type {Object<string, string>} lowercased name → canonical encoding.
+   * Null-prototype: the keys are caller-supplied, so with Object.prototype in the
+   * chain `Buffer.from(s, 'constructor')` resolved to a function instead of
+   * failing, and any `Object.prototype.<name>` a script set forged an encoding.
+   */
   var ENCODING_ALIASES = {
+    __proto__: null,
     utf8: 'utf8',
     'utf-8': 'utf8',
     utf16le: 'utf16le',
@@ -97,9 +114,9 @@
   function numericSeparator(value) {
     var str;
     if (typeof value === 'bigint') str = value.toString();
-    else if (typeof value !== 'number') return String(value);
-    else if (!isFinite(value) || Math.floor(value) !== value) return String(value);
-    else str = String(value);
+    else if (typeof value !== 'number') return StringG(value);
+    else if (!isFinite(value) || Math.floor(value) !== value) return StringG(value);
+    else str = StringG(value);
     var neg = str.charAt(0) === '-';
     if (neg) str = str.slice(1);
     var out = '';
@@ -136,7 +153,7 @@
     } else if (typeof received === 'number' && (received > 4294967296 || received < -4294967296)) {
       rendered = numericSeparator(received);
     } else {
-      rendered = String(received);
+      rendered = StringG(received);
     }
     var e = new RangeError(
       'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + rendered,
@@ -211,19 +228,22 @@
   /** @returns {string} Canonical encoding name (default utf8). */
   function normalizeEncoding(encoding) {
     if (encoding === undefined || encoding === null || encoding === '') return 'utf8';
-    var key = String(encoding).toLowerCase();
+    var key = StringPrototypeToLowerCase(StringG(encoding));
     var canon = ENCODING_ALIASES[key];
     return canon !== undefined ? canon : key;
   }
 
   /** @returns {boolean} */
   function isEncodingName(encoding) {
-    return Object.prototype.hasOwnProperty.call(ENCODING_ALIASES, String(encoding).toLowerCase());
+    return ObjectPrototypeHasOwnProperty(
+      ENCODING_ALIASES,
+      StringPrototypeToLowerCase(StringG(encoding)),
+    );
   }
 
   /** Lenient Node base64/base64url normalization before native decode. */
   function normalizeBase64(str) {
-    str = String(str)
+    str = StringG(str)
       .replaceAll('-', '+')
       .replaceAll('_', '/')
       .replaceAll(/[^A-Za-z0-9+/]/g, '');
@@ -235,7 +255,7 @@
   /** @returns {Uint8Array} */
   function strToBytes(str, encoding) {
     encoding = normalizeEncoding(encoding);
-    str = String(str);
+    str = StringG(str);
     if (encoding === 'utf8') return utf8EncodeNative(str);
     if (encoding === 'utf16le') return utf16leEncodeNative(str);
     if (encoding === 'hex') return hexDecodeNative(str);
@@ -518,7 +538,7 @@
       var max = length === undefined ? remaining : toInteger(length, 0);
       if (max > remaining) max = remaining;
       if (max <= 0) return 0;
-      string = String(string);
+      string = StringG(string);
       if (enc === 'utf8') return utf8WriteIntoNative(this, string, offset, max);
       if (enc === 'latin1' || enc === 'ascii')
         return latin1WriteIntoNative(this, string, offset, max);
@@ -595,7 +615,7 @@
         if (value.length === 0) throw errInvalidArgValue('value', value);
         bytes = value;
       } else {
-        var str = String(value);
+        var str = StringG(value);
         bytes = strToBytes(str, encoding || 'utf8');
         if (bytes.length === 0) {
           if (str.length !== 0) throw errInvalidArgValue('value', value);
@@ -1007,7 +1027,7 @@
    */
   function fromString(str, encoding) {
     encoding = normalizeEncoding(encoding);
-    str = String(str);
+    str = StringG(str);
     if (str.length === 0) return allocate(0);
     if (encoding === 'latin1' || encoding === 'ascii') {
       var b = allocate(str.length);
@@ -1213,12 +1233,12 @@
 
   /** Base64 → latin1 (Node global atob polyfill surface). */
   function atob(data) {
-    return Buffer.from(String(data), 'base64').toString('latin1');
+    return Buffer.from(StringG(data), 'base64').toString('latin1');
   }
 
   /** latin1 → Base64 (Node global btoa polyfill surface). */
   function btoa(data) {
-    return Buffer.from(String(data), 'latin1').toString('base64');
+    return Buffer.from(StringG(data), 'latin1').toString('base64');
   }
 
   /** @param {ArrayBuffer|Uint8Array} input @returns {boolean} */
@@ -1255,7 +1275,7 @@
         new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength)),
       ];
     }
-    var str = String(part);
+    var str = StringG(part);
     if (nativeEndings) str = str.replace(/\r?\n/g, nativeEol());
     return [new Uint8Array(Buffer.from(str, 'utf8'))];
   }
@@ -1272,7 +1292,7 @@
 
   function normalizeBlobType(options) {
     if (!options || options.type === undefined) return '';
-    var type = String(options.type);
+    var type = StringG(options.type);
     for (var i = 0; i < type.length; i++) {
       var code = type.charCodeAt(i);
       if (code < 0x20 || code > 0x7e) return '';
@@ -1371,7 +1391,7 @@
           ' present.',
       );
     Blob.call(this, parts, options);
-    Object.defineProperty(this, '_name', { value: String(name) });
+    Object.defineProperty(this, '_name', { value: StringG(name) });
     var lm =
       options && options.lastModified !== undefined ? Number(options.lastModified) : Date.now();
     Object.defineProperty(this, '_lastModified', { value: lm });
@@ -1439,7 +1459,7 @@
       missingErr.code = 'ERR_MISSING_ARGS';
       throw missingErr;
     }
-    objectUrlRegistry.delete(String(url));
+    objectUrlRegistry.delete(StringG(url));
   }
 
   /** @param {string} id @returns {Blob|File|null} */

@@ -316,9 +316,17 @@ existing transport/loop machinery. This is the highest-leverage _capability_ gap
 ### 5.5 [P2] Consolidate primordials in the JS layer — foundation laid
 
 `pkg/runtime/js/internal/primordials.js` is the shared hardened baseline: a frozen
-table of pristine intrinsics (captured statics + _uncurried_ prototype methods via
-the classic `bind.bind(call)`), so `ArrayPrototypePush(arr, x)` is a
-pollution-proof `arr.push(x)`. The loader **eager-loads it first**, before any
+table of pristine intrinsics — captured statics plus **fixed-arity `.call`
+wrappers** over the captured prototype methods — so `ArrayPrototypePush(arr, x)`
+is a pollution-proof `arr.push(x)`. Deliberately **not** Node's `bind.bind(call)`
+uncurryThis: JSC does not inline through a `JSBoundFunction`, measured ~28x for a
+hot-loop `charCodeAt`, so the classic idiom is a per-call tax here (the cost model
+is documented at the head of `primordials.js`). Arity matters at the call site
+too: the variadic `callerN` fallback carries an `arguments`-length switch, and
+routing a per-code-unit codec loop through it cost 1.43x — hence
+`ArrayPrototypePush1`/`Push2` for the fixed-arity cases, and plain indexed writes
+into a null-prototype array where the loop is the inner loop.
+The loader **eager-loads it first**, before any
 other internal module and before user code, so the captured references are
 pristine; modules consume it via `require('primordials')` and get the cached table.
 This is the JS-layer analog of the native error-intrinsic capture (§4.3/§5.1).
@@ -332,6 +340,24 @@ EventEmitter is _not_ immune here, so this can't be a Node oracle) proves it sta
 correct while `Array.prototype.{push,unshift,slice,splice,map}`, `Object.create`,
 and `Array[Symbol.species]` are all overwritten. Remaining modules adopt primordials
 incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
+
+Adoption is **ratcheted, not aspirational**: `scripts/check-primordials.mjs` counts
+syntactic pollutable prototype-method calls per file against
+`tests/node-compat/pollution-baseline.json`, and `make check-primordials` (part of
+`make check-js`) fails on any increase. `events.js`, `dns_promises.js` and
+`encoding.js` sit at 0; `url.js` is at 45 and `buffer.js` at 22. Differential
+oracles `54-url-pollution.js` and `55-encoding-pollution.js` pin the behavior
+against Node, and `cmd/lava/encoding_pollution_test.odin` pins the axes where Lava
+is deliberately stronger than Node.
+
+A baseline of 0 means "no **counted** call remains", not "immune". The counter
+matches only Array/String prototype method names, so three classes are on the
+author, not the gate: `f.apply(…)`/`f.call(…)` on an uncaptured function (use
+`ReflectApply`); free globals and statics (`String`, `ArrayBuffer.isView`,
+`Buffer.from`, `Buffer.prototype.toString`) — capture at module-eval; and any
+object literal indexed by a caller-supplied key (label, scheme, header, encoding
+tables) — give it `__proto__: null`. The sharpest vector closed in `encoding.js`
+(`String.fromCharCode.apply`) was never visible to the ratchet at all.
 
 `primordials` is internal-only: the loader serves it to internal factories but
 hides it from the public resolver native `require()` consults, so it neither

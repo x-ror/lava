@@ -5,7 +5,13 @@ import "core:testing"
 import lava "lava:pkg/runtime"
 import eventloop "lava:pkg/runtime/eventloop"
 
-// Proves the primordials hardening (pkg/runtime/js/internal/primordials.js): a
+// Proves the primordials hardening (pkg/runtime/js/internal/primordials.js) for
+// EventEmitter and for the encoding.js codecs, in ONE eval on purpose: repeated
+// lava.eval in a single process degrades after ~3 calls (a pre-existing defect —
+// see ROADMAP.md), and a test-runner thread that serves several eval-based tests
+// hits it. Keeping the eval count down is what keeps CI honest until that is fixed.
+//
+// EventEmitter half: a
 // script that overwrites the Array/Object intrinsics EventEmitter uses internally
 // must not be able to break it. This is a Lava-only test, NOT a node-compat oracle
 // case: Node's own EventEmitter is *not* immune here (its _addListener calls a raw
@@ -72,6 +78,82 @@ if (calls !== 7) throw new Error('calls=' + calls);
 if (namesLen !== 1) throw new Error('namesLen=' + namesLen);
 if (listenerCount !== 3) throw new Error('listenerCount=' + listenerCount);
 console.log('primordials-pollution ok');
+
+// --- encoding.js: the axes where Lava is deliberately stronger than Node ---
+'use strict';
+const enc_realToLowerCase = String.prototype.toLowerCase;
+const enc_realTrim = String.prototype.trim;
+const enc_realFromCharCode = String.fromCharCode;
+const enc_realApply = Function.prototype.apply;
+const enc_realPush = Array.prototype.push;
+const enc_realBufferFrom = Buffer.from;
+const enc_realBufferToString = Buffer.prototype.toString;
+const enc_realString = globalThis.String;
+
+// Indexed writes, not push: Array.prototype.push is one of the intrinsics this
+// script poisons, so the harness must not depend on it either.
+const enc_results = [];
+let enc_n = 0;
+function enc_record(name, fn) {
+  try {
+    enc_results[enc_n++] = name + '=' + fn();
+  } catch (e) {
+    enc_results[enc_n++] = name + '=THREW:' + e.name;
+  }
+}
+
+String.prototype.toLowerCase = function () { return 'utf-8'; };
+String.prototype.trim = function () { return 'utf-8'; };
+String.fromCharCode = function () { return 'PWNED'; };
+Function.prototype.apply = function () { return 'PWNED'; };
+Array.prototype.push = function () { return 0; };
+Buffer.from = function () { return new Uint8Array([0x50]); };
+Buffer.prototype.toString = function () { return 'PWNED'; };
+globalThis.String = function () { return 'PWNED'; };
+
+// A mixed-case, ASCII-padded label: Node resolves this through the pollutable
+// toLowerCase fallback and would answer 'utf-8'. Lava normalizes through
+// primordials, so the real encoding must survive.
+enc_record('label', function () { return new TextDecoder('  UTF-16LE  ').encoding; });
+enc_record('utf16', function () {
+  return new TextDecoder('utf-16le').decode(new Uint8Array([0x41, 0x00, 0x42, 0x00]));
+});
+enc_record('win1252', function () {
+  return new TextDecoder('windows-1252').decode(new Uint8Array([0x41, 0x80]));
+});
+enc_record('fatal', function () {
+  return new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0x41, 0xc3, 0xbc]));
+});
+enc_record('fastpath', function () {
+  return new TextDecoder().decode(new Uint8Array([0x41, 0x42]));
+});
+enc_record('encode', function () {
+  return Array.prototype.join.call(Array.from(new TextEncoder().encode('AB')), ',');
+});
+
+String.prototype.toLowerCase = enc_realToLowerCase;
+String.prototype.trim = enc_realTrim;
+String.fromCharCode = enc_realFromCharCode;
+Function.prototype.apply = enc_realApply;
+Array.prototype.push = enc_realPush;
+Buffer.from = enc_realBufferFrom;
+Buffer.prototype.toString = enc_realBufferToString;
+globalThis.String = enc_realString;
+
+const enc_want = [
+  'label=utf-16le',
+  'utf16=AB',
+  'win1252=A€',
+  'fatal=Aü',
+  'fastpath=AB',
+  'encode=65,66',
+];
+for (let i = 0; i < enc_want.length; i++) {
+  if (enc_results[i] !== enc_want[i]) {
+    throw new Error('want ' + enc_want[i] + ' got ' + enc_results[i]);
+  }
+}
+console.log('encoding-pollution ok');
 `
 
 @(test)
