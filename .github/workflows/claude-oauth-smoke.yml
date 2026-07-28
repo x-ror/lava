@@ -29,6 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # The final step posts the result back as a PR comment (a same-repo PR's GITHUB_TOKEN
+    # can write; fork PRs get a read-only token and the guarded step is a no-op).
+    permissions:
+      pull-requests: write
+
     # Only a boolean reaches the environment — never the credential itself.
     env:
       HAS_CLAUDE_CREDENTIAL: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
@@ -49,6 +54,7 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Generate one reply via Sonnet
+        id: gen
         if: env.HAS_CLAUDE_CREDENTIAL == 'true'
         env:
           # The CLI reads this for auth; GitHub masks it in logs. Never echoed here.
@@ -63,6 +69,8 @@ jobs:
             echo "::error::Empty response — CLAUDE_CODE_OAUTH_TOKEN did not generate in CI"
             exit 1
           fi
+          # Hand the reply to the comment step. Single short line, so no heredoc needed.
+          echo "reply=$reply" >> "$GITHUB_OUTPUT"
           {
             printf '%s\n' '## Claude OAuth smoke ✅'
             printf '%s\n' ''
@@ -70,3 +78,20 @@ jobs:
             printf '%s\n' ''
             printf '```\n%s\n```\n' "$reply"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Prove the pipeline itself can write to the PR. Only on pull_request (a workflow_dispatch
+      # run has no PR to comment on) and only with a credential (the generation step ran).
+      - name: Comment the result on the PR
+        if: github.event_name == 'pull_request' && env.HAS_CLAUDE_CREDENTIAL == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPLY: ${{ steps.gen.outputs.reply }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body "🤖 **Posted by CI** (\`claude-oauth-smoke\` workflow, run [#${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})).
+
+          Sonnet generated this in CI via \`CLAUDE_CODE_OAUTH_TOKEN\`:
+
+          > $REPLY
+
+          Confirms the pipeline can both **generate** (subscription token) and **write to the PR** (Actions \`GITHUB_TOKEN\`)."
