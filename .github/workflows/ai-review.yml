@@ -41,7 +41,7 @@ permissions: {}
 
 jobs:
   review:
-    name: /pr-gate (advisory)
+    name: pr-gate (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

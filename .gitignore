@@ -25,3 +25,8 @@ reports/
 
 # graphify knowledge-graph build output — regenerate with `graphify update`
 graphify-out/
+
+# Local secrets — never commit
+.env
+.env.*
+!.env.example
