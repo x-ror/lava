@@ -150,7 +150,7 @@ const enc_want = [
 ];
 for (let i = 0; i < enc_want.length; i++) {
   if (enc_results[i] !== enc_want[i]) {
-    throw new Error('enc_want ' + enc_want[i] + ' got ' + enc_results[i]);
+    throw new Error('want ' + enc_want[i] + ' got ' + enc_results[i]);
   }
 }
 console.log('encoding-pollution ok');
@@ -170,7 +170,7 @@ primordials_pollution_immunity :: proc(t: ^testing.T) {
 		result.status,
 		result.message,
 	)
-	testing.expectf(t, result.exit_code == 0, "eval exit code=%d (enc_want 0)", result.exit_code)
+	testing.expectf(t, result.exit_code == 0, "eval exit code=%d (want 0)", result.exit_code)
 }
 
 // primordials is an internal-only module: internal factories require() it, but it
@@ -210,6 +210,6 @@ primordials_hidden_from_user_require :: proc(t: ^testing.T) {
 		result.status,
 		result.message,
 	)
-	testing.expectf(t, result.exit_code == 0, "eval exit code=%d (enc_want 0)", result.exit_code)
+	testing.expectf(t, result.exit_code == 0, "eval exit code=%d (want 0)", result.exit_code)
 }
 
