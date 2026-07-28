@@ -205,21 +205,51 @@ coupling.
 - [x] **`setTimeout`/`setInterval` ignore extra trailing args** — fixed:
       `capture_timer_args` clones and GC-protects the trailing arguments and
       forwards them to the callback (Node parity).
+- [ ] **`bench --gate` reads a single launch** — `bench/run.mjs` compares one
+      launch per build and `bench/lib/harness.js` takes best-of-5 within it. The
+      measured spread of that estimator is 1.11-1.28x quiet and up to 2.26x under
+      load, so a cap sized to catch a ~1.4x regression cannot separate the two.
+      Taking the MEDIAN of 3 launches for capped benchmarks was measured to cut the
+      loaded-box false-positive rate ~40% with detection unchanged at 100%, for
+      ~16s of CI. Do NOT "fix" this by pinning: pinning shifts the ratio level
+      25-40% (it hurts node more than Lava) and would invalidate all 22 caps.
+- [ ] **Host-native registry: consider moving `g_host_native_fns` onto
+      `Runtime_State`** — it is read only at registration and in the sweep, never
+      on the dispatch path (only `g_host_native_cbs` is), so keying it by the
+      context pointer buys nothing and it could die with the state, deleting the
+      sweep entirely. Not done here for a measured reason: the cache-HIT path is
+      hot (~60k hits per 20k `fs.statSync`, three per `Stats` instance) and
+      currently returns before any state lookup; moving the table would add
+      `JSContextGetGlobalObject` + `JSObjectGetPrivate` to every hit. Needs a
+      profile before committing to it.
 - [ ] **Stack-trace line numbers are off by one** — the CommonJS wrapper
       prepends a line but `JSEvaluateScript` starts at line 1.
-- [ ] **Repeated `lava.eval` in one process degrades** — the 3rd-4th `eval`
-      (each a fresh `JSGlobalContextCreate`) intermittently fails loader init
-      with `TypeError: Map operation called on non-Map object`, and under the
-      Odin test runner escalates to `Signal caught: Segmentation_Fault` or
-      `panic: Tracking allocator error: Bad free of pointer`. Not a thread race:
-      a single-threaded runner reproduces it 100%, while one-thread-per-test
-      never does — the trigger is several `eval`s sharing a thread. Reproduce
-      with a test proc that loops `eventloop.init()` + `lava.eval` 12 times.
-      Pre-existing (reproduces on 9dede5e). Suspect the `thread_local` private-ABI
-      probe state in `pkg/jsc/private_string.odin` surviving a context teardown.
-      Until it is fixed, keep the number of `lava.eval` call sites in
-      `cmd/lava/*_test.odin` low — that is why the encoding pollution assertions
-      share `primordials_test.odin`'s script instead of adding a 5th eval.
+- [x] **Repeated `lava.eval` in one process degrades** — fixed: the thread-local
+      host-call registry in `pkg/runtime/host_natives.odin` is keyed by the JSC
+      context POINTER, and JSC reuses that address for a later
+      `JSGlobalContextCreate`. Nothing dropped a dead context's entries, so from
+      the 3rd-4th eval the key collided and the cache returned a `JSObjectRef`
+      into freed memory — observed as the `allocUninit` binding resolving to
+      `Map.prototype.values` out of `buffer.js` `createPool`, and as segfaults or
+      tracking-allocator bad frees under the Odin test runner.
+      Two lifetime bugs in the same tables, both fixed: (a) the ENTRIES were
+      never dropped when a context died — `host_natives_release_context` now
+      sweeps both tables from `destroy_runtime_state` while the context is still
+      alive; (b) the map BACKING was bound implicitly to whatever
+      `context.allocator` was live at the first insert (Odin binds a zero-valued
+      map's allocator on first grow) even though the tables are thread-lived, so
+      under the test runner's per-test tracking allocator, or an embedder's arena,
+      later inserts wrote through reclaimed memory — both are now bound explicitly
+      to a process-lifetime allocator. Pinned by `cmd/lava/repeated_eval_test.odin`
+      and `cmd/lava/host_native_alloc_test.odin` (both mutation-verified in each
+      direction). The pre-fix bug was not crash-only: a working proof-of-concept
+      showed a native call running a DIFFERENT native's Odin callback, with the
+      registration order steerable from user JS via `require()` order —
+      embedder- and test-runner-reachable, not remotely. (Two earlier suspicions
+      were wrong and are recorded as such: the `thread_local` probe state in
+      `pkg/jsc/private_string.odin` is VM-independent and was never implicated,
+      and the residual failure was not a separate defect in
+      `pkg/runtime/eventloop/loop.odin`.)
 - [ ] **Prototype-pollution hardening of the embedded JS layer** — `primordials.js`
       plus the `make check-primordials` ratchet over
       `tests/node-compat/pollution-baseline.json`. Done: `events.js`,

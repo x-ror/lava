@@ -106,6 +106,15 @@ Thin, per-platform `foreign` declarations of JSC's C API. Highlights:
   arrays from outside a JSC callback (e.g. the fetch streaming body driven from the
   loop). Both are no-ops on Linux/macOS — a clean conditional-compilation pattern.
 
+- Natives are registered through a per-thread host-call registry
+  (`pkg/runtime/host_natives.odin`) keyed by `{context pointer, callback, name}`
+  and dispatched off the call frame's callee slot. JSC hands the _same_ address
+  to a later `JSGlobalContextCreate`, so every entry for a context is dropped in
+  `destroy_runtime_state` while that context is still alive; a surviving entry
+  resolves a binding to an object in a dead VM. The tables are thread-lived, so
+  their backing is bound to a process-lifetime allocator explicitly rather than
+  adopting the caller's.
+
 ### 3.3 Standard library: native + embedded JS
 
 Built-ins are JS factories `#load`-embedded at compile time (`globals.odin:1144`)
@@ -169,7 +178,10 @@ tracking allocator). The fix is _localized_ — each request/job captures the ow
 alloc/free pair stays matched no matter which context is active at either end. This is
 applied to `module_cache` keys, `fetch` (`Fetch_Request` method/url/host/path +
 `request_bytes` + the struct), `dns` (`Dns_Lookup_Request.hostname` + the struct), and
-the fetch DNS pool (`DNS_Job.host` + the struct). It is deliberately _not_ context-based:
+the fetch DNS pool (`DNS_Job.host` + the struct), and the host-native registry's cached
+names (`host_natives.odin`; note that registry's two tables are thread-lived, so their
+_backing_ is bound to a process-lifetime allocator rather than to a state's). It is
+deliberately _not_ context-based:
 those structs free under _multiple_ contexts (e.g. `fetch_reclaim_pending` during normal
 operation vs `fetch_destroy_pending` at teardown; a global DNS pool freeing jobs from
 several runtimes), which a "rebind `context.allocator` at the callback entry" approach

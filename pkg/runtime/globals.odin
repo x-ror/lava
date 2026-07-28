@@ -157,6 +157,10 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 		delete(entry.key, state.allocator)
 	}
 	delete(state.module_cache)
+	// Same lifetime rule as the module cache above, for the thread-local host-call
+	// registry: its entries are keyed by the context POINTER, which JSC reuses for a
+	// later context, so they must go while this context is still the owner.
+	host_natives_release_context(ctx, state.allocator)
 	for _, ctor in state.error_intrinsics {
 		unprotect_before_eval_exit(ctx, ctor)
 	}

@@ -219,6 +219,16 @@ when ODIN_OS == .Linux {
 		return function, function != nil
 	}
 
+	// host_calls_active reports whether the private-ABI host-call path resolved on
+	// this thread. Exported for TESTS only: a regression test that exercises the
+	// host-native registry is silently vacuous if the probe missed (nothing is
+	// ever registered, so nothing can go stale), and a probe miss is a realistic
+	// outcome of a JSC upgrade renaming the mangled symbol this dlsyms.
+	host_calls_active :: proc(ctx: JSContextRef) -> bool {
+		ensure_host(ctx)
+		return g_host_ok
+	}
+
 	// host_throw raises `value` as a JS exception from inside a host function —
 	// the equivalent of the C-API callback machinery's *exception handling. The
 	// host function should return the same value (its result is ignored once
@@ -233,6 +243,12 @@ when ODIN_OS == .Linux {
 } else {
 	host_function_create :: proc(_: JSContextRef, _: string, _: Host_Function_Proc, _: int) -> (function: JSObjectRef, ok: bool) {
 		return nil, false
+	}
+
+	// Honest stub: the host-call path does not exist off Linux, so the registry is
+	// permanently empty there and any test gated on this must skip, not assert.
+	host_calls_active :: proc(_: JSContextRef) -> bool {
+		return false
 	}
 
 	host_throw :: proc "contextless" (_: JSContextRef, _: JSValueRef) {
