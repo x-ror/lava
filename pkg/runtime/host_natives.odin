@@ -2,6 +2,7 @@ package lava_runtime
 
 import "base:runtime"
 import "core:c"
+import "core:mem"
 import "core:strings"
 import jsc "lava:pkg/jsc"
 
@@ -87,6 +88,15 @@ Host_Native_Key :: struct {
 // path, and no data race when N workers build their bindings concurrently
 // (the failure the removed process-global interning risked). The dispatch
 // callback runs on the ctx-owning thread, so it reads the same thread's table.
+//
+// Both tables are swept per context by host_natives_release_context, called from
+// destroy_runtime_state while the context is still alive. Without that sweep the
+// entries outlive the context they were registered for, and JSC hands the SAME
+// address to a later JSGlobalContextCreate: the {ctx, cb, name} key then collides
+// with a dead context's entry, the cache returns a JSObjectRef into freed memory,
+// and the new VM's object at that address is called instead (observed: the
+// `allocUninit` binding resolving to Map.prototype.values, plus segfaults and
+// tracking-allocator bad frees, from the 3rd-4th eval in one process).
 @(private = "file", thread_local) g_host_native_fns: map[Host_Native_Key]jsc.JSObjectRef
 @(private = "file", thread_local) g_host_native_cbs: map[rawptr]jsc.JSObjectCallAsFunctionCallback
 
@@ -112,8 +122,40 @@ host_native_create :: proc(
 	fn, ok := jsc.host_function_create(ctx, name, generic_native_host_cb, 1)
 	if !ok || fn == nil do return nil
 	jsc.JSValueProtect(ctx, jsc.JSValueRef(fn))
-	key.name = strings.clone(name) // outlive the caller's (possibly temp) string
+	// Clone through the Runtime_State's allocator, not the ambient one: this runs
+	// from inject_native_function, which is reachable both from ordinary eval-time
+	// setup AND from inside native_require_cb (a proc "c" whose context is reset to
+	// runtime.default_context()). The sweep frees through the same state allocator,
+	// so the two must not be picked up from whatever context happened to be live.
+	alloc := context.allocator
+	if state := get_state_from_ctx(ctx); state != nil do alloc = state.allocator
+	cloned, clone_err := strings.clone(name, alloc)
+	if clone_err != nil {
+		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
+		return nil
+	}
+	key.name = cloned // outlive the caller's (possibly temp) string
 	g_host_native_fns[key] = fn
 	g_host_native_cbs[rawptr(fn)] = cb
 	return fn
+}
+
+// host_natives_release_context drops every registration made for `ctx`. MUST run
+// while `ctx` is still alive (JSValueUnprotect needs it) and before any later
+// JSGlobalContextCreate can reuse the address — destroy_runtime_state is that
+// point. `alloc` is the Runtime_State allocator the names were cloned through.
+host_natives_release_context :: proc(ctx: jsc.JSContextRef, alloc: mem.Allocator) {
+	if len(g_host_native_fns) == 0 do return
+	// Collect first: deleting from a map while ranging over it is not defined.
+	doomed := make([dynamic]Host_Native_Key, 0, len(g_host_native_fns), context.temp_allocator)
+	for key in g_host_native_fns {
+		if key.ctx == rawptr(ctx) do append(&doomed, key)
+	}
+	for key in doomed {
+		fn := g_host_native_fns[key]
+		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
+		delete_key(&g_host_native_cbs, rawptr(fn))
+		delete_key(&g_host_native_fns, key)
+		delete(key.name, alloc)
+	}
 }

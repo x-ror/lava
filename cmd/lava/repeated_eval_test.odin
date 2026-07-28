@@ -1,0 +1,61 @@
+#+build linux, darwin
+package main
+
+import "core:strings"
+import "core:testing"
+import lava "lava:pkg/runtime"
+import eventloop "lava:pkg/runtime/eventloop"
+
+// Proves that a process can run many lava.eval calls in a row. This is a
+// Lava-only test, not a node-compat oracle case: it is about our own JSC context
+// lifetime, which Node has no equivalent of.
+//
+// The defect it pins: pkg/runtime/host_natives.odin caches host-registered
+// function objects in a thread-local map keyed by {context pointer, callback,
+// name}. Nothing used to drop those entries when a context was destroyed, and JSC
+// hands the same address to a later JSGlobalContextCreate — so the key collided
+// with a dead context's entry and the cache returned a JSObjectRef into freed
+// memory. From the 3rd-4th eval onward this surfaced as the `allocUninit` binding
+// resolving to an unrelated function of the new VM ("TypeError: Map operation
+// called on non-Map object" out of buffer.js createPool), and under the test
+// runner escalated to a segfault or a tracking-allocator bad free. Each eval below
+// must therefore report a clean status AND leave no diagnostic on stderr; the
+// script itself exercises the pooled allocUnsafe path that first showed the bug.
+REPEATED_EVAL_SOURCE :: `
+'use strict';
+const b = Buffer.allocUnsafe(64);
+b.fill(0x61);
+const s = new TextDecoder().decode(new Uint8Array([0x41, 0x42]));
+if (b.toString('latin1', 0, 3) !== 'aaa') throw new Error('pool');
+if (s !== 'AB') throw new Error('decode');
+if (new URL('http://%C3%BCber.example/').hostname !== 'xn--ber-goa.example')
+  throw new Error('url');
+`
+
+@(test)
+repeated_eval_stays_correct :: proc(t: ^testing.T) {
+	// 12 is comfortably past the 3rd-4th eval where address reuse first bit.
+	for i in 0 ..< 12 {
+		loop := eventloop.init()
+		// eval consumes (destroys) the loop on every path; do not destroy it here.
+		result := lava.eval(REPEATED_EVAL_SOURCE, "<repeated-eval-test>", &loop, false)
+		defer lava.result_destroy(&result)
+
+		testing.expectf(
+			t,
+			result.status == .Ok,
+			"eval #%d did not complete cleanly: status=%v message=%q",
+			i,
+			result.status,
+			result.message,
+		)
+		testing.expectf(t, result.exit_code == 0, "eval #%d exit code=%d (want 0)", i, result.exit_code)
+		testing.expectf(
+			t,
+			!strings.contains(result.message, "Map operation"),
+			"eval #%d hit the stale host-native cache: %q",
+			i,
+			result.message,
+		)
+	}
+}

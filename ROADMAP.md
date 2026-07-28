@@ -207,19 +207,33 @@ coupling.
       forwards them to the callback (Node parity).
 - [ ] **Stack-trace line numbers are off by one** — the CommonJS wrapper
       prepends a line but `JSEvaluateScript` starts at line 1.
-- [ ] **Repeated `lava.eval` in one process degrades** — the 3rd-4th `eval`
-      (each a fresh `JSGlobalContextCreate`) intermittently fails loader init
-      with `TypeError: Map operation called on non-Map object`, and under the
-      Odin test runner escalates to `Signal caught: Segmentation_Fault` or
-      `panic: Tracking allocator error: Bad free of pointer`. Not a thread race:
-      a single-threaded runner reproduces it 100%, while one-thread-per-test
-      never does — the trigger is several `eval`s sharing a thread. Reproduce
-      with a test proc that loops `eventloop.init()` + `lava.eval` 12 times.
-      Pre-existing (reproduces on 9dede5e). Suspect the `thread_local` private-ABI
-      probe state in `pkg/jsc/private_string.odin` surviving a context teardown.
-      Until it is fixed, keep the number of `lava.eval` call sites in
-      `cmd/lava/*_test.odin` low — that is why the encoding pollution assertions
-      share `primordials_test.odin`'s script instead of adding a 5th eval.
+- [x] **Repeated `lava.eval` in one process degrades** — fixed: the thread-local
+      host-call registry in `pkg/runtime/host_natives.odin` is keyed by the JSC
+      context POINTER, and JSC reuses that address for a later
+      `JSGlobalContextCreate`. Nothing dropped a dead context's entries, so from
+      the 3rd-4th eval the key collided and the cache returned a `JSObjectRef`
+      into freed memory — observed as the `allocUninit` binding resolving to
+      `Map.prototype.values` out of `buffer.js` `createPool`, and as segfaults or
+      tracking-allocator bad frees under the Odin test runner.
+      `host_natives_release_context` now sweeps both tables from
+      `destroy_runtime_state`, while the context is still alive. Pinned by
+      `cmd/lava/repeated_eval_test.odin`. (The earlier suspicion that the
+      `thread_local` probe state in `pkg/jsc/private_string.odin` was at fault was
+      wrong — that state is VM-independent.)
+- [ ] **Allocator mismatch reachable from a second eval in the same process** — a
+      distinct defect the host-native fix above does NOT cover. Reproduce at
+      `-define:ODIN_TEST_THREADS=1` with
+      `-define:ODIN_TEST_NAMES=main.encoding_pollution_immunity,main.eval_dns_lookup_uses_consistent_allocator`
+      (needs the encoding assertions split back out of `primordials_test.odin`
+      into their own eval): 6/6 runs panic with
+      `Tracking allocator error: Bad free of pointer` at
+      `pkg/runtime/eventloop/loop.odin:278` (`delete(loop.timer_index)`). Pairing
+      the dns test with any OTHER eval-based test is clean, and the dns test alone
+      or after 12 evals is clean — so it is that specific workload, not eval count.
+      Root cause NOT yet established; do not assume the `proc "c"` /
+      `runtime.default_context()` allocator split in
+      `pkg/runtime/typed_array.odin` without measuring, that hypothesis is
+      untested.
 - [ ] **Prototype-pollution hardening of the embedded JS layer** — `primordials.js`
       plus the `make check-primordials` ratchet over
       `tests/node-compat/pollution-baseline.json`. Done: `events.js`,

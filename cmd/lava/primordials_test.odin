@@ -6,10 +6,11 @@ import lava "lava:pkg/runtime"
 import eventloop "lava:pkg/runtime/eventloop"
 
 // Proves the primordials hardening (pkg/runtime/js/internal/primordials.js) for
-// EventEmitter and for the encoding.js codecs, in ONE eval on purpose: repeated
-// lava.eval in a single process degrades after ~3 calls (a pre-existing defect —
-// see ROADMAP.md), and a test-runner thread that serves several eval-based tests
-// hits it. Keeping the eval count down is what keeps CI honest until that is fixed.
+// EventEmitter and for the encoding.js codecs, in ONE eval. The stale host-native
+// cache that originally forced this merge is fixed (host_natives_release_context),
+// but splitting the encoding half back into its own eval still trips a SECOND,
+// unrelated allocator defect — see the open ROADMAP entry; the split is the
+// reproduction. Re-split once that is closed.
 //
 // EventEmitter half: a
 // script that overwrites the Array/Object intrinsics EventEmitter uses internally
