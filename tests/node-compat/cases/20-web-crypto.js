@@ -29,3 +29,7 @@ assert.ok(new Uint8Array(buf, 24, 8).every((x) => x === 0)); // bytes after the 
 
 // node:crypto exposes getRandomValues too.
 assert.equal(typeof require('node:crypto').getRandomValues, 'function');
+
+// Zero-length views are accepted and returned by identity, untouched.
+const zero = new Uint8Array(0);
+assert.equal(crypto.getRandomValues(zero), zero);

@@ -201,3 +201,12 @@ for (const n of [0, 1, 0x1fff, 0x2000, 0x2001]) {
 }
 // A surrogate pair emitted from the accumulator must survive as one code point.
 assert.equal(new TextDecoder('utf-8', { fatal: true }).decode(new TextEncoder().encode('𝄞')), '𝄞');
+
+// -0 keeps its sign in the "Received" tail (Node renders it via util.inspect;
+// bare string concatenation would erase it).
+assert.throws(() => new TextDecoder('utf-8', -0), {
+  message: 'The "options" argument must be of type object. Received type number (-0)',
+});
+assert.throws(() => new TextDecoder().decode(new Uint8Array(1), -0), {
+  message: 'The "options" argument must be of type object. Received type number (-0)',
+});

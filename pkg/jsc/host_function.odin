@@ -208,9 +208,19 @@ when ODIN_OS == .Linux {
 
 		fn := create_raw(ctx, "__lava_hostcall_probe", host_probe, 2)
 		if fn == nil {
-			// Transient: a WTF string-impl or GC-cell allocation failed. Nothing about
+			// Two distinct causes, only one transient. create_raw builds its name
+			// through the private string bridge; if THAT probe latched off (missing
+			// symbol / ABI self-test mismatch — the same JSC-upgrade scenario as the
+			// dlsym miss above), every retry is doomed, so latch: definitive.
+			if string_bridge_latched_off() {
+				debug_log("hostfn: create_raw nil (string bridge latched off)")
+				g_host_checked = true
+				return
+			}
+			// Otherwise a WTF string-impl or GC-cell allocation failed. Nothing about
 			// the ABI was disproved, so do NOT latch — this call falls back, the next
-			// injection tries again.
+			// injection tries again. Neither arm here is pinnable by an in-repo test
+			// (both need a fault injected inside JSC itself); accepted untested.
 			debug_log("hostfn: create_raw nil (transient — not latching)")
 			return
 		}
@@ -274,9 +284,14 @@ when ODIN_OS == .Linux {
 	// Returns whether the exception was actually raised. Callers MUST check: every
 	// guard below is a silent no-op, and a caller that returns `value` anyway hands
 	// an Error object back as an ordinary result — the fail-open shape this exists
-	// to prevent. The !g_host_ok guard is not hypothetical: the only deterministic
-	// way to reach a dispatch miss is a thread whose registry is empty, which is
-	// exactly a thread where ensure_host never ran, i.e. g_host_ok == false.
+	// to prevent. The !g_host_ok guard is defense in depth for an arm that is
+	// unreachable by construction: any function that can dispatch here was minted
+	// by host_function_create AFTER the probe passed on this (context-confined)
+	// thread, so every reachable miss runs with g_host_ok == true and takes the
+	// raise — host_native_failclosed_test.odin's post-sweep assertion depends on
+	// that. The guard survives for the forbidden cross-thread call and the
+	// nil-value/nil-vm cases, where refusing to claim a raise is what keeps the
+	// caller from returning the Error as a value.
 	host_throw :: proc "contextless" (ctx: JSContextRef, value: JSValueRef) -> bool {
 		if !g_host_ok || value == nil do return false
 		vm := JSContextGetGroup(ctx)

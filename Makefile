@@ -194,8 +194,8 @@ test-odin: native-deps
 # lava.eval usually gets a fresh thread — and the host-native registry, the
 # private-ABI probe latch and JSC's context-address recycling are all THREAD-local.
 # ODIN_TEST_THREADS=1 is the only configuration where several eval call sites share
-# one runner thread, which is the exact shape of the two defects fixed in #317 and
-# #319 (a thread-lived table bound to a per-test tracking allocator; a cache keyed
+# one runner thread, which is the exact shape of the two defects fixed in #317
+# (a thread-lived table bound to a per-test tracking allocator; a cache keyed
 # by a recycled JSGlobalContext address). Cheap enough to just run: ~0.25s.
 test-odin-serial: native-deps
 	ODIN_TEST_THREADS=1 $(ODIN) test cmd/lava -collection:lava=.
@@ -285,9 +285,9 @@ test-lava-nohostfn: build
 	RUN_LAVA=1 LAVA_BIN="$(LAVA)" LAVA_HOSTFN_DISABLE=1 ./scripts/run-oracles.sh
 
 # -collection:lava=. is required, not optional: cmd/lava's test files import
-# "lava:pkg/runtime", so without it strip-semicolon fails to parse the package and
-# the target has been exiting non-zero for every caller. CLAUDE.md asks for `make
-# fmt` before committing Odin, so it needs to actually run.
+# "lava:pkg/runtime", so without it strip-semicolon cannot parse the package and
+# the target exits non-zero. CI's "Format (Odin)" step runs this and requires a
+# clean diff afterwards.
 fmt:
 	$(ODIN) strip-semicolon cmd/lava -collection:lava=.
 	$(ODIN) strip-semicolon pkg/jsc -no-entry-point

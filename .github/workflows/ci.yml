@@ -43,6 +43,14 @@ jobs:
       - name: Type-check
         run: make check
 
+      # `make fmt` once exited non-zero for every caller (a strip-semicolon
+      # parse failure, fixed by -collection:lava=.) and nothing noticed, because
+      # no CI step ran it. This pins both that fmt runs and that the tree is
+      # already formatted: fmt rewrites in place, so any diff is a formatting
+      # violation (or a fmt regression).
+      - name: Format (Odin)
+        run: make fmt && git diff --exit-code
+
       - name: JavaScript lint and format
         run: make check-js
 

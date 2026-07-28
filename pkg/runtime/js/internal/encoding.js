@@ -36,6 +36,8 @@
   var Uint8ArrayG = P.Uint8Array;
   var Uint16ArrayG = P.Uint16Array;
   var TypedArrayPrototypeSubarray = P.TypedArrayPrototypeSubarray;
+  var TypedArrayPrototypeGetBuffer = P.TypedArrayPrototypeGetBuffer;
+  var ObjectIs = P.ObjectIs;
   var ArrayBufferG = P.ArrayBuffer;
   var ArrayBufferIsView = P.ArrayBufferIsView;
   // Free globals / statics, captured pristine at module-eval.
@@ -144,7 +146,10 @@
       var s = v.length > 28 ? StringPrototypeSlice(v, 0, 25) + '...' : v;
       return "type string ('" + s + "')";
     }
-    if (t === 'number' || t === 'boolean') return 'type ' + t + ' (' + v + ')';
+    // -0 renders as "-0" in Node (it routes through util.inspect); string
+    // concatenation erases the sign.
+    if (t === 'number') return 'type number (' + (ObjectIs(v, -0) ? '-0' : v) + ')';
+    if (t === 'boolean') return 'type boolean (' + v + ')';
     if (t === 'bigint') return 'type bigint (' + v + 'n)';
     if (t === 'symbol') return 'type symbol (' + v.toString() + ')';
     var ctor = v.constructor && v.constructor.name;
@@ -336,11 +341,8 @@
   // decode regression. Routing the same bytes through the native codec measures
   // 13.74ms — 3.2x FASTER than the Array path this replaces. Numbers from
   // bench/micro/encoding.js's payload size; see the PR for the paired medians.
-  var LITTLE_ENDIAN = (function () {
-    var probe = new Uint16ArrayG(1);
-    probe[0] = 0x0102;
-    return new Uint8ArrayG(probe.buffer)[0] === 0x02;
-  })();
+  // Module-eval probe (pristine intrinsics), same shape as os.js's endianness().
+  var LITTLE_ENDIAN = new Uint8ArrayG(new Uint16ArrayG([1]).buffer)[0] === 1;
 
   // fromCharCode applied to the whole array blows the call stack past ~64k args,
   // so the big-endian fallback builds the result in fixed chunks. `count` is the
@@ -349,15 +351,20 @@
   function unitsToString(units, count) {
     if (count === 0) return '';
     if (LITTLE_ENDIAN)
-      // The view is built with the PRIMORDIAL Uint8Array, not Buffer.from. This
-      // module is hardened and buffer.js is not on this vector: Buffer.from routes
-      // an ArrayBuffer argument through a live `ArrayBuffer.isView` read, so
-      // poisoning globalThis.ArrayBuffer with a plain function made every decode
-      // throw "ArrayBuffer.isView is not a function" — caught by
-      // tests/node-compat/cases/55-encoding-pollution.js P2 the first time this
-      // path shipped. Only the prototype METHOD is borrowed from Buffer, applied to
-      // an ordinary Uint8Array, which is what buffer.js's toString already accepts.
-      return BufferProtoToString.call(new Uint8ArrayG(units.buffer, 0, count * 2), 'utf16le');
+      // Both reads here are captured. The backing store comes through the
+      // CAPTURED %TypedArray%.prototype.buffer getter — `units.buffer` would
+      // resolve through that configurable prototype accessor, and a poisoned
+      // getter substitutes an attacker's ArrayBuffer as the decode output
+      // (pinned by 55-encoding-pollution.js). The view is the PRIMORDIAL
+      // Uint8Array, not Buffer.from: that routes an ArrayBuffer argument
+      // through a live `ArrayBuffer.isView` read, which a replaced global broke
+      // the first time this path shipped (same test, case P2). Only the
+      // prototype METHOD is borrowed from Buffer, applied to an ordinary
+      // Uint8Array, which is what buffer.js's toString already accepts.
+      return BufferProtoToString.call(
+        new Uint8ArrayG(TypedArrayPrototypeGetBuffer(units), 0, count * 2),
+        'utf16le',
+      );
     // Big-endian: Buffer's utf16le would byte-swap every unit. No target Lava
     // builds for is big-endian today, so this arm is correctness insurance for a
     // future port, not a live path — it is the exact code the fast arm replaced.
@@ -597,8 +604,11 @@
     var isFinal = !stream;
 
     // Upper bound on emitted code units: utf-8 and windows-1252 emit at most one
-    // per input byte (a 4-byte sequence yields a surrogate PAIR from 4 bytes),
-    // utf-16le at most one per two, and a final flush adds at most two more.
+    // per input byte (a 4-byte sequence yields a surrogate PAIR from 4 bytes);
+    // utf-16le at most one per TWO bytes — pushU16 amortizes to one emission per
+    // processed unit even through the held-surrogate re-process path. The +4
+    // covers a unit carried in from the previous chunk plus the final flush
+    // (at most two more).
     //
     // A Uint16Array, not a JS Array: every element here IS a UTF-16 code unit, so
     // two bytes each instead of a boxed 8-byte slot, and the storage is off the GC
@@ -607,9 +617,12 @@
     // input" and "4x the input". url.js reaches this for any percent-encoded host
     // (percentDecodeHostStrict), so the input is attacker-sized. It also drops the
     // ObjectSetPrototypeOf hardening this line used to need: indexed access on a
-    // typed array never consults the prototype chain, so there is nothing to
-    // poison.
-    var units = new Uint16ArrayG(bytes.length + 4);
+    // typed array never consults the prototype chain; the one prototype-chain
+    // read left on this path (`.buffer`, at string-building) goes through the
+    // captured getter in unitsToString.
+    var units = new Uint16ArrayG(
+      (this._enc === 'utf-16le' ? (bytes.length + 1) >> 1 : bytes.length) + 4,
+    );
     var count;
     if (this._enc === 'windows-1252') {
       count = decodeWin1252Units(bytes, units);

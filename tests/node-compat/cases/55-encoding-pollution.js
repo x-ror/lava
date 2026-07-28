@@ -513,4 +513,43 @@ console.log(
   })(),
 );
 
+// T: the decode accumulator's string-building reads. A poisoned
+// %TypedArray%.prototype.buffer getter must not swap in an attacker's backing
+// store (Lava reads .buffer only through a getter captured at module-eval;
+// Node's decoder is native and never consults it), and a replaced
+// Buffer.prototype.toString must not intercept the utf16le codec call (Lava
+// borrowed the method pristine at module-eval). Both poisons are live across
+// the two decodes that exercise the accumulator path.
+console.log(
+  'T',
+  (() => {
+    const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+    const bufferDesc = Object.getOwnPropertyDescriptor(taProto, 'buffer');
+    const forged = new Uint16Array([0x21, 0x21, 0x21, 0x21]).buffer; // "!!!!"
+    const realToString = Buffer.prototype.toString;
+    Object.defineProperty(taProto, 'buffer', {
+      configurable: true,
+      get() {
+        return forged;
+      },
+    });
+    Buffer.prototype.toString = function () {
+      return 'POISONED';
+    };
+    let out;
+    try {
+      out = [
+        new TextDecoder('windows-1252').decode(new Uint8Array([0x41, 0x80])),
+        new TextDecoder('utf-16le').decode(new Uint8Array([0x41, 0x00, 0x42, 0x00])),
+      ].join('|');
+    } catch (e) {
+      out = 'THREW:' + e.name;
+    } finally {
+      Object.defineProperty(taProto, 'buffer', bufferDesc);
+      Buffer.prototype.toString = realToString;
+    }
+    return out;
+  })(),
+);
+
 console.log('ok');

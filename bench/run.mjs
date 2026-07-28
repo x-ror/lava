@@ -93,6 +93,9 @@ function collectMedian(bin, args, launches) {
   const samples = new Map();
   for (let i = 0; i < launches; i++) {
     for (const [name, r] of collect(bin, args)) {
+      // Only `ms` is medianed below; every other field (iterations, name)
+      // describes the first launch that reported it, which is all the report
+      // reads. A consumer deriving ns/op from `iterations` would mix launches.
       if (!samples.has(name)) samples.set(name, { r, ms: [] });
       samples.get(name).ms.push(r.ms);
     }
@@ -100,8 +103,10 @@ function collectMedian(bin, args, launches) {
   const byName = new Map();
   for (const [name, { r, ms }] of samples) {
     ms.sort((a, b) => a - b);
-    // Lower median on an even count: with launches=3 this is the true median, and
-    // a pessimistic tie-break is the wrong direction for a regression gate.
+    // With launches=3 this is the true median; an even count is unreachable at
+    // the current GATE_LAUNCHES. If someone raises it, note the lower median is
+    // lenient on the lava side but pessimistic applied to node's (a smaller
+    // node ms inflates every ratio).
     byName.set(name, { ...r, ms: ms[(ms.length - 1) >> 1] });
   }
   return byName;

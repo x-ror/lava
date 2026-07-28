@@ -36,7 +36,12 @@ host_dispatch :: proc "c" (
 	stack_args: [16]jsc.JSValueRef
 	args: []jsc.JSValueRef = stack_args[:]
 	if argc > len(stack_args) {
-		args = make([]jsc.JSValueRef, argc, context.temp_allocator)
+		overflow, alloc_err := make([]jsc.JSValueRef, argc, context.temp_allocator)
+		// Fail closed, same rule as a dispatch miss: a nil slice faults at &args[0]
+		// and a truncated one would run the native against arguments it was never
+		// passed. Reachable only at >16 args under temp-arena OOM.
+		if alloc_err != nil do return host_dispatch_fail(ctx, "lava: host native dispatch failed (argument allocation)")
+		args = overflow
 	}
 	for i in 0 ..< argc {
 		args[i] = jsc.JSValueRef(uintptr(cf[jsc.CALL_FRAME_FIRST_ARG_SLOT + i]))
@@ -46,7 +51,7 @@ host_dispatch :: proc "c" (
 	exception: jsc.JSValueRef
 	ret := cb(ctx, callee, this, c.size_t(argc), &args[0], &exception)
 	if exception != nil {
-		// Same rule as host_dispatch_miss: never return a value we know is not an
+		// Same rule as host_dispatch_fail: never return a value we know is not an
 		// exception. Here g_host_ok is implied (we got here via a table hit, so
 		// registration ran on this thread), but the check costs nothing and keeps
 		// the two sites from drifting.
@@ -158,11 +163,16 @@ generic_native_host_cb :: proc "c" (global: rawptr, cf: [^]u64) -> i64 {
 	// bench/micro/encoding.js, zero misses). Keeping the cold path in its own
 	// #force_no_inline proc restores the previous codegen instruction-for-instruction.
 	cb, found := g_host_native_cbs[rawptr(uintptr(cf[jsc.CALL_FRAME_CALLEE_SLOT]))]
-	if !found do return host_dispatch_miss(jsc.JSContextRef(global))
+	if !found {
+		return host_dispatch_fail(
+			jsc.JSContextRef(global),
+			"lava: host native dispatch failed (unregistered callee)",
+		)
+	}
 	return host_dispatch(global, cf, cb)
 }
 
-// host_dispatch_miss FAILS CLOSED. Returning undefined here is silently wrong,
+// host_dispatch_fail FAILS CLOSED. Returning undefined here is silently wrong,
 // not merely unhelpful: several natives write through a caller-supplied buffer
 // and signal nothing on return. crypto.js does
 // `var buf = Buffer.alloc(size); native.randomFill(buf); return buf;` — alloc
@@ -183,16 +193,17 @@ generic_native_host_cb :: proc "c" (global: rawptr, cf: [^]u64) -> i64 {
 // crypto.randomFill returns the view it filled, which crypto.js does check.
 // Anything that wants a checkable failure signal has to add one deliberately.
 @(private = "file")
-host_dispatch_miss :: #force_no_inline proc "c" (ctx: jsc.JSContextRef) -> i64 {
+host_dispatch_fail :: #force_no_inline proc "c" (ctx: jsc.JSContextRef, why: string) -> i64 {
 	context = runtime.default_context()
-	exception := make_js_error(ctx, "lava: host native dispatch failed (unregistered callee)")
-	// Both guards matter, and neither is theoretical. make_js_error can return nil
-	// under OOM; returning it would hand JSC the EMPTY JSValue with no pending
-	// exception, which is its TDZ sentinel and isCell()-true — a segfault or a
-	// bogus "cannot access before initialization" leaking into JS. And host_throw
-	// no-ops when the private-ABI path never resolved on this thread — which is
-	// precisely the deterministic miss case — so without the check the Error
-	// object would be returned as an ordinary VALUE and we would be fail-open
+	exception := make_js_error(ctx, why)
+	// Both guards matter. make_js_error can return nil under OOM; returning it
+	// would hand JSC the EMPTY JSValue with no pending exception, which is its
+	// TDZ sentinel and isCell()-true — a segfault or a bogus "cannot access
+	// before initialization" leaking into JS. And host_throw reports whether it
+	// actually raised — its no-op arms are unreachable by construction from a
+	// dispatch (see the contract at host_throw, pkg/jsc/host_function.odin), but
+	// a caller that skipped the check would return the Error object as an
+	// ordinary VALUE the moment that reasoning rots, and that is fail-open
 	// again. Undefined is the honest answer when we cannot raise: wrong, but not
 	// a crash and not a forged success.
 	if exception == nil do return transmute(i64)jsc.JSValueMakeUndefined(ctx)

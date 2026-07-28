@@ -212,8 +212,11 @@ coupling.
       1.11-1.28x quiet and up to 2.26x under load, so a cap sized to catch a ~1.4x
       regression could not separate the two; median-of-3 cuts the loaded-box
       false-positive rate ~40% with detection unchanged at 100%, for ~16s of CI.
-      Do NOT "fix" the remaining variance by pinning: pinning shifts the ratio
-      level 25-40% (it hurts node more than Lava) and would invalidate all 22 caps.
+      One deliberate carve-out: `startup` stays a single best-of-15 spawn series
+      even under `--gate` (spawn noise is one-sided, so min-of-N is the right
+      estimator there, unlike the in-process benches). Do NOT "fix" the
+      remaining variance by pinning: pinning shifts the ratio level 25-40% (it
+      hurts node more than Lava) and would invalidate all 22 caps.
 - [ ] **Host-native registry: consider moving `g_host_native_fns` onto
       `Runtime_State`** — it is read only at registration and in the sweep, never
       on the dispatch path (only `g_host_native_cbs` is), so keying it by the

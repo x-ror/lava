@@ -17,8 +17,12 @@ import lava "lava:pkg/runtime"
 // cmd/lava/host_native_failclosed_test.odin pins the dispatcher itself; this file
 // pins what surrounds it — the sweep's context filter, the dedupe that keeps the
 // registry small, the stateless-context refusal, and the allocation-failure path.
+//
+// The helpers below (answer_cb, eval_text, make_context, host_path_active,
+// failing_allocator) are package-visible on purpose: the sibling #+build linux
+// tests (host_native_failclosed_test.odin, module_cache_rollback_test.odin)
+// share them instead of carrying byte-identical copies.
 
-@(private = "file")
 answer_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -30,7 +34,6 @@ answer_cb :: proc "c" (
 	return jsc.JSValueMakeNumber(ctx, 42)
 }
 
-@(private = "file")
 other_cb :: proc "c" (
 	ctx: jsc.JSContextRef,
 	function: jsc.JSObjectRef,
@@ -42,7 +45,6 @@ other_cb :: proc "c" (
 	return jsc.JSValueMakeNumber(ctx, 7)
 }
 
-@(private = "file")
 eval_text :: proc(ctx: jsc.JSContextRef, source: string) -> (string, bool) {
 	c_src, err := strings.clone_to_cstring(source, context.temp_allocator)
 	if err != nil do return "", false
@@ -66,14 +68,12 @@ eval_text :: proc(ctx: jsc.JSContextRef, source: string) -> (string, bool) {
 
 // Context is a bare JSC global context plus the JSClass it needs for the private
 // slot. Both must outlive the Runtime_State that points into them.
-@(private = "file")
 Context :: struct {
 	class: jsc.JSClassRef,
 	gctx:  jsc.JSGlobalContextRef,
 	ctx:   jsc.JSContextRef,
 }
 
-@(private = "file")
 make_context :: proc() -> (Context, bool) {
 	class := lava.make_global_class()
 	gctx := jsc.JSGlobalContextCreate(class)
@@ -84,7 +84,6 @@ make_context :: proc() -> (Context, bool) {
 	return Context{class = class, gctx = gctx, ctx = cast(jsc.JSContextRef)gctx}, true
 }
 
-@(private = "file")
 destroy_context :: proc(c: Context) {
 	jsc.JSGlobalContextRelease(c.gctx)
 	jsc.JSClassRelease(c.class)
@@ -93,7 +92,6 @@ destroy_context :: proc(c: Context) {
 // host_path_active reports whether the private-ABI path resolved. Every test in
 // this file asserts on it rather than skipping quietly: a silently vacuous
 // regression test is the failure mode this whole area keeps hitting.
-@(private = "file")
 host_path_active :: proc(t: ^testing.T, ctx: jsc.JSContextRef) -> bool {
 	if jsc.host_calls_active(ctx) do return true
 	testing.expect(
@@ -212,6 +210,15 @@ host_native_create_declines_without_state :: proc(t: ^testing.T) {
 	lava.inject_native_function(c.ctx, jsc.JSContextGetGlobalObject(c.ctx), "probe", answer_cb)
 	text, ok_eval := eval_text(c.ctx, "String(probe())")
 	testing.expectf(t, ok_eval && text == "42", "C-API fallback binding did not work: %q", text)
+
+	// Pins the documented fallback divergence (require.odin): the public C API
+	// cannot carry an arity, so `.length` is 0 here where the host path (and Node)
+	// report the declared arity. The oracle case (56-native-function-arity.js)
+	// cannot assert this — node runs the same script and reports Node's arity — so
+	// this is the one place the fallback value is pinned. If it ever changes,
+	// update the require.odin comment and case 56 together.
+	len_text, ok_len := eval_text(c.ctx, "String(probe.length)")
+	testing.expectf(t, ok_len && len_text == "0", "C-API fallback .length was not 0: %q", len_text)
 }
 
 // --- allocation-failure injection --------------------------------------------
@@ -224,7 +231,6 @@ host_native_create_declines_without_state :: proc(t: ^testing.T) {
 // .Out_Of_Memory. Frees must still succeed because the code under test rolls back
 // through this same allocator, and an error there would mask the failure being
 // injected rather than exercise it.
-@(private = "file")
 failing_alloc_proc :: proc(
 	allocator_data: rawptr,
 	mode: mem.Allocator_Mode,
@@ -245,7 +251,6 @@ failing_alloc_proc :: proc(
 	return nil, .Out_Of_Memory
 }
 
-@(private = "file")
 failing_allocator :: proc() -> mem.Allocator {
 	return mem.Allocator{procedure = failing_alloc_proc, data = nil}
 }
@@ -293,7 +298,7 @@ host_native_create_survives_allocation_failure :: proc(t: ^testing.T) {
 }
 
 // host_throw's contract is that its RETURN says whether the exception was really
-// raised; host_dispatch and host_dispatch_miss both branch on it rather than
+// raised; host_dispatch and host_dispatch_fail both branch on it rather than
 // returning a value they only hope is an exception. The nil guard is the arm that
 // is reachable in-process (make_js_error returns nil under OOM). The !g_host_ok
 // arm is NOT reachable here and is not pretended to be: contexts are

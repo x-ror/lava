@@ -103,7 +103,11 @@
       var s = value.length > 28 ? value.slice(0, 25) + '...' : value;
       return "type string ('" + s + "')";
     }
-    if (t === 'number' || t === 'boolean') return 'type ' + t + ' (' + value + ')';
+    // -0 renders as "-0" in Node (it routes through util.inspect); string
+    // concatenation erases the sign. 1/value avoids a dependency on Object.is.
+    if (t === 'number')
+      return 'type number (' + (value === 0 && 1 / value < 0 ? '-0' : value) + ')';
+    if (t === 'boolean') return 'type boolean (' + value + ')';
     if (t === 'bigint') return 'type bigint (' + value + 'n)';
     if (t === 'symbol') return 'type symbol (' + value.toString() + ')';
     if (t === 'function') return 'function ' + (value.name || '(anonymous)');

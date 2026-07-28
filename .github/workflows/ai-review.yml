@@ -191,7 +191,14 @@ jobs:
           reason=
           case "$turns" in 0|unknown) reason="it made $turns turns" ;; esac
           [ -z "$reason" ] && [ "$errored" = "true" ] && reason='it reported is_error: true'
-          [ -z "$reason" ] && case "$cost" in 0|0.0|unknown) reason="it cost \$$cost" ;; esac
+          # Cost alone is not a failure signal: a genuine review billed through a
+          # subscription CLAUDE_CODE_OAUTH_TOKEN can report total_cost_usd: 0, and
+          # stamping those "did not run" would train readers to ignore the banner.
+          # ("0.0" is unreachable — the value arrives via String(number), and a JS 0
+          # stringifies to "0".) Zero cost condemns only a run that also did no work:
+          # with 0/unknown turns already tripped above, that means exactly turns == 1,
+          # the observed init-failure shape.
+          [ -z "$reason" ] && [ "$turns" = "1" ] && case "$cost" in 0|unknown) reason="it made 1 turn at \$$cost" ;; esac
 
           if [ -n "$reason" ]; then
             echo "::warning title=AI review did not run::No diff was examined — $reason. The check is green because the job is advisory, not because the code was reviewed."

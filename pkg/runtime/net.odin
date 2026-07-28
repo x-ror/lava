@@ -1752,10 +1752,7 @@ net_shutdown_active :: proc(state: ^Runtime_State) {
 	// nothing. Only INSERTING during a range can resize and skip elements, and the
 	// only two inserts into net_conns are the accept and connect paths
 	// (net_accept_cb / net_connect_cb), neither of which is reachable from this
-	// body — teardown runs no JS and accepts nothing. The snapshot this replaces
-	// justified itself with the opposite belief and paid for it with a `make` +
-	// `append` whose allocator errors were both discarded, i.e. the same silent
-	// fail-open the host-native sweep was just fixed to remove.
+	// body — teardown runs no JS and accepts nothing.
 	for _, conn in state.net_conns {
 		if net_is_proactor(conn) {
 			// ALWAYS silence + unprotect the proactor conn (no JS during teardown), whether it is

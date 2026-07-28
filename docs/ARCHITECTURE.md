@@ -98,7 +98,7 @@ The strongest part of the system, and the right thing to have gotten right first
 Thin, per-platform `foreign` declarations of JSC's C API. Highlights:
 
 - The global object is created from a custom `LavaGlobal` JSClass whose private
-  slot stores `Runtime_State` (`globals.odin:154`), so the loop pointer and module
+  slot stores `Runtime_State` (`make_global_class`, `globals.odin`), so the loop pointer and module
   cache are **unreachable from user JavaScript** — no writable `__loop_ptr__`.
 - `jsc_init.odin` carries a Windows-only bring-up shim (`JSC::initialize` +
   disabling a broken baseline-JIT tier in the bun-webkit build) and a
@@ -120,7 +120,11 @@ Thin, per-platform `foreign` declarations of JSC's C API. Highlights:
   signal nothing on return (`crypto.randomFill` into a zeroed `Buffer.alloc`), so
   answering `undefined` would forge a correct-looking result rather than merely
   fail. The miss raises through `jsc.host_throw` instead, and every native signals
-  failure the same way — by setting `exception^`, never by its return value.
+  failure the same way — by setting `exception^`, never by its return value —
+  with two audited exceptions recorded at the dispatcher comment in
+  `host_natives.odin`: `net.write` returns a backpressure bool (not a failure
+  signal), and `crypto.randomFill` returns the view it filled, which `crypto.js`
+  identity-checks as its second fail-closed layer.
 
 - The host-call path itself is reached by `dlsym`ing a C++ mangled symbol
   (`pkg/jsc/host_function.odin`), so it can vanish under a JSC upgrade; callers
@@ -132,11 +136,12 @@ Thin, per-platform `foreign` declarations of JSC's C API. Highlights:
 
 ### 3.3 Standard library: native + embedded JS
 
-Built-ins are JS factories `#load`-embedded at compile time (`globals.odin:1144`)
-and instantiated by `loader.js`. Each factory receives `(require, module, exports,
+Built-ins are JS factories `#load`-embedded at compile time (the `EMBEDDED_*`
+constants in `globals.odin`) and instantiated by `loader.js`. Each factory
+receives `(require, module, exports,
 native)`; the native fourth argument carries Odin-backed bindings (crypto, buffer,
 fetch, sqlite, dns) so **nothing transient lands on `globalThis`**
-(`install_internal_modules`, `globals.odin:878`). This is an elegant boundary:
+(`install_internal_modules`, `globals.odin`). This is an elegant boundary:
 the spec surface is readable JS, the sharp edges are native, and the seam is one
 well-defined argument.
 
@@ -405,7 +410,7 @@ future follow-up.
   of truth.
 - **`known-lava-gaps.txt`** has no structured format or CI enforcement — define
   `file:reason` tuples and check them so a regression cannot silently widen a gap.
-- **`process.env` is a one-shot snapshot** (`globals.odin:1122`), not live — revisit
+- **`process.env` is a one-shot snapshot** (`install_process_env`, `globals.odin`), not live — revisit
   with a Proxy-backed object when child processes land.
 - **Stack-trace line numbers** are off by one (known) — fix once the loader wrapper
   no longer shifts line 1.

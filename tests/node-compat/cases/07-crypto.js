@@ -323,3 +323,30 @@ assert.throws(() => crypto.createHash('sha256').update(5), { code: 'ERR_INVALID_
 assert.throws(() => crypto.createHmac('sha256', 5), { code: 'ERR_INVALID_ARG_TYPE' });
 assert.throws(() => crypto.timingSafeEqual(5, 5), { code: 'ERR_INVALID_ARG_TYPE' });
 assert.throws(() => crypto.timingSafeEqual('abc', 'abc'), { code: 'ERR_INVALID_ARG_TYPE' });
+
+// Zero-size CSPRNG boundary: every entry point succeeds and returns its
+// argument; the fill APIs are identity even at zero length.
+assert.equal(crypto.randomBytes(0).length, 0);
+const zeroBuf = Buffer.alloc(0);
+assert.equal(crypto.randomFillSync(zeroBuf), zeroBuf);
+
+// A zero-size async request completes SYNCHRONOUSLY — Node queues no work for
+// zero bytes, so the callback has already run when the call returns.
+{
+  let rbSync = false;
+  crypto.randomBytes(0, () => {
+    rbSync = true;
+  });
+  assert.equal(rbSync, true);
+  let rfSync = false;
+  crypto.randomFill(Buffer.alloc(0), () => {
+    rfSync = true;
+  });
+  assert.equal(rfSync, true);
+}
+// And a bad buffer throws from randomFill itself, synchronously — not as an
+// uncaught error out of the deferred fill.
+assert.throws(() => crypto.randomFill('nope', () => {}), { code: 'ERR_INVALID_ARG_TYPE' });
+assert.throws(() => crypto.randomFill(Buffer.alloc(4), 9, () => {}), {
+  code: 'ERR_OUT_OF_RANGE',
+});

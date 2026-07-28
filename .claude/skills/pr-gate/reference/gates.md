@@ -25,7 +25,7 @@ what the check shows.
 | `make build` | Links `bin/lava`. Required before every `*-lava`, smoke, or bench target. |
 | `make test` | Odin unit tests + oracle suites (`scripts/run-tests.sh`). |
 | `make test-lava` | Every oracle suite the platform supports, node-vs-Lava (`run-oracles.sh`). |
-| `make test-lava-nohostfn` | The same suites with `LAVA_HOSTFN_DISABLE=1`, i.e. every native built by the public C API instead of JSC's private host-call ABI. Required for any change under `pkg/jsc`, `host_natives.odin`, or `require.odin`. |
+| `make test-lava-nohostfn` | The same suites with `LAVA_HOSTFN_DISABLE=1`, i.e. every native built by the public C API instead of JSC's private host-call ABI. Runs unconditionally in CI and is the only coverage of the C-API fallback; a failure blocks like any always-gate, and doubly so for changes under `pkg/jsc`, `host_natives.odin`, or `require.odin`. |
 | `make test-odin-serial` | `cmd/lava` tests on ONE runner thread — the only configuration where several `lava.eval` sites share a thread, and therefore the thread-local host-native registry and JSC's recycled context addresses. ~0.25s. |
 
 `make fmt` (`odin strip-semicolon`) before committing Odin.

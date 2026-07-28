@@ -110,6 +110,18 @@ when ODIN_OS == .Linux {
 		if g_ok do g_read_ok = probe_read_layout()
 	}
 
+	// string_bridge_latched_off reports whether ensure_resolved reached a
+	// DEFINITIVE negative verdict on this thread — a missing symbol or an ABI
+	// self-test mismatch, as opposed to a transient allocation failure inside a
+	// later call. host_function.odin consults it: create_raw builds its name
+	// through this bridge, so once the bridge is latched off every host-probe
+	// retry is doomed and ensure_host should latch its own flag instead of
+	// re-probing on every injection.
+	string_bridge_latched_off :: proc() -> bool {
+		ensure_resolved()
+		return !g_ok
+	}
+
 	// self_test round-trips known 8-bit and 16-bit content through the private
 	// constructors and back out via the public C API, proving both the symbol
 	// resolution and the sret/span ABI assumptions on this exact library build.

@@ -172,7 +172,7 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	unprotect_before_eval_exit(ctx, state.next_tick_drain)
 	// Clear the global's private slot BEFORE the free, so get_state_from_ctx can
 	// never hand out a dangling ^Runtime_State. The reachable path is the one the
-	// fail-closed dispatcher defines: host_dispatch_miss -> make_js_error ->
+	// fail-closed dispatcher defines: host_dispatch_fail -> make_js_error ->
 	// get_state_from_ctx, and the sweep above has just emptied this context's
 	// registry, so any host-native call after this point is a GUARANTEED miss.
 	// Without this, the one code path specified to run when our invariants are
@@ -251,8 +251,8 @@ module_cache_get :: proc(state: ^Runtime_State, key: string) -> (jsc.JSValueRef,
 // resources rather than none: the cloned key and a GC root. A discarded insert
 // error leaks the clone and pins `value` for the life of the VM with nothing left
 // that knows to release it — teardown unprotects by walking this very map. That
-// payload, not the shape, is why these two call sites are worth the helper and
-// the ~95 other bare inserts in pkg/runtime are left alone.
+// payload, not the shape, is why these two call sites are worth the helper while
+// the ordinary bare inserts elsewhere in this package are left alone.
 //
 // map_insert returns the stored value's pointer, nil exactly when the grow
 // allocation failed (base/runtime/dynamic_map_internal.odin). Same signal the

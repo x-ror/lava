@@ -6,9 +6,10 @@
 // JSObjectMakeFunctionWithCallback, which cannot carry one and always yields 0.
 // The private path is reached by dlsym'ing a C++ mangled symbol, so a JSC upgrade
 // that renames it demotes every native to the fallback SILENTLY. This case is
-// what makes that loud: `.length` is the only place the two paths are observably
-// different. It also pins the arities themselves, which were all 1 until
-// 2026-07-28.
+// what makes that loud: `.length` and constructibility are the two observable
+// differences between the paths (require.odin records both), and `.length` is
+// the one an oracle script can assert cheaply. It also pins the arities
+// themselves, which were all 1 until 2026-07-28.
 const assert = require('node:assert/strict');
 
 // `name` is carried by both paths, so it is the control: it holds even in the

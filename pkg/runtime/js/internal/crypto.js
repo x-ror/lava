@@ -301,19 +301,13 @@
 
   // Every CSPRNG entry point goes through this, and none calls native.randomFill
   // directly. The native returns the view it filled, so an identity check is the
-  // available proof that the fill ran — and a fill that did NOT run is silently
-  // indistinguishable from success at every one of these call sites: randomBytes
-  // and randomUUID hand back a Buffer.alloc that is merely zeroed, and
-  // getRandomValues hands back the CALLER's array, untouched, without even that.
-  //
-  // The dispatcher (pkg/runtime/host_natives.odin) already fails closed, so this
-  // is the second layer, not the first. It exists because the first one is one
-  // registration decision away from not covering this native — moving randomFill
-  // to a baked-in *_host wrapper, or off the host path entirely, changes which
-  // code answers a miss. A wrong answer here is silent forged entropy, so it is
-  // the one place worth paying a comparison per call to make undeniable. The
-  // error is deliberately not a Node ERR_* code: Node has no counterpart, because
-  // in Node this cannot happen.
+  // available proof that the fill ran. Second layer, not the first: the
+  // dispatcher already fails closed against the miss-forges-entropy scenario
+  // (the canonical write-up is at host_dispatch_fail, pkg/runtime/
+  // host_natives.odin), but that layer is one registration decision away from
+  // not covering this native, and a wrong answer here is silent forged entropy.
+  // The error is deliberately not a Node ERR_* code: Node has no counterpart,
+  // because in Node this cannot happen.
   function fillRandom(view) {
     if (native.randomFill(view) !== view)
       throw new Error('lava: CSPRNG unavailable (native.randomFill did not fill the buffer)');
@@ -328,6 +322,12 @@
     var buf = Buffer.alloc(size);
     if (size > 0) fillRandom(buf);
     if (typeof callback === 'function') {
+      // Node completes a zero-size request synchronously (it queues no work for
+      // zero bytes); only real fills report their completion asynchronously.
+      if (size === 0) {
+        callback(null, buf);
+        return;
+      }
       setImmediate(function () {
         callback(null, buf);
       });
@@ -356,7 +356,10 @@
     return bytes >>> 0;
   }
 
-  function randomFillSync(buffer, offset, size) {
+  // Shared buf/offset/size validation for randomFillSync and randomFill,
+  // resolving to the byte range to fill. Split out so randomFill can validate
+  // SYNCHRONOUSLY the way Node does — only the fill itself is deferred.
+  function resolveFillRange(buffer, offset, size) {
     var ab, base, byteLength, elementSize;
     if (ArrayBuffer.isView(buffer)) {
       ab = buffer.buffer;
@@ -383,7 +386,12 @@
       size === undefined
         ? byteLength - offsetBytes
         : assertSize(size, elementSize, offsetBytes, byteLength);
-    if (sizeBytes > 0) fillRandom(new Uint8Array(ab, base + offsetBytes, sizeBytes));
+    return { base: base + offsetBytes, ab: ab, sizeBytes: sizeBytes };
+  }
+
+  function randomFillSync(buffer, offset, size) {
+    var r = resolveFillRange(buffer, offset, size);
+    if (r.sizeBytes > 0) fillRandom(new Uint8Array(r.ab, r.base, r.sizeBytes));
     return buffer;
   }
 
@@ -397,8 +405,17 @@
       size = undefined;
     }
     if (typeof callback !== 'function') throw new TypeError('Callback must be a function');
+    // Validate now — Node throws a bad buf/offset/size from randomFill itself
+    // (deferring it turned a synchronous TypeError into an uncaught async one)
+    // and completes a zero-byte request synchronously, queueing no work for it.
+    var r = resolveFillRange(buffer, offset, size);
+    if (r.sizeBytes === 0) {
+      callback(null, buffer);
+      return;
+    }
     setImmediate(function () {
-      callback(null, randomFillSync(buffer, offset, size));
+      fillRandom(new Uint8Array(r.ab, r.base, r.sizeBytes));
+      callback(null, buffer);
     });
   }
 
