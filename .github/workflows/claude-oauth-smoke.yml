@@ -1,0 +1,72 @@
+name: Claude OAuth smoke
+
+# One-off smoke test: proves CLAUDE_CODE_OAUTH_TOKEN authenticates AND generates in CI.
+# It drives the Claude Code CLI — the correct client for a subscription OAuth token —
+# rather than a raw /v1/messages call, which subscription tokens are rate-limited out of
+# (a bare `curl` with the token returns 429, the CLI does not).
+#
+# Dormant without a credential: fork PRs never receive secrets, so the guarded steps skip
+# and the job reports success instead of failing red. `secrets` is not readable in `if:`,
+# so the boolean is bridged through a job-level `env:` block — the same trick ai-review.yml
+# uses. Path-filtered to itself so it does not run on unrelated PRs; re-run by hand with
+# the workflow_dispatch button.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/claude-oauth-smoke.yml
+  workflow_dispatch:
+
+concurrency:
+  group: claude-oauth-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  smoke:
+    name: Generation smoke (Sonnet, via CLAUDE_CODE_OAUTH_TOKEN)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Only a boolean reaches the environment — never the credential itself.
+    env:
+      HAS_CLAUDE_CREDENTIAL: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+
+    steps:
+      - name: Report dormant (no CLAUDE_CODE_OAUTH_TOKEN configured)
+        if: env.HAS_CLAUDE_CREDENTIAL != 'true'
+        run: |
+          {
+            printf '%s\n' '## Claude OAuth smoke skipped'
+            printf '%s\n' ''
+            printf '%s\n' 'No `CLAUDE_CODE_OAUTH_TOKEN` secret is set (this includes every fork PR,'
+            printf '%s\n' 'where secrets are never passed), so nothing ran. Not a failure.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Claude Code
+        if: env.HAS_CLAUDE_CREDENTIAL == 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Generate one reply via Sonnet
+        if: env.HAS_CLAUDE_CREDENTIAL == 'true'
+        env:
+          # The CLI reads this for auth; GitHub masks it in logs. Never echoed here.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # `set -e` + command substitution: a non-zero exit from the CLI (auth failure,
+          # rate limit) aborts the step and reds the job — exactly the signal we want.
+          reply=$(claude -p "Reply with exactly: CI OAuth OK" --model claude-sonnet-5)
+          printf 'Claude replied: %s\n' "$reply"
+          if [ -z "${reply// /}" ]; then
+            echo "::error::Empty response — CLAUDE_CODE_OAUTH_TOKEN did not generate in CI"
+            exit 1
+          fi
+          {
+            printf '%s\n' '## Claude OAuth smoke ✅'
+            printf '%s\n' ''
+            printf '%s\n' 'Sonnet generated a reply in CI using `CLAUDE_CODE_OAUTH_TOKEN`:'
+            printf '%s\n' ''
+            printf '```\n%s\n```\n' "$reply"
+          } >> "$GITHUB_STEP_SUMMARY"
