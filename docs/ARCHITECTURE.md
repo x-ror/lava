@@ -115,6 +115,21 @@ Thin, per-platform `foreign` declarations of JSC's C API. Highlights:
   their backing is bound to a process-lifetime allocator explicitly rather than
   adopting the caller's.
 
+- That registry **fails closed**. A dispatch miss means our own tables are
+  inconsistent, and several natives write through a caller-supplied buffer and
+  signal nothing on return (`crypto.randomFill` into a zeroed `Buffer.alloc`), so
+  answering `undefined` would forge a correct-looking result rather than merely
+  fail. The miss raises through `jsc.host_throw` instead, and every native signals
+  failure the same way — by setting `exception^`, never by its return value.
+
+- The host-call path itself is reached by `dlsym`ing a C++ mangled symbol
+  (`pkg/jsc/host_function.odin`), so it can vanish under a JSC upgrade; callers
+  then fall back to `JSObjectMakeFunctionWithCallback`. The two are **not**
+  observably identical (`.length`, constructibility — see `inject_native_function`),
+  so `LAVA_HOSTFN_DISABLE=1` forces the fallback and `make test-lava-nohostfn` runs
+  every oracle suite through it, the same way `LAVA_NET_FORCE_READINESS` covers the
+  second I/O backend.
+
 ### 3.3 Standard library: native + embedded JS
 
 Built-ins are JS factories `#load`-embedded at compile time (`globals.odin:1144`)

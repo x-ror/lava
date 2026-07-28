@@ -170,6 +170,17 @@ destroy_runtime_state :: proc(ctx: jsc.JSContextRef, state: ^Runtime_State) {
 	unprotect_before_eval_exit(ctx, state.rejection_handler)
 	unprotect_before_eval_exit(ctx, state.dispatch_fn)
 	unprotect_before_eval_exit(ctx, state.next_tick_drain)
+	// Clear the global's private slot BEFORE the free, so get_state_from_ctx can
+	// never hand out a dangling ^Runtime_State. The reachable path is the one the
+	// fail-closed dispatcher defines: host_dispatch_miss -> make_js_error ->
+	// get_state_from_ctx, and the sweep above has just emptied this context's
+	// registry, so any host-native call after this point is a GUARANTEED miss.
+	// Without this, the one code path specified to run when our invariants are
+	// already broken would read freed memory; with it, the miss lands in the
+	// already-handled state == nil branch. No JS runs after this today (traced:
+	// release_global_context_after_eval evaluates nothing), so this is defence in
+	// depth, not a live bug — one C-API call at teardown for that.
+	jsc.JSObjectSetPrivate(jsc.JSContextGetGlobalObject(ctx), nil)
 	free(state)
 }
 
@@ -232,6 +243,36 @@ module_cache_get :: proc(state: ^Runtime_State, key: string) -> (jsc.JSValueRef,
 	return entry.value, ok
 }
 
+// module_cache_insert_new adds an entry for a key not already present: clone the
+// key through the state allocator, protect the value, store — rolling back both
+// if the map grow fails.
+//
+// CHECKED, unlike most `m[k] = v` in this package, because this entry owns two
+// resources rather than none: the cloned key and a GC root. A discarded insert
+// error leaks the clone and pins `value` for the life of the VM with nothing left
+// that knows to release it — teardown unprotects by walking this very map. That
+// payload, not the shape, is why these two call sites are worth the helper and
+// the ~95 other bare inserts in pkg/runtime are left alone.
+//
+// map_insert returns the stored value's pointer, nil exactly when the grow
+// allocation failed (base/runtime/dynamic_map_internal.odin). Same signal the
+// host-native registry uses.
+@(private = "file")
+module_cache_insert_new :: proc(
+	ctx: jsc.JSContextRef,
+	state: ^Runtime_State,
+	key: string,
+	value: jsc.JSValueRef,
+) {
+	cloned, err := strings.clone(key, state.allocator)
+	if err != nil do return
+	jsc.JSValueProtect(ctx, value)
+	if map_insert(&state.module_cache, cloned, Cached_Module{value = value, key = cloned}) == nil {
+		jsc.JSValueUnprotect(ctx, value)
+		delete(cloned, state.allocator)
+	}
+}
+
 module_cache_put :: proc(
 	ctx: jsc.JSContextRef,
 	state: ^Runtime_State,
@@ -240,10 +281,7 @@ module_cache_put :: proc(
 ) {
 	if state == nil do return
 	if _, ok := state.module_cache[key]; ok do return
-	cloned, err := strings.clone(key, state.allocator)
-	if err != nil do return
-	jsc.JSValueProtect(ctx, value)
-	state.module_cache[cloned] = Cached_Module{value = value, key = cloned}
+	module_cache_insert_new(ctx, state, key, value)
 }
 
 // module_cache_set inserts or replaces the cached exports for `key`. The
@@ -263,13 +301,13 @@ module_cache_set :: proc(
 		jsc.JSValueProtect(ctx, value) // protect new before unprotecting old
 		jsc.JSValueUnprotect(ctx, entry.value)
 		entry.value = value // keep entry.key (the existing owned key string)
+		// Unchecked on purpose, and it is the one insert shape that cannot fail: the
+		// key is already present (we just read it), so this overwrites a slot instead
+		// of growing the map.
 		state.module_cache[key] = entry
 		return
 	}
-	cloned, err := strings.clone(key, state.allocator)
-	if err != nil do return
-	jsc.JSValueProtect(ctx, value)
-	state.module_cache[cloned] = Cached_Module{value = value, key = cloned}
+	module_cache_insert_new(ctx, state, key, value)
 }
 
 // module_cache_remove drops a cached entry, unprotecting its value and freeing
@@ -734,8 +772,14 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 	set_named(ctx, global, "globalThis", cast(jsc.JSValueRef)global)
 	set_named(ctx, global, "global", cast(jsc.JSValueRef)global)
 
-	inject_native_function(ctx, global, "setTimeout", set_timeout_cb)
-	inject_native_function(ctx, global, "setInterval", set_interval_cb)
+	// Explicit arity: these are the only natives whose `.length` reaches user code,
+	// so Node is the oracle for it — setTimeout(callback, delay) and
+	// setInterval(callback, delay) report 2, the rest 1. They all reported 1 before
+	// (inject_native_function's default), which was a silent parity gap on the
+	// working path, not just on the fallback. Pinned by
+	// tests/node-compat/cases/56-native-function-arity.js.
+	inject_native_function(ctx, global, "setTimeout", set_timeout_cb, arity = 2)
+	inject_native_function(ctx, global, "setInterval", set_interval_cb, arity = 2)
 	inject_native_function(ctx, global, "setImmediate", set_immediate_cb)
 	inject_native_function(ctx, global, "clearTimeout", clear_timer_cb)
 	inject_native_function(ctx, global, "clearInterval", clear_timer_cb)

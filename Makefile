@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials check-jsc check-native native-deps test test-all test-lava api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -49,6 +49,8 @@ help:
 	@printf '%s\n' '  make test               Run Odin and Node compatibility tests'
 	@printf '%s\n' '  make test-all           Run unified test script (Odin + oracle suites)'
 	@printf '%s\n' '  make test-lava          Compare every supported oracle suite through Lava (run-oracles.sh)'
+	@printf '%s\n' '  make test-lava-nohostfn Same suites with the JSC private host-call ABI forced off (C-API fallback)'
+	@printf '%s\n' '  make test-odin-serial   Odin CLI tests on ONE runner thread (shared-thread eval defects)'
 	@printf '%s\n' '  make api-surface        Report Buffer/Crypto API surface differences vs Node'
 	@printf '%s\n' '  make vendor-bun-report  Summarize vendored Bun node compatibility corpus'
 	@printf '%s\n' '  make bun-buffer-report  List vendored Bun buffer tests and adapted ports'
@@ -188,6 +190,16 @@ test-compat-lava-strict: build
 test-odin: native-deps
 	$(ODIN) test cmd/lava -collection:lava=.
 
+# The Odin test runner defaults to one thread per core, so each test that calls
+# lava.eval usually gets a fresh thread — and the host-native registry, the
+# private-ABI probe latch and JSC's context-address recycling are all THREAD-local.
+# ODIN_TEST_THREADS=1 is the only configuration where several eval call sites share
+# one runner thread, which is the exact shape of the two defects fixed in #317 and
+# #319 (a thread-lived table bound to a per-test tracking allocator; a cache keyed
+# by a recycled JSGlobalContext address). Cheap enough to just run: ~0.25s.
+test-odin-serial: native-deps
+	ODIN_TEST_THREADS=1 $(ODIN) test cmd/lava -collection:lava=.
+
 test-eventloop-odin:
 	$(ODIN) test pkg/runtime/eventloop
 
@@ -263,8 +275,21 @@ bench-http: build
 test-lava: build
 	RUN_LAVA=1 LAVA_BIN="$(LAVA)" ./scripts/run-oracles.sh
 
+# Same suites with the private-ABI host-call path forced off, so every native is
+# built by JSObjectMakeFunctionWithCallback instead. That fallback is documented
+# behaviour with no coverage: it was only ever exercised by the macOS and Windows
+# jobs, which have been disabled since the Linux-first switch, and it is exactly
+# where a JSC upgrade that renamed the mangled symbol pkg/jsc dlsyms would land the
+# whole runtime. Same idea as test-net-smoke running both socket backends.
+test-lava-nohostfn: build
+	RUN_LAVA=1 LAVA_BIN="$(LAVA)" LAVA_HOSTFN_DISABLE=1 ./scripts/run-oracles.sh
+
+# -collection:lava=. is required, not optional: cmd/lava's test files import
+# "lava:pkg/runtime", so without it strip-semicolon fails to parse the package and
+# the target has been exiting non-zero for every caller. CLAUDE.md asks for `make
+# fmt` before committing Odin, so it needs to actually run.
 fmt:
-	$(ODIN) strip-semicolon cmd/lava
+	$(ODIN) strip-semicolon cmd/lava -collection:lava=.
 	$(ODIN) strip-semicolon pkg/jsc -no-entry-point
 
 # `rm` isn't a Windows command and can't take the $(RUNSCRIPT) prefix (bash would treat

@@ -11,6 +11,12 @@ conclusions instead. Four routed targets are **not** in CI —
 `make bench-gate` — so a diff that routes to one of those needs a local run, or a
 new CI step if it should be enforced.
 
+**Do not trust the AI review check's colour.** It is advisory and
+`continue-on-error`, so a run that failed at init still reports success. The
+"Flag a no-op review" step now trips on zero turns, `is_error`, *and* a zero
+cost; if the summary says "AI review did not run", nothing was reviewed no matter
+what the check shows.
+
 ## Always
 
 | Command | Covers |
@@ -19,6 +25,8 @@ new CI step if it should be enforced.
 | `make build` | Links `bin/lava`. Required before every `*-lava`, smoke, or bench target. |
 | `make test` | Odin unit tests + oracle suites (`scripts/run-tests.sh`). |
 | `make test-lava` | Every oracle suite the platform supports, node-vs-Lava (`run-oracles.sh`). |
+| `make test-lava-nohostfn` | The same suites with `LAVA_HOSTFN_DISABLE=1`, i.e. every native built by the public C API instead of JSC's private host-call ABI. Required for any change under `pkg/jsc`, `host_natives.odin`, or `require.odin`. |
+| `make test-odin-serial` | `cmd/lava` tests on ONE runner thread — the only configuration where several `lava.eval` sites share a thread, and therefore the thread-local host-native registry and JSC's recycled context addresses. ~0.25s. |
 
 `make fmt` (`odin strip-semicolon`) before committing Odin.
 `make check-js` whenever any `.js`/`.mjs`/`.cjs` under `pkg/runtime/js`, `tests`,
@@ -66,6 +74,13 @@ memory per idle connection), or a profile. JSC sampling profiler:
 Networking has two I/O backends. The smokes that take `LAVA_NET_FORCE_READINESS=1`
 run **twice** (proactor and readiness) — do not report a networking change as
 verified from one backend.
+
+Native-function creation has two backends for the same reason. Normally every
+native is a JSC host function created through a dlsym'd private symbol; with
+`LAVA_HOSTFN_DISABLE=1` (`make test-lava-nohostfn`) they all come from
+`JSObjectMakeFunctionWithCallback` instead. The two are **not** observably
+identical — `.length` and constructibility differ, see `inject_native_function` —
+so a change to native registration is not verified from one of them either.
 
 ## Known-gap files
 

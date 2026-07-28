@@ -205,14 +205,15 @@ coupling.
 - [x] **`setTimeout`/`setInterval` ignore extra trailing args** — fixed:
       `capture_timer_args` clones and GC-protects the trailing arguments and
       forwards them to the callback (Node parity).
-- [ ] **`bench --gate` reads a single launch** — `bench/run.mjs` compares one
-      launch per build and `bench/lib/harness.js` takes best-of-5 within it. The
-      measured spread of that estimator is 1.11-1.28x quiet and up to 2.26x under
-      load, so a cap sized to catch a ~1.4x regression cannot separate the two.
-      Taking the MEDIAN of 3 launches for capped benchmarks was measured to cut the
-      loaded-box false-positive rate ~40% with detection unchanged at 100%, for
-      ~16s of CI. Do NOT "fix" this by pinning: pinning shifts the ratio level
-      25-40% (it hurts node more than Lava) and would invalidate all 22 caps.
+- [x] **`bench --gate` reads a single launch** — fixed: `--gate` now takes the
+      MEDIAN of 3 launches per side (`collectMedian` in `bench/run.mjs`);
+      report-only runs still take one, since they fail nothing and so pay no
+      false-positive cost. The single-launch estimator's measured spread was
+      1.11-1.28x quiet and up to 2.26x under load, so a cap sized to catch a ~1.4x
+      regression could not separate the two; median-of-3 cuts the loaded-box
+      false-positive rate ~40% with detection unchanged at 100%, for ~16s of CI.
+      Do NOT "fix" the remaining variance by pinning: pinning shifts the ratio
+      level 25-40% (it hurts node more than Lava) and would invalidate all 22 caps.
 - [ ] **Host-native registry: consider moving `g_host_native_fns` onto
       `Runtime_State`** — it is read only at registration and in the sweep, never
       on the dispatch path (only `g_host_native_cbs` is), so keying it by the

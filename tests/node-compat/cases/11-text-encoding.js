@@ -147,3 +147,57 @@ assert.throws(
   assert.equal(d.decode(new Uint8Array([0xe2, 0x82]), { stream: true }), '');
   assert.throws(() => d.decode(), { code: 'ERR_ENCODING_INVALID_ENCODED_DATA' });
 }
+
+// --- options validation (Node's validateObject, nullable + arrays + functions) ---
+// Every scalar is rejected; null/array/function are accepted. Lava silently
+// ignored a bad `options` until 2026-07-28.
+for (const bad of [5, -0, NaN, 'x', '', true, false, 1n, Symbol('s')]) {
+  assert.throws(() => new TextDecoder('utf-8', bad), { code: 'ERR_INVALID_ARG_TYPE' });
+  assert.throws(() => new TextDecoder().decode(new Uint8Array(1), bad), {
+    code: 'ERR_INVALID_ARG_TYPE',
+  });
+}
+for (const ok of [undefined, null, [1, 2], function () {}, Object.create(null)]) {
+  assert.equal(new TextDecoder('utf-8', ok).encoding, 'utf-8');
+  assert.equal(new TextDecoder().decode(new Uint8Array([0x41]), ok), 'A');
+}
+// The "Received ..." tail is part of the message, so a mismatched formatter shows up here.
+assert.throws(() => new TextDecoder('utf-8', 5), {
+  message: 'The "options" argument must be of type object. Received type number (5)',
+});
+assert.throws(() => new TextDecoder('utf-8', 'ab'), {
+  message: 'The "options" argument must be of type object. Received type string (\'ab\')',
+});
+
+// Validation ORDER, which is observable three ways.
+// 1. options are validated before the label is resolved
+assert.throws(() => new TextDecoder('bogus-enc', 5), { code: 'ERR_INVALID_ARG_TYPE' });
+// 2. but after the label is coerced, so a throwing toString still wins
+assert.throws(
+  () =>
+    new TextDecoder(
+      {
+        toString() {
+          throw new RangeError('coerced first');
+        },
+      },
+      5,
+    ),
+  { message: 'coerced first' },
+);
+// 3. decode validates options before converting the input
+assert.throws(() => new TextDecoder().decode(5, 5), { code: 'ERR_INVALID_ARG_TYPE' });
+
+// --- decoder accumulator: exact behaviour at unitsToString's 0x2000 chunk edge ---
+// The JS decode paths build a Uint16Array and hand its bytes to the utf16le codec;
+// these sizes straddle the boundary where that used to switch to chunked
+// String.fromCharCode, and one of them is the over-allocated-tail case.
+for (const n of [0, 1, 0x1fff, 0x2000, 0x2001]) {
+  const latin = new Uint8Array(n).fill(0xe9);
+  assert.equal(new TextDecoder('windows-1252').decode(latin), 'é'.repeat(n));
+  const utf16 = new Uint8Array(n * 2);
+  for (let i = 0; i < n; i++) utf16[i * 2] = 0xe9;
+  assert.equal(new TextDecoder('utf-16le').decode(utf16), 'é'.repeat(n));
+}
+// A surrogate pair emitted from the accumulator must survive as one code point.
+assert.equal(new TextDecoder('utf-8', { fatal: true }).decode(new TextEncoder().encode('𝄞')), '𝄞');

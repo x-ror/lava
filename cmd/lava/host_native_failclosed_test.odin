@@ -57,8 +57,14 @@ eval_to_string :: proc(ctx: jsc.JSContextRef, source: string) -> (string, bool) 
 	exception: jsc.JSValueRef
 	value := jsc.JSEvaluateScript(ctx, js_src, nil, nil, 1, &exception)
 	if exception != nil || value == nil do return "", false
-	text, _ := lava.jsc_value_to_string_or_default(ctx, value)
-	return text, true
+	// Owned context.allocator buffer; freed here and re-cloned into the temp arena so
+	// the runner's per-test tracking allocator does not report the helper as a leak.
+	owned, got := lava.jsc_value_to_string_or_default(ctx, value)
+	if !got do return "", true // empty string: nothing was allocated
+	defer delete(owned)
+	copied, clone_err := strings.clone(owned, context.temp_allocator)
+	if clone_err != nil do return "", false
+	return copied, true
 }
 
 @(test)

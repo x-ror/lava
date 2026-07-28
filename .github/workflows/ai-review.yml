@@ -147,7 +147,15 @@ jobs:
 
       # A review that does nothing must not read as a review that found nothing.
       # `continue-on-error` above keeps a failed review from redding the PR, which also
-      # means a zero-turn run reports success — the check is green and no one looks.
+      # means a no-op run reports success — the check is green and no one looks.
+      #
+      # THREE signals, not one. `turns == 0` alone was not enough: every observed run of
+      # this job so far reported `is_error: true`, `num_turns: 1`, `total_cost_usd: 0` and
+      # finished in ~200 ms — it fails immediately after init, almost certainly a
+      # credential/model-access problem. One turn is not zero turns, so the old guard let
+      # it through and wrote "AI review ran" into the summary. Two merged PRs displayed a
+      # green AI review that never happened. A run that errored, or that cost nothing,
+      # examined nothing, whatever its turn count.
       #
       # Zero turns almost always means the prompt resolved to nothing. The usual cause is
       # structural rather than a typo: the action restores .claude/ and CLAUDE.md from
@@ -161,7 +169,7 @@ jobs:
         env:
           EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
         run: |
-          read -r turns cost < <(node -e '
+          read -r turns cost errored < <(node -e '
             const fs = require("fs");
             let msgs = [];
             try {
@@ -176,20 +184,29 @@ jobs:
               }
             } catch {}
             const r = [...msgs].reverse().find(m => m && m.type === "result");
-            console.log(`${r ? r.num_turns : "unknown"} ${r ? r.total_cost_usd : "unknown"}`);
-          ' "$EXECUTION_FILE" 2>/dev/null || echo "unknown unknown")
+            const f = (k) => (r && r[k] !== undefined ? String(r[k]) : "unknown");
+            console.log(`${f("num_turns")} ${f("total_cost_usd")} ${f("is_error")}`);
+          ' "$EXECUTION_FILE" 2>/dev/null || echo "unknown unknown unknown")
 
-          if [ "$turns" = "0" ] || [ "$turns" = "unknown" ]; then
-            echo "::warning title=AI review did not run::The review made $turns turns — no diff was examined. The check is green because the job is advisory, not because the code was reviewed."
+          reason=
+          case "$turns" in 0|unknown) reason="it made $turns turns" ;; esac
+          [ -z "$reason" ] && [ "$errored" = "true" ] && reason='it reported is_error: true'
+          [ -z "$reason" ] && case "$cost" in 0|0.0|unknown) reason="it cost \$$cost" ;; esac
+
+          if [ -n "$reason" ]; then
+            echo "::warning title=AI review did not run::No diff was examined — $reason. The check is green because the job is advisory, not because the code was reviewed."
             {
               printf '%s\n' '## AI review did not run'
               printf '%s\n' ''
-              printf '%s\n' "Turns: \`$turns\`. Cost: \`$cost\`. Nothing was reviewed."
+              printf '%s\n' "Turns: \`$turns\`. Cost: \`$cost\`. is_error: \`$errored\`. Nothing was reviewed ($reason)."
               printf '%s\n' ''
-              printf '%s\n' 'The action restores `.claude/` and `CLAUDE.md` from `origin/master` because the'
-              printf '%s\n' 'PR head is untrusted, so a skill present only on this branch does not exist at'
-              printf '%s\n' 'run time. Expected while the pipeline itself is being added; if master already'
-              printf '%s\n' 'carries `.claude/skills/pr-gate/`, this is a real failure — read the step log.'
+              printf '%s\n' 'An immediate `is_error` with one turn and zero cost is a credential or'
+              printf '%s\n' 'model-access failure — check that `CLAUDE_CODE_OAUTH_TOKEN` (or'
+              printf '%s\n' '`ANTHROPIC_API_KEY`) is still valid and that the pinned `--model` is'
+              printf '%s\n' 'available to it. Zero turns instead means the prompt resolved to nothing: the'
+              printf '%s\n' 'action restores `.claude/` and `CLAUDE.md` from `origin/master` because the PR'
+              printf '%s\n' 'head is untrusted, so a skill present only on this branch does not exist at run'
+              printf '%s\n' 'time. Either way, read the step log.'
             } >> "$GITHUB_STEP_SUMMARY"
           else
             printf '%s\n' "AI review ran: $turns turns, cost $cost." >> "$GITHUB_STEP_SUMMARY"

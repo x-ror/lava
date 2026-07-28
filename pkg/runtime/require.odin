@@ -282,12 +282,40 @@ make_module_not_found :: proc(ctx: jsc.JSContextRef, specifier: string) -> jsc.J
 // (host_natives.odin), which also caches — repeated injections of the same
 // callback (fs.Stats methods, per-instance handles) share one function object.
 // When the host path is unavailable the portable C-API callback is used.
+// `arity` is the function's `.length`. It defaults to 1 because that is right for
+// almost every `native.*` binding, which JS-internal code reaches through the
+// factory's fourth argument where `.length` is unobservable. It matters for the
+// few natives injected onto globalThis (setTimeout & co, globals.odin), where
+// `.length` IS user-visible and Node is the oracle.
+//
+// THE TWO CREATION PATHS ARE NOT OBSERVABLY EQUIVALENT, and earlier comments in
+// this codebase claimed they were. Measured 2026-07-28 on setTimeout:
+//
+//	host path (jsc.host_function_create): .length == arity, constructible
+//	C-API fallback:                       .length == 0,     `new` throws TypeError
+//	node 24:                              .length == 2,     constructible
+//
+// Neither difference is repairable from the public C API. JSObjectSetProperty
+// routes through defineOwnProperty only when the property is ABSENT, and it tests
+// that with hasProperty, which walks the prototype chain — `length` is inherited
+// from Function.prototype, so the call always degrades to a [[Set]] against a
+// writable:false slot and silently no-ops (deleting the own copy first does not
+// help, for the same reason). Fixing it needs a JS-level defineProperty, i.e.
+// evaluating script during global installation, which is not worth it for a path
+// taken only when the private ABI is missing.
+//
+// So the divergence is pinned instead of papered over:
+// tests/node-compat/cases/56-native-function-arity.js asserts Node's arities in
+// the DEFAULT configuration. A JSC upgrade that renamed the mangled symbol
+// pkg/jsc dlsyms silently demotes every native to the fallback — that case is
+// what turns it into a loud failure rather than a `.length` that quietly became 0.
 inject_native_function :: proc(
 	ctx: jsc.JSContextRef,
 	object: jsc.JSObjectRef,
 	name: string,
 	callback: jsc.JSObjectCallAsFunctionCallback,
 	host: jsc.Host_Function_Proc = nil,
+	arity: int = 1,
 ) {
 	c_name, err := strings.clone_to_cstring(name, context.temp_allocator)
 	if err != nil do return
@@ -297,9 +325,9 @@ inject_native_function :: proc(
 
 	fn: jsc.JSObjectRef
 	if host != nil {
-		fn, _ = jsc.host_function_create(ctx, name, host, 1)
+		fn, _ = jsc.host_function_create(ctx, name, host, arity)
 	} else {
-		fn = host_native_create(ctx, name, callback)
+		fn = host_native_create(ctx, name, callback, arity)
 	}
 	if fn == nil {
 		fn = jsc.JSObjectMakeFunctionWithCallback(ctx, js_name, callback)

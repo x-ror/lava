@@ -61,6 +61,21 @@ jobs:
       - name: Test (Lava behavior)
         run: make test-lava
 
+      # The same oracle suites with LAVA_HOSTFN_DISABLE=1, which forces every native
+      # onto the public-C-API fallback instead of JSC's private host-call ABI. Half of
+      # a documented fallback had been running nowhere since the macOS/Windows jobs
+      # were disabled, and it is the path a JSC upgrade renaming the dlsym'd mangled
+      # symbol drops the whole runtime onto.
+      - name: Test (Lava behavior, C-API fallback)
+        run: make test-lava-nohostfn
+
+      # The Odin runner gives each test its own thread by default; on one thread the
+      # eval call sites share the thread-local host-native registry and JSC's recycled
+      # context addresses. That sharing is the shape of two already-fixed defects, and
+      # nothing else in CI produces it. ~0.25s.
+      - name: Test (Odin, single runner thread)
+        run: make test-odin-serial
+
       # Real socket transport: start a Node origin and require lava's fetch output
       # to match Node's, over http://, https:// (TLS), and IPv6 loopback. Excluded
       # from `make test` because it binds a local port; runs here as its own gate.

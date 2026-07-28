@@ -299,13 +299,34 @@
     return out.toString(outputEncoding);
   }
 
+  // Every CSPRNG entry point goes through this, and none calls native.randomFill
+  // directly. The native returns the view it filled, so an identity check is the
+  // available proof that the fill ran — and a fill that did NOT run is silently
+  // indistinguishable from success at every one of these call sites: randomBytes
+  // and randomUUID hand back a Buffer.alloc that is merely zeroed, and
+  // getRandomValues hands back the CALLER's array, untouched, without even that.
+  //
+  // The dispatcher (pkg/runtime/host_natives.odin) already fails closed, so this
+  // is the second layer, not the first. It exists because the first one is one
+  // registration decision away from not covering this native — moving randomFill
+  // to a baked-in *_host wrapper, or off the host path entirely, changes which
+  // code answers a miss. A wrong answer here is silent forged entropy, so it is
+  // the one place worth paying a comparison per call to make undeniable. The
+  // error is deliberately not a Node ERR_* code: Node has no counterpart, because
+  // in Node this cannot happen.
+  function fillRandom(view) {
+    if (native.randomFill(view) !== view)
+      throw new Error('lava: CSPRNG unavailable (native.randomFill did not fill the buffer)');
+    return view;
+  }
+
   function randomBytes(size, callback) {
     // Node validates size as 0..2^31-1 (NaN rejected, fractional truncated); a
     // negative/huge value used to wrap into a multi-gigabyte allocation instead
     // of a catchable RangeError.
     size = validateByteCount(size, 'size');
     var buf = Buffer.alloc(size);
-    native.randomFill(buf);
+    if (size > 0) fillRandom(buf);
     if (typeof callback === 'function') {
       setImmediate(function () {
         callback(null, buf);
@@ -362,7 +383,7 @@
       size === undefined
         ? byteLength - offsetBytes
         : assertSize(size, elementSize, offsetBytes, byteLength);
-    if (sizeBytes > 0) native.randomFill(new Uint8Array(ab, base + offsetBytes, sizeBytes));
+    if (sizeBytes > 0) fillRandom(new Uint8Array(ab, base + offsetBytes, sizeBytes));
     return buffer;
   }
 
@@ -417,9 +438,7 @@
       );
     }
     if (typedArray.byteLength > 0) {
-      native.randomFill(
-        new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength),
-      );
+      fillRandom(new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength));
     }
     return typedArray;
   }

@@ -24,9 +24,6 @@
   // through the variadic ArrayPrototypePush measured 1.43x on the JS decode
   // path (callerN's arguments switch is ~7x a direct call).
   var P = require('primordials');
-  var ArrayG = P.Array;
-  var ObjectSetPrototypeOf = P.ObjectSetPrototypeOf;
-  var ArrayPrototypeSlice = P.ArrayPrototypeSlice;
   var StringPrototypeSlice = P.StringPrototypeSlice;
   var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
   var StringPrototypeCodePointAt = P.StringPrototypeCodePointAt;
@@ -37,6 +34,8 @@
   var TypeErrorG = P.TypeError;
   var RangeErrorG = P.RangeError;
   var Uint8ArrayG = P.Uint8Array;
+  var Uint16ArrayG = P.Uint16Array;
+  var TypedArrayPrototypeSubarray = P.TypedArrayPrototypeSubarray;
   var ArrayBufferG = P.ArrayBuffer;
   var ArrayBufferIsView = P.ArrayBufferIsView;
   // Free globals / statics, captured pristine at module-eval.
@@ -156,6 +155,28 @@
     var e = new TypeErrorG(message);
     e.code = 'ERR_INVALID_ARG_TYPE';
     return e;
+  }
+
+  // Node's validateObject(value, 'options', kValidateObjectAllowObjects) as it is
+  // called from TextDecoder — nullable, and arrays and functions allowed. Verified
+  // against node 24 rather than read off the docs: `null`, `[1,2]` and `()=>{}`
+  // are accepted; every scalar including `-0`, `NaN`, `''` and `false` throws.
+  // It runs BEFORE the label is looked at (see the constructor), which is why it
+  // exists as a function instead of being folded into the `options || kEmptyObject`
+  // line — the order is observable when both arguments are bad.
+  // Callers guard with `options !== undefined && options !== null` before calling,
+  // so the overwhelmingly common `new TextDecoder('utf-8')` / `decode(bytes)` pays
+  // two comparisons and no call. The same test is repeated here because this is a
+  // validator and must be correct when called directly. Worth the duplication:
+  // as a bare call this cost 1.087x on `new-textdecoder` (200k constructions,
+  // paired median of 15 launches); guarded it is 1.035x.
+  function validateOptions(options) {
+    if (options === undefined || options === null) return;
+    var t = typeof options;
+    if (t === 'object' || t === 'function') return;
+    throw errInvalidArgType(
+      'The "options" argument must be of type object. Received ' + describeReceived(options),
+    );
   }
 
   function toBytes(input) {
@@ -303,13 +324,50 @@
     return n + 2;
   }
 
+  // A Uint16Array's backing bytes ARE UTF-16 code units in platform order, so on
+  // a little-endian target the decoded string is exactly what Buffer's native
+  // utf16le codec produces from those same bytes — no per-unit JS work, no
+  // chunking, no `apply` at all.
+  //
+  // This is not just tidier, it is why the accumulator could become a typed array
+  // in the first place. String.fromCharCode.apply has a JSArray-only fast path in
+  // JSC: over a Uint16Array subarray it costs 95.75ms where the plain Array cost
+  // 44.18ms (3960 units x 3000 reps), which turned the memory fix into a 1.6-1.7x
+  // decode regression. Routing the same bytes through the native codec measures
+  // 13.74ms — 3.2x FASTER than the Array path this replaces. Numbers from
+  // bench/micro/encoding.js's payload size; see the PR for the paired medians.
+  var LITTLE_ENDIAN = (function () {
+    var probe = new Uint16ArrayG(1);
+    probe[0] = 0x0102;
+    return new Uint8ArrayG(probe.buffer)[0] === 0x02;
+  })();
+
   // fromCharCode applied to the whole array blows the call stack past ~64k args,
-  // so build the result in fixed chunks.
-  function unitsToString(units) {
-    if (units.length <= 0x2000) return ReflectApply(StringFromCharCode, null, units);
+  // so the big-endian fallback builds the result in fixed chunks. `count` is the
+  // number of units actually emitted; `units` is over-allocated, so every read
+  // goes through subarray.
+  function unitsToString(units, count) {
+    if (count === 0) return '';
+    if (LITTLE_ENDIAN)
+      // The view is built with the PRIMORDIAL Uint8Array, not Buffer.from. This
+      // module is hardened and buffer.js is not on this vector: Buffer.from routes
+      // an ArrayBuffer argument through a live `ArrayBuffer.isView` read, so
+      // poisoning globalThis.ArrayBuffer with a plain function made every decode
+      // throw "ArrayBuffer.isView is not a function" — caught by
+      // tests/node-compat/cases/55-encoding-pollution.js P2 the first time this
+      // path shipped. Only the prototype METHOD is borrowed from Buffer, applied to
+      // an ordinary Uint8Array, which is what buffer.js's toString already accepts.
+      return BufferProtoToString.call(new Uint8ArrayG(units.buffer, 0, count * 2), 'utf16le');
+    // Big-endian: Buffer's utf16le would byte-swap every unit. No target Lava
+    // builds for is big-endian today, so this arm is correctness insurance for a
+    // future port, not a live path — it is the exact code the fast arm replaced.
     var out = '';
-    for (var i = 0; i < units.length; i += 0x2000) {
-      out += ReflectApply(StringFromCharCode, null, ArrayPrototypeSlice(units, i, i + 0x2000));
+    for (var i = 0; i < count; i += 0x2000) {
+      out += ReflectApply(
+        StringFromCharCode,
+        null,
+        TypedArrayPrototypeSubarray(units, i, i + 0x2000 < count ? i + 0x2000 : count),
+      );
     }
     return out;
   }
@@ -459,6 +517,12 @@
     // caller-supplied toString/Symbol.toPrimitive a second time, so the thrown
     // error could name a label that was never looked up. Node coerces once too.
     var text = label === undefined ? 'utf-8' : StringG(label);
+    // Order is Node's, and it is observable in three places, so it is pinned by
+    // 11-text-encoding.js rather than left to reading: the label is COERCED first
+    // (a throwing toString wins over a bad options), options are VALIDATED second
+    // (`new TextDecoder('bogus-enc', 5)` reports the options, not the encoding),
+    // and only then is the label RESOLVED.
+    if (options !== undefined && options !== null) validateOptions(options);
     var enc = normalizeLabel(text);
     if (enc === undefined) {
       var labelErr = new RangeErrorG('The "' + text + '" encoding is not supported');
@@ -467,9 +531,8 @@
     }
     // An omitted `options` must not inherit fatal/ignoreBOM from a poisoned
     // Object.prototype, hence the shared null-prototype kEmptyObject. An options
-    // object the caller passes is read as-is — also what Node does, except that
-    // Node first validateObject()s it (ERR_INVALID_ARG_TYPE for a non-object,
-    // non-null); Lava does not yet, so a scalar options argument is ignored here.
+    // object the caller passes is read as-is, which is also what Node does once it
+    // has validated the argument above.
     options = options || kEmptyObject;
     // `__proto__: null` on the descriptors: ToPropertyDescriptor reads get/set/
     // writable/enumerable with HasProperty, which walks the prototype chain, so
@@ -501,6 +564,9 @@
   });
 
   TextDecoder.prototype.decode = function (input, options) {
+    // Before toBytes, matching Node: decode(5, 5) reports the options, not the
+    // input. Same validator as the constructor.
+    if (options !== undefined && options !== null) validateOptions(options);
     var bytes = toBytes(input);
     var stream = !!(options && options.stream);
     var s = this._state;
@@ -533,7 +599,17 @@
     // Upper bound on emitted code units: utf-8 and windows-1252 emit at most one
     // per input byte (a 4-byte sequence yields a surrogate PAIR from 4 bytes),
     // utf-16le at most one per two, and a final flush adds at most two more.
-    var units = ObjectSetPrototypeOf(new ArrayG(bytes.length + 4), null);
+    //
+    // A Uint16Array, not a JS Array: every element here IS a UTF-16 code unit, so
+    // two bytes each instead of a boxed 8-byte slot, and the storage is off the GC
+    // heap. Measured on a 16 MB windows-1252 decode: 388 MB peak RSS -> 167 MB
+    // against node 24's 135 MB, which is the difference between "scales with the
+    // input" and "4x the input". url.js reaches this for any percent-encoded host
+    // (percentDecodeHostStrict), so the input is attacker-sized. It also drops the
+    // ObjectSetPrototypeOf hardening this line used to need: indexed access on a
+    // typed array never consults the prototype chain, so there is nothing to
+    // poison.
+    var units = new Uint16ArrayG(bytes.length + 4);
     var count;
     if (this._enc === 'windows-1252') {
       count = decodeWin1252Units(bytes, units);
@@ -542,8 +618,7 @@
     } else {
       count = decodeUtf16le(s, bytes, isFinal, this._fatal, units);
     }
-    units.length = count;
-    var result = unitsToString(units);
+    var result = unitsToString(units, count);
     // Strip the BOM once, at the first output of the (possibly chunked) stream.
     if (!s.bomChecked && result.length > 0) {
       s.bomChecked = true;

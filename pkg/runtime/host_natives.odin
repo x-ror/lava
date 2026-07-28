@@ -121,12 +121,29 @@ Host_Native_Key :: struct {
 // before anything can insert. runtime.default_allocator() is the only lifetime
 // that matches a thread-lived table: state.allocator dies with the eval, and the
 // ambient one is whatever the caller happened to install.
+//
+// The two `make` errors are DELIBERATELY dropped, and that was checked rather
+// than assumed. make(map, cap, alloc) routes through make_map_cap, which sets
+// context.allocator = alloc and calls reserve_map; map_reserve_dynamic then binds
+// m.allocator BEFORE the allocation that can fail
+// (base/runtime/dynamic_map_internal.odin: `if m.allocator.procedure == nil {
+// m.allocator = context.allocator }`, then map_alloc_dynamic). So a failed
+// reserve still leaves the table bound to default_allocator with data == 0 — it
+// is NOT the #317 implicit-capture bug, and the very next insert simply retries
+// the grow. That insert is checked (host_native_create below), so an allocation
+// failure surfaces there as a declined cache and a C-API fallback, never as a
+// half-built registry. The flag therefore stays set on the failing path on
+// purpose: re-running the reserve on every injection would buy nothing.
 @(private = "file")
 bind_host_tables :: proc() {
 	if g_host_tables_bound do return
 	g_host_tables_bound = true
-	g_host_native_fns = make(map[Host_Native_Key]jsc.JSObjectRef, 64, runtime.default_allocator())
-	g_host_native_cbs = make(
+	g_host_native_fns, _ = make(
+		map[Host_Native_Key]jsc.JSObjectRef,
+		64,
+		runtime.default_allocator(),
+	)
+	g_host_native_cbs, _ = make(
 		map[rawptr]jsc.JSObjectCallAsFunctionCallback,
 		64,
 		runtime.default_allocator(),
@@ -154,6 +171,17 @@ generic_native_host_cb :: proc "c" (global: rawptr, cf: [^]u64) -> i64 {
 // randomUUID share the shape; getRandomValues is worst, leaving the CALLER's
 // array untouched rather than zeroed. buffer.js's fromString would return
 // uninitialized pool memory. A miss means our own registry is inconsistent.
+//
+// This is the ONLY layer that can close those, and the reason is a convention
+// worth stating so it stops being re-litigated: a native signals failure by
+// setting `exception^` (a real throw), never by its return value. Audited
+// 2026-07-28 — net.end/close/closeServer/startConnection, dns.lookup and
+// sqlite.close/finalize all `return jsc.JSValueMakeUndefined(ctx)` on success and
+// on failure alike, so the JS call sites that "discard the result" are discarding
+// nothing. The two exceptions are documented at their natives: net.write's bool
+// is BACKPRESSURE, not failure (Node's Socket.end ignores it too), and
+// crypto.randomFill returns the view it filled, which crypto.js does check.
+// Anything that wants a checkable failure signal has to add one deliberately.
 @(private = "file")
 host_dispatch_miss :: #force_no_inline proc "c" (ctx: jsc.JSContextRef) -> i64 {
 	context = runtime.default_context()
@@ -175,32 +203,45 @@ host_dispatch_miss :: #force_no_inline proc "c" (ctx: jsc.JSContextRef) -> i64 {
 // host_native_create returns a host-registered function for `cb` (creating and
 // caching it on first use), or nil when the host-call path is unavailable —
 // the caller falls back to JSObjectMakeFunctionWithCallback.
+//
+// `arity` becomes the function's `.length`, so it is part of the OBSERVABLE
+// surface for the handful of natives that reach user code as globals
+// (setTimeout & co). It is also part of the cache key only indirectly: the key is
+// (ctx, cb, name), and a given callback is always injected under one name with
+// one arity, so two arities for one name would collide. Nothing does that today
+// and the naming makes it obvious if anything tries.
 host_native_create :: proc(
 	ctx: jsc.JSContextRef,
 	name: string,
 	cb: jsc.JSObjectCallAsFunctionCallback,
+	arity: int = 1,
 ) -> jsc.JSObjectRef {
 	key := Host_Native_Key{rawptr(ctx), transmute(rawptr)cb, name}
 	// Lookup first: the hit path is hot (measured ~60k hits per 20k fs.statSync,
 	// three per Stats instance) and must not pay for anything below it.
 	if fn, hit := g_host_native_fns[key]; hit do return fn
 
-	fn, ok := jsc.host_function_create(ctx, name, generic_native_host_cb, 1)
+	// State FIRST, before anything is created. Names are cloned through the
+	// Runtime_State's allocator, not the ambient one: this runs from
+	// inject_native_function, which is reachable both from ordinary eval-time setup
+	// AND from inside native_require_cb (a proc "c" whose context is reset to
+	// runtime.default_context()). The sweep frees through that same state
+	// allocator, so the two must be SYMMETRIC — no ambient fallback. Without a
+	// state there is nothing that will ever free the entry, so decline to cache and
+	// let the caller take the C-API path (it already handles a nil return, and
+	// carries `.length` across — see inject_native_function, which also records the
+	// one way the two paths still differ).
+	//
+	// Hoisted above the creation because none of it is needed to answer nil: a
+	// stateless (embedder) context used to mint a JSFunction, protect it, bind two
+	// maps and then discard all three on EVERY injection.
+	state := get_state_from_ctx(ctx)
+	if state == nil do return nil
+
+	fn, ok := jsc.host_function_create(ctx, name, generic_native_host_cb, arity)
 	if !ok || fn == nil do return nil
 	jsc.JSValueProtect(ctx, jsc.JSValueRef(fn))
 	bind_host_tables()
-	// Clone through the Runtime_State's allocator, not the ambient one: this runs
-	// from inject_native_function, which is reachable both from ordinary eval-time
-	// setup AND from inside native_require_cb (a proc "c" whose context is reset to
-	// runtime.default_context()). The sweep frees through that same state
-	// allocator, so the two must be SYMMETRIC — no ambient fallback. Without a
-	// state there is nothing that will ever free this entry, so decline to cache
-	// and let the caller take the C-API path (it already handles a nil return).
-	state := get_state_from_ctx(ctx)
-	if state == nil {
-		jsc.JSValueUnprotect(ctx, jsc.JSValueRef(fn))
-		return nil
-	}
 	alloc := state.allocator
 	cloned, clone_err := strings.clone(name, alloc)
 	if clone_err != nil {

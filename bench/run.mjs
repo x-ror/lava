@@ -72,6 +72,41 @@ function collect(bin, args) {
   return byName;
 }
 
+// --gate reads the MEDIAN of GATE_LAUNCHES launches per side, not a single one.
+//
+// The per-process distribution here is bimodal, so one launch decides a pass/fail
+// on a coin flip the caps were never calibrated against: median-of-3 was measured
+// to cut the loaded-box false-positive rate from ~24% to ~16% with detection
+// unchanged at 100%, for ~16s of CI. bench/thresholds.json has told readers to
+// "re-run and compare MEDIANS of >=3 launches before believing it" since the caps
+// were written — this makes the gate do what the note already asked of humans.
+//
+// Median, never min: min-of-N across launches is invalid on this distribution (it
+// samples the fast mode only, which is not the mode the caps describe). Report-only
+// runs still take one launch, because they fail nothing and pay no false-positive
+// cost. And do NOT try to fix the variance by pinning instead — pinning shifts the
+// ratio level 25-40% (it hurts node more than lava) and would invalidate every cap.
+const GATE_LAUNCHES = 3;
+
+function collectMedian(bin, args, launches) {
+  if (launches <= 1) return collect(bin, args);
+  const samples = new Map();
+  for (let i = 0; i < launches; i++) {
+    for (const [name, r] of collect(bin, args)) {
+      if (!samples.has(name)) samples.set(name, { r, ms: [] });
+      samples.get(name).ms.push(r.ms);
+    }
+  }
+  const byName = new Map();
+  for (const [name, { r, ms }] of samples) {
+    ms.sort((a, b) => a - b);
+    // Lower median on an even count: with launches=3 this is the true median, and
+    // a pessimistic tie-break is the wrong direction for a regression gate.
+    byName.set(name, { ...r, ms: ms[(ms.length - 1) >> 1] });
+  }
+  return byName;
+}
+
 const haveLava = (() => {
   try {
     execFileSync(LAVA_BIN, ['eval', '0'], { stdio: 'ignore' });
@@ -85,7 +120,9 @@ console.log(`node: ${NODE_BIN}`);
 console.log(`lava: ${LAVA_BIN}${haveLava ? '' : '  (not runnable — node-only report)'}`);
 
 const noop = join(ROOT, 'bench', 'micro', 'noop.js');
-const nodeResults = collect(NODE_BIN, []);
+const LAUNCHES = GATE ? GATE_LAUNCHES : 1;
+if (LAUNCHES > 1) console.log(`launches: ${LAUNCHES} per side (median; --gate)`);
+const nodeResults = collectMedian(NODE_BIN, [], LAUNCHES);
 nodeResults.set('startup', {
   name: 'startup',
   iterations: STARTUP_REPS,
@@ -94,7 +131,7 @@ nodeResults.set('startup', {
 
 let lavaResults = new Map();
 if (haveLava) {
-  lavaResults = collect(LAVA_BIN, ['run']);
+  lavaResults = collectMedian(LAVA_BIN, ['run'], LAUNCHES);
   lavaResults.set('startup', {
     name: 'startup',
     iterations: STARTUP_REPS,
