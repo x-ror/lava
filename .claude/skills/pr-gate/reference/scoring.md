@@ -69,9 +69,10 @@ Report the verdict with the two criterion grades, the six gate results, and the
 P0/P1 list. Never report SHIP while a mechanical gate (`make check`,
 `make check-js`, `make test`, the routed smokes) is failing or was not run.
 
-When the mechanical gates are **delegated** (`--review-only`, e.g. a CI job that
-reviews alongside the build job), grade them from the conclusion you actually read
-off the other job — never from the fact that it exists:
+When the mechanical gates are **delegated** (`--review-only` — reviewing from a
+machine without the toolchain, while CI runs the build on the same SHA), grade
+them from the conclusion you actually read off that job — never from the fact
+that it exists:
 
 | State of the routed gate | Counts as | Verdict effect |
 | ------------------------ | --------- | -------------- |
