@@ -27,6 +27,8 @@ const realPush = Array.prototype.push;
 const realBufferFrom = Buffer.from;
 const realBufferToString = Buffer.prototype.toString;
 const realString = globalThis.String;
+const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+const realBufferDesc = Object.getOwnPropertyDescriptor(taProto, 'buffer');
 
 // Indexed writes, not push: Array.prototype.push is one of the intrinsics this
 // script poisons, so the harness must not depend on it either.
@@ -48,6 +50,17 @@ Array.prototype.push = function () { return 0; };
 Buffer.from = function () { return new Uint8Array([0x50]); };
 Buffer.prototype.toString = function () { return 'PWNED'; };
 globalThis.String = function () { return 'PWNED'; };
+// The %TypedArray%.prototype.buffer ACCESSOR — the axis a null prototype cannot
+// close. Node 24 is itself poisonable here: its windows-1252 decode reads the
+// caller's .buffer through this live getter and returns the forged bytes
+// (observed: "!\x00"), which is why this lives in the Lava-only test and not
+// the oracle. Lava must read .buffer only through the getter captured at
+// module-eval (unitsToString and the utf-8 fastpath in encoding.js).
+const forgedBuffer = new Uint16Array([0x21, 0x21, 0x21, 0x21]).buffer;
+Object.defineProperty(taProto, 'buffer', {
+  configurable: true,
+  get() { return forgedBuffer; },
+});
 
 // A mixed-case, ASCII-padded label: Node resolves this through the pollutable
 // toLowerCase fallback and would answer 'utf-8'. Lava normalizes through
@@ -77,6 +90,7 @@ Array.prototype.push = realPush;
 Buffer.from = realBufferFrom;
 Buffer.prototype.toString = realBufferToString;
 globalThis.String = realString;
+Object.defineProperty(taProto, 'buffer', realBufferDesc);
 
 const want = [
   'label=utf-16le',

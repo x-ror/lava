@@ -102,6 +102,12 @@ function collectMedian(bin, args, launches) {
   }
   const byName = new Map();
   for (const [name, { r, ms }] of samples) {
+    // Fail closed on a partial launch: a benchmark missing from one of the
+    // launches means that launch died or truncated its output, and a median
+    // over the remainder would silently gate on incomplete data.
+    if (ms.length !== launches) {
+      throw new Error(`benchmark ${name} reported ${ms.length}/${launches} launches`);
+    }
     ms.sort((a, b) => a - b);
     // With launches=3 this is the true median; an even count is unreachable at
     // the current GATE_LAUNCHES. If someone raises it, note the lower median is

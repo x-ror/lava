@@ -299,7 +299,8 @@ make_module_not_found :: proc(ctx: jsc.JSContextRef, specifier: string) -> jsc.J
 // reuses the call callback as the constructor slot, so `new setTimeout(fn)`
 // evaluates to the CALL result — undefined, where Node (like any ordinary
 // function) yields an object. Nothing observed in the wild constructs timers;
-// recorded, not repaired.
+// recorded and pinned (host_native_construct_returns_call_result,
+// cmd/lava/host_native_registry_test.odin), not repaired.
 //
 // Neither difference is repairable from the public C API. JSObjectSetProperty
 // routes through defineOwnProperty only when the property is ABSENT, and it tests

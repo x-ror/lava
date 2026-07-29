@@ -197,7 +197,9 @@ jobs:
           # ("0.0" is unreachable — the value arrives via String(number), and a JS 0
           # stringifies to "0".) Zero cost condemns only a run that also did no work:
           # with 0/unknown turns already tripped above, that means exactly turns == 1,
-          # the observed init-failure shape.
+          # the observed init-failure shape. A genuine run of this job cannot finish
+          # in one turn — restoring .claude/ and reading the diff are tool turns — so
+          # turns == 1 is itself the no-op signal; cost only corroborates it.
           [ -z "$reason" ] && [ "$turns" = "1" ] && case "$cost" in 0|unknown) reason="it made 1 turn at \$$cost" ;; esac
 
           if [ -n "$reason" ]; then

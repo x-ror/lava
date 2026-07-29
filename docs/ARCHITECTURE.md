@@ -410,7 +410,7 @@ future follow-up.
   of truth.
 - **`known-lava-gaps.txt`** has no structured format or CI enforcement — define
   `file:reason` tuples and check them so a regression cannot silently widen a gap.
-- **`process.env` is a one-shot snapshot** (`install_process_env`, `globals.odin`), not live — revisit
+- **`process.env` is a one-shot snapshot** (`build_env_object`, called from `install_process`, `globals.odin`), not live — revisit
   with a Proxy-backed object when child processes land.
 - **Stack-trace line numbers** are off by one (known) — fix once the loader wrapper
   no longer shifts line 1.

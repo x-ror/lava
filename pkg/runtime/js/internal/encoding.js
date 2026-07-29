@@ -33,6 +33,7 @@
   var ReflectApply = P.ReflectApply;
   var TypeErrorG = P.TypeError;
   var RangeErrorG = P.RangeError;
+  var ErrorG = P.Error;
   var Uint8ArrayG = P.Uint8Array;
   var Uint16ArrayG = P.Uint16Array;
   var TypedArrayPrototypeSubarray = P.TypedArrayPrototypeSubarray;
@@ -350,6 +351,11 @@
   // goes through subarray.
   function unitsToString(units, count) {
     if (count === 0) return '';
+    // Overflow guard for the fixed-size accumulator: a typed array drops
+    // out-of-bounds writes silently (while the emit counter keeps advancing),
+    // so a decoder edit that violates decode()'s sizing formula would garble
+    // output with no failing test. One comparison per decode, not per byte.
+    if (count > units.length) throw new ErrorG('lava: decode accumulator overflow');
     if (LITTLE_ENDIAN)
       // Both reads here are captured. The backing store comes through the
       // CAPTURED %TypedArray%.prototype.buffer getter — `units.buffer` would
@@ -593,8 +599,18 @@
       ) {
         off = 3;
       }
+      // The captured getter, not `bytes.buffer`: this is the same poisonable
+      // prototype-accessor read closed in unitsToString, and Node's native
+      // utf-8 decoder is immune to it — a live read here made the fastpath the
+      // one decode Lava forged while Node did not. Pinned by
+      // cmd/lava/encoding_pollution_test.odin (the byteOffset/byteLength
+      // accessors stay live reads, matching Node's own JS layer).
       return bufferToStringUtf8(
-        BufferFrom(bytes.buffer, bytes.byteOffset + off, bytes.byteLength - off),
+        BufferFrom(
+          TypedArrayPrototypeGetBuffer(bytes),
+          bytes.byteOffset + off,
+          bytes.byteLength - off,
+        ),
       );
     }
     // WHATWG: a non-streaming decode starts a fresh run (reset decoder + BOM

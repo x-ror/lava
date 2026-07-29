@@ -188,6 +188,34 @@ host_native_create_dedupes_per_callback_and_name :: proc(t: ^testing.T) {
 	)
 }
 
+// Pins the host path's construct-result divergence require.odin documents:
+// create_raw reuses the call callback as the constructor slot, so `new` on a
+// host-path native evaluates to the CALL result — here answer_cb's 42, where
+// Node (like any ordinary function) yields an object. The oracle suite cannot
+// assert this (node runs the same script and returns the object), so this is
+// the pin that makes a JSC upgrade or refactor changing [[Construct]] loud.
+// Move require.odin's comment and this assert together.
+@(test)
+host_native_construct_returns_call_result :: proc(t: ^testing.T) {
+	c, ok := make_context()
+	testing.expect(t, ok, "could not create a JSC global context")
+	if !ok do return
+	defer destroy_context(c)
+
+	if !host_path_active(t, c.ctx) do return
+
+	state := lava.new_runtime_state(nil)
+	jsc.JSObjectSetPrivate(jsc.JSContextGetGlobalObject(c.ctx), cast(rawptr)state)
+	defer lava.destroy_runtime_state(c.ctx, state)
+
+	lava.inject_native_function(c.ctx, jsc.JSContextGetGlobalObject(c.ctx), "probe", answer_cb)
+	text, ok_eval := eval_text(
+		c.ctx,
+		"(function(){ var r = new probe(); return typeof r + ':' + String(r); })()",
+	)
+	testing.expectf(t, ok_eval && text == "number:42", "host-path construct result changed: %q", text)
+}
+
 // A context with no Runtime_State has no allocator to clone the name through and
 // nothing that would ever free the entry, so host_native_create declines. This is
 // the branch whose REVERSION survives the whole suite: every other test attaches
