@@ -45,9 +45,23 @@ never edit repo sources; you name the missing tests concretely.
 7. **Determinism.** A test depending on wall-clock timing, network order, or
    machine speed will flake in CI. Prefer the loop's logical clock.
 
+8. **Would a mutation fail it?** For every test the diff adds or changes, name
+   the mutation it should not survive — the line to delete or invert — and say
+   whether it actually would. This is where decorative tests are caught, and
+   presence of a test is not evidence: in #320 two new tests with confident
+   comments both survived the mutation they claimed to pin. Ask specifically
+   whether the assertion would still hold with the code under test removed, and
+   whether it observes state it can actually reach (allocations made under
+   `runtime.default_context()` are invisible to a caller's tracking allocator;
+   the runner does not fail on leaks — `ODIN_TEST_FAIL_ON_BAD_MEMORY` is false;
+   `/proc/self/fd` is noise under the default thread-per-core runner).
+9. **Contract comments** (`CLAUDE.md` §4/§5) on new user-visible surfaces: is
+   the `Node:` line backed by a real probe, and does `Deviates:` name the test
+   that pins it? A contract asserting behavior no test holds is a finding.
+
 You may run the relevant suites to confirm they pass and to check they actually
-exercise the changed lines (comment out / mentally revert the change and ask which
-assertion breaks).
+exercise the changed lines. You cannot mutate sources — you are read-only — so
+report the mutation each test owes and let the implementer run it.
 
 ## Output
 

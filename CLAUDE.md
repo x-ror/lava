@@ -133,6 +133,46 @@ front-end fails CI.
   `environment.odin`.
 - `make fmt` (`odin strip-semicolon`) before committing Odin.
 
+### Contract comments
+
+Anything on a **user-visible surface** — a native behind a Node API, error
+construction, event/callback ordering — carries a structured header above the
+declaration. `odin doc` (and `odin doc -doc-format`, for external tooling) takes
+the comment block verbatim, so this is the doc source, not decoration.
+
+```odin
+// host_native_create returns a host-registered function for `cb`, creating and
+// caching it on first use.
+//
+// Params:
+//   ctx    Thread-confined JSC context that will own the binding.
+//   name   Binding name; cloned through the Runtime_State allocator.
+//   arity  Becomes the function's `.length`.
+// Returns:
+//   The cached-or-new function object; nil when the host path is unavailable
+//   and the caller must fall back to JSObjectMakeFunctionWithCallback.
+// Node:
+//   setTimeout/setInterval report `.length` 2, every other global 1 — verified
+//   against node 24, not read off the docs.
+// Deviates:
+//   The C-API fallback reports 0 and is not repairable through the public API.
+//   Pinned by tests/node-compat/cases/56-native-function-arity.js.
+//
+// <freeform "why" prose continues here: allocator discipline, ordering, the
+// measured reasons — unchanged, and still the bulk of the comment.>
+```
+
+Rules that keep this from becoming ceremony:
+
+- **Structured header first, prose after.** The header states the observable
+  contract; §4's "comments explain why" still governs everything below it. A
+  header that restates the code instead of the contract is noise — delete it.
+- `Params:`/`Returns:` only where the answer is not obvious from the signature.
+- `Node:` records the oracle **and how it was verified**. `Deviates:` names the
+  deviation and the test pinning it, per §1 — omit the line when there is none.
+- Internal helpers with no Node counterpart keep the plain why-comment. Do not
+  retrofit existing code; this applies to new and changed surfaces.
+
 ## 5. Embedded JS conventions (`pkg/runtime/js/internal`)
 
 - Route through `require('primordials')` — internal modules run alongside user
@@ -158,6 +198,25 @@ front-end fails CI.
   with Node's exact message template.
 - Native byte ops stay behind the size threshold (`NATIVE_BYTEOP_MIN`) so small
   inputs skip FFI overhead.
+- **Contract comments** use JSDoc, already the convention in `buffer.js`, so the
+  same block serves editors and any future generator. Same scope rule as §4 —
+  exported spec surface, not every closure:
+
+  ```js
+  /**
+   * Decodes `input` per the WHATWG encoding standard.
+   * @param {Uint8Array|ArrayBuffer} [input]
+   * @param {{stream?: boolean}} [options]
+   * @returns {string}
+   * @throws {TypeError} ERR_INVALID_ARG_TYPE — options is a non-null scalar.
+   * @node Options are validated BEFORE the input is converted; `decode(5, 5)`
+   *       reports the options (node 24, verified).
+   * @deviates none
+   */
+  ```
+
+  `@node` and `@deviates` are repo tags carrying what §1 requires; JSDoc ignores
+  unknown tags, so tooling still parses the block.
 
 ## 6. Tests
 
@@ -168,6 +227,22 @@ output under `node` and under `bin/lava`. Add cases to
 oracle: allocator pairing, probe latching, pollution resistance, FFI ABI.
 
 Widening `known-lava-gaps.txt` is a regression and needs an explicit reason.
+
+**Order: contract → red test → implementation.** Write the contract comment
+(§4/§5) from a real `node` probe, then the tests, and watch them fail *before*
+there is anything to pass them. A test authored after the code routinely asserts
+less than its comment claims, and nothing catches that — two tests landed that
+way in #320, both with confident comments, and mutation is what exposed them.
+
+**A test is not done until a mutation has failed it.** Delete or invert the line
+it claims to pin, re-run, and confirm it goes red for the stated reason; then
+restore. The red phase of test-first gives this for free — for a test added
+afterwards it is a separate, mandatory step. Two examples of what this catches,
+both real: an assertion that holds equally with and without the code under test
+(a failed `map_insert` stores nothing either way, so `!hit` proved nothing), and
+an assertion aimed at memory the test cannot observe (net connections are freed
+under `runtime.default_context()`, so no tracking allocator ever sees them —
+the census had to move to `/proc/self/fd`).
 
 ## 7. PR contract
 

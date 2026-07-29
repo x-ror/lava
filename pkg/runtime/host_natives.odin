@@ -213,16 +213,33 @@ host_dispatch_fail :: #force_no_inline proc "c" (ctx: jsc.JSContextRef, why: str
 	return transmute(i64)exception
 }
 
-// host_native_create returns a host-registered function for `cb` (creating and
-// caching it on first use), or nil when the host-call path is unavailable —
-// the caller falls back to JSObjectMakeFunctionWithCallback.
+// host_native_create returns a host-registered function for `cb`, creating and
+// caching it on first use.
 //
-// `arity` becomes the function's `.length`, so it is part of the OBSERVABLE
-// surface for the handful of natives that reach user code as globals
-// (setTimeout & co). It is also part of the cache key only indirectly: the key is
-// (ctx, cb, name), and a given callback is always injected under one name with
-// one arity, so two arities for one name would collide. Nothing does that today
-// and the naming makes it obvious if anything tries.
+// Params:
+//   ctx    Thread-confined JSC context that will own the binding; also part of
+//          the cache key, so entries die with their context (see the sweep).
+//   name   Binding name, cloned through the Runtime_State allocator.
+//   cb     C-API-shaped callback the shared trampoline dispatches to.
+//   arity  Becomes the function's `.length`.
+// Returns:
+//   The cached-or-new function object; nil when the host-call path is
+//   unavailable or the registry declined, and the caller must fall back to
+//   JSObjectMakeFunctionWithCallback (inject_native_function already does).
+// Node:
+//   `.length` is observable only for the natives injected as globals —
+//   setTimeout/setInterval report 2, the rest 1 (verified against node 24).
+// Deviates:
+//   The C-API fallback reports 0 and cannot carry an arity through the public
+//   API; analysis at inject_native_function (require.odin). Pinned by
+//   tests/node-compat/cases/56-native-function-arity.js in the default
+//   configuration, and by host_native_create_declines_without_state for the
+//   fallback value itself.
+//
+// `arity` is part of the cache key only indirectly: the key is (ctx, cb, name),
+// and a given callback is always injected under one name with one arity, so two
+// arities for one name would collide. Nothing does that today and the naming
+// makes it obvious if anything tries.
 host_native_create :: proc(
 	ctx: jsc.JSContextRef,
 	name: string,

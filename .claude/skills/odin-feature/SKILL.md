@@ -51,19 +51,43 @@ Write a short design (not a document — a message) covering:
 - **Tests**: which oracle cases, which Odin tests, which smoke.
 - **Gates**: the commands the touched paths require.
 
+Then land the contract where it survives the session: the phase-1(a) findings go
+into the **implementation file** as a contract comment (`CLAUDE.md` §4 for Odin,
+§5 for JS) — params, returns, the `Node:` line with how it was verified, and
+`Deviates:` with the test that pins it. A contract that exists only in this
+message is gone by the next one, and the next reader re-derives it wrong.
+
 Stop here with `--design-only`. Otherwise, for anything non-trivial, put the
 design in front of the user before implementing.
 
-## Phase 3 — implement
+## Phase 3 — red tests, then implement
 
-Use `odin-implementer` for scoped, independent pieces (they parallelize well:
-native primitive / JS surface / tests), or implement directly for a small change.
-Either way the conventions in `CLAUDE.md` §4–5 are binding: allocator capture,
-JSC protect/release pairing, `-> bool` for C `_Bool`, primordials in JS, coded
-errors, `when ODIN_OS` honesty, comments that explain why.
+**Tests first, and watch them fail.** Write the oracle cases and Odin tests
+against the phase-2 contract before the code exists, run them, and confirm each
+fails *for the reason it names* — a new test that passes against an unimplemented
+feature is measuring nothing, and that is exactly how two tests in #320 shipped
+asserting less than their comments claimed. This red phase is the mutation check
+(`CLAUDE.md` §6) paid up front; a test added after the code owes it separately.
 
-Order that avoids rework: native primitive → wire the binding → JS surface →
-tests. Keep `make check` green as you go rather than at the end.
+Then implement. Use `odin-implementer` for scoped, independent pieces, or
+implement directly for a small change. Either way the conventions in `CLAUDE.md`
+§4–5 are binding: allocator capture, JSC protect/release pairing, `-> bool` for
+C `_Bool`, primordials in JS, coded errors, `when ODIN_OS` honesty, contract
+comments on user-visible surfaces, prose that explains why.
+
+Order that avoids rework: contract comment → failing tests → native primitive →
+wire the binding → JS surface. Keep `make check` green as you go rather than at
+the end.
+
+Two traps worth naming, both real:
+
+- An assertion that holds with **and** without the code under test. Invert the
+  pinned line and re-run; if it still passes, the test is decorative.
+- An assertion aimed at state the test cannot observe. Check the allocator and
+  the lifetime before trusting a leak check — anything allocated under
+  `runtime.default_context()` (net connections, for one) is invisible to a
+  caller-installed tracking allocator, and the runner does not fail on leaks
+  anyway (`ODIN_TEST_FAIL_ON_BAD_MEMORY` defaults false).
 
 ## Phase 4 — verify
 

@@ -44,6 +44,29 @@ project gates. Read `CLAUDE.md` first — it is the contract, not a suggestion.
 
 ## Tests are part of the implementation
 
+Write them **before** the code and watch them fail, unless your brief says the
+tests already exist and your job is to turn them green. A test authored after
+the implementation routinely asserts less than its comment claims; the red phase
+is what proves otherwise. If you do add a test afterwards, you owe the mutation
+check below explicitly.
+
+**Every test you write or touch must have failed a mutation.** Delete or invert
+the exact line it claims to pin, re-run, confirm it goes red *for the stated
+reason*, then restore. Report the mutation you ran. Two failures this catches,
+both of which shipped in #320:
+
+- an assertion true with and without the code under test (`!hit` after a failed
+  `map_insert` — nothing is stored either way);
+- an assertion aimed at state the test cannot see. Confirm the allocator before
+  trusting a leak check: anything allocated under `runtime.default_context()`
+  (net connections, for one) never reaches a caller-installed tracking
+  allocator, and the runner does not fail on leaks by default
+  (`ODIN_TEST_FAIL_ON_BAD_MEMORY` is false).
+
+Where a process-global observation is the only real signal (open fds, for
+instance), it belongs in the serial gate — `/proc/self/fd` is meaningless under
+the runner's default thread-per-core.
+
 - Node-observable behavior → an oracle case (`tests/node-compat/cases`,
   `tests/runtime/*`, `tests/std/*`) whose output must match `node` byte-for-byte.
 - Not oracle-able (allocator pairing, probe latching, pollution resistance, FFI
