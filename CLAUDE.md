@@ -75,6 +75,8 @@ make check-actions    # actionlint over .github/workflows
 make build            # ./scripts/build.sh → bin/lava
 make test             # Odin unit tests + oracle suites
 make test-lava        # every oracle suite compared node-vs-Lava
+make test-lava-nohostfn  # same suites with the private host-call ABI forced off
+make test-odin-serial # cmd/lava tests on ONE runner thread (shared-thread defects)
 make bench            # node-vs-Lava ratio table (report-only)
 ```
 

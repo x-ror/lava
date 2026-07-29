@@ -8,6 +8,16 @@ import jsc "lava:pkg/jsc"
 // codec without a callee→callback map lookup. Measured +~25ns on tiny hex
 // (110→135ns with the generic path). Colder natives (compare, indexOf, swap,
 // byteLength, allocUninit, isValidUtf8) register via host_native_create only.
+//
+// MOVING A NATIVE OUT OF THIS FILE IS A SECURITY CHANGE, not just a perf one.
+// The three *_write_into wrappers below back buffer.js's fromString, which
+// writes into a slice of the allocUnsafe pool (plain malloc — it can hold a
+// freed request body or key) and DISCARDS the write-through's result. Safe here
+// only because a baked-in callback cannot miss: these entry points never
+// consult the callee→callback registry. A demotion to the generic
+// host_native_create path answers a miss at the fail-closed dispatcher instead
+// (the canonical write-up: host_dispatch_fail, host_natives.odin) — a throw,
+// not a silent correct answer — so measure before moving anything either way.
 
 buffer_hex_encode_host :: proc "c" (g: rawptr, cf: [^]u64) -> i64 {
 	return host_dispatch(g, cf, buffer_hex_encode_cb)

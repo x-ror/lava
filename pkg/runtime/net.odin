@@ -1745,11 +1745,15 @@ net_drain_timeout :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 net_shutdown_active :: proc(state: ^Runtime_State) {
 	if state == nil do return
 	context = runtime.default_context() // alloc/free conns + buffers on the default heap (see net_maybe_free)
-	// net_maybe_free deletes a freed proactor conn from net_conns, so iterate a snapshot.
-	conns := make([dynamic]^Net_Connection, 0, len(state.net_conns))
-	defer delete(conns)
-	for _, conn in state.net_conns do append(&conns, conn)
-	for conn in conns {
+	// Iterated DIRECTLY, not through a snapshot. net_maybe_free deletes the freed
+	// proactor conn from net_conns, and Odin documents that as safe:
+	// base/runtime/core_builtin.odin at delete_key — "It is safe to use
+	// `delete_key` while iterating a map"; erase is tombstone-only and relocates
+	// nothing. Only INSERTING during a range can resize and skip elements, and the
+	// only two inserts into net_conns are the accept and connect paths
+	// (net_accept_cb / net_connect_cb), neither of which is reachable from this
+	// body — teardown runs no JS and accepts nothing.
+	for _, conn in state.net_conns {
 		if net_is_proactor(conn) {
 			// ALWAYS silence + unprotect the proactor conn (no JS during teardown), whether it is
 			// freshly closing or was ALREADY closing with a live op — otherwise that op's later

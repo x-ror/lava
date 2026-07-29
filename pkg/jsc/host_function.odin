@@ -148,23 +148,52 @@ when ODIN_OS == .Linux {
 		return JSObjectRef(fptr)
 	}
 
+	// ensure_host resolves the private-ABI symbols and validates the CallFrame
+	// layout once per thread.
+	//
+	// g_host_checked latches only on a DEFINITIVE verdict — a symbol this JSC does
+	// not export, or a probe/self-test mismatch. Those are facts about the linked
+	// library and cannot change for the life of the process. A TRANSIENT failure
+	// (create_raw returning nil because a WTF allocation failed) proves nothing and
+	// leaves the flag unset, so the next injection retries: CLAUDE.md §4, and the
+	// same rule the sibling private_string.odin states explicitly at string_alloc8
+	// ("Transient create/tryCreate failures return ok=false for this call only —
+	// g_ok is latched false only by ensure_resolved's self-test"). Demotion to the
+	// C-API path is safe but PERMANENT for the thread, so one bad allocation must
+	// not cost every later native on that thread its host-call path.
 	@(private = "file")
 	ensure_host :: proc(ctx: JSContextRef) {
 		if g_host_checked do return
-		g_host_checked = true
 
-		pc := host_dlsym(nil, "_ZN3JSC10JSFunction6createERNS_2VMEPNS_14JSGlobalObjectEjRKN3WTF6StringENS5_11FunctionPtrILNS5_6PtrTagE1EFlS4_PNS_9CallFrameEELNS5_18FunctionAttributesE2EEENS_24ImplementationVisibilityENS_9IntrinsicESF_PKNS_6DOMJIT9SignatureE")
-		pl := host_dlsym(nil, "_ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE")
-		pd := host_dlsym(nil, "_ZN3JSC12JSLockHolderD1Ev")
-		pt := host_dlsym(nil, "_ZN3JSC2VM14throwExceptionEPNS_14JSGlobalObjectENS_7JSValueE")
-		if pc == nil || pl == nil || pd == nil || pt == nil {
-			debug_log("hostfn: dlsym miss")
+		// TEST-ONLY switch, same shape and purpose as net.odin's
+		// LAVA_NET_FORCE_READINESS: force the C-API fallback so CI can exercise the
+		// "probe missed" half of this file on a box where the probe would succeed.
+		// That direction has had no coverage since the macOS/Windows jobs were
+		// disabled, which is exactly the direction a JSC upgrade renaming the mangled
+		// symbol above would take. Deliberate configuration, so it latches.
+		if len(os.get_env("LAVA_HOSTFN_DISABLE", context.temp_allocator)) != 0 {
+			debug_log("hostfn: disabled by LAVA_HOSTFN_DISABLE")
+			g_host_checked = true
 			return
 		}
-		g_host_create = transmute(Create_Host_Fn_Proc)pc
-		g_host_lock_ctor = transmute(Lock_Ctor_Proc)pl
-		g_host_lock_dtor = transmute(Lock_Dtor_Proc)pd
-		g_vm_throw = transmute(Vm_Throw_Proc)pt
+
+		// Resolved once even across a transient retry: dlsym is the expensive half
+		// and its answer is definitive either way.
+		if g_host_create == nil {
+			pc := host_dlsym(nil, "_ZN3JSC10JSFunction6createERNS_2VMEPNS_14JSGlobalObjectEjRKN3WTF6StringENS5_11FunctionPtrILNS5_6PtrTagE1EFlS4_PNS_9CallFrameEELNS5_18FunctionAttributesE2EEENS_24ImplementationVisibilityENS_9IntrinsicESF_PKNS_6DOMJIT9SignatureE")
+			pl := host_dlsym(nil, "_ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE")
+			pd := host_dlsym(nil, "_ZN3JSC12JSLockHolderD1Ev")
+			pt := host_dlsym(nil, "_ZN3JSC2VM14throwExceptionEPNS_14JSGlobalObjectENS_7JSValueE")
+			if pc == nil || pl == nil || pd == nil || pt == nil {
+				debug_log("hostfn: dlsym miss")
+				g_host_checked = true // definitive: this JSC does not export the path
+				return
+			}
+			g_host_create = transmute(Create_Host_Fn_Proc)pc
+			g_host_lock_ctor = transmute(Lock_Ctor_Proc)pl
+			g_host_lock_dtor = transmute(Lock_Dtor_Proc)pd
+			g_vm_throw = transmute(Vm_Throw_Proc)pt
+		}
 
 		// APICast contract: JSContextRef IS the JSGlobalObject cell. It cannot be
 		// checked by comparing against JSContextGetGlobalObject — that returns the
@@ -173,14 +202,32 @@ when ODIN_OS == .Linux {
 		// methodTable()->toThis), so a non-nil result exercises the cast safely.
 		if JSContextGetGlobalObject(ctx) == nil {
 			debug_log("hostfn: GetGlobalObject nil")
+			g_host_checked = true // definitive: the cast contract does not hold
 			return
 		}
 
 		fn := create_raw(ctx, "__lava_hostcall_probe", host_probe, 2)
 		if fn == nil {
-			debug_log("hostfn: create_raw nil")
+			// Two distinct causes, only one transient. create_raw builds its name
+			// through the private string bridge; if THAT probe latched off (missing
+			// symbol / ABI self-test mismatch — the same JSC-upgrade scenario as the
+			// dlsym miss above), every retry is doomed, so latch: definitive.
+			if string_bridge_latched_off() {
+				debug_log("hostfn: create_raw nil (string bridge latched off)")
+				g_host_checked = true
+				return
+			}
+			// Otherwise a WTF string-impl or GC-cell allocation failed. Nothing about
+			// the ABI was disproved, so do NOT latch — this call falls back, the next
+			// injection tries again. Neither arm here is pinnable by an in-repo test
+			// (both need a fault injected inside JSC itself); accepted untested.
+			debug_log("hostfn: create_raw nil (transient — not latching)")
 			return
 		}
+
+		// Past this point every outcome is a verdict on the CallFrame layout, so the
+		// result is permanent whichever way it goes.
+		g_host_checked = true
 
 		args := [2]JSValueRef{
 			JSValueMakeNumber(ctx, 42),
@@ -234,11 +281,23 @@ when ODIN_OS == .Linux {
 	// host function should return the same value (its result is ignored once
 	// the VM has a pending exception). Only meaningful while g_host_ok, i.e.
 	// inside functions created by host_function_create.
-	host_throw :: proc "contextless" (ctx: JSContextRef, value: JSValueRef) {
-		if !g_host_ok || value == nil do return
+	// Returns whether the exception was actually raised. Callers MUST check: every
+	// guard below is a silent no-op, and a caller that returns `value` anyway hands
+	// an Error object back as an ordinary result — the fail-open shape this exists
+	// to prevent. The !g_host_ok guard is defense in depth for an arm that is
+	// unreachable by construction: any function that can dispatch here was minted
+	// by host_function_create AFTER the probe passed on this (context-confined)
+	// thread, so every reachable miss runs with g_host_ok == true and takes the
+	// raise — host_native_failclosed_test.odin's post-sweep assertion depends on
+	// that. The guard survives for the forbidden cross-thread call and the
+	// nil-value/nil-vm cases, where refusing to claim a raise is what keeps the
+	// caller from returning the Error as a value.
+	host_throw :: proc "contextless" (ctx: JSContextRef, value: JSValueRef) -> bool {
+		if !g_host_ok || value == nil do return false
 		vm := JSContextGetGroup(ctx)
-		if vm == nil do return
+		if vm == nil do return false
 		g_vm_throw(vm, rawptr(ctx), transmute(u64)value)
+		return true
 	}
 } else {
 	host_function_create :: proc(_: JSContextRef, _: string, _: Host_Function_Proc, _: int) -> (function: JSObjectRef, ok: bool) {
@@ -251,6 +310,8 @@ when ODIN_OS == .Linux {
 		return false
 	}
 
-	host_throw :: proc "contextless" (_: JSContextRef, _: JSValueRef) {
+	// Honest stub: there is no private-ABI throw off Linux, so this never raises.
+	host_throw :: proc "contextless" (_: JSContextRef, _: JSValueRef) -> bool {
+		return false
 	}
 }

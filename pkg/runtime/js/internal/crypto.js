@@ -32,7 +32,11 @@
     if (value === null) return 'null';
     var t = typeof value;
     if (t === 'undefined') return 'undefined';
-    if (t === 'number' || t === 'boolean') return 'type ' + t + ' (' + value + ')';
+    // -0 renders as "-0" in Node (util.inspect); string concatenation erases the
+    // sign. Same fix as buffer.js/encoding.js's copies of this helper.
+    if (t === 'number')
+      return 'type number (' + (value === 0 && 1 / value < 0 ? '-0' : value) + ')';
+    if (t === 'boolean') return 'type boolean (' + value + ')';
     // A bigint keeps Node's trailing "n" (util.inspect(10n) === '10n'), which bare
     // string coercion ('' + 10n === '10') drops — matches os.js/buffer.js.
     if (t === 'bigint') return 'type bigint (' + value + 'n)';
@@ -299,14 +303,35 @@
     return out.toString(outputEncoding);
   }
 
+  // Every CSPRNG entry point goes through this, and none calls native.randomFill
+  // directly. The native returns the view it filled, so an identity check is the
+  // available proof that the fill ran. Second layer, not the first: the
+  // dispatcher already fails closed against the miss-forges-entropy scenario
+  // (the canonical write-up is at host_dispatch_fail, pkg/runtime/
+  // host_natives.odin), but that layer is one registration decision away from
+  // not covering this native, and a wrong answer here is silent forged entropy.
+  // The error is deliberately not a Node ERR_* code: Node has no counterpart,
+  // because in Node this cannot happen.
+  function fillRandom(view) {
+    if (native.randomFill(view) !== view)
+      throw new Error('lava: CSPRNG unavailable (native.randomFill did not fill the buffer)');
+    return view;
+  }
+
   function randomBytes(size, callback) {
     // Node validates size as 0..2^31-1 (NaN rejected, fractional truncated); a
     // negative/huge value used to wrap into a multi-gigabyte allocation instead
     // of a catchable RangeError.
     size = validateByteCount(size, 'size');
     var buf = Buffer.alloc(size);
-    native.randomFill(buf);
+    if (size > 0) fillRandom(buf);
     if (typeof callback === 'function') {
+      // Node completes a zero-size request synchronously (it queues no work for
+      // zero bytes); only real fills report their completion asynchronously.
+      if (size === 0) {
+        callback(null, buf);
+        return;
+      }
       setImmediate(function () {
         callback(null, buf);
       });
@@ -335,7 +360,10 @@
     return bytes >>> 0;
   }
 
-  function randomFillSync(buffer, offset, size) {
+  // Shared buf/offset/size validation for randomFillSync and randomFill,
+  // resolving to the byte range to fill. Split out so randomFill can validate
+  // SYNCHRONOUSLY the way Node does — only the fill itself is deferred.
+  function resolveFillRange(buffer, offset, size) {
     var ab, base, byteLength, elementSize;
     if (ArrayBuffer.isView(buffer)) {
       ab = buffer.buffer;
@@ -362,7 +390,12 @@
       size === undefined
         ? byteLength - offsetBytes
         : assertSize(size, elementSize, offsetBytes, byteLength);
-    if (sizeBytes > 0) native.randomFill(new Uint8Array(ab, base + offsetBytes, sizeBytes));
+    return { base: base + offsetBytes, ab: ab, sizeBytes: sizeBytes };
+  }
+
+  function randomFillSync(buffer, offset, size) {
+    var r = resolveFillRange(buffer, offset, size);
+    if (r.sizeBytes > 0) fillRandom(new Uint8Array(r.ab, r.base, r.sizeBytes));
     return buffer;
   }
 
@@ -376,8 +409,17 @@
       size = undefined;
     }
     if (typeof callback !== 'function') throw new TypeError('Callback must be a function');
+    // Validate now — Node throws a bad buf/offset/size from randomFill itself
+    // (deferring it turned a synchronous TypeError into an uncaught async one)
+    // and completes a zero-byte request synchronously, queueing no work for it.
+    var r = resolveFillRange(buffer, offset, size);
+    if (r.sizeBytes === 0) {
+      callback(null, buffer);
+      return;
+    }
     setImmediate(function () {
-      callback(null, randomFillSync(buffer, offset, size));
+      fillRandom(new Uint8Array(r.ab, r.base, r.sizeBytes));
+      callback(null, buffer);
     });
   }
 
@@ -417,9 +459,7 @@
       );
     }
     if (typedArray.byteLength > 0) {
-      native.randomFill(
-        new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength),
-      );
+      fillRandom(new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength));
     }
     return typedArray;
   }

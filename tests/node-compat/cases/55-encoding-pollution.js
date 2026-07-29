@@ -513,4 +513,42 @@ console.log(
   })(),
 );
 
+// T: the decode accumulator's string-building reads. A poisoned
+// %TypedArray%.prototype.buffer getter must not swap in an attacker's backing
+// store (Lava reads .buffer only through a getter captured at module-eval),
+// and a replaced Buffer.prototype.toString must not intercept the utf16le
+// codec call (Lava borrowed the method pristine at module-eval). utf-16le
+// ONLY: node's windows-1252 decode reads the caller's `.buffer` through the
+// live getter and returns the FORGED bytes (observed on node 24: "!\x00"), so
+// that half cannot be oracled — Lava's stronger answer is pinned Lava-only in
+// cmd/lava/encoding_pollution_test.odin instead.
+console.log(
+  'T',
+  (() => {
+    const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+    const bufferDesc = Object.getOwnPropertyDescriptor(taProto, 'buffer');
+    const forged = new Uint16Array([0x21, 0x21, 0x21, 0x21]).buffer; // "!!!!"
+    const realToString = Buffer.prototype.toString;
+    Object.defineProperty(taProto, 'buffer', {
+      configurable: true,
+      get() {
+        return forged;
+      },
+    });
+    Buffer.prototype.toString = function () {
+      return 'POISONED';
+    };
+    let out;
+    try {
+      out = new TextDecoder('utf-16le').decode(new Uint8Array([0x41, 0x00, 0x42, 0x00]));
+    } catch (e) {
+      out = 'THREW:' + e.name;
+    } finally {
+      Object.defineProperty(taProto, 'buffer', bufferDesc);
+      Buffer.prototype.toString = realToString;
+    }
+    return out;
+  })(),
+);
+
 console.log('ok');

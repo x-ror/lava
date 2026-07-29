@@ -132,6 +132,7 @@
     TypeError: TypeError,
     RangeError: RangeError,
     Uint8Array: Uint8Array,
+    Uint16Array: Uint16Array,
     ArrayBuffer: ArrayBuffer,
 
     // --- Object statics ---
@@ -221,6 +222,19 @@
     StringPrototypePadStart: caller2(StringProto.padStart),
 
     Uint8ArrayPrototypeSet: caller2(Uint8Array.prototype.set),
+    // %TypedArray%.prototype.subarray — shared by every view type, so reading it
+    // off Uint8Array captures the same function Uint16Array uses. Zero-copy, which
+    // is why encoding.js's chunked fromCharCode wants it rather than a slice.
+    TypedArrayPrototypeSubarray: caller2(Uint8Array.prototype.subarray),
+    // %TypedArray%.prototype's `buffer` accessor. `view.buffer` resolves through
+    // this CONFIGURABLE prototype getter — the one pollution axis a null
+    // prototype cannot close on a typed array — so a hardened module reading
+    // .buffer on an internal view must call the capture instead: a poisoned
+    // getter substitutes an attacker's ArrayBuffer as the backing store. Node's
+    // primordials export the same getter (TypedArrayPrototypeGetBuffer).
+    TypedArrayPrototypeGetBuffer: caller0(
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer').get,
+    ),
   };
 
   // Freeze the table so a consumer (or a leak) cannot mutate the shared set.
