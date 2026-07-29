@@ -228,6 +228,20 @@ coupling.
       profile before committing to it.
 - [ ] **Stack-trace line numbers are off by one** — the CommonJS wrapper
       prepends a line but `JSEvaluateScript` starts at line 1.
+- [ ] **Each `JSGlobalContext` costs one leaked `timerfd`** — JavaScriptCore's
+      per-VM `WTF::RunLoop` timer. Measured 2026-07-29: +1 per context, strictly
+      linear over 20 iterations, reproduced by a bare
+      `JSGlobalContextCreate`/`Release` pair with no event loop, no script and no
+      `Runtime_State`; unchanged by a forced `JSGarbageCollect`, by passing `nil`
+      instead of our `JSClass`, or by waiting. One context running many scripts
+      costs one fd, so the price is per VM. JSC's own GSource `finalize` does
+      close it, so the fd survives because the VM is never finalized — the fix is
+      getting the VM actually destroyed (or an upstream report), not a `close()`
+      of our own. NOT a live defect in what we ship: one context per
+      `lava run`/`lava eval` process and one per worker, both bounded. It bites
+      the Odin test binary (hence the baseline-differential fd census in
+      `cmd/lava/net_teardown_stress_test.odin`) and any embedder calling `eval`
+      repeatedly in one process. Details at `release_global_context_after_eval`.
 - [x] **Repeated `lava.eval` in one process degrades** — fixed: the thread-local
       host-call registry in `pkg/runtime/host_natives.odin` is keyed by the JSC
       context POINTER, and JSC reuses that address for a later

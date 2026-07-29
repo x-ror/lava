@@ -62,10 +62,13 @@ eval_fd_delta :: proc(src: string) -> (delta: int, ok: bool) {
 //     with the sweep mutated to skip a connection, and again with it mutated to
 //     INSERT during the range (the one operation the loop's comment calls
 //     unsafe), an allocator-based version of this test passed both times.
-//   * an ABSOLUTE fd count is confounded: every eval leaks exactly one
-//     `anon_inode:[timerfd]` whether or not it touches net — the loop's timer fd
-//     is not closed by eventloop.destroy. That is a real defect, but it belongs
-//     to pkg/runtime/eventloop, not to this sweep, and it is unconditional.
+//   * an ABSOLUTE fd count is confounded: every eval leaves one
+//     `anon_inode:[timerfd]` behind whether or not it touches net. That one is
+//     JavaScriptCore's, not ours — measured at one per JSGlobalContext, with a
+//     bare create/release pair leaking it just as a full eval does, and neither
+//     a forced JSGarbageCollect nor dropping our JSClass reclaims it (see
+//     release_global_context_after_eval in runtime.odin). Unconditional, and
+//     nothing this sweep can influence.
 // So the baseline eval below is the same script minus the connects: it absorbs
 // the per-eval cost, and what remains is attributable to the three sockets.
 //

@@ -157,6 +157,15 @@ platform_init :: proc(loop: ^Loop) -> bool {
 	if err != nil {
 		linux.close(loop.platform.wakeup_pipe[0])
 		linux.close(loop.platform.wakeup_pipe[1])
+		// Reset, not just close. init returns the Loop even when this fails
+		// (loop.odin: backend stays .Unavailable) and destroy calls
+		// platform_destroy unconditionally, closing every wakeup_pipe entry >= 0
+		// — so a stale number here is closed a SECOND time. epoll_create1 fails
+		// on EMFILE, i.e. exactly when the kernel is recycling numbers, so that
+		// second close lands on an unrelated descriptor rather than being
+		// harmless. Same convention as loop_darwin.odin. Pinned by
+		// failed_platform_init_does_not_double_close.
+		loop.platform.wakeup_pipe = {-1, -1}
 		return false
 	}
 	loop.platform.epoll_fd = fd

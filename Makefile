@@ -207,8 +207,14 @@ test-odin: native-deps
 test-odin-serial: native-deps
 	$(ODIN) test cmd/lava -collection:lava=. -define:ODIN_TEST_THREADS=1
 
+# ONE runner thread: the loop owns process-wide resources (descriptors, and the
+# rlimit that failed_platform_init_does_not_double_close has to tighten to reach
+# the EMFILE path), so tests here cannot run beside each other without turning
+# another test's fd allocation into a spurious failure. The suite is ~55ms; the
+# serial cost is not measurable. Note this must be -define, NOT an environment
+# variable — core/testing reads it via #config at compile time.
 test-eventloop-odin:
-	$(ODIN) test pkg/runtime/eventloop
+	$(ODIN) test pkg/runtime/eventloop -define:ODIN_TEST_THREADS=1
 
 test-runtime-odin:
 	$(ODIN) test pkg/runtime -collection:lava=.

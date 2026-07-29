@@ -55,6 +55,24 @@ result_destroy :: proc(res: ^Result) {
 // harmless (the OS reclaims it on exit, as node/jsc/bun do). If Lava ever grows an
 // embedded / repeated-eval Windows use case, this is the policy to revisit: the
 // teardown ordering must be fixed rather than skipped.
+//
+// LINUX, MEASURED 2026-07-29: this release does not reclaim everything. Each
+// JSGlobalContext costs one `anon_inode:[timerfd]` that survives it —
+// JavaScriptCore's per-VM WTF::RunLoop timer, whose GSource `finalize` does hold
+// the matching close, so the fd outlives us because the VM is not finalized
+// here, not because JSC forgot to. Confirmed by counting /proc/self/fd around a
+// bare JSGlobalContextCreate/Release pair with no loop, no script and no
+// Runtime_State: +1 per context, strictly linear over 20 iterations, unchanged
+// by a forced JSGarbageCollect, by passing nil instead of our JSClass, or by
+// waiting. One context running many scripts costs one fd, so the price is per
+// VM, not per eval.
+//
+// Bounded in everything we ship — one context per `lava run`/`lava eval`
+// process, one per worker — so it is a real defect but not a live one. It bites
+// exactly two callers: the Odin test binary (which is why an fd census there
+// must compare against a baseline eval, see cmd/lava/net_teardown_stress_test)
+// and any embedder calling eval repeatedly in one process. Fixing it means
+// getting the VM actually destroyed, which is upstream of this line.
 release_global_context_after_eval :: proc(ctx: jsc.JSGlobalContextRef) {
 	when ODIN_OS != .Windows {
 		jsc.JSGlobalContextRelease(ctx)
