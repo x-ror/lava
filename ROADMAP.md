@@ -81,6 +81,20 @@ coupling.
 
 ### High priority (the Odin / native part)
 
+- [ ] **The primordials ratchet cannot see accessor reads, and reports 0
+      anyway** — `make check-primordials` counts Array/String prototype METHOD
+      calls, so a read through a configurable prototype ACCESSOR is invisible to
+      it, as is `.call`. This is not theoretical: `encoding.js` reached
+      `units.buffer` and `bytes.buffer` through `%TypedArray%.prototype.buffer`
+      while the ratchet stood at baseline 0, and a poisoned getter substituted an
+      attacker's `ArrayBuffer` as the decode output on every non-fastpath decode
+      — reachable from `url.js` `percentDecodeHostStrict` with attacker-sized
+      input. Fixed in #320 by capturing the getter, but only because a reviewer
+      looked; nothing would have caught the next one. CLAUDE.md §5 already warns
+      that "baseline 0 means no counted call left, not hardened" — the ratchet
+      should count what the warning describes. Do this BEFORE widening pollution
+      hardening to more files (below): extending coverage measured by a blind
+      instrument buys confidence, not safety.
 - [x] **Promise ↔ event-loop ordering.** JSC drains its own promise microtask
       queue at every C-API boundary, so `Promise.then` used to run _before_
       `process.nextTick` (Node is the reverse). `queueMicrotask` lives in a JS shim
@@ -199,6 +213,23 @@ coupling.
 
 ### Low priority / correctness polish
 
+- [x] **Host-native dispatch answered a miss with `undefined`** — fixed (#320):
+      the registry fails closed. A miss meant our own tables were inconsistent,
+      and several natives write through a caller-supplied buffer and signal
+      nothing on return, so `undefined` forged success — `crypto.randomBytes`
+      would have returned a zeroed `Buffer.alloc` as CSPRNG output, `fromString`
+      uninitialized `allocUnsafe` pool memory. The miss now raises, `host_throw`
+      reports whether it actually raised, and `crypto.js` identity-checks
+      `randomFill` as a second layer.
+- [x] **`platform_init` double-closed the wakeup pipe on the epoll failure
+      path** — fixed: it closed both ends but left their NUMBERS in
+      `wakeup_pipe`, and `destroy` calls `platform_destroy` unconditionally, so
+      they were closed again. A wrong-fd close, not a leak, and the trigger is
+      EMFILE — precisely when the kernel is recycling numbers, so the second
+      close lands on an unrelated descriptor. darwin already reset; Linux now
+      does too, pinned by `failed_platform_init_does_not_double_close`, which
+      tightens `RLIMIT_NOFILE` and requires a canary on the recycled number to
+      survive teardown.
 - [x] **`clearInterval` leaks** the `JS_Callback` heap binding + GC protection —
       fixed: the loop's dispose hook (`js_callback_dispose` in
       `pkg/runtime/globals.odin`) frees the binding when an interval is cleared.
@@ -228,6 +259,22 @@ coupling.
       profile before committing to it.
 - [ ] **Stack-trace line numbers are off by one** — the CommonJS wrapper
       prepends a line but `JSEvaluateScript` starts at line 1.
+- [ ] **Two native-function divergences, both declared and pinned, neither
+      repairable from the public C API** — recorded so nobody re-derives them.
+      (a) On the host path `new setTimeout(fn)` evaluates to the CALL result,
+      `undefined`, where Node (like any ordinary function) yields an object:
+      `create_raw` reuses the call callback as the constructor slot. (b) On the
+      C-API fallback every native reports `.length` 0 and is not constructible;
+      `JSObjectSetProperty` cannot fix it, because `length` is inherited from
+      `Function.prototype` so the call degrades to a `[[Set]]` against a
+      non-writable slot. Both are analysed at `inject_native_function`
+      (`require.odin`) and pinned — (a) by
+      `host_native_construct_returns_call_result`, (b) by
+      `host_native_create_declines_without_state` plus
+      `tests/node-compat/cases/56-native-function-arity.js` for the default
+      configuration. Fixing either needs a JS-level `defineProperty` during
+      global installation; not worth it for a path taken only when the private
+      ABI is missing.
 - [ ] **Each `JSGlobalContext` costs one leaked `timerfd`** — JavaScriptCore's
       per-VM `WTF::RunLoop` timer. Measured 2026-07-29: +1 per context, strictly
       linear over 20 iterations, reproduced by a bare
@@ -276,6 +323,11 @@ coupling.
       `slice`/`indexOf`/`includes` sites, plus its percent-decode byte arrays,
       which are still plain arrays and so reachable via an `Array.prototype[0]`
       accessor), `buffer.js` (22), `path.js` (158), `esm.js` (78), `util.js` (48).
+      **Blocked on the ratchet blind spot** (High priority, above): those counts
+      measure method calls only, so driving a file to 0 says nothing about the
+      accessor and `.call` vectors — `encoding.js` sat at 0 while carrying a live
+      `%TypedArray%.prototype.buffer` poisoning path. Teach the ratchet to see
+      them first, re-baseline, then work the list.
 - [x] **Real wall-clock timers** — fixed: in `real_time` mode the loop tracks the
       monotonic wall clock (`sync_real_clock` / `real_now_ms` in
       `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a
@@ -295,8 +347,29 @@ coupling.
 
 ### CI / tooling housekeeping
 
+- [ ] **Give the gates one honest runner** — `make <target> | tail` reports
+      **tail's** exit status, not make's, so a failing gate reads as a pass. This
+      is not hypothetical: during the #320 review it hid a real `make test-lava`
+      failure (the oracle diff was in the output text while the status said 0),
+      and it is how `test-odin-serial` stayed green for a whole session while
+      testing nothing. Wanted: a `make gates` that runs the routed set with real
+      exit codes, stopping at the first failure, so neither a human nor an agent
+      has to remember `set -o pipefail`. Until it exists, every gate claim in a
+      PR body rests on the author having piped correctly.
+- [ ] **A test-only fault-injection seam for JSC-side failures** — three
+      safety-critical branches are accepted-untested today because the fault has
+      to happen _inside_ JSC: the paired `map_insert` rollback in
+      `host_native_create`, the `fillRandom` identity check in `crypto.js`, and
+      `ensure_host`'s transient-vs-definitive retry. Each is code that only runs
+      when an invariant is already broken, which is exactly the code least likely
+      to be exercised and most expensive to get wrong. One env-gated seam
+      (`LAVA_HOSTFN_DISABLE` is the precedent) unlocks all three.
 - [ ] Pin a specific Odin release in CI (currently the `setup-odin` default) for
-      reproducibility, and bump `llvm-version` if a newer Odin needs it.
+      reproducibility, and bump `llvm-version` if a newer Odin needs it. Newly
+      concrete: this session turned on the fact that `ODIN_TEST_THREADS` is a
+      compile-time `#config`, not an environment variable — runner semantics we
+      now depend on in two targets, and which a silent `setup-odin` bump could
+      change under us.
 - [ ] Update `actions/checkout` / `actions/setup-node` past the Node 20
       deprecation warning.
 - [x] Real `odin build` + run job for Windows: the CI Windows job links a
