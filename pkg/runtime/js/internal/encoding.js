@@ -38,7 +38,6 @@
   var Uint16ArrayG = P.Uint16Array;
   var TypedArrayPrototypeSubarray = P.TypedArrayPrototypeSubarray;
   var TypedArrayPrototypeGetBuffer = P.TypedArrayPrototypeGetBuffer;
-  var ObjectIs = P.ObjectIs;
   var ArrayBufferG = P.ArrayBuffer;
   var ArrayBufferIsView = P.ArrayBufferIsView;
   // Free globals / statics, captured pristine at module-eval.
@@ -147,9 +146,10 @@
       var s = v.length > 28 ? StringPrototypeSlice(v, 0, 25) + '...' : v;
       return "type string ('" + s + "')";
     }
-    // -0 renders as "-0" in Node (it routes through util.inspect); string
-    // concatenation erases the sign.
-    if (t === 'number') return 'type number (' + (ObjectIs(v, -0) ? '-0' : v) + ')';
+    // -0 renders as "-0" in Node (util.inspect); string concatenation erases the
+    // sign. `1/v < 0` rather than ObjectIs, matching the buffer.js/crypto.js
+    // copies of this helper — one idiom across all three.
+    if (t === 'number') return 'type number (' + (v === 0 && 1 / v < 0 ? '-0' : v) + ')';
     if (t === 'boolean') return 'type boolean (' + v + ')';
     if (t === 'bigint') return 'type bigint (' + v + 'n)';
     if (t === 'symbol') return 'type symbol (' + v.toString() + ')';
@@ -307,17 +307,20 @@
     return e;
   }
 
-  // The code-unit accumulator is a PREALLOCATED, NULL-PROTOTYPE array written by
-  // index, not a growing array written by push. Two reasons, both load-bearing:
-  //   * a plain array inherits Array.prototype, and `Set(units, "0", v)` walks
-  //     that chain — an accessor installed at Array.prototype[0] intercepted
-  //     every stored code unit and fed the getter's value back to the string
-  //     builder, which is a strictly weaker primitive than replacing push. This
-  //     is the per-hot-array null prototype primordials.js assigns to the
-  //     consuming module. It also drops Array.prototype.constructor out of
-  //     reach, so the chunk slice can no longer be steered by Symbol.species.
-  //   * it is faster than push through any wrapper: the accumulator writes are
-  //     the per-code-unit inner loop of every non-fast-path decode.
+  // The code-unit accumulator is a PREALLOCATED Uint16Array written by index,
+  // not a growing array written by push. Two reasons, both load-bearing:
+  //   * indexed access on a typed array never consults a prototype chain, so
+  //     there is no accessor to install: the earlier null-prototype JS Array
+  //     existed because `Set(units, "0", v)` DID walk that chain, and an
+  //     accessor at Array.prototype[0] intercepted every stored code unit and
+  //     fed the getter's value back to the string builder. A typed array closes
+  //     that by construction, and takes Symbol.species steering of the chunk
+  //     slice with it. (The one prototype-chain read left on this path is
+  //     `.buffer` at string-building time — see unitsToString, which routes it
+  //     through a captured getter.)
+  //   * it is faster than push through any wrapper, and two bytes per unit
+  //     instead of a boxed slot: these writes are the per-code-unit inner loop
+  //     of every non-fast-path decode. See decode() for the sizing bound.
   // Each emitter takes the write index and returns the next one.
   function pushCodePoint(units, n, cp) {
     if (cp <= 0xffff) {

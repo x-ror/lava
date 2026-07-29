@@ -32,7 +32,11 @@
     if (value === null) return 'null';
     var t = typeof value;
     if (t === 'undefined') return 'undefined';
-    if (t === 'number' || t === 'boolean') return 'type ' + t + ' (' + value + ')';
+    // -0 renders as "-0" in Node (util.inspect); string concatenation erases the
+    // sign. Same fix as buffer.js/encoding.js's copies of this helper.
+    if (t === 'number')
+      return 'type number (' + (value === 0 && 1 / value < 0 ? '-0' : value) + ')';
+    if (t === 'boolean') return 'type boolean (' + value + ')';
     // A bigint keeps Node's trailing "n" (util.inspect(10n) === '10n'), which bare
     // string coercion ('' + 10n === '10') drops — matches os.js/buffer.js.
     if (t === 'bigint') return 'type bigint (' + value + 'n)';

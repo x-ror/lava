@@ -193,12 +193,19 @@ test-odin: native-deps
 # The Odin test runner defaults to one thread per core, so each test that calls
 # lava.eval usually gets a fresh thread — and the host-native registry, the
 # private-ABI probe latch and JSC's context-address recycling are all THREAD-local.
-# ODIN_TEST_THREADS=1 is the only configuration where several eval call sites share
-# one runner thread, which is the exact shape of the two defects fixed in #317
-# (a thread-lived table bound to a per-test tracking allocator; a cache keyed
-# by a recycled JSGlobalContext address). Cheap enough to just run: ~0.25s.
+# One runner thread is the only configuration where several eval call sites share
+# a thread, which is the exact shape of the two defects fixed in #317 (a
+# thread-lived table bound to a per-test tracking allocator; a cache keyed by a
+# recycled JSGlobalContext address). Cheap enough to just run: ~0.25s.
+#
+# -define:, NOT an environment variable. core/testing/runner.odin:34 declares
+# `TEST_THREADS :: #config(ODIN_TEST_THREADS, 0)`, and #config is resolved at
+# COMPILE time — an env var of the same name is silently ignored, the binary
+# keeps the 0 default ("one thread per core"), and the target exits 0 having
+# tested nothing. It shipped that way and was green on 16 threads; the runner's
+# own banner ("Set with -define:ODIN_TEST_THREADS=n") is the tell.
 test-odin-serial: native-deps
-	ODIN_TEST_THREADS=1 $(ODIN) test cmd/lava -collection:lava=.
+	$(ODIN) test cmd/lava -collection:lava=. -define:ODIN_TEST_THREADS=1
 
 test-eventloop-odin:
 	$(ODIN) test pkg/runtime/eventloop

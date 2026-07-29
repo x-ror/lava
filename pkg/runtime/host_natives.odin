@@ -174,13 +174,15 @@ generic_native_host_cb :: proc "c" (global: rawptr, cf: [^]u64) -> i64 {
 
 // host_dispatch_fail FAILS CLOSED. Returning undefined here is silently wrong,
 // not merely unhelpful: several natives write through a caller-supplied buffer
-// and signal nothing on return. crypto.js does
-// `var buf = Buffer.alloc(size); native.randomFill(buf); return buf;` — alloc
-// zeroes, the result is ignored — so a no-op randomFill hands back n zero bytes
-// that the caller treats as CSPRNG output. randomFillSync, getRandomValues and
-// randomUUID share the shape; getRandomValues is worst, leaving the CALLER's
-// array untouched rather than zeroed. buffer.js's fromString would return
-// uninitialized pool memory. A miss means our own registry is inconsistent.
+// and signal nothing on return, so a no-op call is indistinguishable from a
+// successful one at the call site. buffer.js's fromString is the live example —
+// it writes into a slice of the allocUnsafe pool and discards the result, so a
+// missed native returns uninitialized pool memory (a freed request body, a key)
+// as if it were the decoded string. The CSPRNG entry points had the same shape
+// (a zeroed Buffer.alloc handed back as random bytes, and getRandomValues worse
+// still, leaving the CALLER's array untouched); crypto.js now checks
+// randomFill's return itself as a second layer, but that is a JS-side decision
+// this layer cannot rely on. A miss means our own registry is inconsistent.
 //
 // This is the ONLY layer that can close those, and the reason is a convention
 // worth stating so it stops being re-litigated: a native signals failure by
