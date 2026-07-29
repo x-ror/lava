@@ -28,7 +28,11 @@
 // tool then prints the tighter baseline to commit. A genuine false positive (a
 // call on a class instance whose class defines that method) can be silenced
 // inline with a `// primordials-ok` comment on the same line, or simply left
-// inside the baseline. Per-class baselines are what make "0" mean something: a
+// inside the baseline. On a line carrying candidates from MORE THAN ONE class
+// the bare marker suppresses nothing — name the class,
+// `// primordials-ok: method` — because a marker added for a known-safe
+// `queue.push(x)` must not also hide the live global read beside it.
+// Per-class baselines are what make "0" mean something: a
 // file may be at 0 globals because it captures them and still carry accessor
 // reads, and mixing the two into one number would let a fixed site pay for a
 // new one.
@@ -147,6 +151,26 @@ function shadow(src) {
           out[i++] = ' ';
           break;
         }
+        // A template hole EXECUTES, so its expression must survive shadowing —
+        // blanking the whole literal hid `${arr.push(x)}` from every detector.
+        // Recursive, because a hole can contain another template, a string or a
+        // comment, and those still need their own treatment.
+        if (q === '`' && src[i] === '$' && src[i + 1] === '{') {
+          out[i++] = ' ';
+          out[i++] = ' ';
+          const start = i;
+          let depth = 1;
+          while (i < n && depth > 0) {
+            if (src[i] === '{') depth++;
+            else if (src[i] === '}') depth--;
+            if (depth === 0) break;
+            i++;
+          }
+          const inner = shadow(src.slice(start, i));
+          for (let k = 0; k < inner.length; k++) out[start + k] = inner[k];
+          if (i < n) out[i++] = ' '; // the closing brace
+          continue;
+        }
         out[i++] = blank(src[i]);
       }
       prevSignificant = 'x'; // a string literal ends an expression
@@ -186,6 +210,39 @@ function shadow(src) {
   return out.join('');
 }
 
+// Function-body nesting depth at every index of the shadowed source.
+//
+// A capture is the FIX only when it runs at module-eval, before user code: the
+// loader evaluates the module body first. The identical line inside a function
+// body runs at CALL time, after a script has had every chance to replace the
+// global, so there it is a read like any other. Depth 1 is the module wrapper
+// every internal module is enclosed in; anything deeper is a real function.
+//
+// A `{` is treated as opening a function body when the previous significant
+// character is `)` or the line ends in `=>`. That also catches `if (x) {`,
+// which is deliberate: a capture inside a conditional is not the unconditional
+// module-eval capture the exemption is for, and over-counting is the safe
+// direction for a security control.
+function functionDepths(shadowed) {
+  const depths = new Int32Array(shadowed.length);
+  const stack = [];
+  let depth = 0;
+  let prev = '';
+  for (let i = 0; i < shadowed.length; i++) {
+    const c = shadowed[i];
+    if (c === '{') {
+      const isFn = prev === ')' || shadowed.slice(Math.max(0, i - 3), i).includes('=>');
+      stack.push(isFn);
+      if (isFn) depth++;
+    } else if (c === '}') {
+      if (stack.pop()) depth = Math.max(0, depth - 1);
+    }
+    depths[i] = depth;
+    if (!/\s/.test(c)) prev = c;
+  }
+  return depths;
+}
+
 function canStartRegex(prev) {
   // A regex can begin when the previous significant char is empty or one that
   // cannot terminate an expression (operators, punctuation, keywords' ends).
@@ -212,8 +269,8 @@ function countSource(src) {
   // shadow() has blanked); the capture test reads the SHADOWED line (so a
   // trailing comment cannot defeat its end anchor).
   const shadowLines = shadowed.split('\n');
+  const depths = functionDepths(shadowed);
   const hits = [];
-  const suppressed = (line) => /\/\/\s*primordials-ok/.test(origLines[line - 1] || '');
   const lineAt = (index) => shadowed.slice(0, index).split('\n').length;
 
   // Class 1 — pollutable prototype METHOD calls: `arr.push(x)`.
@@ -225,9 +282,7 @@ function countSource(src) {
   while ((m = callRe.exec(shadowed)) !== null) {
     const kind = POLLUTABLE.has(m[1]) ? 'method' : INVOKE.has(m[1]) ? 'invoke' : null;
     if (kind === null) continue;
-    const line = lineAt(m.index);
-    if (suppressed(line)) continue;
-    hits.push({ line, kind, name: `.${m[1]}(` });
+    hits.push({ line: lineAt(m.index), kind, name: `.${m[1]}(` });
   }
 
   // Class 3 — reads through a pollutable prototype ACCESSOR. This is the class
@@ -244,25 +299,68 @@ function countSource(src) {
     if (!ACCESSOR.has(m[1])) continue;
     const after = shadowed.slice(m.index + m[0].length).match(/^\s*/)[0].length;
     if (shadowed[m.index + m[0].length + after] === '(') continue;
-    const line = lineAt(m.index);
-    if (suppressed(line)) continue;
-    hits.push({ line, kind: 'accessor', name: `.${m[1]}` });
+    hits.push({ line: lineAt(m.index), kind: 'accessor', name: `.${m[1]}` });
   }
 
   // Class 4 — free reads of a replaceable global (`String(x)`, `Buffer.from`).
   // globalThis.String can be replaced by user code, so an internal module must
   // capture at module-eval — which the loader runs first — and use the capture.
   // The capture ITSELF is the fix, so `var StringG = String;` is exempt.
-  const globalRe = /(^|[^.\w$])([A-Za-z_$][\w$]*)\s*(\(|\.)/g;
+  // Matches every read form, not just `String(` and `String.`: a bare
+  // `return String;` hands the live binding out, and `globalThis.String(x)`
+  // reaches it the long way round. Both were missed until review of #321.
+  const globalRe = /(^|[^.\w$])(globalThis\s*\.\s*)?([A-Za-z_$][\w$]*)/g;
   while ((m = globalRe.exec(shadowed)) !== null) {
-    if (!GLOBALS.has(m[2])) continue;
-    const line = lineAt(m.index);
-    if (suppressed(line)) continue;
-    if (CAPTURE_RE.test(shadowLines[line - 1] || '')) continue;
-    hits.push({ line, kind: 'global', name: m[2] });
+    const name = m[3];
+    if (!GLOBALS.has(name)) continue;
+    const idx = m.index + m[1].length;
+    const rest = shadowed.slice(idx + m[0].length - m[1].length);
+    // `{ String: 1 }` is a key, not a read.
+    if (/^\s*:/.test(rest)) continue;
+    const line = lineAt(idx);
+    // The capture exemption applies ONLY at module-eval depth. Inside a
+    // function body the same line runs after user code and is a read.
+    if (depths[idx] <= 1 && CAPTURE_RE.test(shadowLines[line - 1] || '')) continue;
+    hits.push({ line, kind: 'global', name: m[2] ? `globalThis.${name}` : name });
   }
 
-  return { count: hits.length, hits };
+  return applySuppression(hits, origLines);
+}
+
+// `// primordials-ok` silences a line. Bare, it silences the line ONLY when
+// every candidate on it belongs to a single class — otherwise a marker added
+// for a known-safe `queue.push(x)` would also hide an unrelated live global
+// read that the author never looked at. A mixed line must name its class:
+// `// primordials-ok: method`.
+function applySuppression(hits, origLines) {
+  const byLine = new Map();
+  for (const h of hits) {
+    if (!byLine.has(h.line)) byLine.set(h.line, []);
+    byLine.get(h.line).push(h);
+  }
+  const kept = [];
+  for (const [line, lineHits] of byLine) {
+    const marker = /\/\/\s*primordials-ok(?::\s*([\w,\s]+))?/.exec(origLines[line - 1] || '');
+    if (!marker) {
+      kept.push(...lineHits);
+      continue;
+    }
+    const named = marker[1]
+      ? marker[1]
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : null;
+    if (named) {
+      kept.push(...lineHits.filter((h) => !named.includes(h.kind)));
+      continue;
+    }
+    const classes = new Set(lineHits.map((h) => h.kind));
+    // Bare marker on a mixed line suppresses nothing — make the author say which.
+    kept.push(...(classes.size === 1 ? [] : lineHits));
+  }
+  kept.sort((a, b) => a.line - b.line);
+  return { count: kept.length, hits: kept };
 }
 
 function countFile(file) {
@@ -306,6 +404,64 @@ const SELF_TEST = [
   { name: 'capture with trailing comment', kind: null, src: 'var S = String; // pristine' },
   { name: 'primordial wrapper call', kind: null, src: 'ArrayPrototypePush(arr, x);' },
   { name: 'ReflectApply is the fix', kind: null, src: 'ReflectApply(fn, null, args);' },
+
+  // --- blind spots found in review of #321, each a way the detector could
+  // report OK on a live vector. Every one is a positive; the negatives beside
+  // them keep the fix from over-firing.
+
+  // A capture is only the fix when it runs at MODULE-EVAL, before user code.
+  // The same line inside a function body runs at call time — after a script has
+  // had every chance to replace the global — so it is a read, not a capture.
+  // Both fixtures carry the module wrapper every internal file has, because
+  // that wrapper IS module-eval depth: the loader calls it once, before user
+  // code. Depth 1 is therefore the exemption; the function nested inside it is
+  // depth 2 and runs whenever it is called.
+  {
+    name: 'capture inside a function body',
+    kind: 'global',
+    src: '(function (require, module) {\n  function decode(x) {\n    const BufferFrom = Buffer.from;\n    return BufferFrom(x);\n  }\n})',
+  },
+  {
+    name: 'capture at module level',
+    kind: null,
+    src: '(function (require, module) {\n  var BufferFrom = Buffer.from;\n})',
+  },
+
+  // shadow() blanked whole template literals, so anything inside `${…}` — which
+  // executes — was invisible.
+  { name: 'method in a template hole', kind: 'method', src: 'var s = `${arr.push(x)}`;' },
+  { name: 'global in a template hole', kind: 'global', src: 'function f() { return `${String(y)}`; }' },
+  { name: 'template text is still inert', kind: null, src: 'var s = `arr.push(x) String(y)`;' },
+
+  // Documented live-read forms the global class did not match.
+  { name: 'bare global read', kind: 'global', src: 'function f() { return String; }' },
+  { name: 'qualified via globalThis', kind: 'global', src: 'function f() { return globalThis.String(x); }' },
+  // NOT a fixture: `function f(String) { return String; }`. A local shadowing a
+  // global name is counted, because deciding otherwise needs scope analysis the
+  // scanner does not have. Conservative in the safe direction, and a local
+  // named `String` inside a hardened module is its own problem.
+  { name: 'object key is not a read', kind: null, src: 'var t = { __proto__: null, String: 1 };' },
+];
+
+// A bare `// primordials-ok` must not silence a class the author never looked
+// at. Pinned separately because it is about the SUPPRESSION rule, not about a
+// detector class: the marker is honoured only when every candidate on the line
+// belongs to one class, so a mixed line has to name the class explicitly.
+const SUPPRESSION_TEST = [
+  { name: 'single-class line is suppressed', src: 'q.push(x); // primordials-ok', expect: 0 },
+  // A bare marker on a mixed line suppresses NOTHING — not even the class the
+  // author meant. Silencing only the global would be a guess, and silencing
+  // both is the bug. The author has to name the class.
+  {
+    name: 'mixed line is NOT blanket-suppressed',
+    src: 'function f() { q.push(x); String(y); } // primordials-ok',
+    expect: 2,
+  },
+  {
+    name: 'mixed line, class named explicitly',
+    src: 'function f() { q.push(x); String(y); } // primordials-ok: method',
+    expect: 1,
+  },
 ];
 
 function selfTest() {
@@ -317,6 +473,12 @@ function selfTest() {
       if (hits.length !== 0) failures.push(`${t.name}: expected no hit, got ${got.join(',')}`);
     } else if (!got.includes(t.kind)) {
       failures.push(`${t.name}: expected a '${t.kind}' hit, got ${got.length ? got.join(',') : 'none'}`);
+    }
+  }
+  for (const t of SUPPRESSION_TEST) {
+    const { hits } = countSource(t.src);
+    if (hits.length !== t.expect) {
+      failures.push(`${t.name}: expected ${t.expect} hit(s), got ${hits.length}`);
     }
   }
   return failures;

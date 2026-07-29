@@ -9,13 +9,13 @@
     "method": 11,
     "invoke": 8,
     "accessor": 8,
-    "global": 25
+    "global": 52
   },
   "buffer.js": {
     "method": 22,
     "invoke": 7,
     "accessor": 26,
-    "global": 139
+    "global": 186
   },
   "console.js": {
     "method": 0,
@@ -27,7 +27,7 @@
     "method": 17,
     "invoke": 0,
     "accessor": 20,
-    "global": 57
+    "global": 76
   },
   "diagnostics_channel.js": {
     "method": 4,
@@ -63,25 +63,25 @@
     "method": 0,
     "invoke": 2,
     "accessor": 0,
-    "global": 10
+    "global": 12
   },
   "fetch.js": {
     "method": 20,
     "invoke": 1,
     "accessor": 6,
-    "global": 59
+    "global": 76
   },
   "http.js": {
     "method": 35,
     "invoke": 5,
     "accessor": 3,
-    "global": 41
+    "global": 44
   },
   "https.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 0,
-    "global": 8
+    "global": 12
   },
   "loader.js": {
     "method": 2,
@@ -93,7 +93,7 @@
     "method": 0,
     "invoke": 0,
     "accessor": 0,
-    "global": 2
+    "global": 5
   },
   "mime.js": {
     "method": 26,
@@ -105,13 +105,13 @@
     "method": 1,
     "invoke": 2,
     "accessor": 5,
-    "global": 12
+    "global": 15
   },
   "os.js": {
     "method": 12,
     "invoke": 0,
     "accessor": 1,
-    "global": 13
+    "global": 14
   },
   "parse_args.js": {
     "method": 0,
@@ -147,7 +147,7 @@
     "method": 0,
     "invoke": 9,
     "accessor": 0,
-    "global": 35
+    "global": 56
   },
   "process.js": {
     "method": 0,
@@ -165,19 +165,19 @@
     "method": 8,
     "invoke": 1,
     "accessor": 0,
-    "global": 3
+    "global": 6
   },
   "sqlite.js": {
     "method": 5,
     "invoke": 1,
     "accessor": 3,
-    "global": 25
+    "global": 30
   },
   "stream.js": {
     "method": 30,
     "invoke": 9,
     "accessor": 32,
-    "global": 45
+    "global": 60
   },
   "stream_promises.js": {
     "method": 1,
@@ -189,19 +189,19 @@
     "method": 11,
     "invoke": 0,
     "accessor": 1,
-    "global": 65
+    "global": 67
   },
   "string_decoder.js": {
     "method": 3,
     "invoke": 0,
     "accessor": 3,
-    "global": 3
+    "global": 5
   },
   "structured_clone.js": {
     "method": 5,
     "invoke": 1,
     "accessor": 4,
-    "global": 11
+    "global": 19
   },
   "timers.js": {
     "method": 0,
@@ -231,12 +231,12 @@
     "method": 48,
     "invoke": 14,
     "accessor": 15,
-    "global": 64
+    "global": 77
   },
   "util_types.js": {
     "method": 0,
     "invoke": 1,
     "accessor": 0,
-    "global": 1
+    "global": 2
   }
 }
