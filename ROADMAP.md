@@ -81,20 +81,23 @@ coupling.
 
 ### High priority (the Odin / native part)
 
-- [ ] **The primordials ratchet cannot see accessor reads, and reports 0
-      anyway** — `make check-primordials` counts Array/String prototype METHOD
-      calls, so a read through a configurable prototype ACCESSOR is invisible to
-      it, as is `.call`. This is not theoretical: `encoding.js` reached
-      `units.buffer` and `bytes.buffer` through `%TypedArray%.prototype.buffer`
-      while the ratchet stood at baseline 0, and a poisoned getter substituted an
-      attacker's `ArrayBuffer` as the decode output on every non-fastpath decode
-      — reachable from `url.js` `percentDecodeHostStrict` with attacker-sized
-      input. Fixed in #320 by capturing the getter, but only because a reviewer
-      looked; nothing would have caught the next one. CLAUDE.md §5 already warns
-      that "baseline 0 means no counted call left, not hardened" — the ratchet
-      should count what the warning describes. Do this BEFORE widening pollution
-      hardening to more files (below): extending coverage measured by a blind
-      instrument buys confidence, not safety.
+- [x] **The primordials ratchet cannot see accessor reads, and reports 0
+      anyway** — fixed: it now counts four classes, each baselined separately —
+      `method`, `invoke` (`.call`/`.apply`), `accessor` (reads through a
+      configurable prototype getter) and `global` (a replaceable global read
+      live instead of captured). Verified against the defect that motivated it:
+      `encoding.js` at 401ea40 scores 8 accessor sites including the
+      `units.buffer` read that was the live vector, so the tool would have
+      flagged what a reviewer had to find. The detector self-tests on every run
+      against known-positive and known-negative fixtures and refuses to report
+      on the tree if any regresses — a blind control is worse than none.
+      Per-class baselines are what make "0" mean something: `encoding.js` is at
+      0 globals because it captures them, while its accessor count is not 0 and
+      now says so. Tree total went 583 -> 1555 (method 583, invoke 80,
+      accessor 140, global 752); the new counts are recorded, not fixed.
+      One class remains on the author: an object literal indexed by a
+      caller-supplied key needs `__proto__: null`, and deciding a literal is a
+      dynamic-key lookup table takes dataflow a scanner does not have.
 - [x] **Promise ↔ event-loop ordering.** JSC drains its own promise microtask
       queue at every C-API boundary, so `Promise.then` used to run _before_
       `process.nextTick` (Node is the reverse). `queueMicrotask` lives in a JS shim
@@ -323,11 +326,13 @@ coupling.
       `slice`/`indexOf`/`includes` sites, plus its percent-decode byte arrays,
       which are still plain arrays and so reachable via an `Array.prototype[0]`
       accessor), `buffer.js` (22), `path.js` (158), `esm.js` (78), `util.js` (48).
-      **Blocked on the ratchet blind spot** (High priority, above): those counts
-      measure method calls only, so driving a file to 0 says nothing about the
-      accessor and `.call` vectors — `encoding.js` sat at 0 while carrying a live
-      `%TypedArray%.prototype.buffer` poisoning path. Teach the ratchet to see
-      them first, re-baseline, then work the list.
+      **Unblocked**: the ratchet now counts four classes separately, so the
+      remediation list above is the `method` column only. The other three are
+      recorded per file in `pollution-baseline.json` and are the larger part of
+      the work — tree-wide, `global` 752, `accessor` 140, `invoke` 80 against
+      `method` 583. Take them per file, lowest-hanging first: capturing a
+      module's globals at module-eval is mechanical and drives its `global`
+      column to 0, which `encoding.js` already demonstrates.
 - [x] **Real wall-clock timers** — fixed: in `real_time` mode the loop tracks the
       monotonic wall clock (`sync_real_clock` / `real_now_ms` in
       `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a
