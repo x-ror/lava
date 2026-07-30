@@ -175,15 +175,28 @@ function gateCompat(relPath) {
   return { ok: false, detail: parts.join('\n') };
 }
 
+// EVERY differing line, not just the first. A single mutation legitimately moves
+// more than one vector — reverting the utf-8 decode borrow moves both R and V in
+// 55-encoding-pollution — and reporting only the earliest meant `expect_detail`
+// could never name a later one, so the entry had to fall back to something
+// tautological. Bounded so a wholesale divergence does not bury the report.
+const MAX_DIFF_LINES = 12;
 function firstDiff(a, b) {
   const al = a.split('\n');
   const bl = b.split('\n');
+  const out = [];
+  let more = 0;
   for (let i = 0; i < Math.max(al.length, bl.length); i++) {
-    if (al[i] !== bl[i]) {
-      return `line ${i + 1}:\n    node: ${trunc(al[i])}\n    lava: ${trunc(bl[i])}`;
+    if (al[i] === bl[i]) continue;
+    if (out.length >= MAX_DIFF_LINES) {
+      more++;
+      continue;
     }
+    out.push(`line ${i + 1}:\n    node: ${trunc(al[i])}\n    lava: ${trunc(bl[i])}`);
   }
-  return 'outputs differ';
+  if (out.length === 0) return 'outputs differ';
+  if (more > 0) out.push(`(+${more} more differing line${more === 1 ? '' : 's'})`);
+  return out.join('\n');
 }
 const trunc = (s) => (s === undefined ? '(absent)' : s.length > 140 ? s.slice(0, 137) + '...' : s);
 
