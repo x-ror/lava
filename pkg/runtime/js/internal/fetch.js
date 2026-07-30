@@ -56,12 +56,18 @@
   // here is header injection on the wire. NOT `re.test(...)`: `RegExp.prototype.exec`
   // is a writable data property and RegExpExec re-reads it off the receiver, so an
   // ordinary assignment steers `test` too. primordials deliberately exports no
-  // `RegExpPrototypeTest` for that reason; the captured `exec` is the only sound
-  // spelling.
-  var RegExpPrototypeExec = require('primordials').RegExpPrototypeExec;
+  // `RegExpPrototypeTest` for that reason; `RegExpMatches` (a captured `exec`
+  // compared against null) is the only sound spelling.
+  //
+  // Scope, precisely: this closes the header NAME check. `normalizeHeaderValue`
+  // below still calls a global `replaceAll` with a live regex and runs BEFORE this
+  // validator, so under the same poison it spins rather than returning — a DoS, not
+  // an injection, because `assertValidHeaderValue` is a hand-rolled charCode scan.
+  // Tracked in ROADMAP.
+  var reTest = require('primordials').RegExpMatches;
   var VALID_HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
   function assertValidHeaderName(name) {
-    if (RegExpPrototypeExec(VALID_HEADER_NAME, name) === null) {
+    if (!reTest(VALID_HEADER_NAME, name)) {
       throw new TypeError('Invalid header name: "' + name + '"');
     }
   }

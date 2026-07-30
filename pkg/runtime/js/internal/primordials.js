@@ -110,6 +110,10 @@
     };
   }
 
+  // Captured ONCE. Both the raw and the predicate export below close over this, so
+  // there is exactly one wrapper object rather than a fresh closure per call.
+  var regExpExec = safeCaller1(RegExp.prototype.exec);
+
   // brandedAs is the UNFORGEABLE replacement for `value instanceof Ctor` on a
   // hardening path. `instanceof` dispatches through `Ctor[Symbol.hasInstance]`, a
   // configurable own property of the constructor, so a caller can flip the answer
@@ -423,7 +427,17 @@
     // is invisible next to the match itself — and a validator that is immune to a
     // poisoned `exec` but not to a poisoned `Function.prototype.call` has simply
     // moved the vector.
-    RegExpPrototypeExec: safeCaller1(RegExp.prototype.exec),
+    RegExpPrototypeExec: regExpExec,
+
+    // RegExpMatches is the PREDICATE form, and the only spelling a validator should
+    // use. It lives here rather than in each consumer because three modules each
+    // rewrote it privately during the migration — http.js and url.js as byte-identical
+    // closures, fetch.js inline and INVERTED — which is three chances to get the
+    // negation backwards on the surface where backwards means header injection.
+    // There is deliberately no RegExpPrototypeTest to pair with it: see above.
+    RegExpMatches: function (re, s) {
+      return regExpExec(re, s) !== null;
+    },
 
     // Constructors for the view types structured_clone rebuilds. It used to
     // reach them through `value.constructor`, which is a configurable

@@ -28,17 +28,36 @@
   // assignment steers `test` too — including a captured one. Measured over a real
   // socket before this changed: `Content-Length: abc` answered 200 OK and
   // `Transfer-Encoding: gzip` was accepted as chunked. There is deliberately no
-  // `RegExpPrototypeTest` in primordials; this is the only spelling.
-  var RegExpPrototypeExec = primordials.RegExpPrototypeExec;
-  var reTest = function (re, s) {
-    return RegExpPrototypeExec(re, s) !== null;
-  };
+  // `RegExpPrototypeTest` in primordials; `RegExpMatches` is the only spelling, and
+  // it lives there rather than here because this file, url.js and fetch.js each
+  // grew a private copy during the migration and fetch.js's was inverted.
+  var reTest = primordials.RegExpMatches;
   // Hoisted so the literals are not re-created per request, and so every framing
   // pattern is visible in one place rather than inline at four call sites.
-  var CHUNK_SIZE_RE = /^[0-9a-fA-F]+$/;
+  // allDigits replaces `/^[0-9a-fA-F]+$/` and `/^\d+$/` for the two framing
+  // validators that are nothing but a character class. With no RegExp in the
+  // expression there is nothing to steer at all — `exec`, `test`, `Symbol.match`
+  // and `lastIndex` all drop out together, where routing through a captured `exec`
+  // closes one of them. It is also cheaper — the same swap measured 0.82x-0.90x end
+  // to end on `new URL` (min of 7 interleaved pinned launches per arm) — and the
+  // chunk-size check runs once per CHUNK, not once per request. Empty input is
+  // false, matching the `+` it replaces.
+  var StringPrototypeCharCodeAt = primordials.StringPrototypeCharCodeAt;
+  function allDigits(s, radix) {
+    var n = s.length;
+    if (n === 0) return false;
+    for (var i = 0; i < n; i++) {
+      var c = StringPrototypeCharCodeAt(s, i);
+      if (radix === 16) {
+        if (!((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66)))
+          return false;
+      } else if (c < 0x30 || c > 0x39) return false;
+    }
+    return true;
+  }
+
   var CHUNK_EXT_RE = /^;[^\s;]/;
   var TE_CHUNKED_RE = /^\s*chunked\s*$/i;
-  var CONTENT_LENGTH_RE = /^\d+$/;
   var CONNECTION_CLOSE_RE = /\bclose\b/i;
   var CONNECTION_CLOSE_CS_RE = /\bclose\b/;
   var CONNECTION_KEEPALIVE_RE = /\bkeep-alive\b/;
@@ -254,7 +273,7 @@
           var sizeLine = buffer.toString('latin1', 0, lineEnd);
           var extensionSep = sizeLine.indexOf(';');
           var sizeToken = extensionSep >= 0 ? sizeLine.slice(0, extensionSep) : sizeLine;
-          if (!reTest(CHUNK_SIZE_RE, sizeToken)) return fail();
+          if (!allDigits(sizeToken, 16)) return fail();
           if (extensionSep >= 0 && !reTest(CHUNK_EXT_RE, sizeLine.slice(extensionSep)))
             return fail();
           var chunkSize = parseInt(sizeToken, 16);
@@ -959,7 +978,7 @@
           onRequestBodyComplete,
         );
       } else if (contentLengthHeader !== undefined) {
-        if (!reTest(CONTENT_LENGTH_RE, contentLengthHeader)) return sendErrorAndClose(400);
+        if (!allDigits(contentLengthHeader, 10)) return sendErrorAndClose(400);
         contentLengthRemaining = parseInt(contentLengthHeader, 10);
       }
 

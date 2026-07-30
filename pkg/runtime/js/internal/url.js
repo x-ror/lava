@@ -33,11 +33,12 @@
   // `test` as well — a captured `test` included. primordials exports no
   // `RegExpPrototypeTest` for exactly that reason. `%2f`/`%5c` detection below is
   // the path-traversal check, so this is not cosmetic.
-  var RegExpPrototypeExec = P.RegExpPrototypeExec;
-  var reTest = function (re, str) {
-    return RegExpPrototypeExec(re, str) !== null;
-  };
-  var DIGITS_ONLY_RE = /^[0-9]+$/;
+  //
+  // NOT a complete rule for this file: the `StringPrototypeReplace(…, /re/, …)`
+  // sites below route through the same RegExpExec re-read and are still steerable —
+  // and a GLOBAL one spins rather than answering wrongly, because a forged result
+  // never advances lastIndex. Tracked in ROADMAP; see the note on TAB_NEWLINE_RE_G.
+  var reTest = P.RegExpMatches;
   var PERCENT_2F_RE = /%2f/i;
   var PERCENT_5C_RE = /%5c/i;
   var LEADING_SLASHES_RE = /^\/+/;
@@ -111,6 +112,33 @@
 
   function isHexDigit(c) {
     return (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
+  }
+
+  // allDigits: `/^[0-9]+$/` and friends without a RegExp, for the three validators
+  // that are nothing but a character class over a short token.
+  //
+  // Two reasons, and the second is the better one.
+  // SAFER: with no RegExp in the expression there is nothing to steer — `exec`,
+  // `test`, `Symbol.match`, `Symbol.replace` and `lastIndex` are all out of reach at
+  // once, where routing through a captured `exec` closes exactly one of them.
+  // FASTER: end to end on `new URL`, charCode/exec = 0.82x on a dotted quad, 0.83x
+  // on an octal quad, 0.90x on a plain special-scheme URL — min of 7 interleaved
+  // pinned launches per arm, each launch itself the min of 5 reps of 300k parses.
+  // `new URL` runs 4-7 of these per parse, which is where the +6% to +20% regression
+  // the exec migration introduced came from; this more than reverses it.
+  // Empty input is FALSE, matching `+` in the patterns it replaces.
+  function allDigits(s, radix) {
+    var n = s.length;
+    if (n === 0) return false;
+    for (var i = 0; i < n; i++) {
+      var c = StringPrototypeCharCodeAt(s, i);
+      if (radix === 16) {
+        if (!isHexDigit(c)) return false;
+      } else if (radix === 8) {
+        if (c < 0x30 || c > 0x37) return false;
+      } else if (c < 0x30 || c > 0x39) return false;
+    }
+    return true;
   }
 
   // The WHATWG percent-encode sets, each a predicate over a code point. Every set
@@ -472,8 +500,9 @@
       input = input.slice(1);
     }
     if (input === '') return 0;
-    var re = radix === 10 ? /^[0-9]+$/ : radix === 16 ? /^[0-9a-fA-F]+$/ : /^[0-7]+$/;
-    if (!reTest(re, input)) return FAILURE;
+    // Was three regex literals re-created per call (4-5x per dotted-quad parse) plus
+    // an exec crossing each; now neither.
+    if (!allDigits(input, radix)) return FAILURE;
     var n = parseIntG(input, radix);
     if (!isFiniteG(n)) return FAILURE;
     return n;
@@ -486,7 +515,7 @@
       ArrayPrototypePop(parts);
     }
     var last = parts[parts.length - 1];
-    if (last !== '' && reTest(DIGITS_ONLY_RE, last)) return true;
+    if (allDigits(last, 10)) return true;
     return parseIPv4Number(last) !== FAILURE;
   }
 
