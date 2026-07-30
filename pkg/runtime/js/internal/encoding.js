@@ -40,12 +40,15 @@
   var TypedArrayPrototypeGetBuffer = P.TypedArrayPrototypeGetBuffer;
   var TypedArrayPrototypeGetByteOffset = P.TypedArrayPrototypeGetByteOffset;
   var TypedArrayPrototypeGetByteLength = P.TypedArrayPrototypeGetByteLength;
-  var DataViewG = DataView;
   var DataViewPrototypeGetBuffer = P.DataViewPrototypeGetBuffer;
   var DataViewPrototypeGetByteOffset = P.DataViewPrototypeGetByteOffset;
   var DataViewPrototypeGetByteLength = P.DataViewPrototypeGetByteLength;
-  var ArrayBufferG = P.ArrayBuffer;
   var ArrayBufferIsView = P.ArrayBufferIsView;
+  // Brand by prototype chain, never `instanceof` — see the note on toBytes.
+  var brandedAs = P.brandedAs;
+  var Uint8ArrayPrototype = Uint8Array.prototype;
+  var ArrayBufferPrototype = ArrayBuffer.prototype;
+  var DataViewPrototype = DataView.prototype;
   // Free globals / statics, captured pristine at module-eval.
   var StringG = String;
   var StringFromCharCode = String.fromCharCode;
@@ -226,17 +229,30 @@
     );
   }
 
+  // NOT `instanceof`, on any of the three arms. `instanceof` dispatches through
+  // `Ctor[Symbol.hasInstance]`, a configurable own property, so a caller flips the
+  // brand in either direction and steers the value into the wrong arm. Measured
+  // against node 24, which is native here and immune on every cell: forging
+  // `DataView[Symbol.hasInstance]` to false made `decode(dataView)` THROW
+  // TypeError; forging `ArrayBuffer`'s to false made `decode(arrayBuffer)` throw;
+  // and forging `Uint8Array`'s or `ArrayBuffer`'s to TRUE made `decode()` return
+  // "" — a silent empty decode of valid input, which is the worse half. Six
+  // diverging cells in all, of which a review flagged one.
+  // `brandedAs` walks the prototype chain through a captured
+  // Reflect.getPrototypeOf, which an already-constructed object cannot re-point,
+  // and stays subclass-correct so `Buffer` still takes the Uint8Array arm.
+  // Pinned by vector W in 55-encoding-pollution.js.
   function toBytes(input) {
     if (input === undefined) return new Uint8ArrayG(0);
-    if (input instanceof Uint8ArrayG) return input;
-    if (input instanceof ArrayBufferG) return new Uint8ArrayG(input);
+    if (brandedAs(input, Uint8ArrayPrototype)) return input;
+    if (brandedAs(input, ArrayBufferPrototype)) return new Uint8ArrayG(input);
     // A non-Uint8Array view is re-wrapped over the SAME range, so all three
     // reads must come from the engine's slots: read live, a poisoned trio
     // selected a window across the shared allocUnsafe pool — reproduced with a
     // DataView input returning a neighbouring Buffer's bytes. DataView's
     // accessors are separate properties from %TypedArray%'s, hence two paths.
     if (ArrayBufferIsView(input)) {
-      if (input instanceof DataViewG) {
+      if (brandedAs(input, DataViewPrototype)) {
         return new Uint8ArrayG(
           DataViewPrototypeGetBuffer(input),
           DataViewPrototypeGetByteOffset(input),

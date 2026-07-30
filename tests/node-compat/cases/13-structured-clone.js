@@ -162,7 +162,7 @@ for (const name of [
 ]) {
   const Ctor = globalThis[name];
   if (typeof Ctor !== 'function') continue; // version-dependent, skip quietly
-  const src = /^Big/.test(name) ? new Ctor([1n, 2n]) : new Ctor([1, 2]);
+  const src = name.startsWith('Big') ? new Ctor([1n, 2n]) : new Ctor([1, 2]);
   const copy = structuredClone(src);
   assert.equal(Object.prototype.toString.call(copy), '[object ' + name + ']');
   assert.equal(copy.length, 2);

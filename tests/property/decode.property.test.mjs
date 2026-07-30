@@ -21,7 +21,8 @@
 //
 // fast-check stays on the Node side and drives `bin/lava` as a subprocess.
 // Requiring it inside Lava would test Lava's module resolution against a dual
-// ESM/CJS package rather than the decoder; only bytes cross, via stdin.
+// ESM/CJS package rather than the decoder; only bytes cross, through a corpus
+// file named by PROP_CORPUS (see runBatch — `lava eval` does not read stdin).
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -81,10 +82,10 @@ function runBatch(bin, args, script, corpus, env) {
   return lines;
 }
 
-// The batch driver every property script shares: read stdin, map each hex line
-// through `decodeLine`, print one line per input. Kept as a string because both
-// runtimes evaluate it — `lava eval` and `node -e` are the two entry points the
-// oracle model already uses.
+// The batch driver every property script shares: read the corpus file named by
+// PROP_CORPUS, map each hex line through the per-input expression, print one line
+// per input. Kept as a string because both runtimes evaluate it — `lava eval` and
+// `node -e` are the two entry points the oracle model already uses.
 const DRIVER = (body) => `
   var lines = require('fs').readFileSync(process.env.PROP_CORPUS, 'utf8').split('\\n');
   // Drop ONLY the trailing empty element the final newline produces. An interior
@@ -171,7 +172,13 @@ function differential(t, script, corpus, env, generator) {
       const l = runBatch(LAVA, ['eval'], script, [hex], env)[0];
       assert.equal(l, n, `bytes: ${hex || '(empty)'}`);
     }),
-    { seed: SEED, numRuns: RUNS, endOnFailure: true },
+    // NO `endOnFailure` — it is the option that would defeat the entire purpose of
+    // this re-entry. With it set, fast-check reports the raw first failure instead
+    // of minimizing: measured on a trivial property, `endOnFailure: true` reports
+    // counterexample [99996] where the default reports [6]. The header above
+    // promises a minimal counterexample, so the option and the promise were in
+    // direct contradiction.
+    { seed: SEED, numRuns: RUNS },
   );
   // Shrinking found nothing reproducible on its own — report the first raw diff.
   const i = bad[0];

@@ -112,6 +112,27 @@ const SELF_TEST = [
   // missed `=>` followed by a newline — re-opening the very blind spot the
   // lookback was written to close. The AST cannot regress that way; the fixture
   // stays because the *rule* (depth, not statement shape) is what it pins.
+  // A class field holding a BARE global reference, not a call. The `Identifier`
+  // visitor's shadow-check did `parent.params.includes(node)` unguarded, and
+  // `PropertyDefinition` is in FUNCTION_TYPES (it is a call-time context for the
+  // depth rule) but has no `.params` — so this threw
+  // `Cannot read properties of undefined (reading 'includes')` and crashed the
+  // whole scan on valid syntax. `shadowedByParam` had already been guarded for
+  // exactly this; the twin check had not, and the existing fixtures only covered
+  // the CALL form `x = String()`, whose parent is a CallExpression.
+  // At function depth 2 it is a live read, so it counts.
+  {
+    name: 'class field holding a bare global reference',
+    src: WRAP('  function f() { class C { x = String; } return C; }'),
+    expect: E({ global: 1 }),
+  },
+  // The call form, kept beside it so the pair cannot drift apart again.
+  {
+    name: 'class field calling a global',
+    src: WRAP('  function f() { class C { x = String(); } return C; }'),
+    expect: E({ global: 1 }),
+  },
+
   {
     name: 'capture inside an arrow body',
     src: WRAP(

@@ -101,6 +101,36 @@
     };
   }
 
+  // brandedAs is the UNFORGEABLE replacement for `value instanceof Ctor` on a
+  // hardening path. `instanceof` dispatches through `Ctor[Symbol.hasInstance]`, a
+  // configurable own property of the constructor, so a caller can flip the answer
+  // in EITHER direction and misroute a value into the wrong arm. That is not
+  // hypothetical in this tree: forging `DataView[Symbol.hasInstance]` made
+  // structuredClone throw on a genuine DataView, and made TextDecoder.decode()
+  // return "" — a silent empty decode — for valid input node decodes fine.
+  //
+  // A prototype-chain walk cannot be redirected the same way: the chain of an
+  // already-constructed object is fixed, and ReflectGetPrototypeOf is captured, so
+  // a poisoned `__proto__` accessor does not steer it. It is a CHAIN walk, not one
+  // comparison, so subclasses still match — `Buffer extends Uint8Array` and
+  // `class MyView extends DataView` both brand correctly.
+  //
+  // It is a prototype test, not a slot test: `Object.create(Uint8Array.prototype)`
+  // passes and has no backing store. So did `instanceof`, and the natives reject a
+  // slotless receiver either way — this is strictly stronger than what it replaces,
+  // not a complete brand. Where a true slot test is needed, call a captured getter
+  // and let it throw.
+  var reflectGetPrototypeOf = Reflect.getPrototypeOf;
+  function brandedAs(value, prototype) {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
+    var proto = reflectGetPrototypeOf(value);
+    while (proto !== null) {
+      if (proto === prototype) return true;
+      proto = reflectGetPrototypeOf(proto);
+    }
+    return false;
+  }
+
   // Fixed-arity `.call` wrappers — the fast path on JSC. `fn` is the captured
   // pristine method; the closure forwards a known number of positional args.
   function caller0(fn) {
@@ -175,6 +205,7 @@
   module.exports = {
     uncurryThis: uncurryThis,
     lockIntrinsics: lockIntrinsics,
+    brandedAs: brandedAs,
 
     // --- Constructors / namespaces (captured so a replaced global is ignored) ---
     Object: Object,

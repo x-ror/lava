@@ -424,7 +424,19 @@ function countSource(src, label = '<fixture>') {
       }
       if (parent.type === 'Property' && parent.key === node && !parent.computed) return;
       if (parent.type === 'VariableDeclarator' && parent.id === node) return;
-      if (FUNCTION_TYPES.has(parent.type) && (parent.id === node || parent.params.includes(node))) {
+      // `Array.isArray(parent.params)` for the same reason `shadowedByParam` has
+      // it: FUNCTION_TYPES includes PropertyDefinition, which is a call-time
+      // context for the depth rule but carries no parameter list. Unguarded, a
+      // class field holding a bare global — `class C { x = String; }`, the
+      // class-field spelling of this codebase's own capture idiom — made `parent`
+      // the PropertyDefinition and threw
+      // `Cannot read properties of undefined (reading 'includes')`, crashing the
+      // whole scan on valid syntax. The call form `x = String()` parents to a
+      // CallExpression and never hit it, which is why the fixtures missed this.
+      if (
+        FUNCTION_TYPES.has(parent.type) &&
+        (parent.id === node || (Array.isArray(parent.params) && parent.params.includes(node)))
+      ) {
         return;
       }
       if (parent.type === 'ClassDeclaration' && parent.id === node) return;
