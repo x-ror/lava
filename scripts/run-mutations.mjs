@@ -29,6 +29,13 @@
 //                                  real socket (the *-smoke targets) or a
 //                                  multi-step harness. RED = non-zero exit.
 //
+// `expect_detail` (optional, but use it): a substring the RED output must contain.
+// Going red is not enough — a mutation can break something unrelated and look like
+// it worked. That happened while seeding this manifest: a mis-escaped `\\d` in a
+// replacement produced the regex /^\\d+$/, which matches a literal backslash, so
+// EVERY request 400'd and the parity phase failed. The gate reported "killed" and
+// the smuggling phase it was supposed to pin never ran.
+//
 // Usage:
 //   node scripts/run-mutations.mjs                 # all
 //   node scripts/run-mutations.mjs --filter=clone  # substring match on `name`
@@ -156,7 +163,11 @@ function gateMake(target) {
   const r = capture('make', [target], { cwd: ROOT });
   if (r.status === 0) return { ok: true, detail: `make ${target} passed` };
   const text = r.stdout + r.stderr;
-  const fail = text.split('\n').find((l) => /^FAIL |FAILED|Error \d/.test(l));
+  // Prefer the line naming WHICH phase failed over the first generic error, so
+  // expect_detail can distinguish "the phase I meant" from "something else broke".
+  const lines = text.split('\n');
+  const labelled = lines.find((l) => /FAILED: .* checks failed/.test(l));
+  const fail = labelled ?? lines.find((l) => /^FAIL |FAILED|Error \d/.test(l));
   return { ok: false, detail: fail ? fail.trim() : `make ${target} exited ${r.status}` };
 }
 
@@ -280,6 +291,14 @@ try {
         console.log(`           the gate still passes with this code broken.`);
         console.log(`           expected to catch: ${m.why}`);
         console.log(`           gate: ${m.gate}`);
+      } else if (m.expect_detail && !r.detail.includes(m.expect_detail)) {
+        // Red, but not for the recorded reason — so this mutation is not pinning
+        // what it claims to. Treated as a failure, because a mutation that breaks
+        // something unrelated proves nothing about the test it names.
+        failures++;
+        console.log('WRONG REASON');
+        console.log(`           expected the failure to mention: ${m.expect_detail}`);
+        console.log(`           got: ${r.detail.split('\n')[0]}`);
       } else {
         console.log(`killed (${r.detail.split('\n')[0]})`);
       }
