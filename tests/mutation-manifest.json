@@ -109,16 +109,16 @@
     },
     {
       "name": "the poisoned http-smoke phases die when a framing validator goes back to re.test",
-      "why": "RegExpExec re-reads R.exec off the receiver, so a plain assignment to RegExp.prototype.exec turns the Content-Length and Transfer-Encoding checks off and the server accepts smuggled framing.",
+      "why": "Content-Length framing. With the check on a live regex, a poisoned exec answered 200 OK for `Content-Length: abc` \u2014 parseInt gives NaN and the body framing desyncs. The charCode form has no regex to poison at all.",
       "source": "pkg/runtime/js/internal/http.js",
-      "find": "        if (!reTest(CONTENT_LENGTH_RE, contentLengthHeader)) return sendErrorAndClose(400);",
+      "find": "        if (!allDigits(contentLengthHeader, 10)) return sendErrorAndClose(400);",
       "replace": "        if (!/^\\d+$/.test(contentLengthHeader)) return sendErrorAndClose(400);",
       "gate": "make:test-http-smoke",
       "expect_detail": "malformed-poisoned"
     },
     {
       "name": "the poisoned http-smoke phases die when the chunked check goes back to re.test",
-      "why": "A steered Transfer-Encoding check accepts any coding as chunked, which is the TE half of a smuggling desync.",
+      "why": "Transfer-Encoding framing. A steered check accepted `gzip` as chunked, which is the other half of the smuggling pair.",
       "source": "pkg/runtime/js/internal/http.js",
       "find": "        if (!reTest(TE_CHUNKED_RE, transferEncoding)) return sendErrorAndClose(501);",
       "replace": "        if (!/^\\s*chunked\\s*$/i.test(transferEncoding)) return sendErrorAndClose(501);",
@@ -160,6 +160,42 @@
       "replace": "      console.log('STALE');",
       "gate": "node-test:scripts/run-mutations.test.mjs",
       "expect_detail": "STALE"
+    },
+    {
+      "name": "54-url-pollution X1 dies when endsInANumber goes back to a live re.test",
+      "why": "Steered true, '4x' reads as numeric and parseInt gives 4, so http://1.2.3.4x/ silently becomes http://1.2.3.4/ \u2014 a host substitution.",
+      "source": "pkg/runtime/js/internal/url.js",
+      "find": "    if (allDigits(last, 10)) return true;",
+      "replace": "    if (last !== '' && /^[0-9]+$/.test(last)) return true;",
+      "gate": "compat:tests/node-compat/cases/54-url-pollution.js",
+      "expect_detail": "node: X1 http://1.2.3.4x/"
+    },
+    {
+      "name": "54-url-pollution X2 dies when the %2f check goes back to a live re.test",
+      "why": "The path-traversal guard, in the direction that discriminates: a steered validator makes a legitimate path look encoded and throws where node returns one.",
+      "source": "pkg/runtime/js/internal/url.js",
+      "find": "if (reTest(PERCENT_2F_RE, rest) || (isWindows && reTest(PERCENT_5C_RE, rest))) {",
+      "replace": "if (/%2f/i.test(rest) || (isWindows && /%5c/i.test(rest))) {",
+      "gate": "compat:tests/node-compat/cases/54-url-pollution.js",
+      "expect_detail": "node: X2 /tmp/x"
+    },
+    {
+      "name": "the Lava-only regexp pollution test dies when the header-name validator goes back to re.test",
+      "why": "node ACCEPTS 'X-Evil: 1\\r\\nInjected' under this poison (undici's validator is JS), so this deviation cannot be oracled and CLAUDE.md section 1 requires a Lava-only pin.",
+      "source": "pkg/runtime/js/internal/fetch.js",
+      "find": "    if (!reTest(VALID_HEADER_NAME, name)) {",
+      "replace": "    if (!VALID_HEADER_NAME.test(name)) {",
+      "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
+      "expect_detail": "want inject=THREW:TypeError"
+    },
+    {
+      "name": "the Lava-only regexp pollution test dies when the header trim goes back to a global replaceAll",
+      "why": "A global regex replace does not answer wrongly under a forged exec \u2014 it never terminates, because lastIndex only advances on an empty match. Valid headers stopped returning at all.",
+      "source": "pkg/runtime/js/internal/fetch.js",
+      "find": "    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
+      "replace": "    if (/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g.test(value)) value = value.replace(/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g, '');\n    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
+      "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
+      "expect_detail": "regexp_pollution_immunity"
     }
   ]
 }

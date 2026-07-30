@@ -217,6 +217,15 @@ Rules that keep this from becoming ceremony:
   needs `__proto__: null`. Deciding that a literal is a lookup table read with a
   dynamic key takes dataflow the counter does not have, and a blanket rule would
   fire on every options object.
+  A fourth is COUNTED and still wrong, which is the nastiest of the set because the
+  fix *looks* applied: `StringPrototypeReplace/Match/Search/Split` score 0 in
+  `method`, yet they route through the spec's RegExpExec, which re-reads `R.exec`
+  off the receiver — so a poisoned `exec` steers them straight through the
+  primordial. A GLOBAL one does not answer wrongly, it never returns, because
+  `lastIndex` only advances on an empty match; that shipped as a remote-triggerable
+  hang in `url.js` and `fetch.js`. Validate with `RegExpMatches(re, s)`; there is
+  deliberately no `RegExpPrototypeTest`, and for a plain character class prefer a
+  `charCodeAt` loop, which leaves nothing to poison at all.
   Two more are uncounted, for reasons worth keeping apart. `for…of`, spread and
   `Symbol.toPrimitive` read a well-known SYMBOL, so there is no named property to
   count. `Object.prototype.then` is the opposite: an ordinary named property that

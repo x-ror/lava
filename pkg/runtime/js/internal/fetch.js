@@ -59,12 +59,14 @@
   // `RegExpPrototypeTest` for that reason; `RegExpMatches` (a captured `exec`
   // compared against null) is the only sound spelling.
   //
-  // Scope, precisely: this closes the header NAME check. `normalizeHeaderValue`
-  // below still calls a global `replaceAll` with a live regex and runs BEFORE this
-  // validator, so under the same poison it spins rather than returning — a DoS, not
-  // an injection, because `assertValidHeaderValue` is a hand-rolled charCode scan.
-  // Tracked in ROADMAP.
-  var reTest = require('primordials').RegExpMatches;
+  // The value half is closed too, and differently: `normalizeHeaderValue` below is
+  // now a charCode trim rather than a global `replaceAll`, because a global regex
+  // does not merely answer wrongly under a forged `exec` — it never terminates.
+  // `assertValidHeaderValue` was already a hand-rolled charCode scan.
+  var P = require('primordials');
+  var reTest = P.RegExpMatches;
+  var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
+  var StringPrototypeSlice = P.StringPrototypeSlice;
   var VALID_HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
   function assertValidHeaderName(name) {
     if (!reTest(VALID_HEADER_NAME, name)) {
@@ -89,8 +91,29 @@
   // feed are not HTTP whitespace and are preserved. Wire (response) headers
   // arrive via _append and are not re-normalized — the transport already trims
   // OWS around values — matching undici, which fills response headers verbatim.
+  //
+  // A charCode trim, not `replaceAll(/…/g, '')`. The regex form was a live method
+  // read on the RECEIVER, and a GLOBAL one: `RegExp.prototype[Symbol.replace]`
+  // loops on RegExpExec and only advances `lastIndex` on an EMPTY match, so a
+  // forged non-empty result never terminates. Measured on `bin/lava` before this
+  // change: with `RegExp.prototype.exec` replaced, `new Headers().set('X-Ok','v')`
+  // — a perfectly valid header — never returned, and a URL parse on the same path
+  // reached 1.4 GB RSS in 4 s. That is a remote-triggerable DoS, because it runs
+  // BEFORE assertValidHeaderName on every append and set.
+  // Routing it through a captured `exec` would fix the steering but not the spin;
+  // removing the RegExp removes both, and there is nothing left to poison.
   function normalizeHeaderValue(value) {
-    return value.replaceAll(/^[\r\n\t ]+|[\r\n\t ]+$/g, '');
+    var start = 0;
+    var end = value.length;
+    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;
+    while (end > start && isHttpWhitespace(StringPrototypeCharCodeAt(value, end - 1))) end--;
+    return start === 0 && end === value.length ? value : StringPrototypeSlice(value, start, end);
+  }
+
+  // Tab, LF, CR, space — HTTP whitespace per the fetch spec. Vertical tab and form
+  // feed are deliberately absent; they are not HTTP whitespace and must survive.
+  function isHttpWhitespace(c) {
+    return c === 0x09 || c === 0x0a || c === 0x0d || c === 0x20;
   }
 
   // Shared by Headers.append and Headers.set, which performed the identical

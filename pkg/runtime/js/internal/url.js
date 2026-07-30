@@ -114,6 +114,62 @@
     return (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
   }
 
+  // stripChars: `replace(/[…]/g, '')` without a RegExp.
+  //
+  // A GLOBAL regex replace is the sharpest shape of the exec re-read, and it does
+  // not merely answer wrongly: `RegExp.prototype[Symbol.replace]` loops on
+  // RegExpExec and advances `lastIndex` only on an EMPTY match, so a forged
+  // non-empty result never terminates. Measured on `bin/lava` before this change,
+  // with `RegExp.prototype.exec` replaced: `new URL('http://EXAMPLE.com/')` never
+  // returned and reached 1.4 GB RSS in four seconds, and a remote server's
+  // `Location:` header reaching `new URL(location, req.url)` hung the client.
+  // Routing through a captured `exec` would fix the steering and keep the spin.
+  //
+  // `pred` is a code-point predicate, so the caller keeps its character set
+  // explicit and no RegExp exists to poison. Returns the input unchanged when
+  // nothing matches, which is the common case for both callers.
+  function stripChars(s, pred) {
+    var n = s.length;
+    var i = 0;
+    for (; i < n; i++) {
+      if (pred(StringPrototypeCharCodeAt(s, i))) break;
+    }
+    if (i === n) return s;
+    var out = StringPrototypeSlice(s, 0, i);
+    for (; i < n; i++) {
+      var c = StringPrototypeCharCodeAt(s, i);
+      if (!pred(c)) out += StringFromCharCode(c);
+    }
+    return out;
+  }
+
+  function isTabOrNewline(c) {
+    return c === 0x09 || c === 0x0a || c === 0x0d;
+  }
+
+  // U+3002 IDEOGRAPHIC FULL STOP, U+FF0E FULLWIDTH FULL STOP, U+FF61 HALFWIDTH
+  // IDEOGRAPHIC FULL STOP — the IDNA label separators that fold to '.'. Getting
+  // this wrong is host confusion, not a cosmetic difference.
+  function isIdnaSeparator(c) {
+    return c === 0x3002 || c === 0xff0e || c === 0xff61;
+  }
+
+  // The fold, not a strip: these three map TO '.', they are not removed.
+  function foldIdnaSeparators(s) {
+    var n = s.length;
+    var i = 0;
+    for (; i < n; i++) {
+      if (isIdnaSeparator(StringPrototypeCharCodeAt(s, i))) break;
+    }
+    if (i === n) return s;
+    var out = StringPrototypeSlice(s, 0, i);
+    for (; i < n; i++) {
+      var c = StringPrototypeCharCodeAt(s, i);
+      out += isIdnaSeparator(c) ? '.' : StringFromCharCode(c);
+    }
+    return out;
+  }
+
   // allDigits: `/^[0-9]+$/` and friends without a RegExp, for the three validators
   // that are nothing but a character class over a short token.
   //
@@ -413,7 +469,8 @@
   function domainToASCII(domain) {
     if (domain === '') return '';
     // IDEOGRAPHIC FULL STOP, FULLWIDTH FULL STOP, HALFWIDTH IDEOGRAPHIC FULL STOP.
-    domain = StringPrototypeReplaceAll(domain, /[。．｡]/g, '.');
+    // Fold the three IDNA separators to '.', without a RegExp — see stripChars.
+    domain = foldIdnaSeparators(domain);
     var labels = StringPrototypeSplit(domain, '.');
     var out = [];
     for (var i = 0; i < labels.length; i++) {
@@ -910,7 +967,7 @@
     }
     // Remove all ASCII tab or newline (guarded: almost no real input has them,
     // and replaceAll would re-scan + re-allocate on every parse).
-    if (reTest(TAB_NEWLINE_RE, input)) input = StringPrototypeReplace(input, TAB_NEWLINE_RE_G, '');
+    input = stripChars(input, isTabOrNewline);
 
     // Code POINTS as numbers, one pass, surrogate-aware — same iteration as
     // ArrayFrom(input).map(c => c.codePointAt(0)) without allocating a
@@ -2176,7 +2233,7 @@
   // everything up to the first authority terminator (/ \ ? #). Returns the parsed
   // host string, or FAILURE for an invalid domain.
   function hostFromDomainArg(domain) {
-    var input = StringG(domain).replaceAll(/[\t\n\r]/g, '');
+    var input = stripChars(StringG(domain), isTabOrNewline);
     for (var i = 0; i < input.length; i++) {
       var c = StringPrototypeCharCodeAt(input, i);
       if (c === 0x2f || c === 0x5c || c === 0x3f || c === 0x23) {

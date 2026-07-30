@@ -405,6 +405,16 @@ and live globals used to be the author's problem and are now gated classes;
 **one vector outside those four is still uncounted**, because deciding that an
 object literal is a lookup table read with a caller-supplied key takes dataflow a
 per-file counter does not have — give those `__proto__: null` by hand.
+A fourth vector is COUNTED and still not resolved by routing through the
+primordial, which no other entry in the table above is:
+`StringPrototypeReplace/Match/Search/Split` read 0 in `method`, but the spec's
+RegExpExec re-reads `R.exec` off the receiver, so a poisoned `exec` steers them
+anyway — and a GLOBAL one never terminates rather than answering wrongly, since
+`lastIndex` only advances on an empty match. That shipped as a remote-triggerable
+hang on the URL and header paths. `RegExpPrototypeTest` was removed from the
+frozen table for the same reason: capturing `test` cannot fix what RegExpExec
+re-reads. Use `RegExpMatches`, or drop the RegExp entirely where the pattern is
+just a character class.
 Two more vectors are uncounted, for two DIFFERENT reasons that are worth keeping
 apart. The iterator and coercion protocols (`for…of`, spread, `Symbol.toPrimitive`)
 read a well-known SYMBOL, so there is no named property to count at all. A poisoned

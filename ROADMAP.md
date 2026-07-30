@@ -123,12 +123,20 @@ coupling.
       `bin/lava`. An export that looks safe and is not is worse than no export, so
       `RegExpPrototypeExec(re, s) !== null` is now the only spelling available.
       Pinned by two new `run-http-smoke.sh` phases that replay the whole
-      malformed-input suite against a poisoned server (`exec` and `test` directions
-      separately), and by two entries in `tests/mutation-manifest.json`.
-      Lava-only by necessity: node cannot be the oracle, because its own internals
-      use regexes and its server dies inside `net` at startup under the same poison.
-      That is fail-closed; Lava's was fail-open.
-- [ ] **The rest of the regex surface — 53 sites, and `.test` was not the whole of
+      malformed-input suite against a poisoned server, by vectors X1-X5 in
+      `54-url-pollution.js` (node's URL is native and immune, so those are real
+      differentials), by `cmd/lava/regexp_pollution_test.odin` for the header half —
+      Lava-only because under the same poison node 24 **accepts**
+      `Headers.set('X-Evil: 1\r\nInjected', 'v')`, undici's validator being
+      JavaScript — and by six entries in `tests/mutation-manifest.json`.
+      Four of the validators went further and dropped the regex entirely: a
+      character-class check needs a `charCodeAt` loop, not a pattern, and with no
+      RegExp in the expression `exec`/`test`/`Symbol.match`/`Symbol.replace`/
+      `lastIndex` all drop out at once instead of one of them. It is also faster —
+      0.82x-0.90x on `new URL`, min of 7 interleaved pinned launches per arm — which
+      reversed the +6% to +20% regression the exec migration had introduced and that
+      no benchmark covered.
+- [ ] **The rest of the regex surface, and `.test` was not the whole of
       it** — a poisoned `exec` steers **six** methods, not two: `re.test`, `re.exec`,
       and `String.prototype.replace`/`match`/`search`/`split` whenever the argument
       is a regex, because all of them route through RegExpExec. Verified identically
@@ -140,10 +148,26 @@ coupling.
       because capturing `String.prototype.replace` does nothing about the `exec`
       re-read inside it. Another instance of "floor, not proof", and a sharper one
       than the accessor case, because the fix _looks_ applied.
-      Remaining, by module: `esm.js` 16, `path.js` 7, `util.js` 5, `assert.js` 5,
-      `mime.js` 3, `tty.js`/`punycode.js` 2 each, `sqlite.js`/`querystring.js`/`net.js`
-      1 each. None is on the network path, which is why they are not in the commit
-      above — but `esm.js` is the module loader and deserves to be next.
+      **No count in this prose, deliberately.** The previous version said "53 sites"
+      with a per-module list that summed to 43, credited `sqlite.js` with a site it
+      does not have (a bare grep scored `native.exec(...)`), and omitted `url.js`,
+      `fetch.js`, `buffer.js` and `console.js` — two of which the commit above had
+      just hardened. That is the third time a copied total went stale in this file,
+      under the rule six entries up that forbids exactly this. Derive it instead:
+      an acorn pass over `pkg/runtime/js` counting `re.test`/`re.exec` on a
+      regex-shaped receiver plus `String.prototype.{replace,replaceAll,match,
+      matchAll,search,split}` with a regex first argument. `esm.js` dominates by a
+      wide margin and is the module loader, so it is next.
+      The claim that none of the remainder was on the network path was **false**, and
+      the four that were are now fixed rather than merely re-described:
+      `fetch.js`'s header-value trim (which ran BEFORE the name validator on every
+      `append`/`set`), and `url.js`'s tab/newline strip, IDNA separator fold and
+      `hostFromDomainArg`. Each was a global replace, so under a forged `exec` they
+      did not answer wrongly — they never returned. `new Headers().set('X-Ok','v')`
+      and `new URL('http://EXAMPLE.com/')` both hung, and a remote server's
+      `Location:` header reaching `new URL(location, req.url)` hung the client: a
+      remote-triggerable DoS. The Lava-only test that pins them ran in 3m07s while
+      they spun and runs in 34ms now.
 - [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector** —
       a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
       no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`
