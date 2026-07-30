@@ -256,6 +256,24 @@ test('an explicit empty expect_detail is allowed — the opt-out must be visible
   });
 });
 
+test('a deletion mutation (empty replace) is allowed and applied literally', () => {
+  // Deleting a guard clause is the canonical mutation, so `replace: ''` must be a
+  // valid entry rather than a validation error — it was rejected as "missing", and
+  // the workaround was a fake non-empty replacement that no longer described the
+  // break being tested.
+  withTree(
+    [entry({ find: "export const VALUE = 'expected';\n", replace: '', expect_detail: 'src.mjs' })],
+    {},
+    (dir) => {
+      const { status, out } = run(dir);
+      assert.doesNotMatch(out, /missing "replace"/);
+      assert.match(out, /killed/);
+      assert.equal(status, 0);
+      assert.equal(sourceOf(dir), SOURCE);
+    },
+  );
+});
+
 test('--list reports without patching anything', () => {
   withTree([entry()], {}, (dir) => {
     const { status, out } = run(dir, ['--list']);

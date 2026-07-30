@@ -104,9 +104,12 @@ if (!Array.isArray(manifest.mutations) || manifest.mutations.length === 0) {
 const REQUIRED = ['name', 'why', 'source', 'find', 'replace', 'gate', 'expect_detail'];
 for (const [i, m] of manifest.mutations.entries()) {
   for (const field of REQUIRED) {
-    // expect_detail may be '' (a deliberate, visible opt-out); everything else must
-    // be a non-empty string.
-    if (typeof m[field] !== 'string' || (m[field] === '' && field !== 'expect_detail')) {
+    // Two fields may legitimately be empty. `expect_detail: ''` is a deliberate,
+    // visible opt-out. `replace: ''` is a DELETION — the canonical mutation for a
+    // guard clause, and the shape the two format-guard entries need; rejecting it
+    // forced a fake non-empty replacement that no longer described the break.
+    const mayBeEmpty = field === 'expect_detail' || field === 'replace';
+    if (typeof m[field] !== 'string' || (m[field] === '' && !mayBeEmpty)) {
       die(`mutation #${i} is missing "${field}"`);
     }
   }

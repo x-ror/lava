@@ -84,6 +84,19 @@
   function formatArgs(args) {
     if (args.length === 0) return '';
     var first = args[0];
+    // Node's short circuit, and it must come BEFORE the substitution loop rather
+    // than inside it: a lone string argument is the answer, directives and all.
+    // `format('%s')`, `format('%z')`, `format('100%')` and `format('%%')` all come
+    // back untouched on node 24 (verified, not read off the docs).
+    // Only `%%` used to get this wrong here — `%s` and friends were saved further
+    // down by the "arguments exhausted" branch, which re-emits the directive, while
+    // `%%` was folded unconditionally.
+    // `typeof first === 'string'` matters: `format(5, '%%')` has no format string
+    // at all, so node inspects and space-joins, leaving the later `%%` literal.
+    // Duplicated from internal/util.js rather than shared, and deliberately: this
+    // prelude runs before the module loader, receives only the native write
+    // functions, and has no `require` to reach util with.
+    if (args.length === 1 && typeof first === 'string') return first;
     var i = 1;
     var result;
     if (typeof first === 'string' && first.indexOf('%') !== -1) {

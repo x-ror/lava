@@ -196,6 +196,24 @@
       "replace": "    if (/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g.test(value)) value = value.replace(/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g, '');\n    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
       "expect_detail": "regexp_pollution_immunity"
+    },
+    {
+      "name": "57-format-single-arg dies when util.js drops the single-argument guard",
+      "why": "Without it util.format folds %% even with one argument, where node returns the string verbatim. Pinned separately from console.js because the two are different implementations and one entry would fake coverage of both.",
+      "source": "pkg/runtime/js/internal/util.js",
+      "find": "    if (args.length === 1 && typeof first === 'string') return first;\n",
+      "replace": "",
+      "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
+      "expect_detail": "node: format('a<p><p>b')"
+    },
+    {
+      "name": "57-format-single-arg dies when console.js drops the single-argument guard",
+      "why": "console.js has its own formatter \u2014 it is the bootstrap prelude and has no require to delegate with \u2014 so removing util.js's guard leaves console.log correct and vice versa. This entry moves the raw console.log rows, a different line range from the util entry.",
+      "source": "pkg/runtime/js/console.js",
+      "find": "    if (args.length === 1 && typeof first === 'string') return first;\n",
+      "replace": "",
+      "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
+      "expect_detail": "node: a%%b"
     }
   ]
 }
