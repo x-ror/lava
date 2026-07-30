@@ -184,6 +184,21 @@ coupling.
       coverage it did not have.
       Latent rather than live when found: no committed case contained `%%`, so
       nothing was mis-comparing. A future one would have, silently, on both sides.
+- [ ] **`decode-utf16le` breaches its cap ~3 runs in 8, and `bench-gate` is not in
+      CI** — measured 2026-07-30 over 8 `--gate` runs: 11.07x, 14.01x, 14.44x,
+      14.63x, 15.22x, 15.61x and two unrecorded passes, against a 14.5 cap. The cap
+      was recalibrated 2026-07-28 to "~1.4x the fresh idle-box median-of-3" from a
+      9.8x measurement; the median now reads ~14.3x. Either the box differs or
+      decode-utf16le regressed ~46% in two days — not guessed at here, because
+      `make bench-gate` runs in no CI job, so nothing would have caught either.
+      This is the exact failure `thresholds.json` warns about in its own note ("a
+      light that fires on one clean run in four ... trains reviewers to re-run"),
+      now firing on one of its own caps. It also blocks wiring the URL bench's cap
+      into the mutation gate: that gate refuses a red baseline, correctly, and
+      `make test-mutation` is in CI.
+      First step is deciding which of the two it is — rebuild at the 2026-07-28 tip
+      and re-measure on the same box, rather than widening the cap and losing the
+      detector.
 - [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector** —
       a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
       no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`

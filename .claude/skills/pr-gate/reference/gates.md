@@ -53,6 +53,7 @@ catches what a YAML parse cannot: a context used where it is not available, a ba
 | `require.odin`, `module_resolution.odin`, `js/internal/{loader,esm}.js` | `make test-compat-lava-strict` |
 | `crypto.odin`, `js/internal/crypto.js` | `make test-odin`, `make test-compat-lava`, `make api-surface` |
 | `pkg/runtime/js/**.js` (any — the scan root is the whole tree, `console.js` included) | `make check-js`, `make check-primordials`, `make test-compat-lava` |
+| `js/internal/url.js` | `make bench` — `bench/micro/url.js` exists since 2026-07-30; before it, a +6% to +20% `new URL` regression passed every gate and was found by hand in review |
 | `js/internal/{encoding,url,buffer}.js`, `pkg/runtime/buffer*.odin` | `make test-property` — differential property tests (fast-check generates the corpus; hand-picked oracle cases missed edge cases here twice, and the batched suite found a utf-16le divergence at 5000 inputs). `PROPERTY_RUNS=N` for a deeper local sweep |
 | `scripts/**` | `make test-scripts` — node:test over the build tooling |
 | any file named in `tests/mutation-manifest.json` as a `source` | `make test-mutation` — re-applies the recorded break and requires the named test to go red. Changing one of these files without running it means the recorded mutation may no longer describe the code, which the runner reports as STALE rather than skipping |

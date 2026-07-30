@@ -26,6 +26,14 @@
     "decode-utf8-stream": 17.0,
     "encode-utf8": 3.5,
     "encode-into": 3.5,
-    "new-textdecoder": 14.0
+    "new-textdecoder": 14.0,
+    "//url": "Added 2026-07-30 with bench/micro/url.js, calibrated that day. Nothing measured URL before, which is why a +6% to +20% `new URL` regression shipped and was caught by hand in review rather than by a gate. Caps are ~1.4x the median ratio, matching the encoding convention: measured unpinned (the mode run-bench.sh uses), median-of-3 per round, 5 rounds -> special 11.34x (spread +-4.9%), ipv4 10.51x (+-5.2%), octal 8.17x (+-3.2%), relative 5.64x (+-1.5%), sp-parse 39.70x (+-1.0%), sp-get 0.63x (+-4.8%). READ THE CAPS AS WHAT THEY ARE: 1.4x headroom means a ~40% regression trips them, NOT the 10% one this file was added to catch. A 10% self-regression is resolvable — the same numbers show +-1 to +-5% spread — but not by a ratio-vs-node cap, which is a different mechanism (A/B against the merge-base build); tracked separately rather than faked here. url-relative is capped despite an earlier note calling it too noisy: that +-18% was raw per-launch lava ms on a PINNED box, and the gated statistic (median-of-3 ratio, unpinned) is +-1.5%, the tightest of the six. Do not re-pin to reduce variance; run.mjs already records that pinning shifts the level 25-40% and would invalidate every cap, and this set reproduces it (special 11.34x unpinned vs ~8.5x pinned).",
+    "url-parse-special": 16.0,
+    "url-parse-ipv4": 14.7,
+    "url-parse-octal": 11.4,
+    "url-relative": 7.9,
+    "//urlsearchparams": "sp-parse at ~40x is the worst ratio in this directory (next worst: buffer-from-latin1 and decode-utf8-stream at 17.0), and it is entirely CONSTRUCTION: measured separately, node 3.4ms vs lava 149ms for the parse, against node 0.5ms vs lava 0.6ms for a lookup on a prebuilt object. The two were conflated at first and the combined number read as a slow `get`, which it is not. urlsearchparams-get is capped BELOW 1.0 on purpose — lava wins there unpinned — and 0.9 still leaves the documented 1.4x headroom over 0.63x. It is the one cap that flips with pinning (1.52x pinned), so a pinned run will trip it; that is a symptom of running off-spec, not a regression.",
+    "urlsearchparams-parse": 55.6,
+    "urlsearchparams-get": 0.9
   }
 }

@@ -73,9 +73,13 @@
   //                   for Buffer.from, TextEncoder.encode, util.format,
   //                   path.join, structuredClone.
   //
-  // So the ratio tracks wrapper density, not the surface: URL parsing and event
-  // emission are both on every HTTP request and both pay ~1.7x, which is the
-  // reason the hot wrappers keep `.call`:
+  // So the ratio tracks wrapper density, not the surface. Both of the worst rows
+  // are genuinely hot, though not where an earlier version of this comment claimed:
+  // the http.js SERVER path constructs no URL at all — checked, there is no
+  // `new URL` in it — and the real consumers are fetch.js, which parses once per
+  // request (fetch.js:581), plus three more per redirect (:810, and twice at :830).
+  // EventEmitter.emit is on every request. That is the reason the hot wrappers keep
+  // `.call`:
   //
   //   caller0..callerN  keep `.call`     — hot, per-element, per-character
   //   safeGetter        Reflect.apply    — security-critical reads whose RESULT
