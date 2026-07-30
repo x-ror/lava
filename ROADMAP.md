@@ -420,6 +420,41 @@ coupling.
       not take effect; that narrower divergence needs a Lava-only test pinning it
       per §1, plus a full `make test-lava` pass to find what in the oracle suites
       legitimately writes an intrinsic.
+- [x] **`run_until_idle` ended the drive on one no-progress tick** — fixed: it
+      now keeps polling while `active_io_count` or `active_async` is nonzero, the
+      invariant `run()` has carried since #113 (ba12bd3) and which that fix reached
+      only on `run()` — its own comment says so, "(run_until_idle keeps its bounded
+      form for deterministic tests)", and the bounded form silently kept the early
+      return too.
+      A no-progress tick is routine, not exceptional: `post_async` appends the
+      completion under `async_mutex` and writes the wakeup byte after unlocking,
+      while the poll drains the pipe and `drain_async` drains the queue at different
+      instants — and `drain_async` takes the whole queue per pass, so one byte can
+      carry two completions and leave a surplus byte that pops the next blocking
+      poll with nothing to drain. Draining a wakeup deliberately does not count as
+      I/O progress, so that tick reports `false`, and the old code returned the
+      `did_work` an earlier tick had latched. It therefore read as SUCCESS, which is
+      why it survived: CI saw 2-of-3 completions with `active_async == 1` and no
+      failure on the `run_until_idle` assertion itself.
+      Found by a one-off CI failure in
+      `threadpool_runs_work_offloop_and_completes_on_loop`, at roughly 1-2% per run
+      under CI's 4-core oversubscription — 40 solo runs, 25 whole-suite runs and 20
+      runs under `taskset -c 0,1` on a 16-core box all came back clean, so the
+      reproduction had to come from reading the driver rather than from load.
+      Pinned by `run_until_idle_waits_out_a_stale_wakeup`, which is the existing
+      `run_ignores_stale_wakeup_while_async_is_active` with `run` swapped for
+      `run_until_idle` — the hazard already had a test, on the other driver only.
+      It carries NO timer on purpose: a pending timer gives `platform_poll` a
+      positive timeout, and a positive-timeout poll counts as progress by itself, so
+      the no-progress tick never happens and the bug hides. A first version used a
+      timer to avoid the thread, passed, and passed just as well with the fix
+      reverted.
+      `scripts/run-tests.sh` also ran this suite multithreaded while
+      `make test-eventloop-odin` pinned one thread for a stated reason, so CI
+      contradicted the documented requirement; aligned. That is not the race fix —
+      the defect reproduces at one thread, and deterministically with no threadpool
+      at all (`async_begin` plus a `set_immediate` that calls `wakeup` returns in
+      ~9us with `active_async == 1`).
 - [x] **Real wall-clock timers** — fixed: in `real_time` mode the loop tracks the
       monotonic wall clock (`sync_real_clock` / `real_now_ms` in
       `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a

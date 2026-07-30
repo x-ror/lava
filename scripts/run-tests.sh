@@ -19,7 +19,14 @@ printf '%s\n' '== Odin tests =='
 # them first so the Odin test link succeeds even before `make build` has run.
 "$ROOT_DIR/scripts/build-native-deps.sh"
 "$ODIN" test "$ROOT_DIR/cmd/lava" -collection:lava="$ROOT_DIR"
-"$ODIN" test "$ROOT_DIR/pkg/runtime/eventloop"
+# ONE runner thread, matching `make test-eventloop-odin` and for the reason stated
+# there: the loop owns process-wide resources, so concurrent tests turn one
+# another's fd allocation into spurious failures and skip the two cases that need
+# an exclusive process. This line ran multithreaded for a while and CI silently
+# disagreed with the Makefile about how the suite is meant to run. (It is not a
+# race fix — the stale-wakeup defect this suite caught reproduces at one thread
+# too — it just stops CI from contradicting the documented requirement.)
+"$ODIN" test "$ROOT_DIR/pkg/runtime/eventloop" -define:ODIN_TEST_THREADS=1
 # pkg/runtime unit tests (links JSC like cmd/lava): the LAVA_WORKERS parser + the startup barrier.
 "$ODIN" test "$ROOT_DIR/pkg/runtime" -collection:lava="$ROOT_DIR"
 
