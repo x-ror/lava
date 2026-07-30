@@ -24,6 +24,10 @@
 //   Q  the >0x2000 chunked unitsToString branch (ArrayPrototypeSlice+ReflectApply)
 //   R  Buffer.from / Buffer.prototype.toString / the String global underneath —
 //      the encoding->buffer boundary, one layer below the url->encoding one
+//   V  Function.prototype.call   -> the borrow itself, so the replacement's return
+//                                   value became decode()'s (see V, at the end)
+//   W  Ctor[Symbol.hasInstance]   -> toBytes' three `instanceof` brands, forged in
+//                                   both directions (see W, at the end)
 //
 // Errors are compared by name AND code, so an error-identity divergence cannot
 // hide behind a matching class.
@@ -552,3 +556,162 @@ console.log(
 );
 
 console.log('ok');
+
+// U: the WINDOW accessors, not just the backing store. Poisoning
+// %TypedArray%.prototype.byteOffset/byteLength (and .length, and DataView's own
+// trio) used to move the range a JS-side reader asked for while the bytes came
+// from the real slots — decode() returned a neighbouring Buffer's contents out of
+// the shared allocUnsafe pool. The pool neighbour is allocated first on purpose so
+// there is something to leak; node is native here and agrees, so this is a
+// differential rather than a Lava-only assertion.
+//
+// The VIEWS ARE BUILT BEFORE THE POISON, and that ordering is the whole test.
+// Constructed after, `new DataView(mine.buffer, mine.byteOffset, 4)` reads
+// `byteOffset` through the poisoned getter and the TEST hands the decoder a view
+// that genuinely covers pool bytes 0..4 — at which point both runtimes correctly
+// decode a window the test mis-built, node printed `SECR` and Lava printed
+// something else, and the only thing being compared was pool layout, which this
+// repo has already established is not pinnable. Built before, the real window is
+// baked into the engine slots and the poison can only reach what the DECODER
+// computes, which is the thing under test.
+console.log(
+  'U',
+  (() => {
+    const neighbour = Buffer.from('SECRET-NEIGHBOUR-DATA-0123456789');
+    const mine = Buffer.from('mine');
+    const asDataView = new DataView(mine.buffer, mine.byteOffset, 4);
+    const asInt8 = new Int8Array(mine.buffer, mine.byteOffset, 4);
+    const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+    // A LIST, not a Map keyed by `obj + name`. Building that key coerced the
+    // receiver to a string, and `String(%TypedArray%.prototype)` calls
+    // %TypedArray%.prototype.join on an incompatible receiver and throws — before
+    // the first defineProperty ran. So nothing was ever poisoned, the catch below
+    // swallowed the TypeError, and this case printed `THREW:TypeError` on BOTH
+    // runtimes: byte-identical, and asserting nothing about the decoder. Each
+    // (obj, name) is poisoned exactly once here, so insertion order restores
+    // cleanly and no key is needed at all.
+    const saved = [];
+    const poison = (obj, name, value) => {
+      saved.push([obj, name, Object.getOwnPropertyDescriptor(obj, name)]);
+      Object.defineProperty(obj, name, { configurable: true, get: () => value });
+    };
+    let out;
+    try {
+      poison(taProto, 'byteOffset', 0);
+      poison(taProto, 'byteLength', 64);
+      poison(taProto, 'length', 64);
+      poison(DataView.prototype, 'byteOffset', 0);
+      poison(DataView.prototype, 'byteLength', 64);
+      out = [
+        new TextDecoder().decode(mine),
+        new TextDecoder().decode(asDataView),
+        new TextDecoder().decode(asInt8),
+      ].join('|');
+    } catch (e) {
+      out = 'THREW:' + e.name;
+    } finally {
+      for (const [obj, name, desc] of saved) Object.defineProperty(obj, name, desc);
+    }
+    // `neighbour` must stay referenced or the pool slot may be reused.
+    return out + ' (n=' + neighbour.length + ')';
+  })(),
+);
+
+// V: `Function.prototype.call` replaced — the RETURN path of decode(), which is
+// the sharpest shape in this whole file. The other vectors forge an intermediate
+// and the damage is arithmetic; here the replacement's return value simply became
+// decode()'s, so `decode()` handed back an ArrayBuffer instead of a string. It
+// reached the utf-8 fast path through `Buffer.prototype.toString.call(bytes,
+// 'utf8')` and the utf-16le path through the same borrow, and neither
+// captured-method nor captured-getter hardening touches it: the method was
+// already pristine, `.call` is the live read. Fixed by taking the codec natives
+// (`utf8Decode`/`utf16leDecode`) straight from the loader's native argument, so no
+// `Function.prototype` read is left on the path at all.
+//
+// The decoders are built BEFORE the poison so this measures decode, not
+// construction: label normalization still routes through `.call`-based
+// primordials, so `new TextDecoder()` under this poison throws RangeError under
+// Lava where node succeeds. That residual is the whole `invoke` class, it is
+// tracked in ROADMAP against lockIntrinsics(), and it is deliberately NOT part of
+// this case — a case that asserted it would have to assert the divergence.
+console.log(
+  'V',
+  (() => {
+    const d8 = new TextDecoder();
+    const d16 = new TextDecoder('utf-16le');
+    const utf8 = new Uint8Array([0x68, 0x69]); // "hi"
+    const utf16 = new Uint8Array([0x41, 0x00, 0x42, 0x00]); // "AB"
+    const real = Function.prototype.call;
+    // Nothing between the assignment and the restore may itself use `.call`, so
+    // the results are collected raw and only inspected after `.call` is back.
+    Function.prototype.call = function () {
+      return new ArrayBuffer(8);
+    };
+    let a, b, threw;
+    try {
+      a = d8.decode(utf8);
+      b = d16.decode(utf16);
+    } catch (e) {
+      threw = e;
+    }
+    Function.prototype.call = real;
+    if (threw !== undefined) return 'THREW:' + threw.name;
+    // typeof is asserted explicitly: an ArrayBuffer stringifies to something
+    // harmless-looking in a template, so comparing text alone would pass.
+    return [typeof a, JSON.stringify(a), typeof b, JSON.stringify(b)].join('|');
+  })(),
+);
+
+// W: the BRANDS, not the window. `toBytes` routed on `input instanceof
+// Uint8Array/ArrayBuffer/DataView`, and every one of those dispatches through
+// `Ctor[Symbol.hasInstance]` — a configurable own property of the constructor, so
+// a caller flips the answer in EITHER direction and steers the input into the
+// wrong arm.
+//
+// node is native here and immune on all 24 cells, so this is a differential.
+// Lava diverged on six of them, and the two silent ones are the worse half:
+// forging Uint8Array's or ArrayBuffer's brand to TRUE made `decode()` return ""
+// for valid input — an empty decode, no error — while forging DataView's or
+// ArrayBuffer's to false threw TypeError where node decodes fine.
+//
+// Every cell is asserted rather than a chosen few: which cell diverges depends on
+// arm ORDER inside toBytes, so a reordering that breaks a different cell must not
+// slip through. Same lesson as the DataView brand in structured_clone.js — brand
+// from the prototype chain, which an already-constructed object cannot re-point.
+console.log(
+  'W',
+  (() => {
+    const b = Buffer.from('mine');
+    const inputs = [
+      ['u8', () => new Uint8Array([0x68, 0x69])],
+      ['ab', () => new Uint8Array([0x68, 0x69]).buffer],
+      ['dv', () => new DataView(b.buffer, b.byteOffset, 4)],
+      ['i8', () => new Int8Array(b.buffer, b.byteOffset, 4)],
+    ];
+    const cells = [];
+    for (const ctorName of ['Uint8Array', 'ArrayBuffer', 'DataView']) {
+      const C = globalThis[ctorName];
+      const had = Object.getOwnPropertyDescriptor(C, Symbol.hasInstance);
+      for (const forged of [false, true]) {
+        for (const [vname, make] of inputs) {
+          const v = make();
+          let out;
+          try {
+            Object.defineProperty(C, Symbol.hasInstance, {
+              value: () => forged,
+              configurable: true,
+            });
+            out = new TextDecoder().decode(v);
+          } catch (e) {
+            out = 'THREW:' + e.name;
+          } finally {
+            if (had) Object.defineProperty(C, Symbol.hasInstance, had);
+            else delete C[Symbol.hasInstance];
+          }
+          cells.push(ctorName[0] + (forged ? 'T' : 'F') + vname + '=' + out);
+        }
+      }
+    }
+    return cells.join(' ');
+  })(),
+);

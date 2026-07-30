@@ -1,221 +1,150 @@
-// Prototype-pollution ratchet for the embedded runtime JS layer.
+// Prototype-pollution ratchet — CLI entry point.
 //
-// Internal modules under pkg/runtime/js run BEFORE and ALONGSIDE user code that
-// can mutate shared prototypes (Array.prototype.push = …) or replace globals.
-// A call like `arr.push(x)` or `s.charCodeAt(i)` resolves the method through the
-// live (pollutable) prototype at call time, so a poisoned prototype silently
-// corrupts a built-in. The fix is `require('primordials')` — captured, pristine
-// methods invoked as `ArrayPrototypePush(arr, x)` (see primordials.js).
-//
-// This tool does NOT parse types, so it cannot tell `array.push` from
-// `simpleQueue.push`. Instead it is a RATCHET: it counts syntactic pollutable
-// method calls per file (comment/string/regex-aware) and fails only when a file
-// exceeds its recorded baseline. Hardening a module lowers its count; the tool
-// then prints the tighter baseline to commit. A genuine false positive (a call
-// on a class instance whose class defines that method) can be silenced inline
-// with a `// primordials-ok` comment on the same line, or simply left inside the
-// baseline. New pollutable calls in a not-yet-hardened file are allowed up to
-// the baseline; a hardened file (baseline 0) rejects any new one.
+// The detector lives in lib/primordials-detect.mjs and its fixtures in
+// lib/primordials-fixtures.mjs; this file is the baseline comparison, the
+// --update path, and the report. See the detector for what each class means
+// and why the tool parses rather than scans.
 //
 // Usage:
-//   node scripts/check-primordials.mjs            # check against baseline
-//   node scripts/check-primordials.mjs --update   # rewrite the baseline file
-//
-// Exit 1 if any file exceeds its baseline (or the baseline is stale under
-// --update-less counts, which prints the update hint).
+//   node scripts/check-primordials.mjs                  # check against baseline
+//   node scripts/check-primordials.mjs --update         # lower the baseline
+//   node scripts/check-primordials.mjs --update --allow-raise
 
-import { readdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { relative, sep } from 'node:path';
+import { KINDS, countFile, walkDir, JS_DIR, BASELINE } from './lib/primordials-detect.mjs';
+import { selfTest } from './lib/primordials-fixtures.mjs';
+import { compare, raises, totals } from './lib/primordials-baseline.mjs';
 
-const ROOT = join(import.meta.dirname, '..');
-const JS_DIR = join(ROOT, 'pkg', 'runtime', 'js', 'internal');
-const BASELINE = join(ROOT, 'tests', 'node-compat', 'pollution-baseline.json');
+// --- report ----------------------------------------------------------------
 
-// Pollutable prototype methods: Array/String mutators + accessors that read
-// through the prototype chain. Includes .at and .normalize — the carriers of the
-// two worst known URL vectors (IPv4 normalization bypass, host substitution).
-const POLLUTABLE = new Set([
-  // Array.prototype
-  'push', 'pop', 'shift', 'unshift', 'splice', 'slice', 'concat', 'join',
-  'reverse', 'sort', 'map', 'filter', 'forEach', 'reduce', 'reduceRight',
-  'indexOf', 'lastIndexOf', 'includes', 'find', 'findIndex', 'findLast',
-  'findLastIndex', 'some', 'every', 'flat', 'flatMap', 'fill', 'copyWithin',
-  'entries', 'keys', 'values', 'at',
-  // String.prototype
-  'charCodeAt', 'codePointAt', 'charAt', 'replace', 'replaceAll', 'split',
-  'toLowerCase', 'toUpperCase', 'trim', 'trimStart', 'trimEnd', 'startsWith',
-  'endsWith', 'padStart', 'padEnd', 'repeat', 'normalize', 'localeCompare',
-  'match', 'matchAll', 'search', 'substr', 'substring',
-]);
-
-// Strip comments, string/template literals, and regex literals to a same-length
-// space-filled shadow so a `.push(` inside a comment or string is not counted
-// and line/column stay stable. A small scanner (not a full JS parser) that
-// tracks the handful of contexts that can contain a `.method(` false match.
-function shadow(src) {
-  const out = new Array(src.length);
-  let i = 0;
-  const n = src.length;
-  // Regex vs division disambiguation: a `/` starts a regex when the last
-  // non-space significant char is one that cannot end an expression.
-  let prevSignificant = '';
-  const keep = (c) => c;
-  const blank = (c) => (c === '\n' ? '\n' : ' ');
-  while (i < n) {
-    const c = src[i];
-    const c2 = src[i + 1];
-    if (c === '/' && c2 === '/') {
-      while (i < n && src[i] !== '\n') out[i++] = ' ';
-      continue;
-    }
-    if (c === '/' && c2 === '*') {
-      out[i++] = ' ';
-      out[i++] = ' ';
-      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) out[i++] = blank(src[i]);
-      if (i < n) {
-        out[i++] = ' ';
-        out[i++] = ' ';
-      }
-      continue;
-    }
-    if (c === '"' || c === "'" || c === '`') {
-      const q = c;
-      out[i++] = ' ';
-      while (i < n) {
-        if (src[i] === '\\') {
-          out[i++] = ' ';
-          if (i < n) out[i++] = blank(src[i]);
-          continue;
-        }
-        if (src[i] === q) {
-          out[i++] = ' ';
-          break;
-        }
-        out[i++] = blank(src[i]);
-      }
-      prevSignificant = 'x'; // a string literal ends an expression
-      continue;
-    }
-    // Regex literal: `/` where a regex can start.
-    if (c === '/' && canStartRegex(prevSignificant)) {
-      out[i++] = ' ';
-      let inClass = false;
-      while (i < n) {
-        const d = src[i];
-        if (d === '\\') {
-          out[i++] = ' ';
-          if (i < n) out[i++] = blank(src[i]);
-          continue;
-        }
-        if (d === '[') inClass = true;
-        else if (d === ']') inClass = false;
-        else if (d === '/' && !inClass) {
-          out[i++] = ' ';
-          break;
-        } else if (d === '\n') {
-          // Unterminated regex — bail, treat as division after all.
-          break;
-        }
-        out[i++] = blank(src[i]);
-      }
-      // consume flags
-      while (i < n && /[a-z]/i.test(src[i])) out[i++] = ' ';
-      prevSignificant = 'x';
-      continue;
-    }
-    out[i] = keep(c);
-    if (!/\s/.test(c)) prevSignificant = c;
-    i++;
-  }
-  return out.join('');
+// Before anything else: a detector that has gone blind must not report on the
+// tree, and must not be allowed to rebaseline. Exits non-zero rather than
+// printing a reassuring "OK".
+const selfTestFailures = selfTest();
+if (selfTestFailures.length > 0) {
+  console.error('Pollution ratchet SELF-TEST FAILED — the detector itself is broken:');
+  for (const f of selfTestFailures) console.error(`  ${f}`);
+  console.error(
+    '\nEvery fixture above pins a vector the ratchet is supposed to see, or a\n' +
+      'position it must not count. Fix the detector before trusting any number it\n' +
+      'prints.',
+  );
+  process.exit(1);
 }
 
-function canStartRegex(prev) {
-  // A regex can begin when the previous significant char is empty or one that
-  // cannot terminate an expression (operators, punctuation, keywords' ends).
-  if (prev === '') return true;
-  return '(,=:[!&|?{};+-*%<>~^'.includes(prev);
-}
-
-function walk(dir, out = []) {
-  for (const name of readdirSync(dir)) {
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) walk(full, out);
-    else if (full.endsWith('.js')) out.push(full);
-  }
-  return out;
-}
-
-// Count pollutable `.method(` calls in a file's shadowed source, honoring an
-// inline `// primordials-ok` on the same original line.
-function countFile(file) {
-  const src = readFileSync(file, 'utf8');
-  const shadowed = shadow(src);
-  const origLines = src.split('\n');
-  const re = /\.([A-Za-z]+)\s*\(/g;
-  let m;
-  let count = 0;
-  const hits = [];
-  while ((m = re.exec(shadowed)) !== null) {
-    if (!POLLUTABLE.has(m[1])) continue;
-    // line number of this match
-    const upto = shadowed.slice(0, m.index);
-    const line = upto.split('\n').length;
-    if (/\/\/\s*primordials-ok/.test(origLines[line - 1] || '')) continue;
-    count++;
-    hits.push({ line, method: m[1] });
-  }
-  return { count, hits };
-}
-
-const files = walk(JS_DIR).sort();
+const files = walkDir(JS_DIR).sort();
 const counts = {};
 const allHits = {};
 for (const file of files) {
   const key = relative(JS_DIR, file).split(sep).join('/');
-  const { count, hits } = countFile(file);
-  counts[key] = count;
+  const { hits } = countFile(file);
+  // PER-CLASS counts, not one number. The classes differ by an order of
+  // magnitude, and a single total would let a file trade a fixed accessor for a
+  // new global and still pass.
+  const byKind = {};
+  for (const k of KINDS) byKind[k] = 0;
+  for (const h of hits) byKind[h.kind]++;
+  counts[key] = byKind;
   allHits[key] = hits;
+}
+
+const perKindLine = () => KINDS.map((k) => `${k} ${totals(counts).perKind[k]}`).join(', ');
+const grandTotal = () => totals(counts).total;
+
+// A corrupt baseline is NOT a missing one. Both used to set haveBaseline=false,
+// which put `--update` outside the refuse-to-raise guard entirely — so a file with
+// git conflict markers in it (a large generated JSON that changes on every
+// hardening, so conflicts are likely) turned the tool's own advice, "run
+// --update", into an unguarded rebaseline of every floor.
+let baseline = {};
+let haveBaseline = true;
+let raw = null;
+try {
+  raw = readFileSync(BASELINE, 'utf8');
+} catch {
+  haveBaseline = false;
+}
+if (raw !== null) {
+  try {
+    baseline = JSON.parse(raw);
+  } catch (err) {
+    console.error(`Baseline at ${BASELINE} is not valid JSON: ${err.message}`);
+    console.error(
+      'Fix the file — do NOT rebaseline. Rewriting it would raise every floor to\n' +
+        'whatever the tree currently is, which is what the ratchet exists to prevent.',
+    );
+    process.exit(1);
+  }
 }
 
 const update = process.argv.includes('--update');
 if (update) {
+  // A raise is a policy decision, not a mechanical one: the point of the ratchet
+  // is that a floor only moves down. Previously `--update` rewrote every entry in
+  // both directions, so a contributor who hit a failure and reached for
+  // `UPDATE=1` silently raised the floor for every file — the prose rule in
+  // CLAUDE.md §5 was the only thing stopping it.
+  const up = haveBaseline ? raises(counts, baseline) : [];
+  if (up.length > 0 && !process.argv.includes('--allow-raise')) {
+    console.error('Refusing to RAISE the baseline. These entries would go up:\n');
+    for (const r of up) {
+      console.error(`  ${r.key}: ${r.kind} ${r.base} -> ${r.now} (+${r.now - r.base})`);
+    }
+    console.error(
+      '\nThe ratchet only moves down. Harden the sites, add `// primordials-ok` where\n' +
+        'the receiver genuinely is not a built-in, or pass --allow-raise if you are\n' +
+        'deliberately recording new ground (a newly scanned file, or a new class).',
+    );
+    process.exit(1);
+  }
   writeFileSync(BASELINE, JSON.stringify(counts, null, 2) + '\n');
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  console.log(`Wrote ${BASELINE} — ${total} pollutable sites across ${files.length} files.`);
+  console.log(
+    `Wrote ${BASELINE} — ${grandTotal()} sites across ${files.length} files (${perKindLine()}).`,
+  );
   process.exit(0);
 }
 
-let baseline = {};
-try {
-  baseline = JSON.parse(readFileSync(BASELINE, 'utf8'));
-} catch {
+if (!haveBaseline) {
   console.error(`No baseline at ${BASELINE}. Run: node scripts/check-primordials.mjs --update`);
   process.exit(1);
 }
 
-let failed = false;
-let improved = false;
-for (const key of Object.keys(counts)) {
-  const now = counts[key];
-  const base = baseline[key] ?? 0;
-  if (now > base) {
-    failed = true;
-    console.error(
-      `\n${key}: ${now} pollutable calls, baseline ${base} (+${now - base}). New sites:`,
-    );
-    for (const h of allHits[key]) console.error(`  ${key}:${h.line}  .${h.method}(`);
-  } else if (now < base) {
-    improved = true;
-    console.log(`${key}: ${now} < baseline ${base} — hardened by ${base - now}.`);
+const { failures, improvements, stale } = compare(counts, baseline);
+let failed = failures.length > 0;
+const improved = improvements.length > 0;
+
+for (const f of failures) {
+  console.error(`\n${f.key}: ${f.now} ${f.kind} sites, baseline ${f.base} (+${f.now - f.base}):`);
+  for (const h of allHits[f.key].filter((h) => h.kind === f.kind)) {
+    console.error(`  ${f.key}:${h.line}  ${h.name}`);
   }
+}
+for (const i of improvements) {
+  console.log(`${i.key}: ${i.kind} ${i.now} < baseline ${i.base} — hardened by ${i.base - i.now}.`);
+}
+if (stale.length > 0) {
+  failed = true;
+  console.error('\nStale baseline entries — these files no longer exist:');
+  for (const key of stale) console.error(`  ${key}`);
+  console.error(
+    'A stale entry is a ceiling waiting for a file to be re-added under the same\n' +
+      'path, which would then inherit it instead of starting at 0. Run --update to prune.',
+  );
 }
 
 if (failed) {
   console.error(
-    '\nPollution ratchet FAILED: a module gained pollutable prototype calls. Route them\n' +
-      "through primordials (require('primordials')), or add `// primordials-ok` if the\n" +
-      'receiver is a class instance, not an Array/String.',
+    '\nPollution ratchet FAILED: a module gained pollutable sites. The fix depends on\n' +
+      "the class:  method/invoke -> route through primordials (require('primordials'),\n" +
+      '            ReflectApply for .call/.apply)\n' +
+      '            accessor     -> read via a captured getter, e.g.\n' +
+      '                            TypedArrayPrototypeGetBuffer(view)\n' +
+      '            global       -> capture at module-eval (`var StringG = String;`)\n' +
+      'A genuine false positive (the receiver is a class instance, not a built-in) takes\n' +
+      '`// primordials-ok` on the same line. On a line carrying candidates from more\n' +
+      'than one class the bare marker suppresses nothing — name it:\n' +
+      '`// primordials-ok: method`.',
   );
   process.exit(1);
 }
@@ -225,5 +154,4 @@ if (improved) {
   process.exit(1);
 }
 
-const total = Object.values(counts).reduce((a, b) => a + b, 0);
-console.log(`OK: pollution ratchet holds (${total} sites at or below baseline).`);
+console.log(`OK: pollution ratchet holds (${grandTotal()} sites: ${perKindLine()}).`);

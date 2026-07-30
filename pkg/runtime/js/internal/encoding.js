@@ -1,7 +1,7 @@
 // TextEncoder / TextDecoder (WHATWG Encoding standard), installed as globals.
 // Built on Buffer for utf-8 and utf-16le; windows-1252 (the WHATWG alias for
 // latin1/ascii) uses an explicit high-byte table so it is exact, not approximate.
-(function (require, module, _exports) {
+(function (require, module, _exports, native) {
   'use strict';
 
   // --- Pollution-safe intrinsics -------------------------------------------
@@ -38,24 +38,68 @@
   var Uint16ArrayG = P.Uint16Array;
   var TypedArrayPrototypeSubarray = P.TypedArrayPrototypeSubarray;
   var TypedArrayPrototypeGetBuffer = P.TypedArrayPrototypeGetBuffer;
-  var ArrayBufferG = P.ArrayBuffer;
+  var TypedArrayPrototypeGetByteOffset = P.TypedArrayPrototypeGetByteOffset;
+  var TypedArrayPrototypeGetByteLength = P.TypedArrayPrototypeGetByteLength;
+  var DataViewPrototypeGetBuffer = P.DataViewPrototypeGetBuffer;
+  var DataViewPrototypeGetByteOffset = P.DataViewPrototypeGetByteOffset;
+  var DataViewPrototypeGetByteLength = P.DataViewPrototypeGetByteLength;
   var ArrayBufferIsView = P.ArrayBufferIsView;
+  // Brand by prototype chain, never `instanceof` — see the note on toBytes.
+  var brandedAs = P.brandedAs;
+  var Uint8ArrayPrototype = Uint8Array.prototype;
+  var ArrayBufferPrototype = ArrayBuffer.prototype;
+  var DataViewPrototype = DataView.prototype;
   // Free globals / statics, captured pristine at module-eval.
   var StringG = String;
   var StringFromCharCode = String.fromCharCode;
 
-  // Buffer carries the utf-8 fast path and all of TextEncoder.encode, so its
-  // methods are hardening-relevant exactly like String.fromCharCode: read live
-  // off the (user-reachable) Buffer global, a replaced `Buffer.from` or
-  // `Buffer.prototype.toString` rewrote every encoded/decoded string. Captured
-  // here; invoked through a fixed-arity `.call` closure, the same shape and the
-  // same residual as the primordials wrappers.
+  // Buffer carries all of TextEncoder.encode, so `Buffer.from` is
+  // hardening-relevant exactly like String.fromCharCode: read live off the
+  // (user-reachable) Buffer global, a replaced `Buffer.from` rewrote every encoded
+  // string. It is a static, so capturing it is the whole fix — it is called
+  // directly, with no `Function.prototype` read in the way. The DECODE direction
+  // no longer borrows from Buffer at all; see the natives below. Between them this
+  // module now has ZERO `invoke`-class sites, which is why its ratchet baseline is
+  // 0 in that column rather than 2.
   var bufferModule = require('buffer');
   var Buffer = bufferModule.Buffer;
   var BufferFrom = Buffer.from;
-  var BufferProtoToString = Buffer.prototype.toString;
+
+  // The two decoders this module needs are the SAME Odin natives that
+  // `Buffer.prototype.toString(enc)` dispatches to (`utf8Decode`/`utf16leDecode`,
+  // pkg/runtime/buffer.odin), handed here directly through the loader's fourth
+  // argument and captured at module-eval. That leaves no `.call`, no
+  // `Reflect.apply` and no `Buffer.prototype` read on the path.
+  //
+  // It matters most for utf-8, because that value IS decode()'s return value:
+  // with `Function.prototype.call` replaced, the previous
+  // `BufferProtoToString.call(buf, 'utf8')` handed the replacement's result
+  // straight back, so `decode()` returned an ArrayBuffer instead of a string —
+  // a substituted return, not merely a wrong intermediate.
+  //
+  // Reflect.apply closes the same hole and would be the obvious fix, but it is
+  // not free: measured 1.25x on a 5-9 byte decode and 1.08x on a 20-parameter
+  // URLSearchParams parse. Going to the native is instead FASTER than the `.call`
+  // it replaces, because toString's captured-length read, range clamp and
+  // normalizeEncoding chain all drop out — 93.0 -> 69.0 ns on a 9-byte decode
+  // (0.74x) and 23.20 -> 21.10 us on that URLSearchParams parse (0.91x), medians
+  // of 7 interleaved launches per arm. So this is the rare hardening with no
+  // perf side to weigh.
+  //
+  // Equivalent by construction: this module only ever decodes a WHOLE view, which
+  // is exactly the `start === 0 && end === len` arm toString already funnels into
+  // `bytesToString` -> the same native. Pinned by 11-text-encoding.js and the
+  // differential property suite, which compare every arm against node.
+  function requireNative(name) {
+    var fn = native && native[name];
+    if (typeof fn !== 'function')
+      throw new ErrorG('internal encoding requires the native codec binding: ' + name);
+    return fn;
+  }
+  var utf8DecodeNative = requireNative('utf8Decode');
+  var utf16leDecodeNative = requireNative('utf16leDecode');
   function bufferToStringUtf8(buf) {
-    return BufferProtoToString.call(buf, 'utf8');
+    return utf8DecodeNative(buf);
   }
 
   // Shared, frozen, null-prototype default options — the object is only ever
@@ -185,12 +229,42 @@
     );
   }
 
+  // NOT `instanceof`, on any of the three arms. `instanceof` dispatches through
+  // `Ctor[Symbol.hasInstance]`, a configurable own property, so a caller flips the
+  // brand in either direction and steers the value into the wrong arm. Measured
+  // against node 24, which is native here and immune on every cell: forging
+  // `DataView[Symbol.hasInstance]` to false made `decode(dataView)` THROW
+  // TypeError; forging `ArrayBuffer`'s to false made `decode(arrayBuffer)` throw;
+  // and forging `Uint8Array`'s or `ArrayBuffer`'s to TRUE made `decode()` return
+  // "" — a silent empty decode of valid input, which is the worse half. Six
+  // diverging cells in all, of which a review flagged one.
+  // `brandedAs` walks the prototype chain through a captured
+  // Reflect.getPrototypeOf, which an already-constructed object cannot re-point,
+  // and stays subclass-correct so `Buffer` still takes the Uint8Array arm.
+  // Pinned by vector W in 55-encoding-pollution.js.
   function toBytes(input) {
     if (input === undefined) return new Uint8ArrayG(0);
-    if (input instanceof Uint8ArrayG) return input;
-    if (input instanceof ArrayBufferG) return new Uint8ArrayG(input);
-    if (ArrayBufferIsView(input))
-      return new Uint8ArrayG(input.buffer, input.byteOffset, input.byteLength);
+    if (brandedAs(input, Uint8ArrayPrototype)) return input;
+    if (brandedAs(input, ArrayBufferPrototype)) return new Uint8ArrayG(input);
+    // A non-Uint8Array view is re-wrapped over the SAME range, so all three
+    // reads must come from the engine's slots: read live, a poisoned trio
+    // selected a window across the shared allocUnsafe pool — reproduced with a
+    // DataView input returning a neighbouring Buffer's bytes. DataView's
+    // accessors are separate properties from %TypedArray%'s, hence two paths.
+    if (ArrayBufferIsView(input)) {
+      if (brandedAs(input, DataViewPrototype)) {
+        return new Uint8ArrayG(
+          DataViewPrototypeGetBuffer(input),
+          DataViewPrototypeGetByteOffset(input),
+          DataViewPrototypeGetByteLength(input),
+        );
+      }
+      return new Uint8ArrayG(
+        TypedArrayPrototypeGetBuffer(input),
+        TypedArrayPrototypeGetByteOffset(input),
+        TypedArrayPrototypeGetByteLength(input),
+      );
+    }
     // Node names this argument "list" and appends no "Received" tail here,
     // unlike its other ERR_INVALID_ARG_TYPE messages. SharedArrayBuffer is in
     // the text because Node's is; Lava does not implement it, so that arm is
@@ -367,12 +441,12 @@
       // (pinned by 55-encoding-pollution.js). The view is the PRIMORDIAL
       // Uint8Array, not Buffer.from: that routes an ArrayBuffer argument
       // through a live `ArrayBuffer.isView` read, which a replaced global broke
-      // the first time this path shipped (same test, case P2). Only the
-      // prototype METHOD is borrowed from Buffer, applied to an ordinary
-      // Uint8Array, which is what buffer.js's toString already accepts.
-      return BufferProtoToString.call(
+      // the first time this path shipped (same test, case P2). The decode itself
+      // goes to the captured `utf16leDecode` native rather than borrowing
+      // Buffer's prototype method through `.call` — the native takes any typed
+      // array, so nothing about Buffer is on this path at all.
+      return utf16leDecodeNative(
         new Uint8ArrayG(TypedArrayPrototypeGetBuffer(units), 0, count * 2),
-        'utf16le',
       );
     // Big-endian: Buffer's utf16le would byte-swap every unit. No target Lava
     // builds for is big-endian today, so this arm is correctness insurance for a
@@ -495,25 +569,22 @@
       n = pushU16(s, units, n, bytes[i] | (bytes[i + 1] << 8), fatal);
     }
     if (i < bytes.length) {
-      // one trailing byte in this chunk
-      if (isFinal) {
-        if (fatal) throw fatalErr('utf-16le');
-        units[n++] = 0xfffd;
-      } else {
-        s.pend = bytes[i];
-      }
+      // One trailing byte in this chunk. At EOF it is handled by the flush below
+      // together with any held lead surrogate — NOT here, or the two produce two
+      // errors where the spec produces one.
+      s.pend = bytes[i];
     }
-    if (isFinal) {
-      if (s.hs >= 0) {
-        s.hs = -1;
-        if (fatal) throw fatalErr('utf-16le');
-        units[n++] = 0xfffd;
-      }
-      if (s.pend >= 0) {
-        s.pend = -1;
-        if (fatal) throw fatalErr('utf-16le');
-        units[n++] = 0xfffd;
-      }
+    // WHATWG "shared UTF-16 decoder", EOF step: if EITHER the lead byte or the
+    // lead surrogate is non-null, set BOTH to null and emit ONE error. Emitting
+    // one per pending item is the obvious reading and the wrong one — an
+    // unpaired lead surrogate followed by an odd trailing byte
+    // (`39 db 64`) gave two U+FFFD where node gives one. Found by generating
+    // inputs rather than picking them: 19 mismatches in 30000, all this shape.
+    if (isFinal && (s.hs >= 0 || s.pend >= 0)) {
+      s.hs = -1;
+      s.pend = -1;
+      if (fatal) throw fatalErr('utf-16le');
+      units[n++] = 0xfffd;
     }
     return n;
   }
@@ -592,29 +663,35 @@
     // stripping U+FEFF from the output). Streaming, fatal, and runs chained
     // onto leftover streaming state still take the stateful JS decoder.
     if (this._enc === 'utf-8' && !this._fatal && !stream && !s.doNotFlush) {
-      var off = 0;
-      if (
-        !this._ignoreBOM &&
-        bytes.length >= 3 &&
-        bytes[0] === 0xef &&
-        bytes[1] === 0xbb &&
-        bytes[2] === 0xbf
-      ) {
-        off = 3;
+      // NO JS-side window at all — and that is both the fast shape and the safe
+      // one, which is why it replaced a version of this branch that computed the
+      // window from captured getters.
+      //
+      // The native re-derives the real range from the engine's internal slots
+      // (typed_array_bytes, pkg/jsc/private_view.odin — byteOffset is folded
+      // into the pointer), so any offset/length this layer computes is at best
+      // redundant and at worst forgeable: reading them live let a poisoned
+      // byteOffset/byteLength pair select across the shared allocUnsafe pool,
+      // and routing them through captured getters only moved the same
+      // arithmetic behind a `.call`. Passing the view straight through removes
+      // the arithmetic, the `BufferFrom` view allocation, and the four
+      // pollutable reads (`buffer`, `byteOffset`, `byteLength`, `length`)
+      // together.
+      //
+      // Measured: 114.1 ns/decode against 217.5 for the direct-read version and
+      // 230.5 for the captured-getter one — 11 interleaved launches per arm on a
+      // 9-byte payload, the shape url.js's percentDecode actually passes. Two
+      // decodes per query parameter, so ~4.1 us off a 20-param URLSearchParams
+      // parse.
+      //
+      // The BOM is stripped at STRING level, exactly as the streaming path below
+      // already does. Equivalent because EF BB BF is the only utf-8 encoding of
+      // U+FEFF and an invalid sequence yields U+FFFD, never U+FEFF.
+      var text = bufferToStringUtf8(bytes);
+      if (!this._ignoreBOM && StringPrototypeCharCodeAt(text, 0) === 0xfeff) {
+        text = StringPrototypeSlice(text, 1);
       }
-      // The captured getter, not `bytes.buffer`: this is the same poisonable
-      // prototype-accessor read closed in unitsToString, and Node's native
-      // utf-8 decoder is immune to it — a live read here made the fastpath the
-      // one decode Lava forged while Node did not. Pinned by
-      // cmd/lava/encoding_pollution_test.odin (the byteOffset/byteLength
-      // accessors stay live reads, matching Node's own JS layer).
-      return bufferToStringUtf8(
-        BufferFrom(
-          TypedArrayPrototypeGetBuffer(bytes),
-          bytes.byteOffset + off,
-          bytes.byteLength - off,
-        ),
-      );
+      return text;
     }
     // WHATWG: a non-streaming decode starts a fresh run (reset decoder + BOM
     // window); a streaming decode chains from the previous call's leftover state.

@@ -373,23 +373,47 @@ correct while `Array.prototype.{push,unshift,slice,splice,map}`, `Object.create`
 and `Array[Symbol.species]` are all overwritten. Remaining modules adopt primordials
 incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
 
-Adoption is **ratcheted, not aspirational**: `scripts/check-primordials.mjs` counts
-syntactic pollutable prototype-method calls per file against
-`tests/node-compat/pollution-baseline.json`, and `make check-primordials` (part of
-`make check-js`) fails on any increase. `events.js`, `dns_promises.js` and
-`encoding.js` sit at 0; `url.js` is at 45 and `buffer.js` at 22. Differential
+Adoption is **ratcheted, not aspirational**: `scripts/check-primordials.mjs` parses
+every file under `pkg/runtime/js` with acorn (the detector is
+`scripts/lib/primordials-detect.mjs`; its fixtures and the baseline comparison are
+siblings, each with a `node:test` file) and counts **four classes** of
+pollutable site, each baselined separately in
+`tests/node-compat/pollution-baseline.json`:
+
+| class | example | resolved through |
+| ----- | ------- | ---------------- |
+| `method` | `arr.push(x)` | a pollutable prototype method |
+| `invoke` | `fn.call(t, a)` | `Function.prototype` |
+| `accessor` | `view.buffer` | a configurable prototype getter |
+| `global` | `String(x)` | a replaceable global, read live |
+
+`make check-primordials` (part of `make check-js`) fails on any per-class
+increase, and `--update` refuses to raise a floor without `--allow-raise`. The
+detector self-tests against known-positive and known-negative fixtures on every
+run and refuses to report — or to rebaseline — if one regresses. Differential
 oracles `54-url-pollution.js` and `55-encoding-pollution.js` pin the behavior
 against Node, and `cmd/lava/encoding_pollution_test.odin` pins the axes where Lava
 is deliberately stronger than Node.
 
-A baseline of 0 means "no **counted** call remains", not "immune". The counter
-matches only Array/String prototype method names, so three classes are on the
-author, not the gate: `f.apply(…)`/`f.call(…)` on an uncaptured function (use
-`ReflectApply`); free globals and statics (`String`, `ArrayBuffer.isView`,
-`Buffer.from`, `Buffer.prototype.toString`) — capture at module-eval; and any
-object literal indexed by a caller-supplied key (label, scheme, header, encoding
-tables) — give it `__proto__: null`. The sharpest vector closed in `encoding.js`
-(`String.fromCharCode.apply`) was never visible to the ratchet at all.
+A baseline of 0 in a class means "no **counted** site of that class remains", not
+"immune" — the ratchet is a floor, not a proof. Per-class counts are what make
+that readable: `events.js` is at 0 `method` and 0 `accessor` while still carrying
+`invoke` and `global` sites, which a single total hid. Do not restate the numbers
+here — `pollution-baseline.json` is the source and `make check-primordials` prints
+the live split; the counts copied into prose went stale twice. `.call`/`.apply`
+and live globals used to be the author's problem and are now gated classes;
+**one vector outside those four is still uncounted**, because deciding that an
+object literal is a lookup table read with a caller-supplied key takes dataflow a
+per-file counter does not have — give those `__proto__: null` by hand.
+Two more vectors are uncounted, for two DIFFERENT reasons that are worth keeping
+apart. The iterator and coercion protocols (`for…of`, spread, `Symbol.toPrimitive`)
+read a well-known SYMBOL, so there is no named property to count at all. A poisoned
+`Object.prototype.then` is the opposite case: `then` is an ordinary named property
+and the detector does count it — `p.then(cb)` and `p['then'](cb)` each score 1
+`method` — but `await x` and `Promise.resolve(x)` read it IMPLICITLY, with no
+member expression in the source to see. So the explicit half is gated and only the
+assimilation half is blind, which is why the guidance is a code convention rather
+than a counter: never `await` a caller-supplied value directly.
 
 `primordials` is internal-only: the loader serves it to internal factories but
 hides it from the public resolver native `require()` consults, so it neither

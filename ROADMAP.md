@@ -81,20 +81,63 @@ coupling.
 
 ### High priority (the Odin / native part)
 
-- [ ] **The primordials ratchet cannot see accessor reads, and reports 0
-      anyway** — `make check-primordials` counts Array/String prototype METHOD
-      calls, so a read through a configurable prototype ACCESSOR is invisible to
-      it, as is `.call`. This is not theoretical: `encoding.js` reached
-      `units.buffer` and `bytes.buffer` through `%TypedArray%.prototype.buffer`
-      while the ratchet stood at baseline 0, and a poisoned getter substituted an
-      attacker's `ArrayBuffer` as the decode output on every non-fastpath decode
-      — reachable from `url.js` `percentDecodeHostStrict` with attacker-sized
-      input. Fixed in #320 by capturing the getter, but only because a reviewer
-      looked; nothing would have caught the next one. CLAUDE.md §5 already warns
-      that "baseline 0 means no counted call left, not hardened" — the ratchet
-      should count what the warning describes. Do this BEFORE widening pollution
-      hardening to more files (below): extending coverage measured by a blind
-      instrument buys confidence, not safety.
+- [x] **The primordials ratchet cannot see accessor reads, and reports 0
+      anyway** — fixed: it parses with acorn and counts four classes, each
+      baselined separately — `method`, `invoke` (`.call`/`.apply`), `accessor`
+      (reads through a configurable prototype getter) and `global` (a
+      replaceable global read live instead of captured). Verified against the
+      defect that motivated it: at `07676d8^` — the commit inside #320 that
+      actually carried the vector — `encoding.js` scores 10 accessor sites
+      including `units.buffer` at line 360, against a then-recorded baseline of
+      0, so the tool exits 1 and names the line a reviewer had to find by eye.
+      (An earlier version of this entry cited `401ea40`; that revision predates
+      the vector and scores 8 accessor sites on the neighbouring `bytes.buffer`
+      read.) The detector self-tests on every run against known-positive and
+      known-negative fixtures with exact per-class counts, and refuses to report
+      on the tree _or to rebaseline_ if one regresses — a blind control is worse
+      than none. `--update` also refuses to raise a floor without
+      `--allow-raise`.
+      Do not copy the tree totals into prose; `pollution-baseline.json` is the
+      source and `make check-primordials` prints the live number. Scope is now
+      all of `pkg/runtime/js`, not just `internal/` — the real 371-line
+      `console.js` was outside the scan while the baseline described the 7-line
+      re-export, so the report read as "console is hardened".
+      One vector remains on the author (an object literal indexed by a
+      caller-supplied key needs `__proto__: null`), and two more are uncounted for
+      two different reasons: `for…of`/spread/`Symbol.toPrimitive` read a well-known
+      SYMBOL, so there is no named property to count, whereas `Object.prototype.then`
+      is an ordinary named property the detector DOES count when written
+      (`p.then(cb)` scores 1 `method`) and misses only when `await`/`Promise.resolve`
+      read it implicitly. That last one is also a plain data property settable by an
+      ordinary merge gadget — the sharpest uncounted vector, and its own item below.
+- [ ] **Route the 15 regex validators through a captured `exec`, not `test`** —
+      `fetch.js`, `http.js` and `url.js` still validate with live
+      `RegExp.prototype.test`/`.exec`, so a plain assignment to either (writable
+      data properties, no `defineProperty` needed) reaches the header-name
+      validator — CRLF in a header name is injection on the wire — and makes
+      `http.js` read Content-Length as NaN, parsing the body as the next request.
+      `RegExpPrototypeTest`/`Exec` are exported for this and have zero call sites,
+      so the vectors are live today.
+      The trap, measured before the migration rather than after: **swapping in
+      `RegExpPrototypeTest` does not close it.** The spec's RegExpExec re-reads
+      `R.exec` off the receiver, so `RegExp.prototype.exec = () => ['forged']`
+      makes even a captured `test` return true for
+      `'X-Evil: 1\r\nInjected'` — identical on node 24 and `bin/lava`, and
+      identical through `.call` and `Reflect.apply`, because the re-read is inside
+      the abstract op and not in the invocation. Validate with
+      `RegExpPrototypeExec(re, s) !== null` instead, which has no such indirection,
+      and pin it with a poisoned-`exec` case in `54-url-pollution.js`.
+- [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector** —
+      a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
+      no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`
+      and `Promise.resolve(obj)` both execute attacker code inside an internal
+      await, and internals carry 5 awaits plus ~31 `.then(` sites. The ratchet
+      cannot see the implicit read (an explicit `p.then(cb)` IS counted, as
+      `method`; `await x` and `Promise.resolve(x)` carry no member expression to
+      count), so this needs a code convention instead: never `await` a
+      caller-supplied value directly, or route it through a captured
+      `PromiseResolve`. Same shape for the iterator protocol (`for…of`, spread)
+      on caller-supplied values.
 - [x] **Promise ↔ event-loop ordering.** JSC drains its own promise microtask
       queue at every C-API boundary, so `Promise.then` used to run _before_
       `process.nextTick` (Node is the reverse). `queueMicrotask` lives in a JS shim
@@ -317,17 +360,101 @@ coupling.
       `pkg/runtime/eventloop/loop.odin`.)
 - [ ] **Prototype-pollution hardening of the embedded JS layer** — `primordials.js`
       plus the `make check-primordials` ratchet over
-      `tests/node-compat/pollution-baseline.json`. Done: `events.js`,
-      `dns_promises.js`, `encoding.js` (0), and the encoding-name path of
-      `buffer.js`. Remaining: `url.js` (45 — the type-ambiguous
+      `tests/node-compat/pollution-baseline.json`. Done in the `method` column:
+      `events.js`, `dns_promises.js`, and the encoding-name path of `buffer.js`;
+      `encoding.js` sits at 1, not 0. Six files are 0 in all four classes, but
+      none of them is evidence of hardening — every one is a 6–19 line re-export
+      shim (`console.js`, `dns_promises.js`, `path_posix.js`, `path_win32.js`,
+      `process.js`, `timers.js`). No file with real logic is clean in all four.
+      Remaining in `method`: `url.js` (the type-ambiguous
       `slice`/`indexOf`/`includes` sites, plus its percent-decode byte arrays,
       which are still plain arrays and so reachable via an `Array.prototype[0]`
-      accessor), `buffer.js` (22), `path.js` (158), `esm.js` (78), `util.js` (48).
-      **Blocked on the ratchet blind spot** (High priority, above): those counts
-      measure method calls only, so driving a file to 0 says nothing about the
-      accessor and `.call` vectors — `encoding.js` sat at 0 while carrying a live
-      `%TypedArray%.prototype.buffer` poisoning path. Teach the ratchet to see
-      them first, re-baseline, then work the list.
+      accessor), `buffer.js`, `path.js`, `esm.js`, `util.js`, and the newly
+      in-scope `console.js`.
+      **Unblocked**: the ratchet counts four classes separately, so that list is
+      the `method` column only; the other three are recorded per file in
+      `pollution-baseline.json` and are the larger part of the work. Read the
+      current split from `make check-primordials` rather than from prose here —
+      copied totals went stale twice. Take them per file, lowest-hanging first:
+      capturing a module's globals at module-eval is mechanical and drives its
+      `global` column to 0, which `encoding.js` already demonstrates. Note
+      `primordials.js` reads 9 in `invoke` **by construction** — every `callerN`
+      wrapper is a `fn.call` — while its `global` column is 1, because the
+      module-eval rule already exempts the capture table. Neither is work.
+      **Next, and it is the largest single win left**: wire `lockIntrinsics()`.
+      It is written and exported in `primordials.js` and called from nowhere, so
+      the whole `invoke` class is live today. Now that the class is counted it is
+      also measurable, and the exposure is worse than the "exotic axis" the file
+      header used to call it: replacing `Function.prototype.call` makes Lava throw
+      where Node succeeds (TextDecoder/TextEncoder construction, `Buffer.from`,
+      `buf.toString`, `Buffer.concat`, `new URL`) and — worse — answer _wrongly_
+      where Node is right (`URLSearchParams.get` → `null`, `util.format` →
+      `'undefined'`). Not hypothetical: instrumentation and tracing libraries wrap
+      `Function.prototype.call` for legitimate reasons.
+      Converting the wrappers to `Reflect.apply` instead was measured and is not
+      the answer for the hot ones — `bin/lava` vs a build with `caller0..3`
+      rewritten, end to end: `new URL` 1.76x, `EventEmitter.emit` 1.63x,
+      `decode(5B)` 1.49x, `URLSearchParams.get` 1.41x, `toString('hex')` 1.28x,
+      TextDecoder ctor 1.21x, `decode(1800B)` 1.11x. URL parsing and event
+      emission are on every HTTP request, so ~1.7x there is not payable.
+      But the same table says the conversion is **free** (~1.00x) for
+      `Buffer.from`, `TextEncoder.encode`, `util.format`, `path.join` and
+      `structuredClone`, so the work splits cleanly: `lockIntrinsics()` at
+      bootstrap for the hot paths at zero per-call cost, and `Reflect.apply` for
+      the wrapper-sparse cold ones regardless.
+      One site is already done, and it shows a third option worth looking for
+      first: `encoding.js` reached the utf-8 and utf-16le decoders as
+      `Buffer.prototype.toString.call(bytes, enc)`, which put the live `.call` read
+      on decode()'s **return** path — `decode()` handed back the replacement's
+      ArrayBuffer instead of a string. It now takes `utf8Decode`/`utf16leDecode`
+      straight from the loader's native argument, which needs no `Function.prototype`
+      read at all and is FASTER than the `.call` it replaced (0.74x on a 9-byte
+      decode, 0.91x on a 20-parameter URLSearchParams parse, medians of 7
+      interleaved launches) because toString's length getter, range clamp and
+      encoding-name dispatch drop out. Pinned by vector V in
+      `55-encoding-pollution.js`. Where a JS layer is borrowing a prototype method
+      that only wraps a native we already own, going to the native beats both
+      `.call` and `Reflect.apply` — check for that before reaching for either. The open question is only
+      `lockIntrinsics()`'s own Node deviation — Node leaves the intrinsics
+      writable, so a program assigning `Function.prototype.call` would silently
+      not take effect; that narrower divergence needs a Lava-only test pinning it
+      per §1, plus a full `make test-lava` pass to find what in the oracle suites
+      legitimately writes an intrinsic.
+- [x] **`run_until_idle` ended the drive on one no-progress tick** — fixed: it
+      now keeps polling while `active_io_count` or `active_async` is nonzero, the
+      invariant `run()` has carried since #113 (ba12bd3) and which that fix reached
+      only on `run()` — its own comment says so, "(run_until_idle keeps its bounded
+      form for deterministic tests)", and the bounded form silently kept the early
+      return too.
+      A no-progress tick is routine, not exceptional: `post_async` appends the
+      completion under `async_mutex` and writes the wakeup byte after unlocking,
+      while the poll drains the pipe and `drain_async` drains the queue at different
+      instants — and `drain_async` takes the whole queue per pass, so one byte can
+      carry two completions and leave a surplus byte that pops the next blocking
+      poll with nothing to drain. Draining a wakeup deliberately does not count as
+      I/O progress, so that tick reports `false`, and the old code returned the
+      `did_work` an earlier tick had latched. It therefore read as SUCCESS, which is
+      why it survived: CI saw 2-of-3 completions with `active_async == 1` and no
+      failure on the `run_until_idle` assertion itself.
+      Found by a one-off CI failure in
+      `threadpool_runs_work_offloop_and_completes_on_loop`, at roughly 1-2% per run
+      under CI's 4-core oversubscription — 40 solo runs, 25 whole-suite runs and 20
+      runs under `taskset -c 0,1` on a 16-core box all came back clean, so the
+      reproduction had to come from reading the driver rather than from load.
+      Pinned by `run_until_idle_waits_out_a_stale_wakeup`, which is the existing
+      `run_ignores_stale_wakeup_while_async_is_active` with `run` swapped for
+      `run_until_idle` — the hazard already had a test, on the other driver only.
+      It carries NO timer on purpose: a pending timer gives `platform_poll` a
+      positive timeout, and a positive-timeout poll counts as progress by itself, so
+      the no-progress tick never happens and the bug hides. A first version used a
+      timer to avoid the thread, passed, and passed just as well with the fix
+      reverted.
+      `scripts/run-tests.sh` also ran this suite multithreaded while
+      `make test-eventloop-odin` pinned one thread for a stated reason, so CI
+      contradicted the documented requirement; aligned. That is not the race fix —
+      the defect reproduces at one thread, and deterministically with no threadpool
+      at all (`async_begin` plus a `set_immediate` that calls `wakeup` returns in
+      ~9us with `active_async == 1`).
 - [x] **Real wall-clock timers** — fixed: in `real_time` mode the loop tracks the
       monotonic wall clock (`sync_real_clock` / `real_now_ms` in
       `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a

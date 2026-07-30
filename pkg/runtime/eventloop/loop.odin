@@ -953,12 +953,45 @@ run_until_idle :: proc(loop: ^Loop, max_iterations := 1024) -> bool {
 	did_work := false
 
 	for i in 0 ..< max_iterations {
-		if !has_pending_work(loop) || loop.backend_error {
+		// force_exit for the same reason run() carries it: the Forced shutdown state
+		// must end the drive even while work is pending, and without it this loop
+		// would burn all max_iterations tickless (run_once returns immediately once
+		// force_exit is set). Bounded rather than hung, but still wrong.
+		if !has_pending_work(loop) || loop.backend_error || loop.force_exit {
 			return did_work
 		}
 
 		if !run_next(loop) {
-			return did_work
+			// A no-progress tick is NOT idleness while off-loop work is in flight —
+			// the same invariant run() states above, which #113 (ba12bd3) fixed there
+			// and only there: the parenthetical "(run_until_idle keeps its bounded
+			// form for deterministic tests)" kept the ceiling AND, by accident, this
+			// early return.
+			//
+			// The tick that reports no progress is real and routine. post_async
+			// appends the completion under async_mutex and writes the wakeup byte
+			// after unlocking, while the poll drains the pipe and drain_async drains
+			// the queue at different instants — and drain_async takes the WHOLE queue
+			// per pass. So one byte can carry two completions and leave a surplus
+			// byte, which pops the next blocking poll with nothing to drain. Draining
+			// a wakeup deliberately does not bump io_events (loop_linux.odin), so that
+			// tick returns false. Returning here ended the drive with active_async
+			// still nonzero, and returned the `did_work` an EARLIER tick had latched —
+			// which is how it read as success.
+			//
+			// Reproduced deterministically without any threadpool at all: async_begin
+			// plus a set_immediate that calls wakeup() makes run_until_idle return
+			// true in ~9us with active_async == 1. Under CI's oversubscription the
+			// threadpool version hit roughly 1-2% per run, which is why 40 solo runs
+			// and 25 whole-suite runs on a 16-core box all came back clean.
+			//
+			// Exiting only when BOTH counters are zero keeps the bounded, deterministic
+			// behavior every existing caller relies on: has_pending_work can be true
+			// for a not-yet-due timer with nothing off-loop, and that must still return.
+			if loop.active_io_count == 0 && loop.active_async == 0 {
+				return did_work
+			}
+			continue
 		}
 		did_work = true
 	}

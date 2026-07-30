@@ -10,7 +10,7 @@ Layering (never blur it):
 | --------------------------- | ----------------------------- | ------------------------------------------------ |
 | CLI                         | `cmd/lava`                    | argv → loop → `runtime.eval/run_file`            |
 | Runtime orchestration       | `pkg/runtime`                 | globals, require, native primitives              |
-| Embedded spec surface       | `pkg/runtime/js/internal/*.js`| `Buffer`, `fetch`, streams, `URL`, `http`…       |
+| Embedded spec surface       | `pkg/runtime/js/**.js`        | `Buffer`, `fetch`, streams, `URL`, `http`…       |
 | Engine FFI / private ABI    | `pkg/jsc`                     | JSC C API, string/view/host ABI, probes          |
 | Event loop                  | `pkg/runtime/eventloop`       | phases, timers, io_uring/epoll, threadpool       |
 
@@ -69,7 +69,7 @@ Use the `odin-sdk-scout` agent for this search — it reads the real SDK source.
 
 ```sh
 make check            # Odin type-check (incl. windows/darwin cross-target front-end)
-make check-js         # vp fmt + lint + orphan-JS + primordials ratchet
+make check-js         # vp fmt + lint + orphan-JS + node:test over scripts/ + primordials ratchet
 make check-md         # markdownlint over the repo's docs (make fix-md auto-fixes)
 make check-actions    # actionlint over .github/workflows
 make build            # ./scripts/build.sh → bin/lava
@@ -173,20 +173,49 @@ Rules that keep this from becoming ceremony:
 - Internal helpers with no Node counterpart keep the plain why-comment. Do not
   retrofit existing code; this applies to new and changed surfaces.
 
-## 5. Embedded JS conventions (`pkg/runtime/js/internal`)
+## 5. Embedded JS conventions (`pkg/runtime/js`, incl. the top-level preludes)
 
 - Route through `require('primordials')` — internal modules run alongside user
   code that can poison prototypes. `make check-primordials` is a **ratchet**: a
   hardened file (baseline 0) rejects any new pollutable call. `UPDATE=1` only to
   *lower* a baseline.
-- The ratchet only counts Array/String prototype **method** calls. Three vector
-  classes are invisible to it and are on you: (a) `f.apply(…)`/`f.call(…)` on an
-  uncaptured function — use `ReflectApply`; (b) free globals and statics
-  (`String`, `ArrayBuffer.isView`, `Buffer.from`, `Buffer.prototype.toString`) —
-  capture at module-eval, which the loader runs before user code; (c) any object
+- The ratchet parses with acorn and counts **four** classes, each baselined
+  separately: `method` (`arr.push(x)`, and `RegExp`/`Promise`/`Function`
+  prototype methods too), `invoke` (`fn.call/apply` — use `ReflectApply`),
+  `accessor` (a read through a configurable prototype getter: `view.buffer`,
+  `.byteOffset`, `.byteLength`, `.constructor`, `__proto__` — use a captured
+  getter such as `TypedArrayPrototypeGetBuffer`), and `global` (a replaceable
+  global read live instead of captured at module-eval, which the loader runs
+  before user code). Computed and destructured forms count the same as the dot
+  form, so `view['buffer']` is not a way to lower a number.
+- A false positive takes `// primordials-ok` on the line. On a line carrying
+  candidates from **more than one class** the bare marker suppresses nothing —
+  name it, `// primordials-ok: method` (comma-separated list allowed). An
+  unrecognized class name suppresses nothing, so a typo fails loud.
+- `UPDATE=1` only *lowers* a baseline. Raising one needs
+  `make check-primordials UPDATE=1 RAISE=--allow-raise` and a stated reason (a
+  newly scanned file, or a new class). A corrupt baseline fails hard rather than
+  inviting a rebaseline.
+- **One vector is still on you**, outside the four counted classes: an object
   literal indexed by a caller-supplied key (label/scheme/header/encoding tables)
-  — give it `__proto__: null`. Baseline 0 means "no counted call left", not
-  "hardened".
+  needs `__proto__: null`. Deciding that a literal is a lookup table read with a
+  dynamic key takes dataflow the counter does not have, and a blanket rule would
+  fire on every options object.
+  Two more are uncounted, for reasons worth keeping apart. `for…of`, spread and
+  `Symbol.toPrimitive` read a well-known SYMBOL, so there is no named property to
+  count. `Object.prototype.then` is the opposite: an ordinary named property that
+  IS counted when written (`p.then(cb)` scores 1 `method`), but `await x` and
+  `Promise.resolve(x)` read it implicitly, with no member expression in the
+  source. It is also a plain data property an ordinary merge gadget can set, so
+  treat `await` on a caller-supplied value as a live call.
+- "Baseline 0" in a class means no *counted* site of that class is left — the
+  ratchet is a floor, not a proof, and per-class counts are what make it
+  readable rather than reassuring. It earned that caveat: `encoding.js` stood at
+  0 while `units.buffer` went through the live `%TypedArray%.prototype.buffer`
+  getter, which is why the accessor class exists. And a high number is not
+  automatically work: `primordials.js` reads 9 in `invoke` **by construction**,
+  because every `callerN` wrapper is a `fn.call` — its `global` column is 1,
+  since the module-eval rule already exempts the capture table.
 - Pick the primordial by **arity**. `callerN` (`ArrayPrototypePush`) carries an
   `arguments` switch and belongs at cold call sites; per-element loops use the
   fixed-arity wrappers (`ArrayPrototypePush1`/`Push2`) or plain indexed writes
@@ -227,6 +256,17 @@ output under `node` and under `bin/lava`. Add cases to
 oracle: allocator pairing, probe latching, pollution resistance, FFI ABI.
 
 Widening `known-lava-gaps.txt` is a regression and needs an explicit reason.
+
+Two more kinds, both added because hand-picked inputs kept missing edge cases:
+
+- **Differential property tests** — `tests/property/*.property.test.mjs`.
+  fast-check generates a seeded corpus on the Node side and drives `bin/lava` as a
+  subprocess, one process pair per property, comparing byte-for-byte. For input
+  spaces too large to pick by hand (decoders, URL, buffer). `make test-property`,
+  in CI, `PROPERTY_RUNS=N` to sweep deeper. It earned its place by finding a
+  utf-16le divergence at 5000 inputs that 200 hand-picked ones missed.
+- **Build-tooling tests** — `scripts/**/*.test.mjs` under `node:test`,
+  `make test-scripts`, run inside `make check-js`.
 
 **Order: contract → red test → implementation.** Write the contract comment
 (§4/§5) from a real `node` probe, then the tests, and watch them fail *before*

@@ -548,6 +548,49 @@ async_handoff_runs_posted_callback :: proc(t: ^testing.T) {
 	testing.expect_value(t, pending_count(&loop), 0)
 }
 
+// The same stale-wakeup hazard, but through run_until_idle — the driver the tests
+// themselves use, and the one #113 did not reach. `run()` exits solely on
+// !has_pending_work; run_until_idle used to exit on ONE no-progress tick, so a
+// surplus wakeup byte ended the drive with an off-loop completion still in flight
+// and returned the `did_work` an earlier tick had latched. That read as success,
+// which is why it survived: CI saw 2-of-3 completions with active_async == 1 and
+// no failure on the run_until_idle assertion itself.
+//
+// This is the sibling test below with `run` swapped for `run_until_idle`, and that
+// is the whole point — the hazard already had a test, on the other driver only.
+//
+// NO TIMER, deliberately. A pending timer gives platform_poll a positive timeout,
+// and a positive-timeout poll counts as progress on its own (see run_once), so the
+// no-progress tick never happens and the bug hides. It takes the blocking poll —
+// timeout -1 — which means the only thing that may complete the async is an
+// off-loop thread. A first version of this test used a timer to avoid the thread,
+// passed, and passed just as well with the fix reverted.
+@(test)
+run_until_idle_waits_out_a_stale_wakeup :: proc(t: ^testing.T) {
+	loop := init()
+	defer destroy(&loop)
+
+	rec := Recorder{}
+	defer delete(rec.events)
+	arg := Async_Arg {
+		loop = &loop,
+		rec  = &rec,
+	}
+
+	async_begin(&loop)
+	// The surplus byte, published before the drive starts: exactly what a
+	// completion drained one tick before its wakeup byte leaves behind.
+	wakeup(&loop)
+	thread.create_and_start_with_data(&arg, async_worker, context, .Normal, true)
+
+	testing.expect(t, run_until_idle(&loop))
+
+	// The completion ran, so the drive did not stop at the no-progress tick.
+	expect_events(t, rec.events[:], []int{1})
+	testing.expect_value(t, loop.active_async, 0)
+	testing.expect_value(t, pending_count(&loop), 0)
+}
+
 @(test)
 run_ignores_stale_wakeup_while_async_is_active :: proc(t: ^testing.T) {
 	loop := init()

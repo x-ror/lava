@@ -22,9 +22,18 @@
 // prototype-method pollution (Array.prototype.push = …) and global replacement
 // (globalThis.Array = …) — the realistic axes. They invoke through `.call`,
 // which reads Function.prototype.call dynamically, so a script that overrides
-// `Function.prototype.call/apply` can still reach them. That exotic axis (which
-// also breaks essentially all JS that uses `.call`, so it is self-defeating as
-// an attack) is closed only by lockIntrinsics(), applied opt-in by the runtime.
+// `Function.prototype.call/apply` still reaches them. This file used to call that
+// axis "exotic … self-defeating as an attack"; that was wrong twice over, and the
+// `invoke` ratchet class made it measurable. Wrapping `Function.prototype.call` is
+// something instrumentation, tracing and coverage libraries do on purpose, so the
+// trigger need not be an attacker at all — and the outcome is not a uniform
+// breakage but a SPLIT: TextDecoder/TextEncoder construction, Buffer.from,
+// buf.toString, Buffer.concat and new URL throw where node succeeds, while
+// URLSearchParams.get answers `null` and util.format answers `'undefined'` where
+// node is right. A silent wrong answer from a URL parameter lookup is the sharp
+// end of that. See the measured table above caller0 below; closed completely only
+// by lockIntrinsics(), which is written, exported, called from nowhere, and
+// tracked in ROADMAP.
 // The accessor axis (a setter on a numeric-index property of Array/Object.proto)
 // is not a method concern and is handled per-hot-array with null prototypes in
 // the consuming modules.
@@ -39,6 +48,88 @@
   var ObjectProto = Object.prototype;
   var ArrayProto = Array.prototype;
   var StringProto = String.prototype;
+
+  // --- the `.call` residual, and where it is NOT acceptable ---------------
+  //
+  // Every wrapper below invokes through `fn.call(t, …)`, which READS
+  // Function.prototype.call at call time. That property is writable, so a script
+  // that replaces it reaches every primordial — the residual this file's header
+  // has always documented, "closed only by lockIntrinsics(), applied opt-in".
+  //
+  // It is not theoretical. Poisoning ONLY Function.prototype.call — leaving the
+  // byteOffset/byteLength descriptors untouched — reproduced a full Buffer-pool
+  // disclosure through TextDecoder.decode(), because the captured view getters
+  // were reached through `.call` like everything else.
+  //
+  // Reflect.apply is immune (a plain call, no `.call` read). Two costs, and only
+  // the second one justifies anything — measured on this JSC, `bin/lava` vs a
+  // build with caller0..3 rewritten to reflectApply:
+  //
+  //   wrapper alone   1.3 -> 33.7 ns/op (25x). A bound captured `call`
+  //                   (reflectApply(bind, call, [fn])) is worse still, 47.0.
+  //   end to end      new URL 1.76x · EventEmitter.emit 1.63x · decode(5B) 1.49x
+  //                   · URLSearchParams.get 1.41x · toString('hex') 1.28x ·
+  //                   TextDecoder ctor 1.21x · decode(1800B) 1.11x — and ~1.00x
+  //                   for Buffer.from, TextEncoder.encode, util.format,
+  //                   path.join, structuredClone.
+  //
+  // So the ratio tracks wrapper density, not the surface: URL parsing and event
+  // emission are both on every HTTP request and both pay ~1.7x, which is the
+  // reason the hot wrappers keep `.call`:
+  //
+  //   caller0..callerN  keep `.call`     — hot, per-element, per-character
+  //   safeGetter        Reflect.apply    — security-critical reads whose RESULT
+  //                                       selects a memory window
+  //
+  // The view accessors below are `safeGetter`: three calls per decode against a
+  // ~1-4us decode, so the 33ns each is under 3% and buys immunity on the path
+  // where a forged answer reads another request's bytes.
+  //
+  // What the residual actually costs today, since the `invoke` class is now
+  // counted and therefore measurable: with `Function.prototype.call` replaced,
+  // Lava diverges from Node on TextDecoder/TextEncoder construction, Buffer.from,
+  // buf.toString, Buffer.concat and new URL (they throw where Node succeeds) and
+  // — worse — answers WRONGLY on URLSearchParams.get (null) and util.format
+  // ('undefined'). lockIntrinsics() closes all of it at zero per-call cost; it is
+  // written, exported, and called from nowhere. Wiring it at bootstrap is the
+  // complete answer and is tracked in ROADMAP with this table.
+  var reflectApply = Reflect.apply;
+  var NO_ARGS = Object.freeze([]);
+  function safeGetter(fn) {
+    return function (t) {
+      return reflectApply(fn, t, NO_ARGS);
+    };
+  }
+
+  // brandedAs is the UNFORGEABLE replacement for `value instanceof Ctor` on a
+  // hardening path. `instanceof` dispatches through `Ctor[Symbol.hasInstance]`, a
+  // configurable own property of the constructor, so a caller can flip the answer
+  // in EITHER direction and misroute a value into the wrong arm. That is not
+  // hypothetical in this tree: forging `DataView[Symbol.hasInstance]` made
+  // structuredClone throw on a genuine DataView, and made TextDecoder.decode()
+  // return "" — a silent empty decode — for valid input node decodes fine.
+  //
+  // A prototype-chain walk cannot be redirected the same way: the chain of an
+  // already-constructed object is fixed, and ReflectGetPrototypeOf is captured, so
+  // a poisoned `__proto__` accessor does not steer it. It is a CHAIN walk, not one
+  // comparison, so subclasses still match — `Buffer extends Uint8Array` and
+  // `class MyView extends DataView` both brand correctly.
+  //
+  // It is a prototype test, not a slot test: `Object.create(Uint8Array.prototype)`
+  // passes and has no backing store. So did `instanceof`, and the natives reject a
+  // slotless receiver either way — this is strictly stronger than what it replaces,
+  // not a complete brand. Where a true slot test is needed, call a captured getter
+  // and let it throw.
+  var reflectGetPrototypeOf = Reflect.getPrototypeOf;
+  function brandedAs(value, prototype) {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
+    var proto = reflectGetPrototypeOf(value);
+    while (proto !== null) {
+      if (proto === prototype) return true;
+      proto = reflectGetPrototypeOf(proto);
+    }
+    return false;
+  }
 
   // Fixed-arity `.call` wrappers — the fast path on JSC. `fn` is the captured
   // pristine method; the closure forwards a known number of positional args.
@@ -114,6 +205,7 @@
   module.exports = {
     uncurryThis: uncurryThis,
     lockIntrinsics: lockIntrinsics,
+    brandedAs: brandedAs,
 
     // --- Constructors / namespaces (captured so a replaced global is ignored) ---
     Object: Object,
@@ -172,7 +264,9 @@
 
     // --- Object.prototype.* (call as fn(obj, ...)) ---
     ObjectPrototypeHasOwnProperty: caller1(ObjectProto.hasOwnProperty),
-    ObjectPrototypeToString: caller0(ObjectProto.toString),
+    // safeGetter, not caller0: structured_clone keys its view-constructor table
+    // off this result, so a forged answer selects the wrong constructor.
+    ObjectPrototypeToString: safeGetter(ObjectProto.toString),
 
     // --- Function.prototype.* ---
     FunctionPrototypeApply: caller2(apply),
@@ -232,9 +326,113 @@
     // .buffer on an internal view must call the capture instead: a poisoned
     // getter substitutes an attacker's ArrayBuffer as the backing store. Node's
     // primordials export the same getter (TypedArrayPrototypeGetBuffer).
-    TypedArrayPrototypeGetBuffer: caller0(
+    TypedArrayPrototypeGetBuffer: safeGetter(
       Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer').get,
     ),
+    // The other two view accessors, for the same reason. Poisoning these does
+    // not widen a view — every native re-derives the real length from the
+    // engine's internal slots — but it does move the WINDOW a JS-side reader
+    // computes, which is how a poisoned pair turned TextDecoder.decode() into a
+    // read across the whole shared Buffer pool. Captured so a hardened module
+    // can compute its window from the real slots.
+    TypedArrayPrototypeGetByteOffset: safeGetter(
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'byteOffset')
+        .get,
+    ),
+    TypedArrayPrototypeGetByteLength: safeGetter(
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'byteLength')
+        .get,
+    ),
+
+    // The BRAND, taken from the prototype rather than from Symbol.toStringTag.
+    // structured_clone used to key its constructor table off
+    // Object.prototype.toString, which CONSULTS Symbol.toStringTag — a
+    // configurable accessor — so `Object.defineProperty(v, Symbol.toStringTag,
+    // …)` or a subclass getter forged the brand and made a legitimate clone
+    // throw. A prototype identity cannot be forged by assignment.
+    TypedArrayPrototypes: Object.freeze([
+      [Uint8Array.prototype, Uint8Array],
+      [Uint8ClampedArray.prototype, Uint8ClampedArray],
+      [Int8Array.prototype, Int8Array],
+      [Uint16Array.prototype, Uint16Array],
+      [Int16Array.prototype, Int16Array],
+      [Uint32Array.prototype, Uint32Array],
+      [Int32Array.prototype, Int32Array],
+      [Float32Array.prototype, Float32Array],
+      [Float64Array.prototype, Float64Array],
+      [BigInt64Array.prototype, BigInt64Array],
+      [BigUint64Array.prototype, BigUint64Array],
+      // Float16Array is Node 24+/JSC-version dependent. Omitting it made
+      // structuredClone THROW on a type Node clones, so it is included
+      // conditionally rather than assumed present.
+      ...(typeof Float16Array === 'function' ? [[Float16Array.prototype, Float16Array]] : []),
+    ]),
+
+    // %TypedArray%.prototype.length — configurable like the rest. Excluded from
+    // the ratchet's ACCESSOR list because a poisoned length cannot WIDEN a view
+    // (natives re-derive), but it does decide the range a JS-side reader asks
+    // for: poisoned to 0 it made every Buffer#toString return "".
+    TypedArrayPrototypeGetLength: safeGetter(
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'length').get,
+    ),
+
+    // DataView's three accessors are SEPARATE properties from %TypedArray%'s and
+    // equally configurable. encoding.js re-wraps a non-Uint8Array view as a
+    // Uint8Array over the same range, so a forged answer here selects a window
+    // out of the shared Buffer pool — reproduced through a DataView input.
+    DataViewPrototypeGetBuffer: safeGetter(
+      Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get,
+    ),
+    DataViewPrototypeGetByteOffset: safeGetter(
+      Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset').get,
+    ),
+    DataViewPrototypeGetByteLength: safeGetter(
+      Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get,
+    ),
+
+    // RegExp.prototype.test/exec are writable DATA properties — an ordinary
+    // assignment replaces them, no defineProperty needed. A poisoned `test` made
+    // fetch.js's header-name validator accept a name containing CRLF (header
+    // injection on the wire) and made http.js read Content-Length as NaN, so the
+    // body was parsed as the next request. Any internal module validating with a
+    // regex must route through these.
+    //
+    // BUT `RegExpPrototypeTest` IS NOT A SOUND VALIDATOR ON ITS OWN, and neither
+    // a `.call` nor a `Reflect.apply` invocation changes that. The spec's
+    // RegExpExec abstract op re-reads `R.exec` off the RECEIVER before falling
+    // back to the builtin, so replacing `RegExp.prototype.exec` — a writable data
+    // property — steers a captured `test`. Measured on both node 24 and bin/lava:
+    // with `RegExp.prototype.exec = () => ['forged']`, the captured `test` returns
+    // TRUE for 'X-Evil: 1\r\nInjected' against a strict header-name pattern,
+    // identically through `.call` and through `Reflect.apply`.
+    // So the pending migration of the ~15 `.test`/`.exec` sites in
+    // fetch.js/http.js/url.js must NOT simply swap in `RegExpPrototypeTest`: that
+    // closes the `.test`-assignment vector and leaves an equally cheap
+    // `.exec`-assignment vector open. Validate through the captured `exec`
+    // directly (`RegExpPrototypeExec(re, s) !== null`), which has no such
+    // indirection. Tracked in ROADMAP.
+    RegExpPrototypeTest: caller1(RegExp.prototype.test),
+    RegExpPrototypeExec: caller1(RegExp.prototype.exec),
+
+    // Constructors for the view types structured_clone rebuilds. It used to
+    // reach them through `value.constructor`, which is a configurable
+    // prototype-chain read: poisoning `Uint8Array.prototype.constructor` made
+    // `structuredClone(view)` invoke attacker code with the internals' freshly
+    // cloned ArrayBuffer, and hand back an arbitrary object as the clone.
+    TypedArrayConstructors: Object.freeze({
+      __proto__: null,
+      '[object Uint8Array]': Uint8Array,
+      '[object Uint8ClampedArray]': Uint8ClampedArray,
+      '[object Int8Array]': Int8Array,
+      '[object Uint16Array]': Uint16Array,
+      '[object Int16Array]': Int16Array,
+      '[object Uint32Array]': Uint32Array,
+      '[object Int32Array]': Int32Array,
+      '[object Float32Array]': Float32Array,
+      '[object Float64Array]': Float64Array,
+      '[object BigInt64Array]': BigInt64Array,
+      '[object BigUint64Array]': BigUint64Array,
+    }),
   };
 
   // Freeze the table so a consumer (or a leak) cannot mutate the shared set.
