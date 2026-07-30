@@ -61,7 +61,21 @@ never edit repo sources; you name the missing tests concretely.
 7. **Determinism.** A test depending on wall-clock timing, network order, or
    machine speed will flake in CI. Prefer the loop's logical clock.
 
-8. **Would a mutation fail it?** For every test the diff adds or changes, name
+8. **Is the mutation RECORDED, not just imagined?** `tests/mutation-manifest.json`
+   plus `make test-mutation` re-applies each recorded break in CI and fails if the
+   test survives it. For a diff touching a user-visible surface, a security
+   property, or a gate script, a new test with no manifest entry is a finding —
+   name the entry to add (`source`, `find`, `replace`, `gate`). Three tests reached
+   `master` in #321 that passed for the wrong reason, and each was caught only by
+   someone remembering to do this by hand.
+   Watch specifically for the shape that inspection misses: a test whose SETUP or
+   SCAFFOLDING suppresses the condition under test — an assertion that throws
+   before reaching the code (identical output on both runtimes reads as an oracle
+   pass), or a timer added to avoid needing a thread, where the timer itself gives
+   the poll a positive timeout and so counts as the progress the test was meant to
+   deny.
+
+9. **Would a mutation fail it?** For every test the diff adds or changes, name
    the mutation it should not survive — the line to delete or invert — and say
    whether it actually would. This is where decorative tests are caught, and
    presence of a test is not evidence: in #320 two new tests with confident
@@ -71,13 +85,15 @@ never edit repo sources; you name the missing tests concretely.
    `runtime.default_context()` are invisible to a caller's tracking allocator;
    the runner does not fail on leaks — `ODIN_TEST_FAIL_ON_BAD_MEMORY` is false;
    `/proc/self/fd` is noise under the default thread-per-core runner).
-9. **Contract comments** (`CLAUDE.md` §4/§5) on new user-visible surfaces: is
-   the `Node:` line backed by a real probe, and does `Deviates:` name the test
-   that pins it? A contract asserting behavior no test holds is a finding.
+10. **Contract comments** (`CLAUDE.md` §4/§5) on new user-visible surfaces: is
+    the `Node:` line backed by a real probe, and does `Deviates:` name the test
+    that pins it? A contract asserting behavior no test holds is a finding.
 
 You may run the relevant suites to confirm they pass and to check they actually
 exercise the changed lines. You cannot mutate sources — you are read-only — so
-report the mutation each test owes and let the implementer run it.
+report the mutation each test owes and let the implementer run it. `make
+test-mutation --list` (or reading `tests/mutation-manifest.json`) tells you which
+tests already have a recorded mutation, so you can report only the gaps.
 
 ## Output
 

@@ -28,6 +28,16 @@ Layering (never blur it):
    less memory per connection/request. A perf claim without a `make bench` number
    or a profile is not a perf claim.
 
+   A number written into a comment carries **how it was measured**, in the same
+   breath: what was compared against what, and at what size or count — "0.74x on a
+   9-byte decode, medians of 7 interleaved launches per arm", not "faster". Without
+   that the number cannot be rechecked and quietly becomes folklore: this file's own
+   justification for keeping `.call` over `Reflect.apply` read "2.22x" for months,
+   and remeasuring gave 25x on the bare wrapper and 1.00x–1.76x end to end depending
+   on wrapper density. The decision survived; the stated reason for it did not.
+   A comment that cites a ratio with no method is worse than one that cites none,
+   because it stops the next reader from measuring.
+
 Everything else (quality, docs, security, coverage) is a gate, not a ranking:
 a PR that fails one of them does not merge regardless of how fast it is.
 
@@ -87,6 +97,12 @@ Never claim a change works without running the gates its paths map to.
 **Linux-first.** darwin/windows native code is stubs; CI runs Linux only. But
 `make check` still cross-checks both targets — a change that breaks the stub
 front-end fails CI.
+
+**CI runs on `ubuntu-latest`: 4 cores.** Worth knowing before trying to reproduce
+a concurrency failure — a dev box with 16 cores does not oversubscribe the way CI
+does, and the `run_until_idle` race that CI caught survived 40 runs of the test
+alone, 25 whole-suite runs and 20 under `taskset -c 0,1` locally. When a race only
+appears in CI, read the code or shrink the CPU set; do not just re-run.
 
 ---
 
@@ -277,12 +293,29 @@ way in #320, both with confident comments, and mutation is what exposed them.
 **A test is not done until a mutation has failed it.** Delete or invert the line
 it claims to pin, re-run, and confirm it goes red for the stated reason; then
 restore. The red phase of test-first gives this for free — for a test added
-afterwards it is a separate, mandatory step. Two examples of what this catches,
+afterwards it is a separate, mandatory step.
+
+For anything on a user-visible surface, a security property, or a gate script,
+**record the mutation** in `tests/mutation-manifest.json` instead of only doing it
+once by hand: `make test-mutation` re-applies it in CI and fails if the test
+survives. Doing it by hand depends on remembering to, and that is exactly how the
+three examples below got in — each passed, and each passed just as well with the
+code it claimed to pin deleted. The runner refuses to report unless the tree is
+clean, each `find` is unique, and every gate is green *before* mutating; a stale
+entry is a failure, not a skip. Two examples of what this catches,
 both real: an assertion that holds equally with and without the code under test
 (a failed `map_insert` stores nothing either way, so `!hit` proved nothing), and
 an assertion aimed at memory the test cannot observe (net connections are freed
 under `runtime.default_context()`, so no tracking allocator ever sees them —
-the census had to move to `/proc/self/fd`).
+the census had to move to `/proc/self/fd`), and an assertion whose *setup* threw
+before reaching the code under test — `obj + name` as a map key coerces
+`%TypedArray%.prototype` and calls `join` on an incompatible receiver, so the case
+printed `THREW:TypeError` on both runtimes: byte-identical, which is exactly what
+the oracle model reads as success. A third shape worth naming because it is
+invisible on inspection: a test whose *scaffolding* suppresses the condition under
+test — an event-loop case used a timer to avoid needing a thread, and a pending
+timer gives `platform_poll` a positive timeout, which counts as progress by itself,
+so the no-progress tick being tested never occurred.
 
 ## 7. PR contract
 

@@ -11,7 +11,9 @@ without the toolchain. Four routed targets are **not** in CI — `make bun-buffe
 `make api-surface`, `make test-compat-lava-strict` and `make bench-gate` — so a
 diff that routes to one of those needs a local run, or a new CI step if it should
 be enforced. (`make test-scripts` runs in CI inside `make check-js`;
-`make test-property` is its own CI step since batching took it from 64s to ~1s.)
+`make test-property` is its own CI step since batching took it from 64s to ~1s;
+`make test-mutation` is its own CI step because it rebuilds `bin/lava` once per
+embedded-JS mutation.)
 
 ## Always
 
@@ -53,6 +55,7 @@ catches what a YAML parse cannot: a context used where it is not available, a ba
 | `pkg/runtime/js/**.js` (any — the scan root is the whole tree, `console.js` included) | `make check-js`, `make check-primordials`, `make test-compat-lava` |
 | `js/internal/{encoding,url,buffer}.js`, `pkg/runtime/buffer*.odin` | `make test-property` — differential property tests (fast-check generates the corpus; hand-picked oracle cases missed edge cases here twice, and the batched suite found a utf-16le divergence at 5000 inputs). `PROPERTY_RUNS=N` for a deeper local sweep |
 | `scripts/**` | `make test-scripts` — node:test over the build tooling |
+| any file named in `tests/mutation-manifest.json` as a `source` | `make test-mutation` — re-applies the recorded break and requires the named test to go red. Changing one of these files without running it means the recorded mutation may no longer describe the code, which the runner reports as STALE rather than skipping |
 | `pkg/runtime/globals.odin`, `runtime.odin`, `errors.odin` | `make test-odin`, `make test-compat-lava` |
 | `bench/**`, `bench/thresholds.json` | `make bench-gate` — and a stated reason if a cap was loosened |
 | `Makefile`, `scripts/**`, `.github/workflows/**` | run the targets the change touches, end to end |

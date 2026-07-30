@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property test-mutation check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -45,6 +45,7 @@ help:
 	@printf '%s\n' '  make check-actions      actionlint over .github/workflows'
 	@printf '%s\n' '  make check-primordials  Prototype-pollution ratchet over embedded JS (UPDATE=1 to lower; RAISE=--allow-raise to record new ground)'
 	@printf '%s\n' '  make test-scripts       node:test over scripts/ (the ratchet detector fixtures)'
+	@printf '%s\n' '  make test-mutation      Prove each recorded test dies when its code is broken'
 	@printf '%s\n' '  make test-property      Differential property tests node-vs-Lava (fast-check; PROPERTY_RUNS=N)'
 	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
 	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
@@ -160,6 +161,20 @@ check-primordials:
 # --test-name-pattern for iterating on one case. Part of `make check-js`.
 test-scripts:
 	node --test 'scripts/**/*.test.mjs'
+
+# MUTATION GATE. Applies each entry in tests/mutation-manifest.json to production
+# source and requires the named test to go RED. CLAUDE.md §6 has always demanded
+# this by hand; doing it by hand depends on remembering to, and three tests in #321
+# got past exactly that — each passed, and each passed just as well with the code it
+# claimed to pin deleted. Refuses to report unless the tree is clean, every `find`
+# is unique, and every gate is green BEFORE mutating: "it went red" proves nothing
+# about a gate that was already red.
+# Rebuilds bin/lava per embedded-JS mutation, so it is minutes, not seconds — its
+# own target and its own CI step, never part of the always-block.
+#   make test-mutation FILTER=clone   # substring match on the entry name
+#   node scripts/run-mutations.mjs --list
+test-mutation: build
+	@node scripts/run-mutations.mjs $(if $(FILTER),--filter=$(FILTER),)
 
 # Differential PROPERTY tests: fast-check generates the inputs and both runtimes
 # answer, so a mismatch shrinks to a minimal reproducer instead of arriving as a

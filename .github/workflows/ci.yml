@@ -74,6 +74,17 @@ jobs:
       - name: Test (differential property suite)
         run: make test-property
 
+      # MUTATION GATE. Breaks the code each recorded test claims to pin and requires
+      # the test to go red. It exists because three tests in #321 passed for the
+      # wrong reason and every one was caught only by doing this by hand: an oracle
+      # case that threw inside its own setup and so printed identical output on both
+      # runtimes, a property suite that compared zero inputs after a NaN run count,
+      # and an event-loop test whose timer gave platform_poll a positive timeout —
+      # which counts as progress by itself, so the no-progress tick under test never
+      # happened. Rebuilds bin/lava per embedded-JS mutation, hence its own step.
+      - name: Test (mutation gate)
+        run: make test-mutation
+
       - name: Test (Lava behavior)
         run: make test-lava
 

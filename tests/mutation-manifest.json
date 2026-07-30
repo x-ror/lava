@@ -1,0 +1,108 @@
+{
+  "$comment": [
+    "Every entry names a test and the ONE-LINE change to production source that must",
+    "make it go red. `make test-mutation` applies each change, runs the named gate,",
+    "and fails if the gate still passes \u2014 because a test that survives the deletion of",
+    "the code it claims to pin is asserting something else.",
+    "",
+    "This exists because three tests landed in #321 that passed for the wrong reason,",
+    "and every one was caught by doing this by hand: an oracle case that threw inside",
+    "its own setup and so printed identical output on both runtimes, a property suite",
+    "that compared zero inputs after a NaN run count, and an event-loop test whose",
+    "timer handed platform_poll a positive timeout, which counts as progress by itself",
+    "and so never produced the no-progress tick under test. Doing it by hand depends on",
+    "remembering to; this does not.",
+    "",
+    "Fields:",
+    "  name    what the mutation proves, in the form '<test> dies when <code> is broken'",
+    "  why     one sentence: the defect this catches if the mutation survives",
+    "  source  production file to patch (never a test file)",
+    "  find    exact string to replace; must appear EXACTLY once (the runner checks)",
+    "  replace what to put there \u2014 usually the pre-fix code, or a deleted guard",
+    "  gate    how to observe red; see GATE KINDS in scripts/run-mutations.mjs",
+    "  rebuild true when `source` is embedded JS or Odin and bin/lava must be rebuilt"
+  ],
+  "mutations": [
+    {
+      "name": "55-encoding-pollution V dies when the utf-8 decode return path goes back through .call",
+      "why": "A replaced Function.prototype.call substitutes decode()'s return value outright, so decode() hands back an ArrayBuffer instead of a string.",
+      "source": "pkg/runtime/js/internal/encoding.js",
+      "find": "  function bufferToStringUtf8(buf) {\n    return utf8DecodeNative(buf);\n  }",
+      "replace": "  function bufferToStringUtf8(buf) {\n    return Buffer.prototype.toString.call(buf, 'utf8');\n  }",
+      "gate": "compat:tests/node-compat/cases/55-encoding-pollution.js",
+      "rebuild": true
+    },
+    {
+      "name": "55-encoding-pollution U dies when toBytes reads the view window live",
+      "why": "A poisoned byteOffset/byteLength pair selects a window across the shared allocUnsafe pool, so decode() returns a neighbouring Buffer's bytes.",
+      "source": "pkg/runtime/js/internal/encoding.js",
+      "find": "      return new Uint8ArrayG(\n        TypedArrayPrototypeGetBuffer(input),\n        TypedArrayPrototypeGetByteOffset(input),\n        TypedArrayPrototypeGetByteLength(input),\n      );",
+      "replace": "      return new Uint8ArrayG(input.buffer, input.byteOffset, input.byteLength);",
+      "gate": "compat:tests/node-compat/cases/55-encoding-pollution.js",
+      "rebuild": true
+    },
+    {
+      "name": "55-encoding-pollution W dies when toBytes brands with instanceof",
+      "why": "Ctor[Symbol.hasInstance] is a configurable own property, so the brand is forgeable in both directions and misroutes the input into the wrong arm.",
+      "source": "pkg/runtime/js/internal/encoding.js",
+      "find": "    if (brandedAs(input, DataViewPrototype)) {",
+      "replace": "    if (input instanceof DataView) {",
+      "gate": "compat:tests/node-compat/cases/55-encoding-pollution.js",
+      "rebuild": true
+    },
+    {
+      "name": "13-structured-clone dies when the DataView clone arm reads its window live",
+      "why": "structuredClone copies the whole backing buffer and re-slices the copy, so a poisoned window exposes pool neighbours in the clone.",
+      "source": "pkg/runtime/js/internal/structured_clone.js",
+      "find": "      var srcByteLength = isDataView\n        ? DataViewPrototypeGetByteLength(value)\n        : TypedArrayPrototypeGetByteLength(value);",
+      "replace": "      var srcByteLength = isDataView ? value.byteLength : TypedArrayPrototypeGetByteLength(value);",
+      "gate": "compat:tests/node-compat/cases/13-structured-clone.js",
+      "rebuild": true
+    },
+    {
+      "name": "13-structured-clone dies when the DataView brand goes back to instanceof",
+      "why": "A forged DataView[Symbol.hasInstance] misroutes a genuine DataView into the typed-array arm, where the captured getter rejects the receiver.",
+      "source": "pkg/runtime/js/internal/structured_clone.js",
+      "find": "      var isDataView = hasPrototypeInChain(value, DataViewPrototype);",
+      "replace": "      var isDataView = value instanceof DataViewG;",
+      "gate": "compat:tests/node-compat/cases/13-structured-clone.js",
+      "rebuild": true
+    },
+    {
+      "name": "run_until_idle_waits_out_a_stale_wakeup dies when a no-progress tick ends the drive",
+      "why": "A surplus wakeup byte ends the drive with an off-loop completion still in flight, and it returns the did_work an earlier tick latched \u2014 so it reports success.",
+      "source": "pkg/runtime/eventloop/loop.odin",
+      "find": "\t\t\tif loop.active_io_count == 0 && loop.active_async == 0 {\n\t\t\t\treturn did_work\n\t\t\t}\n\t\t\tcontinue",
+      "replace": "\t\t\treturn did_work",
+      "gate": "odin:pkg/runtime/eventloop:eventloop.run_until_idle_waits_out_a_stale_wakeup",
+      "rebuild": false
+    },
+    {
+      "name": "the detector's fixtures die when isWrite swallows read-modify-write again",
+      "why": "Compound, logical and update assignments all run GetValue before PutValue, so exempting them lets the ratchet pay out for rewriting a counted read as `??=`.",
+      "source": "scripts/lib/primordials-detect.mjs",
+      "find": "      const isPlainWrite =\n        parent &&\n        parent.type === 'AssignmentExpression' &&\n        parent.left === node &&\n        parent.operator === '=';\n      if (isPlainWrite) return;",
+      "replace": "      const isPlainWrite =\n        parent &&\n        ((parent.type === 'AssignmentExpression' && parent.left === node) ||\n          (parent.type === 'UpdateExpression' && parent.argument === node));\n      if (isPlainWrite) return;",
+      "gate": "node-test:scripts/check-primordials.test.mjs",
+      "rebuild": false
+    },
+    {
+      "name": "the detector's fixtures die when the Identifier visitor's params guard is removed",
+      "why": "PropertyDefinition is in FUNCTION_TYPES but has no .params, so `class C { x = String; }` crashed the whole scan on valid syntax.",
+      "source": "scripts/lib/primordials-detect.mjs",
+      "find": "        (parent.id === node || (Array.isArray(parent.params) && parent.params.includes(node)))",
+      "replace": "        (parent.id === node || parent.params.includes(node))",
+      "gate": "node-test:scripts/check-primordials.test.mjs",
+      "rebuild": false
+    },
+    {
+      "name": "the baseline tests die when the per-class comparison collapses into a total",
+      "why": "A file that fixes one accessor and gains one live global has an unchanged total, and per-class baselines exist precisely so that cannot pass.",
+      "source": "scripts/lib/primordials-baseline.mjs",
+      "find": "  const failures = [];\n  const improvements = [];\n  for (const key of Object.keys(counts)) {\n    for (const kind of KINDS) {",
+      "replace": "  const failures = [];\n  const improvements = [];\n  for (const key of Object.keys(counts)) {\n    for (const kind of KINDS.slice(0, 1)) {",
+      "gate": "node-test:scripts/check-primordials.baseline.test.mjs",
+      "rebuild": false
+    }
+  ]
+}
