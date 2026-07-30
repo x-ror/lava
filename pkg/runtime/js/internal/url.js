@@ -874,7 +874,7 @@
     // single-character string per code point (the old form dominated the whole
     // parse: one string alloc + one codePointAt call per character per read).
     var cps = [];
-    for (var ci = 0; ci < input.length; ) {
+    for (var ci = 0; ci < input.length;) {
       var cc = StringPrototypeCodePointAt(input, ci);
       ArrayPrototypePush(cps, cc);
       ci += cc > 0xffff ? 2 : 1;
@@ -1585,7 +1585,7 @@
       var list = this[kList];
       // Set the first matching tuple in place and drop the rest (URL Standard).
       var found = false;
-      for (var i = 0; i < list.length; ) {
+      for (var i = 0; i < list.length;) {
         if (list[i][0] === n) {
           if (found) {
             ArrayPrototypeSplice(list, i, 1);

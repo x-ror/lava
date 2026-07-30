@@ -121,7 +121,7 @@
       output.push(input.charCodeAt(j));
     }
 
-    for (var index = basic > 0 ? basic + 1 : 0; index < inputLength; ) {
+    for (var index = basic > 0 ? basic + 1 : 0; index < inputLength;) {
       var oldi = i;
       for (var w = 1, k = base; ; k += base) {
         if (index >= inputLength) error('invalid-input');

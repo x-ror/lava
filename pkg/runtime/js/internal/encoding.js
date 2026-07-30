@@ -325,7 +325,7 @@
     // codePointAt: the ASCII/BMP case (the overwhelming majority of input) then
     // costs a single primordial call and no branch on a >0xffff result, and the
     // astral case pays a second call it would otherwise pay inside codePointAt.
-    for (var i = 0; i < source.length; ) {
+    for (var i = 0; i < source.length;) {
       var cp = StringPrototypeCharCodeAt(source, i);
       var units = 1;
       if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < source.length) {
@@ -470,7 +470,7 @@
   // U+FFFD, or an error when fatal) on the final, non-streaming call.
   function decodeUtf8(s, bytes, isFinal, fatal, units) {
     var n = 0;
-    for (var i = 0; i < bytes.length; ) {
+    for (var i = 0; i < bytes.length;) {
       var b = bytes[i];
       if (s.needed === 0) {
         if (b <= 0x7f) {
