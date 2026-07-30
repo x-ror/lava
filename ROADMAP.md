@@ -168,6 +168,22 @@ coupling.
       `Location:` header reaching `new URL(location, req.url)` hung the client: a
       remote-triggerable DoS. The Lava-only test that pins them ran in 3m07s while
       they spun and runs in 34ms now.
+- [x] **`util.format` ignored Node's single-argument rule** — fixed: a string
+      first argument with nothing after it is returned verbatim, directives and
+      all. Lava ran the substitution loop regardless and folded `%%` to `%`;
+      exactly 8 rows of a 31-row contract probe against node 24 diverged, all of
+      them `%%` with one argument. The directive cases (`%s`, `%z`, `100%`) already
+      matched by a different route — the "arguments exhausted" branch re-emits
+      `'%' + spec` — which is why the guard belongs before the loop, not in it.
+      Both implementations were wrong: `internal/util.js` behind `util.format`, and
+      `console.js`'s own `formatArgs` behind `console.log`. The duplication stays,
+      justified: `console.js` is the bootstrap prelude, takes the native write
+      functions as arguments, and has no `require` to delegate with.
+      Pinned by `57-format-single-arg.js` and TWO manifest entries — removing one
+      guard leaves the other path correct, so a single entry would have reported
+      coverage it did not have.
+      Latent rather than live when found: no committed case contained `%%`, so
+      nothing was mis-comparing. A future one would have, silently, on both sides.
 - [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector** —
       a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
       no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`
