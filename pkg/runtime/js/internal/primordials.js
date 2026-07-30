@@ -235,6 +235,49 @@
     TypedArrayPrototypeGetBuffer: caller0(
       Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer').get,
     ),
+    // The other two view accessors, for the same reason. Poisoning these does
+    // not widen a view — every native re-derives the real length from the
+    // engine's internal slots — but it does move the WINDOW a JS-side reader
+    // computes, which is how a poisoned pair turned TextDecoder.decode() into a
+    // read across the whole shared Buffer pool. Captured so a hardened module
+    // can compute its window from the real slots.
+    TypedArrayPrototypeGetByteOffset: caller0(
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'byteOffset')
+        .get,
+    ),
+    TypedArrayPrototypeGetByteLength: caller0(
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'byteLength')
+        .get,
+    ),
+
+    // RegExp.prototype.test/exec are writable DATA properties — an ordinary
+    // assignment replaces them, no defineProperty needed. A poisoned `test` made
+    // fetch.js's header-name validator accept a name containing CRLF (header
+    // injection on the wire) and made http.js read Content-Length as NaN, so the
+    // body was parsed as the next request. Any internal module validating with a
+    // regex must route through these.
+    RegExpPrototypeTest: caller1(RegExp.prototype.test),
+    RegExpPrototypeExec: caller1(RegExp.prototype.exec),
+
+    // Constructors for the view types structured_clone rebuilds. It used to
+    // reach them through `value.constructor`, which is a configurable
+    // prototype-chain read: poisoning `Uint8Array.prototype.constructor` made
+    // `structuredClone(view)` invoke attacker code with the internals' freshly
+    // cloned ArrayBuffer, and hand back an arbitrary object as the clone.
+    TypedArrayConstructors: Object.freeze({
+      __proto__: null,
+      '[object Uint8Array]': Uint8Array,
+      '[object Uint8ClampedArray]': Uint8ClampedArray,
+      '[object Int8Array]': Int8Array,
+      '[object Uint16Array]': Uint16Array,
+      '[object Int16Array]': Int16Array,
+      '[object Uint32Array]': Uint32Array,
+      '[object Int32Array]': Int32Array,
+      '[object Float32Array]': Float32Array,
+      '[object Float64Array]': Float64Array,
+      '[object BigInt64Array]': BigInt64Array,
+      '[object BigUint64Array]': BigUint64Array,
+    }),
   };
 
   // Freeze the table so a consumer (or a leak) cannot mutate the shared set.

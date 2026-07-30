@@ -373,23 +373,37 @@ correct while `Array.prototype.{push,unshift,slice,splice,map}`, `Object.create`
 and `Array[Symbol.species]` are all overwritten. Remaining modules adopt primordials
 incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
 
-Adoption is **ratcheted, not aspirational**: `scripts/check-primordials.mjs` counts
-syntactic pollutable prototype-method calls per file against
-`tests/node-compat/pollution-baseline.json`, and `make check-primordials` (part of
-`make check-js`) fails on any increase. `events.js`, `dns_promises.js` and
-`encoding.js` sit at 0; `url.js` is at 45 and `buffer.js` at 22. Differential
+Adoption is **ratcheted, not aspirational**: `scripts/check-primordials.mjs` parses
+every file under `pkg/runtime/js` with acorn and counts **four classes** of
+pollutable site, each baselined separately in
+`tests/node-compat/pollution-baseline.json`:
+
+| class | example | resolved through |
+| ----- | ------- | ---------------- |
+| `method` | `arr.push(x)` | a pollutable prototype method |
+| `invoke` | `fn.call(t, a)` | `Function.prototype` |
+| `accessor` | `view.buffer` | a configurable prototype getter |
+| `global` | `String(x)` | a replaceable global, read live |
+
+`make check-primordials` (part of `make check-js`) fails on any per-class
+increase, and `--update` refuses to raise a floor without `--allow-raise`. The
+detector self-tests against known-positive and known-negative fixtures on every
+run and refuses to report — or to rebaseline — if one regresses. Differential
 oracles `54-url-pollution.js` and `55-encoding-pollution.js` pin the behavior
 against Node, and `cmd/lava/encoding_pollution_test.odin` pins the axes where Lava
 is deliberately stronger than Node.
 
-A baseline of 0 means "no **counted** call remains", not "immune". The counter
-matches only Array/String prototype method names, so three classes are on the
-author, not the gate: `f.apply(…)`/`f.call(…)` on an uncaptured function (use
-`ReflectApply`); free globals and statics (`String`, `ArrayBuffer.isView`,
-`Buffer.from`, `Buffer.prototype.toString`) — capture at module-eval; and any
-object literal indexed by a caller-supplied key (label, scheme, header, encoding
-tables) — give it `__proto__: null`. The sharpest vector closed in `encoding.js`
-(`String.fromCharCode.apply`) was never visible to the ratchet at all.
+A baseline of 0 in a class means "no **counted** site of that class remains", not
+"immune" — the ratchet is a floor, not a proof. Per-class counts are what make
+that readable: `dns_promises.js` is the only file at 0 in all four, while
+`events.js` and `encoding.js` are at 0 `method` and still carry `invoke`,
+`global` and `accessor` sites. `.call`/`.apply` and live globals used to be the
+author's problem and are now gated; **one class still is not**, because deciding
+that an object literal is a lookup table read with a caller-supplied key takes
+dataflow a per-file counter does not have — give those `__proto__: null` by hand.
+Two protocol-shaped axes are also uncounted by construction, since they read a
+well-known symbol rather than a named property: the iterator protocol, and a
+poisoned `Object.prototype.then` reached by an internal `await`.
 
 `primordials` is internal-only: the loader serves it to internal factories but
 hides it from the public resolver native `require()` consults, so it neither

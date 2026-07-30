@@ -19,6 +19,16 @@
 
   var toString = Object.prototype.toString;
 
+  // Captured view constructors, keyed by the same brand tag this file already
+  // switches on. Rebuilding a view through `value.constructor` is a
+  // configurable prototype-chain read: poisoning
+  // `Uint8Array.prototype.constructor` made structuredClone invoke attacker code
+  // with the internals' freshly cloned ArrayBuffer and return an arbitrary
+  // object as the clone. A brand tag cannot be forged by assignment, so the
+  // lookup is the fix — and the table is null-prototype because the key comes
+  // from the value under clone.
+  var VIEW_CTORS = require('primordials').TypedArrayConstructors;
+
   var ERROR_CTORS = {
     Error: Error,
     EvalError: EvalError,
@@ -88,7 +98,9 @@
       if (tag === '[object DataView]') {
         view = new DataView(clonedBuffer, value.byteOffset, value.byteLength);
       } else {
-        view = new value.constructor(clonedBuffer, value.byteOffset, value.length);
+        var Ctor = VIEW_CTORS[tag];
+        if (Ctor === undefined) throw dataCloneError(tag + ' could not be cloned.');
+        view = new Ctor(clonedBuffer, value.byteOffset, value.length);
       }
       seen.set(value, view);
       return view;

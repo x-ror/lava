@@ -179,22 +179,37 @@ Rules that keep this from becoming ceremony:
   code that can poison prototypes. `make check-primordials` is a **ratchet**: a
   hardened file (baseline 0) rejects any new pollutable call. `UPDATE=1` only to
   *lower* a baseline.
-- The ratchet counts **four** classes, each baselined separately: `method`
-  (`arr.push(x)`), `invoke` (`fn.call/apply` — use `ReflectApply`), `accessor`
-  (a read through a configurable prototype getter: `view.buffer`,
+- The ratchet parses with acorn and counts **four** classes, each baselined
+  separately: `method` (`arr.push(x)`, and `RegExp`/`Promise`/`Function`
+  prototype methods too), `invoke` (`fn.call/apply` — use `ReflectApply`),
+  `accessor` (a read through a configurable prototype getter: `view.buffer`,
   `.byteOffset`, `.byteLength`, `.constructor`, `__proto__` — use a captured
   getter such as `TypedArrayPrototypeGetBuffer`), and `global` (a replaceable
   global read live instead of captured at module-eval, which the loader runs
-  before user code). Per-class baselines are the point: 0 globals in a file says
-  it captures them, and says nothing about its accessor reads.
+  before user code). Computed and destructured forms count the same as the dot
+  form, so `view['buffer']` is not a way to lower a number.
+- A false positive takes `// primordials-ok` on the line. On a line carrying
+  candidates from **more than one class** the bare marker suppresses nothing —
+  name it, `// primordials-ok: method` (comma-separated list allowed). An
+  unrecognized class name suppresses nothing, so a typo fails loud.
+- `UPDATE=1` only *lowers* a baseline; raising one needs `--allow-raise` and a
+  stated reason (a newly scanned file, or a new class).
 - **One class is still on you**: an object literal indexed by a caller-supplied
   key (label/scheme/header/encoding tables) needs `__proto__: null`. Deciding
   that a literal is a lookup table read with a dynamic key takes dataflow the
-  scanner does not have, and a blanket rule would fire on every options object.
+  counter does not have, and a blanket rule would fire on every options object.
+  Two more are uncounted by construction, because they read a well-known symbol
+  rather than a named property: the iterator protocol, and a poisoned
+  `Object.prototype.then` reached by an internal `await` — that one is a plain
+  data property settable by an ordinary merge gadget, so treat `await` on a
+  caller-supplied value as a live call.
 - "Baseline 0" in a class means no *counted* site of that class is left — the
-  ratchet is a floor, not a proof. It earned that caveat: `encoding.js` stood at
-  0 while `units.buffer` went through the live `%TypedArray%.prototype.buffer`
-  getter, which is exactly why the accessor class exists now.
+  ratchet is a floor, not a proof, and per-class counts are what make it
+  readable rather than reassuring. It earned that caveat twice: `encoding.js`
+  stood at 0 while `units.buffer` went through the live
+  `%TypedArray%.prototype.buffer` getter (which is why the accessor class
+  exists), and `primordials.js` reads high in `global` precisely *because* it is
+  the capture table — a low number is not by itself evidence of anything.
 - Pick the primordial by **arity**. `callerN` (`ArrayPrototypePush`) carries an
   `arguments` switch and belongs at cold call sites; per-element loops use the
   fixed-arity wrappers (`ArrayPrototypePush1`/`Push2`) or plain indexed writes

@@ -82,22 +82,43 @@ coupling.
 ### High priority (the Odin / native part)
 
 - [x] **The primordials ratchet cannot see accessor reads, and reports 0
-      anyway** — fixed: it now counts four classes, each baselined separately —
-      `method`, `invoke` (`.call`/`.apply`), `accessor` (reads through a
-      configurable prototype getter) and `global` (a replaceable global read
-      live instead of captured). Verified against the defect that motivated it:
-      `encoding.js` at 401ea40 scores 8 accessor sites including the
-      `units.buffer` read that was the live vector, so the tool would have
-      flagged what a reviewer had to find. The detector self-tests on every run
-      against known-positive and known-negative fixtures and refuses to report
-      on the tree if any regresses — a blind control is worse than none.
-      Per-class baselines are what make "0" mean something: `encoding.js` is at
-      0 globals because it captures them, while its accessor count is not 0 and
-      now says so. Tree total went 583 -> 1555 (method 583, invoke 80,
-      accessor 140, global 752); the new counts are recorded, not fixed.
-      One class remains on the author: an object literal indexed by a
-      caller-supplied key needs `__proto__: null`, and deciding a literal is a
-      dynamic-key lookup table takes dataflow a scanner does not have.
+      anyway** — fixed: it parses with acorn and counts four classes, each
+      baselined separately — `method`, `invoke` (`.call`/`.apply`), `accessor`
+      (reads through a configurable prototype getter) and `global` (a
+      replaceable global read live instead of captured). Verified against the
+      defect that motivated it: at `07676d8^` — the commit inside #320 that
+      actually carried the vector — `encoding.js` scores 10 accessor sites
+      including `units.buffer` at line 360, against a then-recorded baseline of
+      0, so the tool exits 1 and names the line a reviewer had to find by eye.
+      (An earlier version of this entry cited `401ea40`; that revision predates
+      the vector and scores 8 accessor sites on the neighbouring `bytes.buffer`
+      read.) The detector self-tests on every run against known-positive and
+      known-negative fixtures with exact per-class counts, and refuses to report
+      on the tree _or to rebaseline_ if one regresses — a blind control is worse
+      than none. `--update` also refuses to raise a floor without
+      `--allow-raise`.
+      Do not copy the tree totals into prose; `pollution-baseline.json` is the
+      source and `make check-primordials` prints the live number. Scope is now
+      all of `pkg/runtime/js`, not just `internal/` — the real 371-line
+      `console.js` was outside the scan while the baseline described the 7-line
+      re-export, so the report read as "console is hardened".
+      One class remains on the author (an object literal indexed by a
+      caller-supplied key needs `__proto__: null`), and two are uncounted by
+      construction because they read a well-known symbol rather than a named
+      property: the iterator protocol, and a poisoned `Object.prototype.then`
+      reached by an internal `await`. That last one is a plain data property
+      settable by an ordinary merge gadget — the sharpest uncounted vector, and
+      its own item below.
+- [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector** —
+      a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
+      no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`
+      and `Promise.resolve(obj)` both execute attacker code inside an internal
+      await, and internals carry 5 awaits plus 34 `.then(` sites. The ratchet
+      cannot count it (awaiting reads a well-known symbol, not a named
+      property), so this needs a code convention instead: never `await` a
+      caller-supplied value directly, or route it through a captured
+      `PromiseResolve`. Same shape for the iterator protocol (`for…of`, spread)
+      on caller-supplied values.
 - [x] **Promise ↔ event-loop ordering.** JSC drains its own promise microtask
       queue at every C-API boundary, so `Promise.then` used to run _before_
       `process.nextTick` (Node is the reverse). `queueMicrotask` lives in a JS shim
@@ -320,19 +341,23 @@ coupling.
       `pkg/runtime/eventloop/loop.odin`.)
 - [ ] **Prototype-pollution hardening of the embedded JS layer** — `primordials.js`
       plus the `make check-primordials` ratchet over
-      `tests/node-compat/pollution-baseline.json`. Done: `events.js`,
-      `dns_promises.js`, `encoding.js` (0), and the encoding-name path of
-      `buffer.js`. Remaining: `url.js` (45 — the type-ambiguous
+      `tests/node-compat/pollution-baseline.json`. Done in the `method` column:
+      `events.js`, `dns_promises.js`, `encoding.js`, and the encoding-name path
+      of `buffer.js` — of which only `dns_promises.js` is 0 in all four classes.
+      Remaining in `method`: `url.js` (the type-ambiguous
       `slice`/`indexOf`/`includes` sites, plus its percent-decode byte arrays,
       which are still plain arrays and so reachable via an `Array.prototype[0]`
-      accessor), `buffer.js` (22), `path.js` (158), `esm.js` (78), `util.js` (48).
-      **Unblocked**: the ratchet now counts four classes separately, so the
-      remediation list above is the `method` column only. The other three are
-      recorded per file in `pollution-baseline.json` and are the larger part of
-      the work — tree-wide, `global` 752, `accessor` 140, `invoke` 80 against
-      `method` 583. Take them per file, lowest-hanging first: capturing a
-      module's globals at module-eval is mechanical and drives its `global`
-      column to 0, which `encoding.js` already demonstrates.
+      accessor), `buffer.js`, `path.js`, `esm.js`, `util.js`, and the newly
+      in-scope `console.js`.
+      **Unblocked**: the ratchet counts four classes separately, so that list is
+      the `method` column only; the other three are recorded per file in
+      `pollution-baseline.json` and are the larger part of the work. Read the
+      current split from `make check-primordials` rather than from prose here —
+      copied totals went stale twice. Take them per file, lowest-hanging first:
+      capturing a module's globals at module-eval is mechanical and drives its
+      `global` column to 0, which `encoding.js` already demonstrates. Note the
+      `global` column counts the capture TABLE too, so `primordials.js` reads
+      high there by construction and is not work.
 - [x] **Real wall-clock timers** — fixed: in `real_time` mode the loop tracks the
       monotonic wall clock (`sync_real_clock` / `real_now_ms` in
       `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a

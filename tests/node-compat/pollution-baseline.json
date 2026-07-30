@@ -1,239 +1,245 @@
 {
-  "abort.js": {
+  "console.js": {
+    "method": 53,
+    "invoke": 3,
+    "accessor": 2,
+    "global": 40
+  },
+  "internal/abort.js": {
     "method": 6,
     "invoke": 2,
     "accessor": 0,
-    "global": 12
+    "global": 9
   },
-  "assert.js": {
-    "method": 11,
+  "internal/assert.js": {
+    "method": 19,
     "invoke": 8,
     "accessor": 8,
     "global": 52
   },
-  "buffer.js": {
-    "method": 22,
+  "internal/buffer.js": {
+    "method": 47,
     "invoke": 7,
-    "accessor": 26,
-    "global": 186
+    "accessor": 22,
+    "global": 130
   },
-  "console.js": {
+  "internal/console.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 0,
     "global": 0
   },
-  "crypto.js": {
-    "method": 17,
+  "internal/crypto.js": {
+    "method": 22,
     "invoke": 0,
     "accessor": 20,
-    "global": 76
+    "global": 71
   },
-  "diagnostics_channel.js": {
-    "method": 4,
+  "internal/diagnostics_channel.js": {
+    "method": 5,
     "invoke": 9,
     "accessor": 0,
-    "global": 16
+    "global": 13
   },
-  "dns.js": {
+  "internal/dns.js": {
     "method": 10,
     "invoke": 0,
     "accessor": 0,
-    "global": 10
+    "global": 8
   },
-  "dns_promises.js": {
+  "internal/dns_promises.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 0,
     "global": 0
   },
-  "encoding.js": {
-    "method": 0,
+  "internal/encoding.js": {
+    "method": 1,
     "invoke": 2,
-    "accessor": 8,
+    "accessor": 6,
     "global": 0
   },
-  "esm.js": {
-    "method": 78,
+  "internal/esm.js": {
+    "method": 81,
     "invoke": 0,
     "accessor": 0,
     "global": 20
   },
-  "events.js": {
+  "internal/events.js": {
     "method": 0,
     "invoke": 2,
     "accessor": 0,
     "global": 12
   },
-  "fetch.js": {
-    "method": 20,
+  "internal/fetch.js": {
+    "method": 31,
     "invoke": 1,
     "accessor": 6,
-    "global": 76
+    "global": 75
   },
-  "http.js": {
-    "method": 35,
+  "internal/http.js": {
+    "method": 47,
     "invoke": 5,
-    "accessor": 3,
-    "global": 44
+    "accessor": 0,
+    "global": 34
   },
-  "https.js": {
-    "method": 0,
+  "internal/https.js": {
+    "method": 2,
     "invoke": 0,
     "accessor": 0,
-    "global": 12
+    "global": 10
   },
-  "loader.js": {
+  "internal/loader.js": {
     "method": 2,
     "invoke": 1,
     "accessor": 0,
+    "global": 0
+  },
+  "internal/microtasks.js": {
+    "method": 1,
+    "invoke": 0,
+    "accessor": 0,
     "global": 2
   },
-  "microtasks.js": {
-    "method": 0,
+  "internal/mime.js": {
+    "method": 29,
     "invoke": 0,
     "accessor": 0,
     "global": 5
   },
-  "mime.js": {
-    "method": 26,
-    "invoke": 0,
-    "accessor": 0,
-    "global": 17
-  },
-  "net.js": {
-    "method": 1,
+  "internal/net.js": {
+    "method": 2,
     "invoke": 2,
-    "accessor": 5,
-    "global": 15
+    "accessor": 3,
+    "global": 11
   },
-  "os.js": {
+  "internal/os.js": {
     "method": 12,
     "invoke": 0,
     "accessor": 1,
-    "global": 14
+    "global": 10
   },
-  "parse_args.js": {
+  "internal/parse_args.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 0,
     "global": 1
   },
-  "parse_env.js": {
+  "internal/parse_env.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 3,
     "global": 2
   },
-  "path.js": {
-    "method": 158,
+  "internal/path.js": {
+    "method": 163,
     "invoke": 0,
     "accessor": 0,
     "global": 9
   },
-  "path_posix.js": {
+  "internal/path_posix.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 0,
     "global": 0
   },
-  "path_win32.js": {
+  "internal/path_win32.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 0,
     "global": 0
   },
-  "primordials.js": {
+  "internal/primordials.js": {
     "method": 0,
     "invoke": 9,
     "accessor": 0,
-    "global": 56
+    "global": 1
   },
-  "process.js": {
+  "internal/process.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 0,
     "global": 0
   },
-  "punycode.js": {
-    "method": 23,
+  "internal/punycode.js": {
+    "method": 25,
     "invoke": 0,
     "accessor": 0,
     "global": 2
   },
-  "querystring.js": {
+  "internal/querystring.js": {
     "method": 8,
     "invoke": 1,
     "accessor": 0,
     "global": 6
   },
-  "sqlite.js": {
-    "method": 5,
+  "internal/sqlite.js": {
+    "method": 10,
     "invoke": 1,
     "accessor": 3,
-    "global": 30
+    "global": 22
   },
-  "stream.js": {
-    "method": 30,
+  "internal/stream.js": {
+    "method": 42,
     "invoke": 9,
-    "accessor": 32,
-    "global": 60
+    "accessor": 25,
+    "global": 37
   },
-  "stream_promises.js": {
+  "internal/stream_promises.js": {
     "method": 1,
     "invoke": 1,
     "accessor": 0,
     "global": 2
   },
-  "streams.js": {
-    "method": 11,
+  "internal/streams.js": {
+    "method": 22,
     "invoke": 0,
     "accessor": 1,
-    "global": 67
+    "global": 65
   },
-  "string_decoder.js": {
-    "method": 3,
+  "internal/string_decoder.js": {
+    "method": 14,
     "invoke": 0,
     "accessor": 3,
     "global": 5
   },
-  "structured_clone.js": {
-    "method": 5,
+  "internal/structured_clone.js": {
+    "method": 6,
     "invoke": 1,
     "accessor": 4,
-    "global": 19
+    "global": 15
   },
-  "timers.js": {
+  "internal/timers.js": {
     "method": 0,
     "invoke": 0,
     "accessor": 0,
     "global": 0
   },
-  "timers_promises.js": {
+  "internal/timers_promises.js": {
     "method": 2,
     "invoke": 0,
     "accessor": 0,
     "global": 4
   },
-  "tty.js": {
-    "method": 0,
-    "invoke": 2,
-    "accessor": 2,
-    "global": 4
-  },
-  "url.js": {
-    "method": 45,
+  "internal/tty.js": {
+    "method": 2,
     "invoke": 2,
     "accessor": 0,
-    "global": 33
+    "global": 2
   },
-  "util.js": {
-    "method": 48,
+  "internal/url.js": {
+    "method": 53,
+    "invoke": 2,
+    "accessor": 0,
+    "global": 24
+  },
+  "internal/util.js": {
+    "method": 57,
     "invoke": 14,
     "accessor": 15,
-    "global": 77
+    "global": 72
   },
-  "util_types.js": {
+  "internal/util_types.js": {
     "method": 0,
     "invoke": 1,
     "accessor": 0,

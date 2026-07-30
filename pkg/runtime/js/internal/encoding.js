@@ -38,6 +38,8 @@
   var Uint16ArrayG = P.Uint16Array;
   var TypedArrayPrototypeSubarray = P.TypedArrayPrototypeSubarray;
   var TypedArrayPrototypeGetBuffer = P.TypedArrayPrototypeGetBuffer;
+  var TypedArrayPrototypeGetByteOffset = P.TypedArrayPrototypeGetByteOffset;
+  var TypedArrayPrototypeGetByteLength = P.TypedArrayPrototypeGetByteLength;
   var ArrayBufferG = P.ArrayBuffer;
   var ArrayBufferIsView = P.ArrayBufferIsView;
   // Free globals / statics, captured pristine at module-eval.
@@ -602,18 +604,18 @@
       ) {
         off = 3;
       }
-      // The captured getter, not `bytes.buffer`: this is the same poisonable
-      // prototype-accessor read closed in unitsToString, and Node's native
-      // utf-8 decoder is immune to it — a live read here made the fastpath the
-      // one decode Lava forged while Node did not. Pinned by
-      // cmd/lava/encoding_pollution_test.odin (the byteOffset/byteLength
-      // accessors stay live reads, matching Node's own JS layer).
+      // ALL THREE reads go through captured getters. Leaving byteOffset and
+      // byteLength live was justified as "matching Node's own JS layer", and
+      // that was wrong: Node's utf-8 decode is native and consults none of
+      // them, so the live pair was a divergence, not parity. Poisoning the two
+      // getters moves the WINDOW while the backing store comes from the real
+      // slots — a reviewer reproduced `decode(Buffer.from('mine'))` returning
+      // another Buffer's contents out of the shared allocUnsafe pool. Pinned by
+      // cmd/lava/encoding_pollution_test.odin.
+      var base = TypedArrayPrototypeGetByteOffset(bytes);
+      var span = TypedArrayPrototypeGetByteLength(bytes);
       return bufferToStringUtf8(
-        BufferFrom(
-          TypedArrayPrototypeGetBuffer(bytes),
-          bytes.byteOffset + off,
-          bytes.byteLength - off,
-        ),
+        BufferFrom(TypedArrayPrototypeGetBuffer(bytes), base + off, span - off),
       );
     }
     // WHATWG: a non-streaming decode starts a fresh run (reset decoder + BOM
