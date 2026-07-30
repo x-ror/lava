@@ -230,10 +230,14 @@ const GLOBALS = new Set([
   'Proxy',
 ]);
 
+// A class instance-field initialiser is not a Function node, but it RUNS at
+// construction time — after user code has had every chance to replace a global.
+// Counting it as module-eval let `class C { x = String(); }` score 0.
 const FUNCTION_TYPES = new Set([
   'FunctionDeclaration',
   'FunctionExpression',
   'ArrowFunctionExpression',
+  'PropertyDefinition',
 ]);
 
 // The property name a member expression reads, or null when the key is not in
@@ -241,8 +245,13 @@ const FUNCTION_TYPES = new Set([
 // return 'buffer'; `view[k]` returns null (see the header's NOT-covered list).
 function propName(node) {
   if (!node.computed) return node.property.type === 'Identifier' ? node.property.name : null;
-  if (node.property.type === 'Literal' && typeof node.property.value === 'string') {
-    return node.property.value;
+  const key = node.property;
+  if (key.type === 'Literal' && typeof key.value === 'string') return key.value;
+  // A template with no interpolation is a literal key wearing a different hat.
+  // Leaving it out meant `view[`buffer`]` counted 0 while `view['buffer']` counted
+  // 1 — a third spelling of the rename this detector exists to refuse to pay for.
+  if (key.type === 'TemplateLiteral' && key.expressions.length === 0 && key.quasis.length === 1) {
+    return key.quasis[0].value.cooked;
   }
   return null;
 }
@@ -265,8 +274,8 @@ function functionDepth(ancestors) {
 //
 // This replaced a line-shaped "is it a capture?" regex, which had to guess and
 // guessed wrong in both directions: it exempted a capture inside a function body
-// (a call-time read) and counted primordials.js's export table (73 module-level
-// mentions that are the capture itself).
+// (a call-time read) and counted primordials.js's own export table, where every
+// module-level mention IS the capture.
 function runsAtModuleEval(ancestors) {
   return functionDepth(ancestors) <= 1;
 }
@@ -275,7 +284,10 @@ function runsAtModuleEval(ancestors) {
 // shadows the global, so the body's `String` is a local, not a live global read.
 function shadowedByParam(name, ancestors) {
   for (const a of ancestors) {
-    if (!FUNCTION_TYPES.has(a.type)) continue;
+    // FUNCTION_TYPES includes PropertyDefinition, which is a call-time context for
+    // the depth rule but has no parameter list — hence the guard rather than a
+    // narrower set, so the two uses cannot drift apart.
+    if (!FUNCTION_TYPES.has(a.type) || !Array.isArray(a.params)) continue;
     for (const p of a.params) {
       if (p.type === 'Identifier' && p.name === name) return true;
     }
@@ -361,11 +373,14 @@ function countSource(src, label = '<fixture>') {
       at(node, 'accessor', `.${name}`);
     },
 
-    // `const { buffer } = view` resolves the same getter as `view.buffer`.
+    // `const { buffer } = view` resolves the same getter as `view.buffer`, and so
+    // does `const { 'buffer': b } = view` — both were a way to lower a count.
     ObjectPattern(node) {
       for (const p of node.properties) {
-        if (p.type !== 'Property' || p.computed) continue;
-        const key = p.key.type === 'Identifier' ? p.key.name : null;
+        if (p.type !== 'Property') continue;
+        let key = null;
+        if (!p.computed && p.key.type === 'Identifier') key = p.key.name;
+        else if (p.key.type === 'Literal' && typeof p.key.value === 'string') key = p.key.value;
         if (key && ACCESSOR.has(key)) at(p, 'accessor', `{ ${key} } =`);
       }
     },
@@ -373,20 +388,14 @@ function countSource(src, label = '<fixture>') {
     Identifier(node, _state, ancestors) {
       const parent = ancestors[ancestors.length - 2];
       if (!parent) return;
-      // `globalThis.String(x)` reaches the same replaceable binding the long way.
-      if (
-        parent.type === 'MemberExpression' &&
-        parent.property === node &&
-        parent.object.type === 'Identifier' &&
-        parent.object.name === 'globalThis' &&
-        GLOBALS.has(node.name)
-      ) {
-        at(node, 'global', `globalThis.${node.name}`);
-        return;
-      }
       if (!GLOBALS.has(node.name)) return;
       // Property, key, label and binding positions are not reads of the global.
-      if (parent.type === 'MemberExpression' && parent.property === node) return;
+      // `!computed` matters: `o[String]` READS the global as a key, where
+      // `o.String` only names a property. Without it the largest class still paid
+      // out for a rename.
+      if (parent.type === 'MemberExpression' && parent.property === node && !parent.computed) {
+        return;
+      }
       if (parent.type === 'Property' && parent.key === node && !parent.computed) return;
       if (parent.type === 'VariableDeclarator' && parent.id === node) return;
       if (FUNCTION_TYPES.has(parent.type) && (parent.id === node || parent.params.includes(node))) {
@@ -418,7 +427,7 @@ function applySuppression(hits, lineComments) {
   const kept = [];
   for (const [line, lineHits] of byLine) {
     const comment = lineComments.get(line);
-    const marker = comment ? /^\s*primordials-ok(?::\s*([\w,\s]+))?/.exec(comment) : null;
+    const marker = comment ? /^\s*primordials-ok(?::\s*([\w,\s]+))?\s*$/.exec(comment) : null;
     if (!marker) {
       kept.push(...lineHits);
       continue;

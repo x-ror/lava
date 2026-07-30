@@ -57,6 +57,7 @@
   var StringG = String;
   var StringPrototypeToLowerCase = P.StringPrototypeToLowerCase;
   var ObjectPrototypeHasOwnProperty = P.ObjectPrototypeHasOwnProperty;
+  var TypedArrayPrototypeGetLength = P.TypedArrayPrototypeGetLength;
 
   /**
    * @type {Object<string, string>} lowercased name → canonical encoding.
@@ -464,7 +465,12 @@
      * @returns {string}
      */
     toString(encoding, start, end) {
-      var len = this.length;
+      // The captured getter, not `this.length`: %TypedArray%.prototype.length is
+      // a configurable accessor, and this value decides the output range. With it
+      // poisoned to 0 every toString — and so every TextDecoder.decode — returned
+      // "" while node returned the real text. Truncation rather than an
+      // over-read, but a silent wrong answer either way.
+      var len = TypedArrayPrototypeGetLength(this);
       if (start === undefined || start <= 0) start = 0;
       else if (start >= len) return '';
       else start |= 0;

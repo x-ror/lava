@@ -113,7 +113,7 @@ coupling.
       a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
       no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`
       and `Promise.resolve(obj)` both execute attacker code inside an internal
-      await, and internals carry 5 awaits plus 34 `.then(` sites. The ratchet
+      await, and internals carry 5 awaits plus ~31 `.then(` sites. The ratchet
       cannot count it (awaiting reads a well-known symbol, not a named
       property), so this needs a code convention instead: never `await` a
       caller-supplied value directly, or route it through a captured
@@ -342,8 +342,11 @@ coupling.
 - [ ] **Prototype-pollution hardening of the embedded JS layer** — `primordials.js`
       plus the `make check-primordials` ratchet over
       `tests/node-compat/pollution-baseline.json`. Done in the `method` column:
-      `events.js`, `dns_promises.js`, `encoding.js`, and the encoding-name path
-      of `buffer.js` — of which only `dns_promises.js` is 0 in all four classes.
+      `events.js`, `dns_promises.js`, and the encoding-name path of `buffer.js`;
+      `encoding.js` sits at 1, not 0. Six files are 0 in all four classes, but
+      none of them is evidence of hardening — every one is a 6–19 line re-export
+      shim (`console.js`, `dns_promises.js`, `path_posix.js`, `path_win32.js`,
+      `process.js`, `timers.js`). No file with real logic is clean in all four.
       Remaining in `method`: `url.js` (the type-ambiguous
       `slice`/`indexOf`/`includes` sites, plus its percent-decode byte arrays,
       which are still plain arrays and so reachable via an `Array.prototype[0]`
@@ -355,9 +358,49 @@ coupling.
       current split from `make check-primordials` rather than from prose here —
       copied totals went stale twice. Take them per file, lowest-hanging first:
       capturing a module's globals at module-eval is mechanical and drives its
-      `global` column to 0, which `encoding.js` already demonstrates. Note the
-      `global` column counts the capture TABLE too, so `primordials.js` reads
-      high there by construction and is not work.
+      `global` column to 0, which `encoding.js` already demonstrates. Note
+      `primordials.js` reads 9 in `invoke` **by construction** — every `callerN`
+      wrapper is a `fn.call` — while its `global` column is 1, because the
+      module-eval rule already exempts the capture table. Neither is work.
+      **Next, and it is the largest single win left**: wire `lockIntrinsics()`.
+      It is written and exported in `primordials.js` and called from nowhere, so
+      the whole `invoke` class is live today. Now that the class is counted it is
+      also measurable, and the exposure is worse than the "exotic axis" the file
+      header used to call it: replacing `Function.prototype.call` makes Lava throw
+      where Node succeeds (TextDecoder/TextEncoder construction, `Buffer.from`,
+      `buf.toString`, `Buffer.concat`, `new URL`) and — worse — answer _wrongly_
+      where Node is right (`URLSearchParams.get` → `null`, `util.format` →
+      `'undefined'`). Not hypothetical: instrumentation and tracing libraries wrap
+      `Function.prototype.call` for legitimate reasons.
+      Converting the wrappers to `Reflect.apply` instead was measured and is not
+      the answer for the hot ones — `bin/lava` vs a build with `caller0..3`
+      rewritten, end to end: `new URL` 1.76x, `EventEmitter.emit` 1.63x,
+      `decode(5B)` 1.49x, `URLSearchParams.get` 1.41x, `toString('hex')` 1.28x,
+      TextDecoder ctor 1.21x, `decode(1800B)` 1.11x. URL parsing and event
+      emission are on every HTTP request, so ~1.7x there is not payable.
+      But the same table says the conversion is **free** (~1.00x) for
+      `Buffer.from`, `TextEncoder.encode`, `util.format`, `path.join` and
+      `structuredClone`, so the work splits cleanly: `lockIntrinsics()` at
+      bootstrap for the hot paths at zero per-call cost, and `Reflect.apply` for
+      the wrapper-sparse cold ones regardless.
+      One site is already done, and it shows a third option worth looking for
+      first: `encoding.js` reached the utf-8 and utf-16le decoders as
+      `Buffer.prototype.toString.call(bytes, enc)`, which put the live `.call` read
+      on decode()'s **return** path — `decode()` handed back the replacement's
+      ArrayBuffer instead of a string. It now takes `utf8Decode`/`utf16leDecode`
+      straight from the loader's native argument, which needs no `Function.prototype`
+      read at all and is FASTER than the `.call` it replaced (0.74x on a 9-byte
+      decode, 0.91x on a 20-parameter URLSearchParams parse, medians of 7
+      interleaved launches) because toString's length getter, range clamp and
+      encoding-name dispatch drop out. Pinned by vector V in
+      `55-encoding-pollution.js`. Where a JS layer is borrowing a prototype method
+      that only wraps a native we already own, going to the native beats both
+      `.call` and `Reflect.apply` — check for that before reaching for either. The open question is only
+      `lockIntrinsics()`'s own Node deviation — Node leaves the intrinsics
+      writable, so a program assigning `Function.prototype.call` would silently
+      not take effect; that narrower divergence needs a Lava-only test pinning it
+      per §1, plus a full `make test-lava` pass to find what in the oracle suites
+      legitimately writes an intrinsic.
 - [x] **Real wall-clock timers** — fixed: in `real_time` mode the loop tracks the
       monotonic wall clock (`sync_real_clock` / `real_now_ms` in
       `pkg/runtime/eventloop/loop.odin`), so `setTimeout(fn, 1000)` fires after a

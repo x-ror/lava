@@ -140,4 +140,111 @@ for (const bad of [() => {}, Symbol('x'), Promise.resolve(1), new WeakMap(), new
 }
 assert.throws(() => structuredClone(), TypeError);
 
+// --- every view type, by brand ---------------------------------------------
+// The clone rebuilds views from a captured prototype->constructor table. A closed
+// table means a type absent from it THROWS, which is how Float16Array — which
+// this runtime ships and Node clones — regressed while the suite stayed green
+// because it only exercised Uint8Array/Uint16Array/DataView. Looping means the
+// next brand JSC gains is caught rather than discovered.
+for (const name of [
+  'Uint8Array',
+  'Uint8ClampedArray',
+  'Int8Array',
+  'Uint16Array',
+  'Int16Array',
+  'Uint32Array',
+  'Int32Array',
+  'Float32Array',
+  'Float64Array',
+  'BigInt64Array',
+  'BigUint64Array',
+  'Float16Array',
+]) {
+  const Ctor = globalThis[name];
+  if (typeof Ctor !== 'function') continue; // version-dependent, skip quietly
+  const src = /^Big/.test(name) ? new Ctor([1n, 2n]) : new Ctor([1, 2]);
+  const copy = structuredClone(src);
+  assert.equal(Object.prototype.toString.call(copy), '[object ' + name + ']');
+  assert.equal(copy.length, 2);
+  assert.notEqual(copy.buffer, src.buffer);
+}
+
+// Buffer is a Uint8Array subclass and the spec clones by brand, so the clone is a
+// plain Uint8Array in both runtimes — and so is an arbitrary subclass.
+{
+  const b = structuredClone(Buffer.from('hi'));
+  assert.equal(b.constructor.name, 'Uint8Array');
+  assert.ok(b instanceof Uint8Array);
+  class Mine extends Uint8Array {}
+  const m = structuredClone(new Mine([7, 8]));
+  assert.equal(m.constructor.name, 'Uint8Array');
+  assert.deepEqual(Array.from(m), [7, 8]);
+  // A pooled, offset view keeps its contents and not its neighbours'.
+  const off = Buffer.from('abcdefgh').subarray(3);
+  assert.equal(Buffer.from(structuredClone(off)).toString(), 'defgh');
+}
+
+// --- the clone must not be steerable by the value under clone ---------------
+// Each of these was a reproduced vector: `value.constructor` invoked attacker
+// code with the internals' freshly cloned ArrayBuffer; a forged
+// `Symbol.toStringTag` made a legitimate clone throw; and an Error `name` reached
+// Object.prototype through an un-nulled lookup table.
+{
+  const realCtor = Uint8Array.prototype.constructor;
+  let attackerRan = false;
+  Uint8Array.prototype.constructor = function () {
+    attackerRan = true;
+    return { evil: 1 };
+  };
+  let tag, vals;
+  try {
+    const c = structuredClone(new Uint8Array([1, 2, 3]));
+    tag = Object.prototype.toString.call(c);
+    vals = Array.from(c).join(',');
+  } finally {
+    Uint8Array.prototype.constructor = realCtor;
+  }
+  assert.equal(attackerRan, false);
+  assert.equal(tag, '[object Uint8Array]');
+  assert.equal(vals, '1,2,3');
+}
+{
+  const u = new Uint8Array([4, 5]);
+  Object.defineProperty(u, Symbol.toStringTag, { value: 'Bar', configurable: true });
+  const c = structuredClone(u);
+  assert.equal(c.constructor.name, 'Uint8Array');
+  assert.deepEqual(Array.from(c), [4, 5]);
+}
+{
+  class Foo extends Uint8Array {
+    get [Symbol.toStringTag]() {
+      return 'Foo';
+    }
+  }
+  const c = structuredClone(new Foo([1, 2, 3]));
+  assert.equal(c.constructor.name, 'Uint8Array');
+  assert.deepEqual(Array.from(c), [1, 2, 3]);
+}
+// An unrecognized `name` normalizes to Error (Node's behaviour, verified); a
+// recognized one is carried over. The interesting inputs are the ones that used to
+// reach Object.prototype through the lookup table.
+for (const name of ['toString', 'valueOf', 'constructor', '__proto__', 'NotAnError']) {
+  const e = new Error('boom');
+  e.name = name;
+  const c = structuredClone(e);
+  assert.ok(c instanceof Error, name + ' should clone to an Error');
+  assert.equal(c.message, 'boom');
+  assert.equal(c.name, 'Error');
+}
+for (const [name, Ctor] of [
+  ['TypeError', TypeError],
+  ['RangeError', RangeError],
+  ['SyntaxError', SyntaxError],
+]) {
+  const e = new Ctor('boom');
+  const c = structuredClone(e);
+  assert.equal(c.name, name);
+  assert.equal(c.constructor.name, name);
+}
+
 console.log('structured-clone-ok');

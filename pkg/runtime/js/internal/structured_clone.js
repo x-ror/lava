@@ -19,17 +19,50 @@
 
   var toString = Object.prototype.toString;
 
-  // Captured view constructors, keyed by the same brand tag this file already
-  // switches on. Rebuilding a view through `value.constructor` is a
-  // configurable prototype-chain read: poisoning
-  // `Uint8Array.prototype.constructor` made structuredClone invoke attacker code
-  // with the internals' freshly cloned ArrayBuffer and return an arbitrary
-  // object as the clone. A brand tag cannot be forged by assignment, so the
-  // lookup is the fix — and the table is null-prototype because the key comes
-  // from the value under clone.
-  var VIEW_CTORS = require('primordials').TypedArrayConstructors;
+  var P = require('primordials');
+  // Rebuilding a view through `value.constructor` is a configurable
+  // prototype-chain read: poisoning `Uint8Array.prototype.constructor` made
+  // structuredClone invoke attacker code with the internals' freshly cloned
+  // ArrayBuffer and hand back an arbitrary object as the clone.
+  //
+  // The replacement is PROTOTYPE IDENTITY, not the brand tag. Keying off
+  // `Object.prototype.toString` looked equivalent and was not:
+  // `Object.prototype.toString` consults `Symbol.toStringTag`, a configurable
+  // accessor, so `Object.defineProperty(v, Symbol.toStringTag, …)` or a subclass
+  // getter forged the brand — which made a legitimate clone THROW and could
+  // select the wrong constructor. A prototype cannot be forged by assignment.
+  //
+  // The chain is walked, not matched once, because Node clones a SUBCLASS to its
+  // nearest built-in (`class My extends Uint8Array {}` clones to a plain
+  // Uint8Array), and Buffer is a Uint8Array subclass — so the first match going
+  // up is exactly Node's answer.
+  var VIEW_PROTOS = P.TypedArrayPrototypes;
+  var ReflectGetPrototypeOf = P.ReflectGetPrototypeOf;
+  var TypedArrayPrototypeGetBuffer = P.TypedArrayPrototypeGetBuffer;
+  var TypedArrayPrototypeGetByteOffset = P.TypedArrayPrototypeGetByteOffset;
+  var TypedArrayPrototypeGetByteLength = P.TypedArrayPrototypeGetByteLength;
+  var StringPrototypeSlice = P.StringPrototypeSlice;
+  var DataViewG = DataView;
 
+  function viewConstructorOf(value) {
+    var proto = ReflectGetPrototypeOf(value);
+    while (proto !== null) {
+      for (var i = 0; i < VIEW_PROTOS.length; i++) {
+        if (VIEW_PROTOS[i][0] === proto) return VIEW_PROTOS[i][1];
+      }
+      proto = ReflectGetPrototypeOf(proto);
+    }
+    return undefined;
+  }
+
+  // `__proto__: null` because the key is `value.name`, straight off the object
+  // under clone: without it, `err.name = 'toString'` reached
+  // Object.prototype.toString and `new` on it threw, and a poisoned
+  // `Object.prototype.<anything>` supplied an arbitrary constructor. Node
+  // normalizes an unrecognized name to Error, which the `|| Error` fallback now
+  // actually reaches for every name.
   var ERROR_CTORS = {
+    __proto__: null,
     Error: Error,
     EvalError: EvalError,
     RangeError: RangeError,
@@ -69,7 +102,7 @@
     var tag = toString.call(value);
 
     if (tag === '[object Promise]' || tag === '[object WeakMap]' || tag === '[object WeakSet]') {
-      throw dataCloneError(tag.slice(8, -1) + ' could not be cloned.');
+      throw dataCloneError(StringPrototypeSlice(tag, 8, -1) + ' could not be cloned.');
     }
 
     if (tag === '[object Date]') {
@@ -93,14 +126,24 @@
     // Typed arrays and DataView: clone the backing buffer through `seen` so
     // multiple views over one buffer keep sharing a single cloned buffer.
     if (ArrayBuffer.isView(value)) {
-      var clonedBuffer = clone(value.buffer, seen);
+      // Every read of the window goes through a captured getter: `clone()` copies
+      // the WHOLE backing ArrayBuffer, so a poisoned byteOffset/byteLength pair
+      // selecting out of that copy is a read across the shared allocUnsafe pool
+      // — reproduced returning a neighbouring Buffer's contents.
+      var isDataView = value instanceof DataViewG;
+      var srcBuffer = isDataView ? value.buffer : TypedArrayPrototypeGetBuffer(value);
+      var srcOffset = isDataView ? value.byteOffset : TypedArrayPrototypeGetByteOffset(value);
+      var srcByteLength = isDataView ? value.byteLength : TypedArrayPrototypeGetByteLength(value);
+      var clonedBuffer = clone(srcBuffer, seen);
       var view;
-      if (tag === '[object DataView]') {
-        view = new DataView(clonedBuffer, value.byteOffset, value.byteLength);
+      if (isDataView) {
+        view = new DataViewG(clonedBuffer, srcOffset, srcByteLength);
       } else {
-        var Ctor = VIEW_CTORS[tag];
-        if (Ctor === undefined) throw dataCloneError(tag + ' could not be cloned.');
-        view = new Ctor(clonedBuffer, value.byteOffset, value.length);
+        var Ctor = viewConstructorOf(value);
+        if (Ctor === undefined) {
+          throw dataCloneError(StringPrototypeSlice(tag, 8, -1) + ' could not be cloned.');
+        }
+        view = new Ctor(clonedBuffer, srcOffset, srcByteLength / Ctor.BYTES_PER_ELEMENT);
       }
       seen.set(value, view);
       return view;
@@ -125,10 +168,17 @@
     }
 
     if (value instanceof Error) {
-      var Ctor = ERROR_CTORS[value.name] || Error;
+      // Node NORMALIZES an unrecognized name to Error rather than carrying it
+      // over: `e.name = 'NotAnError'` clones to `name === 'Error'` (verified
+      // against node 24). Preserving it was a quiet divergence, and reapplying
+      // it unconditionally is also what made `e.name = 'toString'` interesting —
+      // the un-nulled table reached Object.prototype and `new` on the result
+      // threw.
+      var recognized = ERROR_CTORS[value.name];
+      var Ctor = recognized || Error;
       var errClone = new Ctor(value.message);
       seen.set(value, errClone);
-      if (value.name !== errClone.name) errClone.name = value.name;
+      if (recognized !== undefined && value.name !== errClone.name) errClone.name = value.name;
       errClone.stack = value.stack;
       if ('cause' in value) errClone.cause = clone(value.cause, seen);
       return errClone;

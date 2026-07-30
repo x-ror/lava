@@ -374,7 +374,9 @@ and `Array[Symbol.species]` are all overwritten. Remaining modules adopt primord
 incrementally — the same grow-as-you-go model as the `ERR_*` taxonomy.
 
 Adoption is **ratcheted, not aspirational**: `scripts/check-primordials.mjs` parses
-every file under `pkg/runtime/js` with acorn and counts **four classes** of
+every file under `pkg/runtime/js` with acorn (the detector is
+`scripts/lib/primordials-detect.mjs`; its fixtures and the baseline comparison are
+siblings, each with a `node:test` file) and counts **four classes** of
 pollutable site, each baselined separately in
 `tests/node-compat/pollution-baseline.json`:
 
@@ -395,9 +397,10 @@ is deliberately stronger than Node.
 
 A baseline of 0 in a class means "no **counted** site of that class remains", not
 "immune" — the ratchet is a floor, not a proof. Per-class counts are what make
-that readable: `dns_promises.js` is the only file at 0 in all four, while
-`events.js` and `encoding.js` are at 0 `method` and still carry `invoke`,
-`global` and `accessor` sites. `.call`/`.apply` and live globals used to be the
+that readable: `events.js` is at 0 `method` and 0 `accessor` while still carrying
+`invoke` and `global` sites, which a single total hid. Do not restate the numbers
+here — `pollution-baseline.json` is the source and `make check-primordials` prints
+the live split; the counts copied into prose went stale twice. `.call`/`.apply` and live globals used to be the
 author's problem and are now gated; **one class still is not**, because deciding
 that an object literal is a lookup table read with a caller-supplied key takes
 dataflow a per-file counter does not have — give those `__proto__: null` by hand.

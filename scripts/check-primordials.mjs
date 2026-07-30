@@ -14,6 +14,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { relative, sep } from 'node:path';
 import { KINDS, countFile, walkDir, JS_DIR, BASELINE } from './lib/primordials-detect.mjs';
 import { selfTest } from './lib/primordials-fixtures.mjs';
+import { compare, raises, totals } from './lib/primordials-baseline.mjs';
 
 // --- report ----------------------------------------------------------------
 
@@ -48,17 +49,33 @@ for (const file of files) {
   allHits[key] = hits;
 }
 
-const perKindLine = () =>
-  KINDS.map((k) => `${k} ${Object.values(counts).reduce((a, b) => a + b[k], 0)}`).join(', ');
-const grandTotal = () =>
-  Object.values(counts).reduce((a, b) => a + KINDS.reduce((s, k) => s + b[k], 0), 0);
+const perKindLine = () => KINDS.map((k) => `${k} ${totals(counts).perKind[k]}`).join(', ');
+const grandTotal = () => totals(counts).total;
 
+// A corrupt baseline is NOT a missing one. Both used to set haveBaseline=false,
+// which put `--update` outside the refuse-to-raise guard entirely — so a file with
+// git conflict markers in it (a large generated JSON that changes on every
+// hardening, so conflicts are likely) turned the tool's own advice, "run
+// --update", into an unguarded rebaseline of every floor.
 let baseline = {};
 let haveBaseline = true;
+let raw = null;
 try {
-  baseline = JSON.parse(readFileSync(BASELINE, 'utf8'));
+  raw = readFileSync(BASELINE, 'utf8');
 } catch {
   haveBaseline = false;
+}
+if (raw !== null) {
+  try {
+    baseline = JSON.parse(raw);
+  } catch (err) {
+    console.error(`Baseline at ${BASELINE} is not valid JSON: ${err.message}`);
+    console.error(
+      'Fix the file — do NOT rebaseline. Rewriting it would raise every floor to\n' +
+        'whatever the tree currently is, which is what the ratchet exists to prevent.',
+    );
+    process.exit(1);
+  }
 }
 
 const update = process.argv.includes('--update');
@@ -68,22 +85,12 @@ if (update) {
   // both directions, so a contributor who hit a failure and reached for
   // `UPDATE=1` silently raised the floor for every file — the prose rule in
   // CLAUDE.md §5 was the only thing stopping it.
-  const raises = [];
-  if (haveBaseline) {
-    for (const key of Object.keys(counts)) {
-      for (const kind of KINDS) {
-        const base = baseline[key]?.[kind] ?? 0;
-        if (counts[key][kind] > base) {
-          raises.push(
-            `  ${key}: ${kind} ${base} -> ${counts[key][kind]} (+${counts[key][kind] - base})`,
-          );
-        }
-      }
-    }
-  }
-  if (raises.length > 0 && !process.argv.includes('--allow-raise')) {
+  const up = haveBaseline ? raises(counts, baseline) : [];
+  if (up.length > 0 && !process.argv.includes('--allow-raise')) {
     console.error('Refusing to RAISE the baseline. These entries would go up:\n');
-    for (const r of raises) console.error(r);
+    for (const r of up) {
+      console.error(`  ${r.key}: ${r.kind} ${r.base} -> ${r.now} (+${r.now - r.base})`);
+    }
     console.error(
       '\nThe ratchet only moves down. Harden the sites, add `// primordials-ok` where\n' +
         'the receiver genuinely is not a built-in, or pass --allow-raise if you are\n' +
@@ -103,25 +110,27 @@ if (!haveBaseline) {
   process.exit(1);
 }
 
-let failed = false;
-let improved = false;
-for (const key of Object.keys(counts)) {
-  for (const kind of KINDS) {
-    const now = counts[key][kind];
-    // A file absent from the baseline starts at 0 in every class, so a new
-    // unhardened module cannot land silently.
-    const base = baseline[key]?.[kind] ?? 0;
-    if (now > base) {
-      failed = true;
-      console.error(`\n${key}: ${now} ${kind} sites, baseline ${base} (+${now - base}):`);
-      for (const h of allHits[key].filter((h) => h.kind === kind)) {
-        console.error(`  ${key}:${h.line}  ${h.name}`);
-      }
-    } else if (now < base) {
-      improved = true;
-      console.log(`${key}: ${kind} ${now} < baseline ${base} — hardened by ${base - now}.`);
-    }
+const { failures, improvements, stale } = compare(counts, baseline);
+let failed = failures.length > 0;
+const improved = improvements.length > 0;
+
+for (const f of failures) {
+  console.error(`\n${f.key}: ${f.now} ${f.kind} sites, baseline ${f.base} (+${f.now - f.base}):`);
+  for (const h of allHits[f.key].filter((h) => h.kind === f.kind)) {
+    console.error(`  ${f.key}:${h.line}  ${h.name}`);
   }
+}
+for (const i of improvements) {
+  console.log(`${i.key}: ${i.kind} ${i.now} < baseline ${i.base} — hardened by ${i.base - i.now}.`);
+}
+if (stale.length > 0) {
+  failed = true;
+  console.error('\nStale baseline entries — these files no longer exist:');
+  for (const key of stale) console.error(`  ${key}`);
+  console.error(
+    'A stale entry is a ceiling waiting for a file to be re-added under the same\n' +
+      'path, which would then inherit it instead of starting at 0. Run --update to prune.',
+  );
 }
 
 if (failed) {

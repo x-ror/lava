@@ -9,9 +9,9 @@
 //
 // Run: node --test scripts/       (or `make test-scripts`)
 //
-// There was no test runner for scripts in this repo, and I asserted that as a
-// constraint and hand-rolled around it. node:test has been stable since Node 20
-// and the repo requires 24 — the constraint was never real.
+// These are node:test, not a hand-rolled harness. The repo had no runner for
+// `scripts/` and that absence was mistaken for a constraint once; node:test ships
+// in the Node the repo already requires, so there was never anything to build.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';

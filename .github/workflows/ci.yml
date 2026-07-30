@@ -66,6 +66,14 @@ jobs:
       - name: Test
         run: make test
 
+      # Differential property tests: fast-check generates the corpus and both
+      # runtimes answer it in one process pair per property. It was out of CI when
+      # it spawned a pair per input (64s for 200 inputs); batched it is ~1s for
+      # 5000, and at that size it found a real utf-16le divergence the hand-picked
+      # oracle cases missed.
+      - name: Test (differential property suite)
+        run: make test-property
+
       - name: Test (Lava behavior)
         run: make test-lava
 

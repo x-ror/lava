@@ -24,6 +24,8 @@
 //   Q  the >0x2000 chunked unitsToString branch (ArrayPrototypeSlice+ReflectApply)
 //   R  Buffer.from / Buffer.prototype.toString / the String global underneath —
 //      the encoding->buffer boundary, one layer below the url->encoding one
+//   V  Function.prototype.call   -> the borrow itself, so the replacement's return
+//                                   value became decode()'s (see V, at the end)
 //
 // Errors are compared by name AND code, so an error-identity divergence cannot
 // hide behind a matching class.
@@ -552,3 +554,88 @@ console.log(
 );
 
 console.log('ok');
+
+// U: the WINDOW accessors, not just the backing store. Poisoning
+// %TypedArray%.prototype.byteOffset/byteLength (and .length, and DataView's own
+// trio) used to move the range a JS-side reader asked for while the bytes came
+// from the real slots — decode() returned a neighbouring Buffer's contents out of
+// the shared allocUnsafe pool. The pool neighbour is allocated first on purpose so
+// there is something to leak; node is native here and agrees, so this is a
+// differential rather than a Lava-only assertion.
+console.log(
+  'U',
+  (() => {
+    const neighbour = Buffer.from('SECRET-NEIGHBOUR-DATA-0123456789');
+    const mine = Buffer.from('mine');
+    const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+    const saved = new Map();
+    const poison = (obj, name, value) => {
+      saved.set(obj + name, [obj, name, Object.getOwnPropertyDescriptor(obj, name)]);
+      Object.defineProperty(obj, name, { configurable: true, get: () => value });
+    };
+    let out;
+    try {
+      poison(taProto, 'byteOffset', 0);
+      poison(taProto, 'byteLength', 64);
+      poison(taProto, 'length', 64);
+      poison(DataView.prototype, 'byteOffset', 0);
+      poison(DataView.prototype, 'byteLength', 64);
+      out = [
+        new TextDecoder().decode(mine),
+        new TextDecoder().decode(new DataView(mine.buffer, mine.byteOffset, 4)),
+        new TextDecoder().decode(new Int8Array(mine.buffer, mine.byteOffset, 4)),
+      ].join('|');
+    } catch (e) {
+      out = 'THREW:' + e.name;
+    } finally {
+      for (const [obj, name, desc] of saved.values()) Object.defineProperty(obj, name, desc);
+    }
+    // `neighbour` must stay referenced or the pool slot may be reused.
+    return out + ' (n=' + neighbour.length + ')';
+  })(),
+);
+
+// V: `Function.prototype.call` replaced — the RETURN path of decode(), which is
+// the sharpest shape in this whole file. The other vectors forge an intermediate
+// and the damage is arithmetic; here the replacement's return value simply became
+// decode()'s, so `decode()` handed back an ArrayBuffer instead of a string. It
+// reached the utf-8 fast path through `Buffer.prototype.toString.call(bytes,
+// 'utf8')` and the utf-16le path through the same borrow, and neither
+// captured-method nor captured-getter hardening touches it: the method was
+// already pristine, `.call` is the live read. Fixed by taking the codec natives
+// (`utf8Decode`/`utf16leDecode`) straight from the loader's native argument, so no
+// `Function.prototype` read is left on the path at all.
+//
+// The decoders are built BEFORE the poison so this measures decode, not
+// construction: label normalization still routes through `.call`-based
+// primordials, so `new TextDecoder()` under this poison throws RangeError under
+// Lava where node succeeds. That residual is the whole `invoke` class, it is
+// tracked in ROADMAP against lockIntrinsics(), and it is deliberately NOT part of
+// this case — a case that asserted it would have to assert the divergence.
+console.log(
+  'V',
+  (() => {
+    const d8 = new TextDecoder();
+    const d16 = new TextDecoder('utf-16le');
+    const utf8 = new Uint8Array([0x68, 0x69]); // "hi"
+    const utf16 = new Uint8Array([0x41, 0x00, 0x42, 0x00]); // "AB"
+    const real = Function.prototype.call;
+    // Nothing between the assignment and the restore may itself use `.call`, so
+    // the results are collected raw and only inspected after `.call` is back.
+    Function.prototype.call = function () {
+      return new ArrayBuffer(8);
+    };
+    let a, b, threw;
+    try {
+      a = d8.decode(utf8);
+      b = d16.decode(utf16);
+    } catch (e) {
+      threw = e;
+    }
+    Function.prototype.call = real;
+    if (threw !== undefined) return 'THREW:' + threw.name;
+    // typeof is asserted explicitly: an ArrayBuffer stringifies to something
+    // harmless-looking in a template, so comparing text alone would pass.
+    return [typeof a, JSON.stringify(a), typeof b, JSON.stringify(b)].join('|');
+  })(),
+);

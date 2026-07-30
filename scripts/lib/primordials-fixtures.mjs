@@ -107,8 +107,11 @@ const SELF_TEST = [
     ),
     expect: E({ global: 1 }),
   },
-  // The arrow form: the old 3-char lookback missed `=>` followed by a newline,
-  // which re-opened the very blind spot it was written to close.
+  // The arrow form. Pinned because the regex scanner this replaced decided
+  // "is the enclosing thing a function?" from a 3-character lookback, and so
+  // missed `=>` followed by a newline — re-opening the very blind spot the
+  // lookback was written to close. The AST cannot regress that way; the fixture
+  // stays because the *rule* (depth, not statement shape) is what it pins.
   {
     name: 'capture inside an arrow body',
     src: WRAP(
@@ -157,6 +160,60 @@ const SELF_TEST = [
   { name: 'primordial wrapper call', src: 'ArrayPrototypePush(arr, x);', expect: E() },
   { name: 'ReflectApply is the fix', src: 'ReflectApply(fn, null, args);', expect: E() },
 
+  // --- forms that used to be a free way to lower a count -------------------
+  // Each of these is the SAME read as its dotted sibling; counting one and not
+  // the other is a ratchet that pays for a rename.
+  { name: 'template-literal key', src: 'var b = view[`buffer`];', expect: E({ accessor: 1 }) },
+  { name: 'method via template key', src: 'arr[`push`](x);', expect: E({ method: 1 }) },
+  {
+    name: 'string-literal pattern key',
+    src: "var { 'buffer': b } = view;",
+    expect: E({ accessor: 1 }),
+  },
+  {
+    name: 'computed global read as a key',
+    src: WRAP('function f(o) { return o[String]; }'),
+    expect: E({ global: 1 }),
+  },
+  {
+    name: 'named property is not a global read',
+    src: WRAP('function f(o) { return o.String; }'),
+    expect: E(),
+  },
+
+  // A class instance field runs at construction, i.e. after user code — so it is
+  // NOT module-eval however high in the file it sits.
+  {
+    name: 'class field initializer is call-time',
+    src: WRAP('  class C { x = String(); }'),
+    expect: E({ global: 1 }),
+  },
+  {
+    name: 'static block is class-definition time',
+    src: WRAP('  class C { static { var s = String(); } }'),
+    expect: E(),
+  },
+
+  // The marker must be the WHOLE comment; "primordials-okay" is not it.
+  {
+    name: 'marker typo does not suppress',
+    src: 'q.push(x); // primordials-okay',
+    expect: E({ method: 1 }),
+  },
+  {
+    name: 'marker with trailing prose does not suppress',
+    src: 'q.push(x); // primordials-ok because queue',
+    expect: E({ method: 1 }),
+  },
+  {
+    name: 'block comment does not suppress',
+    src: 'q.push(x); /* primordials-ok */',
+    expect: E({ method: 1 }),
+  },
+
+  // An update expression is a write, not a getter read.
+  { name: 'update expression is a write', src: 'v.byteLength++;', expect: E() },
+
   // --- lexical contexts: inert text must stay inert, executable text must not ---
   { name: 'method in a comment', src: '// arr.push(x)', expect: E() },
   { name: 'method in a string', src: 'var s = "arr.push(x)";', expect: E() },
@@ -179,8 +236,11 @@ const SELF_TEST = [
     expect: E({ global: 1 }),
   },
   { name: 'template text is inert', src: 'var s = `arr.push(x) String(y)`;', expect: E() },
-  // A brace inside a string inside a hole desynchronised the old shadower and
-  // blanked the REST OF THE FILE, reporting a blinded file as clean.
+  // A brace inside a string inside a template hole. The replaced scanner tracked
+  // template nesting by counting braces, so this desynchronised it and blanked
+  // the REST OF THE FILE — url.js went from 80 counted sites to 0 and read as
+  // clean. Worth a fixture even under a real parser: a blinded file scoring 0 is
+  // the one failure mode this gate cannot survive.
   {
     name: 'brace in a hole string does not blind the rest',
     src: "var t = `${ o['}'] }`;\narr.push(x);",

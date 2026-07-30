@@ -20,6 +20,18 @@ never edit repo sources; you name the missing tests concretely.
   `pkg/runtime/eventloop/*_test.odin`.
 - **Smokes** — bind a real port and compare a real client's output node-vs-Lava
   (`run-*-smoke.sh`). Networking changes need these; they are separate CI gates.
+- **`node:test` over the build tooling** — `scripts/*.test.mjs`, run by
+  `make test-scripts` (and folded into `make check-js`). The gate scripts are
+  themselves code that can be wrong: the primordials detector and its baseline
+  decision layer are covered here, against fixture sources with exact per-class
+  expectations. Node runs these directly, so no oracle applies.
+- **Differential property tests** — `tests/property/*.property.test.mjs`, run by
+  `make test-property`. `fast-check` generates the corpus on the Node side and
+  both runtimes answer the *whole batch* in one process pair per property; the
+  oracle model is unchanged, only the input selection is. Use for a surface where
+  the interesting inputs are edge cases nobody thinks to pick (codecs, parsers,
+  streaming splits, offsets). Per-input process pairs are what made this too slow
+  to keep in CI before — do not reintroduce that shape.
 - **Gap files** — `known-lava-gaps.txt` lists paths skipped under Lava.
 
 ## What to check
@@ -30,7 +42,11 @@ never edit repo sources; you name the missing tests concretely.
 2. **The right kind of test.** Node-observable → oracle case (a Lava-only
    assertion here is weaker than it looks: it pins *our* opinion, not Node's).
    Lifetime/probe/pollution/ABI → Odin test. A deliberate Node deviation → a
-   Lava-only test pinning the deviation, since no oracle can express it.
+   Lava-only test pinning the deviation, since no oracle can express it. Build
+   tooling (a `scripts/` gate, a detector, a baseline rule) → `node:test`, and the
+   case must be a fixture with the exact expected counts, not a smoke that only
+   checks the exit code. A codec/parser where the edge cases are the point → also
+   a property test, generated rather than hand-picked.
 3. **Edge cases**, not just the happy path: empty input, boundary lengths,
    invalid encoding, error paths, cancellation/teardown mid-flight, both backends
    where a backend switch exists (`LAVA_NET_FORCE_READINESS=1` vs proactor).

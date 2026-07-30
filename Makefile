@@ -148,7 +148,8 @@ check-actions:
 	vp run actions:check
 
 # Prototype-pollution ratchet over the embedded runtime JS (also part of check-js).
-# Run with UPDATE=1 to rewrite the baseline after hardening a module.
+# UPDATE=1 LOWERS the baseline after hardening a module; a RAISE is refused
+# unless RAISE=--allow-raise is passed too (a newly scanned file, or a new class).
 check-primordials:
 	@if [ "$(UPDATE)" = "1" ]; then node scripts/check-primordials.mjs --update $(RAISE); \
 	else node scripts/check-primordials.mjs; fi
@@ -163,9 +164,11 @@ test-scripts:
 # Differential PROPERTY tests: fast-check generates the inputs and both runtimes
 # answer, so a mismatch shrinks to a minimal reproducer instead of arriving as a
 # 4 KB buffer. Every decoder defect found in #320/#321 was an edge case somebody
-# picked or missed by hand; this explores the space instead. Needs bin/lava, and
-# spawns a node+lava pair per input (~40ms), so it is its own target rather than
-# part of the always-block. PROPERTY_RUNS raises the count for a deeper local run.
+# picked or missed by hand; this explores the space instead. BATCHED — one node
+# +lava process pair per property, not per input, which is what made 5000 inputs
+# affordable (~1s) where the per-input shape cost 64s for 200 and had to stay out
+# of CI. Needs bin/lava, hence its own target rather than part of the
+# always-block. PROPERTY_RUNS raises the count for a deeper local run.
 test-property: build
 	LAVA_BIN="$(LAVA)" node --test 'tests/property/**/*.property.test.mjs'
 
