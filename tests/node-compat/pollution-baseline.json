@@ -72,13 +72,13 @@
     "global": 12
   },
   "internal/fetch.js": {
-    "method": 31,
+    "method": 30,
     "invoke": 1,
     "accessor": 6,
     "global": 75
   },
   "internal/http.js": {
-    "method": 47,
+    "method": 38,
     "invoke": 5,
     "accessor": 0,
     "global": 34
@@ -228,7 +228,7 @@
     "global": 2
   },
   "internal/url.js": {
-    "method": 53,
+    "method": 47,
     "invoke": 2,
     "accessor": 0,
     "global": 24

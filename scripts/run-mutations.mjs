@@ -25,6 +25,9 @@
 //                                  stdout/stderr/exit. RED = any difference.
 //   odin:<package>:<test.name>     one Odin test, single runner thread.
 //   node-test:<path>               a node:test file.
+//   make:<target>                  any Makefile target — for a gate that needs a
+//                                  real socket (the *-smoke targets) or a
+//                                  multi-step harness. RED = non-zero exit.
 //
 // Usage:
 //   node scripts/run-mutations.mjs                 # all
@@ -92,6 +95,7 @@ function runGate(gate) {
   if (kind === 'compat') return gateCompat(rest.join(':'));
   if (kind === 'odin') return gateOdin(rest[0], rest[1]);
   if (kind === 'node-test') return gateNodeTest(rest.join(':'));
+  if (kind === 'make') return gateMake(rest.join(':'));
   die(`unknown gate kind "${kind}" in "${gate}"`);
 }
 
@@ -143,6 +147,17 @@ function gateOdin(pkg, testName) {
   }
   const err = text.split('\n').find((l) => l.includes('[ERROR]') || l.includes('Error:'));
   return { ok: false, detail: err ? err.trim() : `odin test exited ${r.status}` };
+}
+
+// `make` gates own their own build, so the runner must not also rebuild for them —
+// `rebuild: false` is correct even for an embedded-JS mutation here, because the
+// target's own `build` prerequisite picks the patched source up.
+function gateMake(target) {
+  const r = capture('make', [target], { cwd: ROOT });
+  if (r.status === 0) return { ok: true, detail: `make ${target} passed` };
+  const text = r.stdout + r.stderr;
+  const fail = text.split('\n').find((l) => /^FAIL |FAILED|Error \d/.test(l));
+  return { ok: false, detail: fail ? fail.trim() : `make ${target} exited ${r.status}` };
 }
 
 function gateNodeTest(relPath) {

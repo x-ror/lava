@@ -2,6 +2,36 @@
 // scripts/run-http-smoke.sh; the same Node client (client.js) hits each and the
 // deterministic response fields (status, chosen headers, body) must match. Binds an
 // ephemeral port and prints it as READYPORT=<port>. Echoes method, url, and body.
+// TEST-ONLY POISON, off unless HTTP_POISON_REGEXP is set. Emulates a dependency
+// that has replaced RegExp.prototype.exec or .test — both are writable data
+// properties, so this is a plain assignment, no defineProperty needed.
+//
+// `exec` is the sharper of the two and the reason this knob exists: the spec's
+// RegExpExec abstract operation re-reads `R.exec` off the RECEIVER before falling
+// back to the builtin, so poisoning `exec` alone also steers `test` — including a
+// `test` captured pristine at module-eval, and including one invoked through
+// Reflect.apply. Capturing `test` is therefore NOT a fix; only routing through a
+// captured `exec` is.
+//
+// Applied before `require('node:http')` so the server's own module-eval captures
+// see the poisoned prototype, which is the realistic order: a dependency required
+// earlier than the server.
+if (process.env.HTTP_POISON_REGEXP) {
+  const forged = ['forged'];
+  forged.index = 0;
+  forged.input = '';
+  if (process.env.HTTP_POISON_REGEXP !== 'test') {
+    RegExp.prototype.exec = function () {
+      return forged;
+    };
+  }
+  if (process.env.HTTP_POISON_REGEXP !== 'exec') {
+    RegExp.prototype.test = function () {
+      return true;
+    };
+  }
+}
+
 const http = require('node:http');
 
 // Short timeouts for the slowloris phase (run-http-smoke.sh phase 4), passed via the

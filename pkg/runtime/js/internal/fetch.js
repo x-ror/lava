@@ -52,9 +52,16 @@
   // rejects spaces, ':' (which would forge a second header on the wire), control
   // chars, and non-ASCII alike. Wire (response) headers arrive pre-framed via
   // _append and skip this, matching undici.
+  // Header-name validation over caller-controlled text — a CRLF that gets through
+  // here is header injection on the wire. NOT `re.test(...)`: `RegExp.prototype.exec`
+  // is a writable data property and RegExpExec re-reads it off the receiver, so an
+  // ordinary assignment steers `test` too. primordials deliberately exports no
+  // `RegExpPrototypeTest` for that reason; the captured `exec` is the only sound
+  // spelling.
+  var RegExpPrototypeExec = require('primordials').RegExpPrototypeExec;
   var VALID_HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
   function assertValidHeaderName(name) {
-    if (!VALID_HEADER_NAME.test(name)) {
+    if (RegExpPrototypeExec(VALID_HEADER_NAME, name) === null) {
       throw new TypeError('Invalid header name: "' + name + '"');
     }
   }

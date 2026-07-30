@@ -103,6 +103,24 @@
       "replace": "  const failures = [];\n  const improvements = [];\n  for (const key of Object.keys(counts)) {\n    for (const kind of KINDS.slice(0, 1)) {",
       "gate": "node-test:scripts/check-primordials.baseline.test.mjs",
       "rebuild": false
+    },
+    {
+      "name": "the poisoned http-smoke phases die when a framing validator goes back to re.test",
+      "why": "RegExpExec re-reads R.exec off the receiver, so a plain assignment to RegExp.prototype.exec turns the Content-Length and Transfer-Encoding checks off and the server accepts smuggled framing.",
+      "source": "pkg/runtime/js/internal/http.js",
+      "find": "        if (!reTest(CONTENT_LENGTH_RE, contentLengthHeader)) return sendErrorAndClose(400);",
+      "replace": "        if (!/^\\\\d+$/.test(contentLengthHeader)) return sendErrorAndClose(400);",
+      "gate": "make:test-http-smoke",
+      "rebuild": false
+    },
+    {
+      "name": "the poisoned http-smoke phases die when the chunked check goes back to re.test",
+      "why": "A steered Transfer-Encoding check accepts any coding as chunked, which is the TE half of a smuggling desync.",
+      "source": "pkg/runtime/js/internal/http.js",
+      "find": "        if (!reTest(TE_CHUNKED_RE, transferEncoding)) return sendErrorAndClose(501);",
+      "replace": "        if (!/^\\\\s*chunked\\\\s*$/i.test(transferEncoding)) return sendErrorAndClose(501);",
+      "gate": "make:test-http-smoke",
+      "rebuild": false
     }
   ]
 }

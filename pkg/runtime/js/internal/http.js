@@ -22,6 +22,27 @@
   var net = require('net');
   /** Pristine intrinsics — response head must not use overridable Buffer methods. */
   var primordials = require('primordials');
+  // Every regex below decides FRAMING over attacker-controlled bytes, so none of
+  // them may go through `re.test(...)`: `RegExp.prototype.exec` is a writable data
+  // property, and the spec's RegExpExec re-reads it off the receiver, so a plain
+  // assignment steers `test` too — including a captured one. Measured over a real
+  // socket before this changed: `Content-Length: abc` answered 200 OK and
+  // `Transfer-Encoding: gzip` was accepted as chunked. There is deliberately no
+  // `RegExpPrototypeTest` in primordials; this is the only spelling.
+  var RegExpPrototypeExec = primordials.RegExpPrototypeExec;
+  var reTest = function (re, s) {
+    return RegExpPrototypeExec(re, s) !== null;
+  };
+  // Hoisted so the literals are not re-created per request, and so every framing
+  // pattern is visible in one place rather than inline at four call sites.
+  var CHUNK_SIZE_RE = /^[0-9a-fA-F]+$/;
+  var CHUNK_EXT_RE = /^;[^\s;]/;
+  var TE_CHUNKED_RE = /^\s*chunked\s*$/i;
+  var CONTENT_LENGTH_RE = /^\d+$/;
+  var CONNECTION_CLOSE_RE = /\bclose\b/i;
+  var CONNECTION_CLOSE_CS_RE = /\bclose\b/;
+  var CONNECTION_KEEPALIVE_RE = /\bkeep-alive\b/;
+  var TE_HAS_CHUNKED_RE = /\bchunked\b/i;
   var nativeLatin1WriteInto =
     typeof native.latin1WriteInto === 'function' ? native.latin1WriteInto : null;
 
@@ -233,8 +254,9 @@
           var sizeLine = buffer.toString('latin1', 0, lineEnd);
           var extensionSep = sizeLine.indexOf(';');
           var sizeToken = extensionSep >= 0 ? sizeLine.slice(0, extensionSep) : sizeLine;
-          if (!/^[0-9a-fA-F]+$/.test(sizeToken)) return fail();
-          if (extensionSep >= 0 && !/^;[^\s;]/.test(sizeLine.slice(extensionSep))) return fail();
+          if (!reTest(CHUNK_SIZE_RE, sizeToken)) return fail();
+          if (extensionSep >= 0 && !reTest(CHUNK_EXT_RE, sizeLine.slice(extensionSep)))
+            return fail();
           var chunkSize = parseInt(sizeToken, 16);
           if (!Number.isSafeInteger(chunkSize) || chunkSize < 0) return fail();
           buffer = buffer.slice(lineEnd + 2);
@@ -465,7 +487,7 @@
     if (!selfDelimited) this._keepAlive = false;
 
     if (this.hasHeader('connection')) {
-      if (/\bclose\b/i.test(this.getHeader('connection'))) this._keepAlive = false;
+      if (reTest(CONNECTION_CLOSE_RE, this.getHeader('connection'))) this._keepAlive = false;
     } else {
       head += this._keepAlive ? CONNECTION_KEEP_ALIVE : CONNECTION_CLOSE;
     }
@@ -506,7 +528,7 @@
         this._chunked = true;
         this.setHeader('Transfer-Encoding', 'chunked');
       } else if (this._allowChunked && this.hasHeader('transfer-encoding')) {
-        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
+        this._chunked = reTest(TE_HAS_CHUNKED_RE, this.getHeader('transfer-encoding'));
       }
       this._flushHead();
     }
@@ -549,7 +571,7 @@
         this.setHeader('Content-Length', String(body ? body.length : 0));
       }
       if (this._allowChunked && this.hasHeader('transfer-encoding')) {
-        this._chunked = /\bchunked\b/i.test(this.getHeader('transfer-encoding'));
+        this._chunked = reTest(TE_HAS_CHUNKED_RE, this.getHeader('transfer-encoding'));
       }
 
       var headText = this._buildHead();
@@ -596,8 +618,8 @@
    */
   function shouldKeepAlive(httpMinor, connectionHeader) {
     var connection = (connectionHeader || '').toLowerCase();
-    if (httpMinor >= 1) return !/\bclose\b/.test(connection);
-    return /\bkeep-alive\b/.test(connection);
+    if (httpMinor >= 1) return !reTest(CONNECTION_CLOSE_CS_RE, connection);
+    return reTest(CONNECTION_KEEPALIVE_RE, connection);
   }
 
   var EMPTY_BUFFER = Buffer.alloc(0);
@@ -927,7 +949,7 @@
       var contentLengthHeader = request.headers['content-length'];
       if (transferEncoding !== undefined) {
         if (contentLengthHeader !== undefined) return sendErrorAndClose(400);
-        if (!/^\s*chunked\s*$/i.test(transferEncoding)) return sendErrorAndClose(501);
+        if (!reTest(TE_CHUNKED_RE, transferEncoding)) return sendErrorAndClose(501);
         chunkedDecoder = createChunkedDecoder(
           request,
           function () {
@@ -937,7 +959,7 @@
           onRequestBodyComplete,
         );
       } else if (contentLengthHeader !== undefined) {
-        if (!/^\d+$/.test(contentLengthHeader)) return sendErrorAndClose(400);
+        if (!reTest(CONTENT_LENGTH_RE, contentLengthHeader)) return sendErrorAndClose(400);
         contentLengthRemaining = parseInt(contentLengthHeader, 10);
       }
 

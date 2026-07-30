@@ -101,8 +101,15 @@ lava_assert() {
 		cat "$TMP_DIR/srv.out" >&2 || true
 		exit 1
 	fi
+	# `set -e` is on, and a failing assertion client is an EXPECTED outcome here —
+	# it is how a phase reports failure. Without the guard the shell dies on that
+	# exit status before the `cat` below, so a failing phase printed nothing at all:
+	# no check list, no label, no reason. Found by adding a phase that was supposed
+	# to fail and getting silence instead of a diagnosis.
+	set +e
 	HTTP_PORT="$port" "$NODE_BIN" "$client" >"$TMP_DIR/$label.out" 2>&1
 	rc=$?
+	set -e
 	kill "$SRV_PID" 2>/dev/null || true
 	wait "$SRV_PID" 2>/dev/null || true
 	SRV_PID=""
@@ -115,6 +122,27 @@ lava_assert() {
 
 # Phase 2 — malformed/untrusted-input handling (injection, smuggling, oversized, etc.).
 lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed
+# Phase 2b — the SAME checks against a server whose RegExp.prototype has been
+# replaced, which is a plain assignment away for anything in the dependency tree.
+# Every framing check in phase 2 is regex-validated (Content-Length numeric,
+# Transfer-Encoding chunked, chunk size hex, chunk extension), so before these
+# validators were routed through a captured `exec` a poisoned prototype turned
+# exactly four of them off: `Content-Length: abc` answered 200 OK, and
+# `Transfer-Encoding: gzip` was accepted as chunked. That is request smuggling, and
+# the other 18 checks kept passing, which is why it needs its own phase rather than
+# a note in the first one.
+#
+# Both directions are run because they are not the same vector. `exec` is the
+# sharper: the spec's RegExpExec re-reads `R.exec` off the receiver, so poisoning it
+# also steers a `test` captured pristine at module-eval — capturing `test` is not a
+# fix, only calling a captured `exec` is. `test` is the obvious one and is pinned so
+# a future refactor cannot quietly reintroduce `re.test(...)`.
+#
+# Lava-only by necessity, not by choice: node cannot be the oracle here because
+# node's own internals use regexes, and its server dies inside `net` at startup
+# under the same poison. That is fail-closed, and Lava's was fail-open.
+lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed-poisoned-exec "HTTP_POISON_REGEXP=exec"
+lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed-poisoned-test "HTTP_POISON_REGEXP=test"
 # Phase 3 — keep-alive: connection reuse, pipelining, Connection: close, HTTP/1.0.
 lava_assert "$ROOT_DIR/tests/runtime/http/keepalive.js" keepalive
 # Phase 4 — timeouts / slowloris: idle, slow-head, slow-body evicted; fast client OK.

@@ -101,6 +101,15 @@
     };
   }
 
+  // The one-argument sibling, for a COLD call site whose answer is a security
+  // decision. Allocates an args array per call, which is why it is not the default
+  // — see the measured table above — and why nothing per-character uses it.
+  function safeCaller1(fn) {
+    return function (t, a) {
+      return reflectApply(fn, t, [a]);
+    };
+  }
+
   // brandedAs is the UNFORGEABLE replacement for `value instanceof Ctor` on a
   // hardening path. `instanceof` dispatches through `Ctor[Symbol.hasInstance]`, a
   // configurable own property of the constructor, so a caller can flip the answer
@@ -390,29 +399,31 @@
       Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get,
     ),
 
-    // RegExp.prototype.test/exec are writable DATA properties — an ordinary
-    // assignment replaces them, no defineProperty needed. A poisoned `test` made
-    // fetch.js's header-name validator accept a name containing CRLF (header
-    // injection on the wire) and made http.js read Content-Length as NaN, so the
-    // body was parsed as the next request. Any internal module validating with a
-    // regex must route through these.
+    // RegExp.prototype.exec is a writable DATA property — an ordinary assignment
+    // replaces it, no defineProperty needed. Every framing validator in http.js and
+    // the header-name validator in fetch.js runs a regex over attacker-controlled
+    // bytes, so this is the pollution axis with the shortest path to the wire.
+    // Measured against the real server over a socket: with `RegExp.prototype.exec`
+    // replaced, `Content-Length: abc` answered 200 OK instead of 400 and
+    // `Transfer-Encoding: gzip` was accepted as chunked — request smuggling, with
+    // the other 18 malformed-input checks still passing. Pinned by the
+    // malformed-poisoned phases of run-http-smoke.sh.
     //
-    // BUT `RegExpPrototypeTest` IS NOT A SOUND VALIDATOR ON ITS OWN, and neither
-    // a `.call` nor a `Reflect.apply` invocation changes that. The spec's
-    // RegExpExec abstract op re-reads `R.exec` off the RECEIVER before falling
-    // back to the builtin, so replacing `RegExp.prototype.exec` — a writable data
-    // property — steers a captured `test`. Measured on both node 24 and bin/lava:
-    // with `RegExp.prototype.exec = () => ['forged']`, the captured `test` returns
-    // TRUE for 'X-Evil: 1\r\nInjected' against a strict header-name pattern,
-    // identically through `.call` and through `Reflect.apply`.
-    // So the pending migration of the ~15 `.test`/`.exec` sites in
-    // fetch.js/http.js/url.js must NOT simply swap in `RegExpPrototypeTest`: that
-    // closes the `.test`-assignment vector and leaves an equally cheap
-    // `.exec`-assignment vector open. Validate through the captured `exec`
-    // directly (`RegExpPrototypeExec(re, s) !== null`), which has no such
-    // indirection. Tracked in ROADMAP.
-    RegExpPrototypeTest: caller1(RegExp.prototype.test),
-    RegExpPrototypeExec: caller1(RegExp.prototype.exec),
+    // THERE IS DELIBERATELY NO `RegExpPrototypeTest`. It cannot be made sound: the
+    // spec's RegExpExec abstract operation re-reads `R.exec` off the RECEIVER
+    // before falling back to the builtin, so replacing `RegExp.prototype.exec`
+    // steers `test` even when `test` itself was captured pristine at module-eval
+    // and invoked through Reflect.apply. Verified identically on node 24 and
+    // bin/lava. Exporting a `Test` that looks safe and is not would be worse than
+    // exporting nothing, so the only spelling available is
+    // `RegExpPrototypeExec(re, s) !== null`.
+    //
+    // Reflect.apply rather than `.call`, unlike the hot wrappers above: this runs
+    // once per header or per chunk header, never per character, so the wrapper cost
+    // is invisible next to the match itself — and a validator that is immune to a
+    // poisoned `exec` but not to a poisoned `Function.prototype.call` has simply
+    // moved the vector.
+    RegExpPrototypeExec: safeCaller1(RegExp.prototype.exec),
 
     // Constructors for the view types structured_clone rebuilds. It used to
     // reach them through `value.constructor`, which is a configurable

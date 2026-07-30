@@ -27,6 +27,20 @@
   // decodeURIComponent, or String.prototype.normalize otherwise silently
   // substitutes hosts / disables IPv4 normalization; see the URL vector audit).
   var P = require('primordials');
+  // Every regex below runs over a caller-supplied URL, so none may go through
+  // `re.test(...)`: `RegExp.prototype.exec` is a writable data property and the
+  // spec's RegExpExec re-reads it off the receiver, so a plain assignment steers
+  // `test` as well — a captured `test` included. primordials exports no
+  // `RegExpPrototypeTest` for exactly that reason. `%2f`/`%5c` detection below is
+  // the path-traversal check, so this is not cosmetic.
+  var RegExpPrototypeExec = P.RegExpPrototypeExec;
+  var reTest = function (re, str) {
+    return RegExpPrototypeExec(re, str) !== null;
+  };
+  var DIGITS_ONLY_RE = /^[0-9]+$/;
+  var PERCENT_2F_RE = /%2f/i;
+  var PERCENT_5C_RE = /%5c/i;
+  var LEADING_SLASHES_RE = /^\/+/;
   var ArrayPrototypePush = P.ArrayPrototypePush;
   var ArrayPrototypePop = P.ArrayPrototypePop;
   var ArrayPrototypeShift = P.ArrayPrototypeShift;
@@ -459,7 +473,7 @@
     }
     if (input === '') return 0;
     var re = radix === 10 ? /^[0-9]+$/ : radix === 16 ? /^[0-9a-fA-F]+$/ : /^[0-7]+$/;
-    if (!re.test(input)) return FAILURE;
+    if (!reTest(re, input)) return FAILURE;
     var n = parseIntG(input, radix);
     if (!isFiniteG(n)) return FAILURE;
     return n;
@@ -472,7 +486,7 @@
       ArrayPrototypePop(parts);
     }
     var last = parts[parts.length - 1];
-    if (last !== '' && /^[0-9]+$/.test(last)) return true;
+    if (last !== '' && reTest(DIGITS_ONLY_RE, last)) return true;
     return parseIPv4Number(last) !== FAILURE;
   }
 
@@ -655,7 +669,7 @@
       return parseIPv6(input.slice(1, -1));
     }
     if (!isSpecial) return parseOpaqueHost(input);
-    if (SIMPLE_HOST_RE.test(input) && input.indexOf('xn--') === -1) {
+    if (reTest(SIMPLE_HOST_RE, input) && input.indexOf('xn--') === -1) {
       if (endsInANumber(input)) return parseIPv4(input);
       return input;
     }
@@ -867,7 +881,7 @@
     }
     // Remove all ASCII tab or newline (guarded: almost no real input has them,
     // and replaceAll would re-scan + re-allocate on every parse).
-    if (TAB_NEWLINE_RE.test(input)) input = StringPrototypeReplace(input, TAB_NEWLINE_RE_G, '');
+    if (reTest(TAB_NEWLINE_RE, input)) input = StringPrototypeReplace(input, TAB_NEWLINE_RE_G, '');
 
     // Code POINTS as numbers, one pass, surrogate-aware — same iteration as
     // ArrayFrom(input).map(c => c.codePointAt(0)) without allocating a
@@ -2003,7 +2017,7 @@
     if (hash !== -1) rest = rest.slice(0, hash);
     var query = rest.indexOf('?');
     if (query !== -1) rest = rest.slice(0, query);
-    if (/%2f/i.test(rest) || (isWindows && /%5c/i.test(rest))) {
+    if (reTest(PERCENT_2F_RE, rest) || (isWindows && reTest(PERCENT_5C_RE, rest))) {
       var sepErr = new TypeError('File URL path must not include encoded / or \\ characters');
       sepErr.code = 'ERR_INVALID_FILE_URL_PATH';
       throw sepErr;
@@ -2068,7 +2082,7 @@
         url.pathname = slash === -1 ? '/' : withoutLead.slice(slash);
         return url;
       }
-      url.pathname = '/' + StringPrototypeReplace(encoded, /^\/+/, '');
+      url.pathname = '/' + StringPrototypeReplace(encoded, LEADING_SLASHES_RE, '');
     } else {
       url.pathname = encoded;
     }

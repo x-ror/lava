@@ -110,23 +110,40 @@ coupling.
       (`p.then(cb)` scores 1 `method`) and misses only when `await`/`Promise.resolve`
       read it implicitly. That last one is also a plain data property settable by an
       ordinary merge gadget — the sharpest uncounted vector, and its own item below.
-- [ ] **Route the 15 regex validators through a captured `exec`, not `test`** —
-      `fetch.js`, `http.js` and `url.js` still validate with live
-      `RegExp.prototype.test`/`.exec`, so a plain assignment to either (writable
-      data properties, no `defineProperty` needed) reaches the header-name
-      validator — CRLF in a header name is injection on the wire — and makes
-      `http.js` read Content-Length as NaN, parsing the body as the next request.
-      `RegExpPrototypeTest`/`Exec` are exported for this and have zero call sites,
-      so the vectors are live today.
-      The trap, measured before the migration rather than after: **swapping in
-      `RegExpPrototypeTest` does not close it.** The spec's RegExpExec re-reads
-      `R.exec` off the receiver, so `RegExp.prototype.exec = () => ['forged']`
-      makes even a captured `test` return true for
-      `'X-Evil: 1\r\nInjected'` — identical on node 24 and `bin/lava`, and
-      identical through `.call` and `Reflect.apply`, because the re-read is inside
-      the abstract op and not in the invocation. Validate with
-      `RegExpPrototypeExec(re, s) !== null` instead, which has no such indirection,
-      and pin it with a poisoned-`exec` case in `54-url-pollution.js`.
+- [x] **Route the network-facing regex validators through a captured `exec`** —
+      done for `http.js` (9 sites), `url.js` (6) and `fetch.js` (1). Proven before
+      being fixed, over a real socket against the actual server: with
+      `RegExp.prototype.exec` replaced — an ordinary assignment, it is a writable
+      data property — `Content-Length: abc` answered **200 OK** instead of 400 and
+      `Transfer-Encoding: gzip` was accepted as chunked, while the other 18
+      malformed-input checks kept passing. That is request smuggling.
+      `RegExpPrototypeTest` was **removed** rather than fixed: the spec's RegExpExec
+      re-reads `R.exec` off the receiver, so it steers a `test` captured pristine at
+      module-eval and invoked through `Reflect.apply` — identical on node 24 and
+      `bin/lava`. An export that looks safe and is not is worse than no export, so
+      `RegExpPrototypeExec(re, s) !== null` is now the only spelling available.
+      Pinned by two new `run-http-smoke.sh` phases that replay the whole
+      malformed-input suite against a poisoned server (`exec` and `test` directions
+      separately), and by two entries in `tests/mutation-manifest.json`.
+      Lava-only by necessity: node cannot be the oracle, because its own internals
+      use regexes and its server dies inside `net` at startup under the same poison.
+      That is fail-closed; Lava's was fail-open.
+- [ ] **The rest of the regex surface — 53 sites, and `.test` was not the whole of
+      it** — a poisoned `exec` steers **six** methods, not two: `re.test`, `re.exec`,
+      and `String.prototype.replace`/`match`/`search`/`split` whenever the argument
+      is a regex, because all of them route through RegExpExec. Verified identically
+      on node 24 and `bin/lava`. `matchAll` and a global `replace` are worse still —
+      a forged result never advances `lastIndex`, so they spin: a 1.4 GB OOM in the
+      probe that found this, i.e. a denial of service, not just a wrong answer.
+      This also means **the ratchet's `method` column gives false comfort here**: a
+      file can read `method 0` while calling `StringPrototypeReplace(s, /re/, x)`,
+      because capturing `String.prototype.replace` does nothing about the `exec`
+      re-read inside it. Another instance of "floor, not proof", and a sharper one
+      than the accessor case, because the fix _looks_ applied.
+      Remaining, by module: `esm.js` 16, `path.js` 7, `util.js` 5, `assert.js` 5,
+      `mime.js` 3, `tty.js`/`punycode.js` 2 each, `sqlite.js`/`querystring.js`/`net.js`
+      1 each. None is on the network path, which is why they are not in the commit
+      above — but `esm.js` is the module loader and deserves to be next.
 - [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector** —
       a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
       no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`
