@@ -1,0 +1,259 @@
+// Fixture table for the pollution ratchet's detector — see
+// scripts/lib/primordials-detect.mjs. Kept in its own module so ONE table
+// serves two consumers: the fail-closed gate inside the ratchet itself (a
+// detector that has gone blind must not report on the tree, nor rebaseline),
+// and scripts/check-primordials.test.mjs, which runs the same fixtures under
+// node:test for named subtests and a real diff on failure.
+//
+// A fixture FILE under pkg/runtime/js would be counted as production source,
+// which is why these are inline strings rather than files on disk.
+
+import { KINDS, countSource } from './primordials-detect.mjs';
+
+// --- self-test -------------------------------------------------------------
+//
+// The ratchet is a security control, and a blind one is worse than none: it
+// reports "OK" and a reviewer stops looking. So the detector proves itself on
+// every run against fixtures with EXACT per-class expectations, and refuses to
+// report on the tree if any of them regresses.
+//
+// Exact counts, not "includes": an `includes` assertion passes while the
+// detector also over-fires, which is how a `length`-in-ACCESSOR regression and a
+// double-count both slipped past the previous harness.
+//
+// Fixtures are inline strings on purpose: a fixture FILE under the scanned
+// directory would be counted as production source.
+const E = (o = {}) => ({ method: 0, invoke: 0, accessor: 0, global: 0, ...o });
+const WRAP = (body) => `(function (require, module) {\n${body}\n})`;
+
+const SELF_TEST = [
+  // --- the four classes, each in its plainest form ---
+  { name: 'method call', src: 'arr.push(x);', expect: E({ method: 1 }) },
+  { name: 'accessor read', src: 'var b = view.buffer;', expect: E({ accessor: 1 }) },
+  { name: 'two accessor reads', src: 'f(v.byteOffset, v.byteLength);', expect: E({ accessor: 2 }) },
+  { name: 'dynamic .call', src: 'fn.call(thisArg, a);', expect: E({ invoke: 1 }) },
+  { name: 'dynamic .apply', src: 'fn.apply(thisArg, args);', expect: E({ invoke: 1 }) },
+  {
+    name: 'live global call',
+    src: WRAP('function f() { return String(x); }'),
+    expect: E({ global: 1 }),
+  },
+  {
+    name: 'bare global read',
+    src: WRAP('function f() { return String; }'),
+    expect: E({ global: 1 }),
+  },
+  {
+    name: 'qualified via globalThis',
+    src: WRAP('function f() { return globalThis.String(x); }'),
+    expect: E({ global: 1 }),
+  },
+
+  // --- the prototypes added after a reproduced exploit ---
+  // A poisoned RegExp.prototype.test let a CRLF-bearing header name through
+  // fetch.js's validator and onto the wire, and made http.js read
+  // Content-Length as NaN (smuggling desync). Both are writable data properties.
+  {
+    name: 'RegExp test is pollutable',
+    src: 'if (RE.test(name)) return;',
+    expect: E({ method: 1 }),
+  },
+  { name: 'RegExp exec is pollutable', src: 'var m = RE.exec(s);', expect: E({ method: 1 }) },
+  { name: 'Promise then is pollutable', src: 'p.then(f);', expect: E({ method: 1 }) },
+
+  // --- read vs write vs callee: the structural distinctions a scanner got wrong ---
+  // A write does not resolve a getter. This was 24% of the old accessor count.
+  // `Stream` is not a counted global, so a correct detector reports NOTHING here
+  // — the point is that `.constructor` on the left of `=` is a write.
+  {
+    name: 'assignment target is not a read',
+    src: 'Stream.prototype.constructor = Stream;',
+    expect: E(),
+  },
+  {
+    name: 'accessor write via a global receiver',
+    src: WRAP('function f(g) { Object.prototype.toString = g; }'),
+    expect: E({ global: 1 }),
+  },
+  // `new v.constructor(…)` DOES reach the prototype chain — the old trailing-"("
+  // rule skipped it and hid a reproduced structured_clone.js vector.
+  {
+    name: 'constructor as a callee is a read',
+    src: 'var v = new value.constructor(buf, 0, n);',
+    expect: E({ accessor: 1 }),
+  },
+  // A static call on a global constructor reads the constructor's own property.
+  {
+    name: 'static call on a global',
+    src: WRAP('function f() { return Buffer.byteLength(s); }'),
+    expect: E({ global: 1 }),
+  },
+  // `this.buffer` is the object's own field — every stream.js accessor hit.
+  { name: 'own field via this', src: WRAP('function f() { return this.buffer; }'), expect: E() },
+
+  // --- computed and destructured reads: the ratchet must not pay for a rename ---
+  { name: 'computed accessor read', src: "var b = view['buffer'];", expect: E({ accessor: 1 }) },
+  { name: 'computed method call', src: "arr['push'](x);", expect: E({ method: 1 }) },
+  { name: 'destructured accessor read', src: 'var { buffer } = view;', expect: E({ accessor: 1 }) },
+  // A fully dynamic key is not in the source — documented as not covered.
+  { name: 'fully dynamic key is not counted', src: 'var b = view[k];', expect: E() },
+
+  // --- the capture exemption, which is only sound at module-eval ---
+  { name: 'capture at module level', src: WRAP('  var BufferFrom = Buffer.from;'), expect: E() },
+  {
+    name: 'capture inside a function body',
+    src: WRAP(
+      '  function d(x) {\n    const BufferFrom = Buffer.from;\n    return BufferFrom(x);\n  }',
+    ),
+    expect: E({ global: 1 }),
+  },
+  // The arrow form: the old 3-char lookback missed `=>` followed by a newline,
+  // which re-opened the very blind spot it was written to close.
+  {
+    name: 'capture inside an arrow body',
+    src: WRAP(
+      '  var d = (x) =>\n  {\n    const BufferFrom = Buffer.from;\n    return BufferFrom(x);\n  };',
+    ),
+    expect: E({ global: 1 }),
+  },
+  {
+    // At module-eval the SHAPE does not matter — a capture and a use both read a
+    // pristine binding, because the loader runs the module body before user
+    // code. Inside a function both are live reads. That is why the detector
+    // asks "when does this run", not "does this line look like a capture".
+    name: 'use at module level is safe',
+    src: WRAP('  var b = Buffer.from(x);'),
+    expect: E(),
+  },
+  {
+    name: 'the same use inside a function',
+    src: WRAP('function f() { var b = Buffer.from(x); return b; }'),
+    expect: E({ global: 1 }),
+  },
+  {
+    name: 'export table is the capture',
+    src: WRAP('  module.exports = { Object: Object, Array: Array };'),
+    expect: E(),
+  },
+
+  // --- positions that are not reads at all ---
+  { name: 'object key is not a read', src: 'var t = { __proto__: null, String: 1 };', expect: E() },
+  {
+    name: 'ternary reads both globals',
+    src: WRAP('function f(c) { return c ? String : Number; }'),
+    expect: E({ global: 2 }),
+  },
+  {
+    name: 'case label is a read',
+    src: WRAP('function f(x) { switch (x) { case String: return 1; } }'),
+    expect: E({ global: 1 }),
+  },
+  {
+    name: 'param shadows the global',
+    src: WRAP('function f(String) { return String; }'),
+    expect: E(),
+  },
+  { name: '__proto__ read', src: 'var p = obj.__proto__;', expect: E({ accessor: 1 }) },
+  { name: 'primordial wrapper call', src: 'ArrayPrototypePush(arr, x);', expect: E() },
+  { name: 'ReflectApply is the fix', src: 'ReflectApply(fn, null, args);', expect: E() },
+
+  // --- lexical contexts: inert text must stay inert, executable text must not ---
+  { name: 'method in a comment', src: '// arr.push(x)', expect: E() },
+  { name: 'method in a string', src: 'var s = "arr.push(x)";', expect: E() },
+  {
+    name: 'escaped quote keeps the string inert',
+    src: 'var s = "a \\" arr.push(x) \\" b";',
+    expect: E(),
+  },
+  { name: 'regex literal is inert', src: 'var re = /\\.push\\(|String/;', expect: E() },
+  {
+    name: 'division is not a regex',
+    src: WRAP('function f() { var h = len / 2; return String(h); }'),
+    expect: E({ global: 1 }),
+  },
+  // A template HOLE executes; the literal text around it does not.
+  { name: 'method in a template hole', src: 'var s = `${arr.push(x)}`;', expect: E({ method: 1 }) },
+  {
+    name: 'global in a template hole',
+    src: WRAP('function f() { return `${String(y)}`; }'),
+    expect: E({ global: 1 }),
+  },
+  { name: 'template text is inert', src: 'var s = `arr.push(x) String(y)`;', expect: E() },
+  // A brace inside a string inside a hole desynchronised the old shadower and
+  // blanked the REST OF THE FILE, reporting a blinded file as clean.
+  {
+    name: 'brace in a hole string does not blind the rest',
+    src: "var t = `${ o['}'] }`;\narr.push(x);",
+    expect: E({ method: 1 }),
+  },
+  {
+    name: 'regex after return does not blind the rest',
+    src: WRAP('function f(s) { return /[\'"]/.test(s); }\nfunction g() { arr.push(x); }'),
+    expect: E({ method: 2 }),
+  },
+
+  // --- line attribution, which suppression depends on ---
+  {
+    name: 'line survives a multiline template',
+    src: 'var m = `${a}\n${b}`;\narr.push(x);',
+    expectLine: 3,
+    expect: E({ method: 1 }),
+  },
+
+  // --- suppression ---
+  { name: 'single-class line is suppressed', src: 'q.push(x); // primordials-ok', expect: E() },
+  {
+    name: 'marker inside a string does not suppress',
+    src: 'function f(){ q.push(x); var s = "// primordials-ok"; }',
+    expect: E({ method: 1 }),
+  },
+  {
+    name: 'mixed line is not blanket-suppressed',
+    src: WRAP('function f() { q.push(x); String(y); } // primordials-ok'),
+    expect: E({ method: 1, global: 1 }),
+  },
+  {
+    name: 'mixed line, one class named',
+    src: WRAP('function f() { q.push(x); String(y); } // primordials-ok: method'),
+    expect: E({ global: 1 }),
+  },
+  {
+    name: 'mixed line, both classes named',
+    src: WRAP('function f() { q.push(x); String(y); } // primordials-ok: method, global'),
+    expect: E(),
+  },
+  {
+    name: 'unknown class name suppresses nothing',
+    src: 'q.push(x); // primordials-ok: methods',
+    expect: E({ method: 1 }),
+  },
+];
+
+function selfTest() {
+  const failures = [];
+  for (const t of SELF_TEST) {
+    let got;
+    try {
+      got = countSource(t.src, t.name);
+    } catch (err) {
+      failures.push(`${t.name}: ${err.message}`);
+      continue;
+    }
+    const actual = E();
+    for (const h of got.hits) actual[h.kind]++;
+    for (const kind of KINDS) {
+      if (actual[kind] !== t.expect[kind]) {
+        failures.push(
+          `${t.name}: expected ${t.expect[kind]} ${kind}, got ${actual[kind]}` +
+            ` (all: ${KINDS.map((k) => `${k} ${actual[k]}`).join(', ')})`,
+        );
+      }
+    }
+    if (t.expectLine !== undefined && got.hits.length > 0 && got.hits[0].line !== t.expectLine) {
+      failures.push(`${t.name}: expected the hit on line ${t.expectLine}, got ${got.hits[0].line}`);
+    }
+  }
+  return failures;
+}
+
+export { E, WRAP, SELF_TEST, selfTest };

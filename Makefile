@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
+.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -43,7 +43,9 @@ help:
 	@printf '%s\n' '  make check-md           Markdown lint over the repo docs (markdownlint-cli2)'
 	@printf '%s\n' '  make fix-md             Auto-fix markdown lint issues'
 	@printf '%s\n' '  make check-actions      actionlint over .github/workflows'
-	@printf '%s\n' '  make check-primordials  Prototype-pollution ratchet over embedded JS (UPDATE=1 to rebaseline)'
+	@printf '%s\n' '  make check-primordials  Prototype-pollution ratchet over embedded JS (UPDATE=1 to lower; RAISE=--allow-raise to record new ground)'
+	@printf '%s\n' '  make test-scripts       node:test over scripts/ (the ratchet detector fixtures)'
+	@printf '%s\n' '  make test-property      Differential property tests node-vs-Lava (fast-check; PROPERTY_RUNS=N)'
 	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
 	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
 	@printf '%s\n' '  make test               Run Odin and Node compatibility tests'
@@ -148,8 +150,24 @@ check-actions:
 # Prototype-pollution ratchet over the embedded runtime JS (also part of check-js).
 # Run with UPDATE=1 to rewrite the baseline after hardening a module.
 check-primordials:
-	@if [ "$(UPDATE)" = "1" ]; then node scripts/check-primordials.mjs --update; \
+	@if [ "$(UPDATE)" = "1" ]; then node scripts/check-primordials.mjs --update $(RAISE); \
 	else node scripts/check-primordials.mjs; fi
+
+# node:test over the build-tooling scripts. The pollution ratchet's fixtures gate
+# the ratchet itself (it refuses to report or rebaseline when one regresses); this
+# target runs the same table with named subtests, a real diff, and
+# --test-name-pattern for iterating on one case. Part of `make check-js`.
+test-scripts:
+	node --test 'scripts/**/*.test.mjs'
+
+# Differential PROPERTY tests: fast-check generates the inputs and both runtimes
+# answer, so a mismatch shrinks to a minimal reproducer instead of arriving as a
+# 4 KB buffer. Every decoder defect found in #320/#321 was an edge case somebody
+# picked or missed by hand; this explores the space instead. Needs bin/lava, and
+# spawns a node+lava pair per input (~40ms), so it is its own target rather than
+# part of the always-block. PROPERTY_RUNS raises the count for a deeper local run.
+test-property: build
+	LAVA_BIN="$(LAVA)" node --test 'tests/property/**/*.property.test.mjs'
 
 check-jsc:
 	$(RUNSCRIPT) ./scripts/check-jsc.sh

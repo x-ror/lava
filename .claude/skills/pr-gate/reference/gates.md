@@ -7,10 +7,11 @@ disagree with this table, they win — and fix this table.
 every routed smoke, on both I/O backends. Nothing else runs them: `/pr-gate` is
 invoked by a human, locally, and `--review-only` (which executes no `make`
 target and reads CI's conclusions instead) is for reviewing from a machine
-without the toolchain. Four routed targets are **not** in CI —
-`make bun-buffer-tests`, `make api-surface`, `make test-compat-lava-strict`, and
-`make bench-gate` — so a diff that routes to one of those needs a local run, or a
-new CI step if it should be enforced.
+without the toolchain. Five routed targets are **not** in CI —
+`make bun-buffer-tests`, `make api-surface`, `make test-compat-lava-strict`,
+`make bench-gate` and `make test-property` — so a diff that routes to one of
+those needs a local run, or a new CI step if it should be enforced.
+(`make test-scripts` IS in CI: it runs inside `make check-js`.)
 
 ## Always
 
@@ -50,6 +51,8 @@ catches what a YAML parse cannot: a context used where it is not available, a ba
 | `require.odin`, `module_resolution.odin`, `js/internal/{loader,esm}.js` | `make test-compat-lava-strict` |
 | `crypto.odin`, `js/internal/crypto.js` | `make test-odin`, `make test-compat-lava`, `make api-surface` |
 | `js/internal/**.js` (any) | `make check-js`, `make check-primordials`, `make test-compat-lava` |
+| `js/internal/{encoding,url,buffer}.js`, `pkg/runtime/buffer*.odin` | `make test-property` — differential property tests (fast-check generates the inputs; hand-picked oracle cases have missed edge cases in this area twice) |
+| `scripts/**` | `make test-scripts` — node:test over the build tooling |
 | `pkg/runtime/globals.odin`, `runtime.odin`, `errors.odin` | `make test-odin`, `make test-compat-lava` |
 | `bench/**`, `bench/thresholds.json` | `make bench-gate` — and a stated reason if a cap was loosened |
 | `Makefile`, `scripts/**`, `.github/workflows/**` | run the targets the change touches, end to end |
