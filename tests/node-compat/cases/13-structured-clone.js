@@ -283,7 +283,9 @@ for (const [name, Ctor] of [
   assert.equal(Object.prototype.toString.call(clone), '[object DataView]');
   // The length assertion is the one that catches the over-read; the byte check is
   // what proves the over-read was a disclosure and not just a longer zero run.
-  assert.equal(clone.byteLength, 2);
+  // Carries a message so the mutation gate can record WHY this goes red — without
+  // one the failure reads `64 strictEqual 2`, which names no vector.
+  assert.equal(clone.byteLength, 2, 'DataView clone window must not widen under a poisoned getter');
   const bytes = Buffer.from(clone.buffer, clone.byteOffset, clone.byteLength).toString('latin1');
   assert.equal(bytes, 'hi');
   assert.equal(bytes.indexOf('SECRET'), -1, 'clone must not expose pool neighbours');

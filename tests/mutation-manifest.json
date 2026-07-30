@@ -60,7 +60,7 @@
       "find": "      var srcByteLength = isDataView\n        ? DataViewPrototypeGetByteLength(value)\n        : TypedArrayPrototypeGetByteLength(value);",
       "replace": "      var srcByteLength = isDataView ? value.byteLength : TypedArrayPrototypeGetByteLength(value);",
       "gate": "compat:tests/node-compat/cases/13-structured-clone.js",
-      "expect_detail": "cloning a DataView must not throw under a poisoned window"
+      "expect_detail": "DataView clone window must not widen under a poisoned getter"
     },
     {
       "name": "13-structured-clone dies when the DataView brand goes back to instanceof",
