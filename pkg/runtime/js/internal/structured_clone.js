@@ -41,8 +41,17 @@
   var TypedArrayPrototypeGetBuffer = P.TypedArrayPrototypeGetBuffer;
   var TypedArrayPrototypeGetByteOffset = P.TypedArrayPrototypeGetByteOffset;
   var TypedArrayPrototypeGetByteLength = P.TypedArrayPrototypeGetByteLength;
+  // DataView's three accessors are SEPARATE properties from %TypedArray%'s — they
+  // live on DataView.prototype, not on the shared %TypedArray% prototype — so
+  // capturing the typed-array trio above leaves the DataView arm unprotected.
+  // That is exactly how this module shipped: the typed-array half read through
+  // captured getters while the DataView half still read `value.byteOffset` live.
+  var DataViewPrototypeGetBuffer = P.DataViewPrototypeGetBuffer;
+  var DataViewPrototypeGetByteOffset = P.DataViewPrototypeGetByteOffset;
+  var DataViewPrototypeGetByteLength = P.DataViewPrototypeGetByteLength;
   var StringPrototypeSlice = P.StringPrototypeSlice;
   var DataViewG = DataView;
+  var DataViewPrototype = DataView.prototype;
 
   function viewConstructorOf(value) {
     var proto = ReflectGetPrototypeOf(value);
@@ -53,6 +62,20 @@
       proto = ReflectGetPrototypeOf(proto);
     }
     return undefined;
+  }
+
+  // Is `target` anywhere on `value`'s prototype chain? The subclass-tolerant brand
+  // test, and the reason it is a chain walk rather than one comparison: a
+  // `class MyView extends DataView` instance must still take the DataView arm.
+  // Uses the captured ReflectGetPrototypeOf, so a poisoned `__proto__` accessor
+  // cannot redirect the walk.
+  function hasPrototypeInChain(value, target) {
+    var proto = ReflectGetPrototypeOf(value);
+    while (proto !== null) {
+      if (proto === target) return true;
+      proto = ReflectGetPrototypeOf(proto);
+    }
+    return false;
   }
 
   // `__proto__: null` because the key is `value.name`, straight off the object
@@ -126,14 +149,31 @@
     // Typed arrays and DataView: clone the backing buffer through `seen` so
     // multiple views over one buffer keep sharing a single cloned buffer.
     if (ArrayBuffer.isView(value)) {
-      // Every read of the window goes through a captured getter: `clone()` copies
-      // the WHOLE backing ArrayBuffer, so a poisoned byteOffset/byteLength pair
-      // selecting out of that copy is a read across the shared allocUnsafe pool
-      // — reproduced returning a neighbouring Buffer's contents.
-      var isDataView = value instanceof DataViewG;
-      var srcBuffer = isDataView ? value.buffer : TypedArrayPrototypeGetBuffer(value);
-      var srcOffset = isDataView ? value.byteOffset : TypedArrayPrototypeGetByteOffset(value);
-      var srcByteLength = isDataView ? value.byteLength : TypedArrayPrototypeGetByteLength(value);
+      // Every read of the window goes through a captured getter, on BOTH arms:
+      // `clone()` copies the WHOLE backing ArrayBuffer and then re-slices the copy,
+      // so the offset/length read here decide what the clone exposes. A poisoned
+      // pair selects across the shared allocUnsafe pool — reproduced on the
+      // DataView arm returning a neighbouring Buffer's `SECRET-TOKEN…` where node
+      // clones 2 bytes. Pinned by both window vectors in 13-structured-clone.js.
+      // NOT `value instanceof DataViewG`: `instanceof` dispatches through
+      // `DataView[Symbol.hasInstance]`, a configurable own property of the
+      // constructor, so the brand is forgeable in both directions. Forged to false
+      // it misrouted a genuine DataView into the typed-array arm, where the
+      // captured %TypedArray% getter rejected the receiver and threw
+      // `TypeError: Receiver should be a typed array view` on a value node clones
+      // fine. The prototype chain cannot be re-pointed on an already-constructed
+      // object, which is why `viewConstructorOf` above uses it too — same fix, and
+      // the same one the `Symbol.toStringTag` forgery already forced here.
+      var isDataView = hasPrototypeInChain(value, DataViewPrototype);
+      var srcBuffer = isDataView
+        ? DataViewPrototypeGetBuffer(value)
+        : TypedArrayPrototypeGetBuffer(value);
+      var srcOffset = isDataView
+        ? DataViewPrototypeGetByteOffset(value)
+        : TypedArrayPrototypeGetByteOffset(value);
+      var srcByteLength = isDataView
+        ? DataViewPrototypeGetByteLength(value)
+        : TypedArrayPrototypeGetByteLength(value);
       var clonedBuffer = clone(srcBuffer, seen);
       var view;
       if (isDataView) {

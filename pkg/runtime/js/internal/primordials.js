@@ -22,9 +22,18 @@
 // prototype-method pollution (Array.prototype.push = …) and global replacement
 // (globalThis.Array = …) — the realistic axes. They invoke through `.call`,
 // which reads Function.prototype.call dynamically, so a script that overrides
-// `Function.prototype.call/apply` can still reach them. That exotic axis (which
-// also breaks essentially all JS that uses `.call`, so it is self-defeating as
-// an attack) is closed only by lockIntrinsics(), applied opt-in by the runtime.
+// `Function.prototype.call/apply` still reaches them. This file used to call that
+// axis "exotic … self-defeating as an attack"; that was wrong twice over, and the
+// `invoke` ratchet class made it measurable. Wrapping `Function.prototype.call` is
+// something instrumentation, tracing and coverage libraries do on purpose, so the
+// trigger need not be an attacker at all — and the outcome is not a uniform
+// breakage but a SPLIT: TextDecoder/TextEncoder construction, Buffer.from,
+// buf.toString, Buffer.concat and new URL throw where node succeeds, while
+// URLSearchParams.get answers `null` and util.format answers `'undefined'` where
+// node is right. A silent wrong answer from a URL parameter lookup is the sharp
+// end of that. See the measured table above caller0 below; closed completely only
+// by lockIntrinsics(), which is written, exported, called from nowhere, and
+// tracked in ROADMAP.
 // The accessor axis (a setter on a numeric-index property of Array/Object.proto)
 // is not a method concern and is handled per-hot-array with null prototypes in
 // the consuming modules.
@@ -356,6 +365,21 @@
     // injection on the wire) and made http.js read Content-Length as NaN, so the
     // body was parsed as the next request. Any internal module validating with a
     // regex must route through these.
+    //
+    // BUT `RegExpPrototypeTest` IS NOT A SOUND VALIDATOR ON ITS OWN, and neither
+    // a `.call` nor a `Reflect.apply` invocation changes that. The spec's
+    // RegExpExec abstract op re-reads `R.exec` off the RECEIVER before falling
+    // back to the builtin, so replacing `RegExp.prototype.exec` — a writable data
+    // property — steers a captured `test`. Measured on both node 24 and bin/lava:
+    // with `RegExp.prototype.exec = () => ['forged']`, the captured `test` returns
+    // TRUE for 'X-Evil: 1\r\nInjected' against a strict header-name pattern,
+    // identically through `.call` and through `Reflect.apply`.
+    // So the pending migration of the ~15 `.test`/`.exec` sites in
+    // fetch.js/http.js/url.js must NOT simply swap in `RegExpPrototypeTest`: that
+    // closes the `.test`-assignment vector and leaves an equally cheap
+    // `.exec`-assignment vector open. Validate through the captured `exec`
+    // directly (`RegExpPrototypeExec(re, s) !== null`), which has no such
+    // indirection. Tracked in ROADMAP.
     RegExpPrototypeTest: caller1(RegExp.prototype.test),
     RegExpPrototypeExec: caller1(RegExp.prototype.exec),
 

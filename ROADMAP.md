@@ -102,20 +102,39 @@ coupling.
       all of `pkg/runtime/js`, not just `internal/` — the real 371-line
       `console.js` was outside the scan while the baseline described the 7-line
       re-export, so the report read as "console is hardened".
-      One class remains on the author (an object literal indexed by a
-      caller-supplied key needs `__proto__: null`), and two are uncounted by
-      construction because they read a well-known symbol rather than a named
-      property: the iterator protocol, and a poisoned `Object.prototype.then`
-      reached by an internal `await`. That last one is a plain data property
-      settable by an ordinary merge gadget — the sharpest uncounted vector, and
-      its own item below.
+      One vector remains on the author (an object literal indexed by a
+      caller-supplied key needs `__proto__: null`), and two more are uncounted for
+      two different reasons: `for…of`/spread/`Symbol.toPrimitive` read a well-known
+      SYMBOL, so there is no named property to count, whereas `Object.prototype.then`
+      is an ordinary named property the detector DOES count when written
+      (`p.then(cb)` scores 1 `method`) and misses only when `await`/`Promise.resolve`
+      read it implicitly. That last one is also a plain data property settable by an
+      ordinary merge gadget — the sharpest uncounted vector, and its own item below.
+- [ ] **Route the 15 regex validators through a captured `exec`, not `test`** —
+      `fetch.js`, `http.js` and `url.js` still validate with live
+      `RegExp.prototype.test`/`.exec`, so a plain assignment to either (writable
+      data properties, no `defineProperty` needed) reaches the header-name
+      validator — CRLF in a header name is injection on the wire — and makes
+      `http.js` read Content-Length as NaN, parsing the body as the next request.
+      `RegExpPrototypeTest`/`Exec` are exported for this and have zero call sites,
+      so the vectors are live today.
+      The trap, measured before the migration rather than after: **swapping in
+      `RegExpPrototypeTest` does not close it.** The spec's RegExpExec re-reads
+      `R.exec` off the receiver, so `RegExp.prototype.exec = () => ['forged']`
+      makes even a captured `test` return true for
+      `'X-Evil: 1\r\nInjected'` — identical on node 24 and `bin/lava`, and
+      identical through `.call` and `Reflect.apply`, because the re-read is inside
+      the abstract op and not in the invocation. Validate with
+      `RegExpPrototypeExec(re, s) !== null` instead, which has no such indirection,
+      and pin it with a poisoned-`exec` case in `54-url-pollution.js`.
 - [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector** —
       a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
       no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`
       and `Promise.resolve(obj)` both execute attacker code inside an internal
       await, and internals carry 5 awaits plus ~31 `.then(` sites. The ratchet
-      cannot count it (awaiting reads a well-known symbol, not a named
-      property), so this needs a code convention instead: never `await` a
+      cannot see the implicit read (an explicit `p.then(cb)` IS counted, as
+      `method`; `await x` and `Promise.resolve(x)` carry no member expression to
+      count), so this needs a code convention instead: never `await` a
       caller-supplied value directly, or route it through a captured
       `PromiseResolve`. Same shape for the iterator protocol (`for…of`, spread)
       on caller-supplied values.

@@ -400,13 +400,20 @@ A baseline of 0 in a class means "no **counted** site of that class remains", no
 that readable: `events.js` is at 0 `method` and 0 `accessor` while still carrying
 `invoke` and `global` sites, which a single total hid. Do not restate the numbers
 here — `pollution-baseline.json` is the source and `make check-primordials` prints
-the live split; the counts copied into prose went stale twice. `.call`/`.apply` and live globals used to be the
-author's problem and are now gated; **one class still is not**, because deciding
-that an object literal is a lookup table read with a caller-supplied key takes
-dataflow a per-file counter does not have — give those `__proto__: null` by hand.
-Two protocol-shaped axes are also uncounted by construction, since they read a
-well-known symbol rather than a named property: the iterator protocol, and a
-poisoned `Object.prototype.then` reached by an internal `await`.
+the live split; the counts copied into prose went stale twice. `.call`/`.apply`
+and live globals used to be the author's problem and are now gated classes;
+**one vector outside those four is still uncounted**, because deciding that an
+object literal is a lookup table read with a caller-supplied key takes dataflow a
+per-file counter does not have — give those `__proto__: null` by hand.
+Two more vectors are uncounted, for two DIFFERENT reasons that are worth keeping
+apart. The iterator and coercion protocols (`for…of`, spread, `Symbol.toPrimitive`)
+read a well-known SYMBOL, so there is no named property to count at all. A poisoned
+`Object.prototype.then` is the opposite case: `then` is an ordinary named property
+and the detector does count it — `p.then(cb)` and `p['then'](cb)` each score 1
+`method` — but `await x` and `Promise.resolve(x)` read it IMPLICITLY, with no
+member expression in the source to see. So the explicit half is gated and only the
+assimilation half is blind, which is why the guidance is a code convention rather
+than a counter: never `await` a caller-supplied value directly.
 
 `primordials` is internal-only: the loader serves it to internal factories but
 hides it from the public resolver native `require()` consults, so it neither

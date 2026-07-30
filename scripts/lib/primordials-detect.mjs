@@ -57,14 +57,20 @@
 //   * a fully dynamic member read (`var k = 'buffer'; view[k]`) — the key is not
 //     in the source. A literal key IS counted.
 //   * an object literal indexed by a caller-supplied key needs `__proto__: null`
-//     (CLAUDE.md §5, the "One class is still on you" bullet). Deciding a literal
+//     (CLAUDE.md §5, the "One vector is still on you" bullet). Deciding a literal
 //     is a dynamic-key lookup table takes dataflow.
-//   * the iterator / thenable / coercion protocols (`for…of`, `await` on a
-//     poisoned `Object.prototype.then`, `Symbol.toPrimitive`) — these read a
-//     well-known symbol, not a named property, so there is no name to count.
-//     `Object.prototype.then` in particular is a plain data property reachable
-//     by an ordinary merge gadget; it is the sharpest uncounted vector and is
-//     recorded in ROADMAP rather than implied to be handled.
+//   * the iterator and coercion protocols (`for…of`, spread, `Symbol.toPrimitive`)
+//     — these read a well-known SYMBOL, not a named property, so there is no name
+//     to count.
+//   * `await` / `Promise.resolve` assimilation, which is a DIFFERENT gap and is
+//     often described as the same one. `then` is an ordinary named property and
+//     it IS in POLLUTABLE below, so `p.then(cb)` and `p['then'](cb)` each count 1
+//     `method`. What is invisible is the IMPLICIT read: `await x` and
+//     `Promise.resolve(x)` resolve `x.then` with no member expression in the
+//     source, so there is no node to attribute. Only the implicit half is blind.
+//     `Object.prototype.then` is also a plain data property reachable by an
+//     ordinary merge gadget — no `defineProperty` needed — which makes it the
+//     sharpest uncounted vector; recorded in ROADMAP rather than implied handled.
 //
 // Usage:
 //   node scripts/check-primordials.mjs                  # check against baseline
@@ -304,7 +310,14 @@ function countSource(src, label = '<fixture>') {
   let ast;
   try {
     ast = parse(src, {
-      ecmaVersion: 2023,
+      // 'latest', not a pinned year: a pinned version turns valid new syntax into
+      // a hard parse failure, and this gate runs on every `make check-js`, so the
+      // failure mode is "CI blocks on correct code with a confusing acorn error"
+      // rather than anything safer. Nothing here is version-sensitive — the
+      // visitors match node TYPES, which do not change for existing syntax. Note
+      // that newer symbol-keyed protocols (`using` reads `Symbol.dispose`) join
+      // the uncounted-by-construction list above rather than becoming countable.
+      ecmaVersion: 'latest',
       sourceType: 'script',
       locations: true,
       allowReturnOutsideFunction: true,
@@ -329,13 +342,26 @@ function countSource(src, label = '<fixture>') {
       const name = propName(node);
       if (name === null) return;
       const parent = ancestors[ancestors.length - 2];
-      const isWrite =
+      // ONLY a plain `=` skips the getter. The spec evaluates a simple assignment
+      // as PutValue with no preceding GetValue, so `o.constructor = X` really does
+      // not resolve the accessor — `Stream.prototype.constructor = Stream` was 24%
+      // of the old accessor count and is correctly exempt.
+      //
+      // Every OTHER form in the family reads first: compound (`+=`), logical
+      // (`||= &&= ??=`) and update (`++ --`) all run GetValue -> op -> PutValue.
+      // Exempting them was a rename the ratchet would have paid for, which is the
+      // one thing this tool exists to refuse: `if (o.constructor === undefined)
+      // o.constructor = X` counted 1 accessor and `o.constructor ??= X` counted 0
+      // for the same live read, and lowering is the always-allowed direction
+      // through `--update`. Narrowing changed no per-file per-class count across
+      // the tree — there is no such site in it today — so this is a floor raised
+      // before anything stood on it.
+      const isPlainWrite =
         parent &&
-        ((parent.type === 'AssignmentExpression' && parent.left === node) ||
-          (parent.type === 'UpdateExpression' && parent.argument === node));
-      // A write does not resolve a getter, so it is not a pollutable read.
-      // `Stream.prototype.constructor = Stream` was 24% of the old accessor count.
-      if (isWrite) return;
+        parent.type === 'AssignmentExpression' &&
+        parent.left === node &&
+        parent.operator === '=';
+      if (isPlainWrite) return;
 
       // `globalThis.String(x)` reaches the same replaceable binding the long way
       // round. Handled HERE rather than in the Identifier visitor because

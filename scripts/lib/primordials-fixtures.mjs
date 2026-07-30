@@ -211,8 +211,49 @@ const SELF_TEST = [
     expect: E({ method: 1 }),
   },
 
-  // An update expression is a write, not a getter read.
-  { name: 'update expression is a write', src: 'v.byteLength++;', expect: E() },
+  // A PLAIN `=` is the only assignment form that does not resolve the getter:
+  // spec order is PutValue with no preceding GetValue.
+  // `Stream.prototype.constructor = Stream` was 24% of the old accessor count.
+  { name: 'plain assignment target is not a read', src: 'o.constructor = X;', expect: E() },
+
+  // Everything else in the assignment family READS FIRST — GetValue -> op ->
+  // PutValue — so the getter runs and the site counts. The detector used to
+  // exempt the whole family, which handed the ratchet a rename it would pay for:
+  // `if (o.constructor === undefined) o.constructor = X` counted 1 accessor and
+  // `o.constructor ??= X` counted 0, same live read, lower number, and lowering is
+  // the always-allowed direction. Verified against a real accessor: each of the
+  // forms below invokes the getter exactly once.
+  {
+    name: 'update expression reads the getter',
+    src: 'v.byteLength++;',
+    expect: E({ accessor: 1 }),
+  },
+  { name: 'prefix update reads the getter', src: '--v.byteOffset;', expect: E({ accessor: 1 }) },
+  {
+    name: 'compound assignment reads the getter',
+    src: 'view.byteOffset += 1;',
+    expect: E({ accessor: 1 }),
+  },
+  {
+    name: 'logical assignment reads the getter',
+    src: 'o.constructor ??= X;',
+    expect: E({ accessor: 1 }),
+  },
+  { name: 'or-assignment reads the getter', src: 'o.__proto__ ||= P;', expect: E({ accessor: 1 }) },
+  {
+    name: 'computed logical assignment reads the getter too',
+    src: "o['constructor'] ??= X;",
+    expect: E({ accessor: 1 }),
+  },
+  // The `global` class reaches the same conclusion by the same route: a live
+  // globalThis read is a read whether or not a write follows it. (An internal
+  // module writing a global is separately barred by CLAUDE.md section 5; the
+  // point here is only that the detector must not score it 0.)
+  {
+    name: 'logical assignment to a global is still a live read',
+    src: WRAP('  function f() { globalThis.String ??= S; }'),
+    expect: E({ global: 1 }),
+  },
 
   // --- lexical contexts: inert text must stay inert, executable text must not ---
   { name: 'method in a comment', src: '// arr.push(x)', expect: E() },

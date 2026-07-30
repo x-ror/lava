@@ -196,15 +196,18 @@ Rules that keep this from becoming ceremony:
   `make check-primordials UPDATE=1 RAISE=--allow-raise` and a stated reason (a
   newly scanned file, or a new class). A corrupt baseline fails hard rather than
   inviting a rebaseline.
-- **One class is still on you**: an object literal indexed by a caller-supplied
-  key (label/scheme/header/encoding tables) needs `__proto__: null`. Deciding
-  that a literal is a lookup table read with a dynamic key takes dataflow the
-  counter does not have, and a blanket rule would fire on every options object.
-  Two more are uncounted by construction, because they read a well-known symbol
-  rather than a named property: the iterator protocol, and a poisoned
-  `Object.prototype.then` reached by an internal `await` — that one is a plain
-  data property settable by an ordinary merge gadget, so treat `await` on a
-  caller-supplied value as a live call.
+- **One vector is still on you**, outside the four counted classes: an object
+  literal indexed by a caller-supplied key (label/scheme/header/encoding tables)
+  needs `__proto__: null`. Deciding that a literal is a lookup table read with a
+  dynamic key takes dataflow the counter does not have, and a blanket rule would
+  fire on every options object.
+  Two more are uncounted, for reasons worth keeping apart. `for…of`, spread and
+  `Symbol.toPrimitive` read a well-known SYMBOL, so there is no named property to
+  count. `Object.prototype.then` is the opposite: an ordinary named property that
+  IS counted when written (`p.then(cb)` scores 1 `method`), but `await x` and
+  `Promise.resolve(x)` read it implicitly, with no member expression in the
+  source. It is also a plain data property an ordinary merge gadget can set, so
+  treat `await` on a caller-supplied value as a live call.
 - "Baseline 0" in a class means no *counted* site of that class is left — the
   ratchet is a floor, not a proof, and per-class counts are what make it
   readable rather than reassuring. It earned that caveat: `encoding.js` stood at

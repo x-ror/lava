@@ -206,7 +206,7 @@
   "internal/structured_clone.js": {
     "method": 5,
     "invoke": 1,
-    "accessor": 3,
+    "accessor": 0,
     "global": 14
   },
   "internal/timers.js": {

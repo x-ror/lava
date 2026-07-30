@@ -27,7 +27,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fc from 'fast-check';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -38,7 +38,25 @@ const NODE = process.env.NODE_BIN ?? process.execPath;
 // A fixed seed keeps a failure reproducible — "it passed on my machine" is not a
 // possibility. Raise for a deeper local sweep; the committed value is what the
 // batched design can afford in CI.
-const RUNS = Number(process.env.PROPERTY_RUNS ?? 5000);
+//
+// VALIDATED, not just coerced. `Number('abc')` is NaN, and `fc.sample` answers a
+// NaN/0/negative `numRuns` with an EMPTY array rather than an error — so a typo in
+// the one knob this suite exposes produced a zero-input corpus and every property
+// below compared nothing and reported green. A differential suite that passes
+// because it ran no inputs is worse than one that fails: it is the silent-green
+// failure this repo has been bitten by before, and the reason `make check-js`
+// grew a fixture self-test. Fail loudly instead.
+const RAW_RUNS = process.env.PROPERTY_RUNS;
+const RUNS = RAW_RUNS === undefined ? 5000 : Number(RAW_RUNS);
+if (!Number.isInteger(RUNS) || RUNS <= 0) {
+  throw new Error(`PROPERTY_RUNS must be a positive integer, got ${JSON.stringify(RAW_RUNS)}`);
+}
+// `make test-property` depends on `build`, but running this file directly does
+// not; without the check the first property dies on an ENOENT thrown from inside
+// execFileSync, which reads as a decoder failure rather than a missing binary.
+if (!existsSync(LAVA)) {
+  throw new Error(`${LAVA} not found — run \`make build\`, or set LAVA_BIN`);
+}
 const SEED = 20260730;
 
 const toHex = (u8) => Buffer.from(u8).toString('hex');
@@ -162,6 +180,18 @@ function differential(t, script, corpus, env, generator) {
 
 const bytesGen = fc.uint8Array({ maxLength: 96 });
 const corpus = fc.sample(bytesGen, { seed: SEED, numRuns: RUNS }).map(toHex);
+
+// The self-check, kept even though RUNS is validated above: the guard covers the
+// input, this covers the OUTPUT. If a future fast-check changes what `sample`
+// returns for an edge-case `numRuns`, or a refactor drops the guard, an empty
+// corpus must fail here rather than sail through ten properties as green.
+test('the corpus is actually populated', () => {
+  assert.equal(corpus.length, RUNS, 'fc.sample returned a corpus of the wrong size');
+  assert.ok(
+    corpus.some((hex) => hex.length > 0),
+    'every generated input was empty — the generator produced nothing to compare',
+  );
+});
 
 for (const enc of ['utf-8', 'utf-16le', 'windows-1252']) {
   for (const fatal of [false, true]) {
