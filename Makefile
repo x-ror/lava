@@ -173,6 +173,7 @@ test-scripts:
 # own target and its own CI step, never part of the always-block.
 #   make test-mutation FILTER=clone   # substring match on the entry name
 #   node scripts/run-mutations.mjs --list
+#   MUTATION_TIMEOUT_MS=N             # default per-gate timeout ms (default 120000); hang pins use manifest timeout_ms
 test-mutation: build
 	@node scripts/run-mutations.mjs $(if $(FILTER),--filter=$(FILTER),)
 

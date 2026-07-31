@@ -130,12 +130,19 @@ coupling.
       `Headers.set('X-Evil: 1\r\nInjected', 'v')`, undici's validator being
       JavaScript — and by six entries in `tests/mutation-manifest.json`.
       Four of the validators went further and dropped the regex entirely: a
-      character-class check needs a `charCodeAt` loop, not a pattern, and with no
-      RegExp in the expression `exec`/`test`/`Symbol.match`/`Symbol.replace`/
-      `lastIndex` all drop out at once instead of one of them. It is also faster —
-      0.82x-0.90x on `new URL`, min of 7 interleaved pinned launches per arm — which
-      reversed the +6% to +20% regression the exec migration had introduced and that
-      no benchmark covered.
+      character-class check needs a code-unit loop over the **captured**
+      `StringPrototypeCharCodeAt`, not a pattern, and with no RegExp in the
+      expression `exec`/`test`/`Symbol.match`/`Symbol.replace`/`lastIndex` all drop
+      out at once instead of one of them. A live `.charCodeAt` is its own carrier —
+      do not treat the loop as enough. Capture `parseInt`/`Number` used for
+      Content-Length / chunk-size conversion too. It is also faster: **elapsed-time
+      ratio** of `new URL(s)` over a fixed string pool (special / IPv4 / relative /
+      short absolute hosts, same inputs as the later `bench/micro/url.js` cases),
+      **char-loop + captured `StringPrototypeCharCodeAt`** vs the prior **captured
+      `RegExpMatches` / `re.test` form**, min of 7 interleaved pinned launches per
+      arm on Linux JSC — 0.82x–0.90x (lower is faster) — which reversed the +6% to
+      +20% regression the exec migration had introduced and that no benchmark
+      covered.
 - [ ] **The rest of the regex surface, and `.test` was not the whole of
       it** — a poisoned `exec` steers **six** methods, not two: `re.test`, `re.exec`,
       and `String.prototype.replace`/`match`/`search`/`split` whenever the argument
@@ -156,10 +163,13 @@ coupling.
       under the rule six entries up that forbids exactly this. Derive it instead:
       an acorn pass over `pkg/runtime/js` counting `re.test`/`re.exec` on a
       regex-shaped receiver plus `String.prototype.{replace,replaceAll,match,
-      matchAll,search,split}` with a regex first argument. `esm.js` dominates by a
+      matchAll,search,split}` with a regex argument in EITHER position — `s.replace(re, …)`
+      and the primordial `StringPrototypeReplace(s, re, …)`, where the regex is the
+      SECOND argument. Written for the first position only, this recipe scored zero on
+      `url.js`'s own residue sites, which the paragraph above names. `esm.js` dominates by a
       wide margin and is the module loader, so it is next.
       The claim that none of the remainder was on the network path was **false**, and
-      the four that were are now fixed rather than merely re-described:
+      the sites that were are now fixed rather than merely re-described:
       `fetch.js`'s header-value trim (which ran BEFORE the name validator on every
       `append`/`set`), and `url.js`'s tab/newline strip, IDNA separator fold and
       `hostFromDomainArg`. Each was a global replace, so under a forged `exec` they
@@ -168,6 +178,15 @@ coupling.
       `Location:` header reaching `new URL(location, req.url)` hung the client: a
       remote-triggerable DoS. The Lava-only test that pins them ran in 3m07s while
       they spun and runs in 34ms now.
+      A second pass closed the **adjacent carriers** the regex hardening left open:
+      live `String.prototype.charCodeAt` on header value/name scans (response
+      splitting under `HTTP_POISON_REGEXP=charcodeat`), live `parseInt` beside
+      Content-Length / chunk framing (desync under `HTTP_POISON_REGEXP=parseint`;
+      capture is on `primordials` at bootstrap because `http.js` is lazy), and two
+      more global-replace hangs on the network path — `buffer.js` `normalizeBase64`
+      (Basic-auth / JWT) and `url.js` `toUSVString` (emoji in a remote query). Each
+      has a Lava-only pin, an http-smoke phase where relevant, and a mutation-manifest
+      entry.
 - [x] **`util.format` ignored Node's single-argument rule** — fixed: a string
       first argument with nothing after it is returned verbatim, directives and
       all. Lava ran the substitution loop regardless and folded `%%` to `%`;
@@ -362,7 +381,7 @@ coupling.
       even under `--gate` (spawn noise is one-sided, so min-of-N is the right
       estimator there, unlike the in-process benches). Do NOT "fix" the
       remaining variance by pinning: pinning shifts the ratio level 25-40% (it
-      hurts node more than Lava) and would invalidate all 22 caps.
+      hurts node more than Lava) and would invalidate every cap in bench/thresholds.json.
 - [ ] **Host-native registry: consider moving `g_host_native_fns` onto
       `Runtime_State`** — it is read only at registration and in the sweep, never
       on the dispatch path (only `g_host_native_cbs` is), so keying it by the

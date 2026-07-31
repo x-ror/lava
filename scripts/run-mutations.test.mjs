@@ -20,7 +20,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,11 +64,11 @@ function makeTree(mutations, { source = SOURCE, gate = GATE } = {}) {
   return dir;
 }
 
-function run(dir, extra = []) {
+function run(dir, extra = [], env = {}) {
   const r = spawnSync(
     process.execPath,
     [RUNNER, `--root=${dir}`, `--manifest=${join(dir, 'manifest.json')}`, ...extra],
-    { encoding: 'utf8', cwd: dir },
+    { encoding: 'utf8', cwd: dir, env: { ...process.env, ...env } },
   );
   return { status: r.status, out: (r.stdout ?? '') + (r.stderr ?? '') };
 }
@@ -195,17 +195,112 @@ test('a dirty source is refused, since it could not be restored', () => {
   });
 });
 
-test('a source escaping the repo root is refused', () => {
-  // join(ROOT, '../../x') resolves happily outside the tree, and this runner
-  // rewrites what it is handed before make spawns shells over the result.
-  withTree([entry({ source: '../escape.mjs' })], {}, (dir) => {
-    writeFileSync(join(dir, '..', 'escape.mjs'), 'outside\n');
+// The next two cases were ONE case with a disjunction —
+// `/escapes the repo root|git status failed/` — and a review proved that pinned
+// neither guard: deleting the containment check alone left 16/16 green, and so did
+// deleting the git-status check alone. Only removing both went red. They are split
+// so each asserts its own message, with no alternation.
+test('a source escaping the repo root is refused by the containment check', () => {
+  // Containment runs before git is asked anything, so the verdict can only come
+  // from the path check. The unique name keeps concurrent runs from racing on a
+  // shared tmpdir entry. Manifest source and the file we create MUST agree —
+  // otherwise the runner never sees the outside file and "untouched" asserts
+  // nothing.
+  const name = `escape-${process.pid}.mjs`;
+  withTree([entry({ source: `sub/../../${name}` })], {}, (dir) => {
+    const outside = join(dir, '..', name);
+    writeFileSync(outside, 'outside\n');
+    try {
+      const { status, out } = run(dir);
+      assert.equal(status, 1);
+      assert.match(out, /escapes the repo root/);
+      assert.doesNotMatch(out, /git status failed/, 'must fail on containment, not on git');
+      assert.equal(readFileSync(outside, 'utf8'), 'outside\n');
+    } finally {
+      // In the finally, not after the assertions: a failing assertion used to leak
+      // this file into the shared tmpdir, where two concurrent runs then raced on
+      // a fixed name.
+      rmSync(outside, { force: true });
+    }
+  });
+});
+
+test('a git status that FAILS is not read as clean', () => {
+  // `git status --porcelain -- <path>` exits 128 with EMPTY stdout when the path is
+  // outside the repo, so returning only stdout made a failure read as clean. Here
+  // the tree is not a git repo at all, which makes git exit non-zero for a source
+  // that is perfectly well contained.
+  const dir = mkdtempSync(join(tmpdir(), 'lava-mut-nogit-'));
+  try {
+    mkdirSync(join(dir, 'fx'), { recursive: true });
+    writeFileSync(join(dir, 'fx', 'src.mjs'), SOURCE);
+    writeFileSync(join(dir, 'fx', 'gate.test.mjs'), GATE);
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ mutations: [entry()] }, null, 2));
     const { status, out } = run(dir);
     assert.equal(status, 1);
-    assert.match(out, /escapes the repo root|git status failed/);
-    assert.equal(readFileSync(join(dir, '..', 'escape.mjs'), 'utf8'), 'outside\n');
-    rmSync(join(dir, '..', 'escape.mjs'), { force: true });
+    assert.match(out, /git status failed/);
+    assert.doesNotMatch(out, /escapes the repo root/, 'must fail on git, not on containment');
+    assert.equal(readFileSync(join(dir, 'fx', 'src.mjs'), 'utf8'), SOURCE, 'nothing patched');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a symlink pointing out of the repo is refused, not followed', () => {
+  // The containment check is LEXICAL unless it resolves: `resolve()` does not follow
+  // symlinks and `readFileSync`/`writeFileSync` do, so an in-repo link to an
+  // out-of-root file passed the prefix test and the runner rewrote the target.
+  // Reproduced by a review before realpathSync was added.
+  withTree([entry({ source: 'fx/link.mjs' })], {}, (dir) => {
+    const outside = join(dir, '..', `victim-${process.pid}.mjs`);
+    writeFileSync(outside, 'DO-NOT-TOUCH\n');
+    try {
+      symlinkSync(outside, join(dir, 'fx', 'link.mjs'));
+      const { status, out } = run(dir);
+      assert.equal(status, 1);
+      assert.match(out, /escapes the repo root/);
+      assert.equal(readFileSync(outside, 'utf8'), 'DO-NOT-TOUCH\n', 'target must be untouched');
+    } finally {
+      rmSync(outside, { force: true });
+    }
   });
+});
+
+test('a make: gate leaves the binary rebuilt from RESTORED source', () => {
+  // needsBuild/dirtiesBinary had no coverage at all: every other fixture uses a
+  // `node-test:` gate, so neither the compat-implies-build rule nor the
+  // make-dirties-the-binary rule ever executed under test. The bug that split fixed
+  // was security-relevant — a `--filter` over make: entries finished with a clean
+  // git tree, a success message, and a bin/lava built from the mutated source.
+  const dir = makeTree([
+    {
+      name: 'fixture dies when VALUE is broken',
+      why: 'the make gate must observe VALUE through the built artifact',
+      source: 'fx/src.mjs',
+      find: "export const VALUE = 'expected';",
+      replace: "export const VALUE = 'BROKEN';",
+      gate: 'make:gate',
+      expect_detail: 'make gate saw BROKEN',
+    },
+  ]);
+  try {
+    // `build` copies the source to the artifact; `gate` fails when the artifact
+    // carries the mutation. Tabs matter to make.
+    writeFileSync(
+      join(dir, 'Makefile'),
+      'build:\n\tmkdir -p bin && cp fx/src.mjs bin/lava\n\n' +
+        'gate: build\n\t@grep -q BROKEN bin/lava && { echo "make gate saw BROKEN"; exit 1; } || exit 0\n',
+    );
+    const { status, out } = run(dir);
+    assert.equal(status, 0, out);
+    assert.match(out, /killed/);
+    // The point of the case: the artifact on disk must be the RESTORED source, not
+    // the mutated one the gate just built from.
+    assert.equal(readFileSync(join(dir, 'bin', 'lava'), 'utf8'), SOURCE, 'binary must be rebuilt');
+    assert.equal(sourceOf(dir), SOURCE);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a replacement containing $-substitution patterns is written literally', () => {
@@ -270,6 +365,76 @@ test('a deletion mutation (empty replace) is allowed and applied literally', () 
       assert.match(out, /killed/);
       assert.equal(status, 0);
       assert.equal(sourceOf(dir), SOURCE);
+    },
+  );
+});
+
+test('a gate that hangs is RED with a timeout verdict, not a hang', () => {
+  // Several manifest entries deliberately reintroduce a spin, because the bug class
+  // they pin is "a global regex replace never terminates". Without a bound here the
+  // gate ran until the allocator gave up — 6.2 GB and climbing locally, 3m16s in CI
+  // — and a SIGKILL under a memory cap produced no error line at all, so the verdict
+  // degraded to WRONG REASON naming nothing about memory.
+  //
+  // capture() runs the gate under GNU timeout so the whole process group is killed
+  // (spawnSync alone leaves a node --test worker spinning). Assert no orphan.
+  withTree(
+    [entry({ gate: 'node-test:fx/hang.test.mjs', expect_detail: 'timed out' })],
+    {},
+    (dir) => {
+      const hangPath = join(dir, 'fx', 'hang.test.mjs');
+      writeFileSync(
+        hangPath,
+        // Green when VALUE is intact, spins when it is not — the shape of the real
+        // entries, without the multi-GB appetite.
+        "import { VALUE } from './src.mjs';\n" + "if (VALUE !== 'expected') { for (;;) {} }\n",
+      );
+      const { status, out } = run(dir, [], { MUTATION_TIMEOUT_MS: '3000' });
+      assert.match(out, /killed/);
+      assert.match(out, /timed out/);
+      assert.equal(status, 0);
+      assert.equal(sourceOf(dir), SOURCE);
+      // No worker still executing THIS hang fixture (process-group kill).
+      // Scope to hangPath so leftovers from earlier runs do not false-positive.
+      const ps = spawnSync('ps', ['-eo', 'args='], { encoding: 'utf8' });
+      const survivors = (ps.stdout ?? '').split('\n').filter((l) => l.includes(hangPath));
+      assert.equal(survivors.length, 0, `orphan hang process(es):\n${survivors.join('\n')}`);
+    },
+  );
+});
+
+test('expect_detail as an array accepts any alternative', () => {
+  // Hang pins fail as timeout on some runners and RangeError on others; the
+  // manifest records both with a string[]. Any one match is a kill.
+  withTree(
+    [
+      entry({
+        replace: "export const VALUE = 'broken';",
+        expect_detail: ['NO-MATCH-A', 'THE-RECORDED-REASON', 'NO-MATCH-B'],
+      }),
+    ],
+    {},
+    (dir) => {
+      const { status, out } = run(dir);
+      assert.equal(status, 0, out);
+      assert.match(out, /killed/);
+    },
+  );
+});
+
+test('expect_detail as an array rejects when none match', () => {
+  withTree(
+    [
+      entry({
+        replace: "export const VALUE = 'broken';",
+        expect_detail: ['NO-MATCH-A', 'NO-MATCH-B'],
+      }),
+    ],
+    {},
+    (dir) => {
+      const { status, out } = run(dir);
+      assert.equal(status, 1, out);
+      assert.match(out, /WRONG REASON/);
     },
   );
 });

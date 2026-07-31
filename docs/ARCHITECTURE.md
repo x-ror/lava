@@ -414,7 +414,12 @@ anyway — and a GLOBAL one never terminates rather than answering wrongly, sinc
 hang on the URL and header paths. `RegExpPrototypeTest` was removed from the
 frozen table for the same reason: capturing `test` cannot fix what RegExpExec
 re-reads. Use `RegExpMatches`, or drop the RegExp entirely where the pattern is
-just a character class.
+just a character class — and when you do, scan with the **captured**
+`StringPrototypeCharCodeAt`, not a live `.charCodeAt` (that is its own writable
+data property; a CR/LF-lying gadget splits HTTP responses). Capture free globals
+used for conversion beside the validator (`parseInt`/`Number` on `primordials` at
+bootstrap) the same way: a sound digit check next to a live `parseInt` still
+desyncs Content-Length framing.
 Two more vectors are uncounted, for two DIFFERENT reasons that are worth keeping
 apart. The iterator and coercion protocols (`for…of`, spread, `Symbol.toPrimitive`)
 read a well-known SYMBOL, so there is no named property to count at all. A poisoned

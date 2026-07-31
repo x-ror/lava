@@ -75,7 +75,16 @@
   }
   function assertValidHeaderValue(name, value) {
     for (var i = 0; i < value.length; i++) {
-      var code = value.charCodeAt(i);
+      // The CAPTURED read, not `value.charCodeAt(i)`. `String.prototype.charCodeAt`
+      // is a writable data property like any other, so a hand-rolled scan is only
+      // as sound as the primitive it scans with — routing this file's validators
+      // off RegExp said nothing about that. A gadget reporting 0x41 for CR and LF
+      // is enough: measured, node rejects and Lava accepted
+      // `a\r\nInjected: yes` as a header value. Pinned by `cc-value=` in
+      // cmd/lava/regexp_pollution_test.odin (and the fetch.js mutation-manifest
+      // entry). The same gadget on the HTTP response path is pinned by the
+      // charcodeat phase of run-http-smoke.sh against http.js.
+      var code = StringPrototypeCharCodeAt(value, i);
       if (code === 0 || code === 10 || code === 13) {
         throw new TypeError('Invalid header value for "' + name + '": "' + value + '"');
       }

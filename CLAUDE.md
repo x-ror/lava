@@ -225,7 +225,11 @@ Rules that keep this from becoming ceremony:
   `lastIndex` only advances on an empty match; that shipped as a remote-triggerable
   hang in `url.js` and `fetch.js`. Validate with `RegExpMatches(re, s)`; there is
   deliberately no `RegExpPrototypeTest`, and for a plain character class prefer a
-  `charCodeAt` loop, which leaves nothing to poison at all.
+  code-unit loop over the **captured** `StringPrototypeCharCodeAt` — a live
+  `value.charCodeAt(i)` is itself a writable data property (response splitting
+  under `HTTP_POISON_REGEXP=charcodeat`). Capture `parseInt`/`Number` used for
+  framing conversion the same way (bootstrap on `primordials`); a sound digit
+  check beside a live `parseInt` still desyncs Content-Length.
   Two more are uncounted, for reasons worth keeping apart. `for…of`, spread and
   `Symbol.toPrimitive` read a well-known SYMBOL, so there is no named property to
   count. `Object.prototype.then` is the opposite: an ordinary named property that

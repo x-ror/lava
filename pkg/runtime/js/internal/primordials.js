@@ -117,6 +117,22 @@
   // Captured ONCE. Both the raw and the predicate export below close over this, so
   // there is exactly one wrapper object rather than a fresh closure per call.
   var regExpExec = safeCaller1(RegExp.prototype.exec);
+  var stringCharCodeAt = caller1(StringProto.charCodeAt);
+
+  // Free globals captured at primordials module-eval — the loader runs this before
+  // user code. A lazy consumer that writes `var parseIntG = parseInt` at ITS own
+  // factory time is not the same: http.js is not eager, so a dependency that
+  // poisons `globalThis.parseInt` before `require('node:http')` binds the gadget
+  // into Content-Length / chunk-size conversion and frames the body as whatever
+  // the gadget returns. url.js is eager and happened to be safe; http.js was not.
+  // Capture here once; every consumer reads the pristine binding.
+  var parseIntG = parseInt;
+  var NumberG = Number;
+  // Static predicates on Number are also writable data properties of the Number
+  // constructor. Capturing the functions (not the receiver) is enough: they do not
+  // re-read off Number at call time. Same reason parseInt is captured above.
+  var numberIsInteger = Number.isInteger;
+  var numberIsSafeInteger = Number.isSafeInteger;
 
   // brandedAs is the UNFORGEABLE replacement for `value instanceof Ctor` on a
   // hardening path. `instanceof` dispatches through `Ctor[Symbol.hasInstance]`, a
@@ -423,8 +439,9 @@
     // steers `test` even when `test` itself was captured pristine at module-eval
     // and invoked through Reflect.apply. Verified identically on node 24 and
     // bin/lava. Exporting a `Test` that looks safe and is not would be worse than
-    // exporting nothing, so the only spelling available is
-    // `RegExpPrototypeExec(re, s) !== null`.
+    // exporting nothing. The predicate form below, `RegExpMatches(re, s)`, is the
+    // spelling a validator should use; `RegExpPrototypeExec` stays exported for a
+    // caller that needs the match OBJECT rather than a yes/no.
     //
     // Reflect.apply rather than `.call`, unlike the hot wrappers above, and for a
     // security reason rather than a cost one: a validator immune to a poisoned
@@ -439,8 +456,48 @@
     // is the count, not the unit: 1-2 of these per request against a ~17 us request
     // is under 0.6%, and two interleaved HTTP A/Bs plus a mem/conn A/B came back
     // neutral-to-positive. Where the count is NOT small — 4-7 per `new URL` — the
-    // right answer was to leave RegExp behind entirely; see `allDigits` in url.js.
+    // right answer was to leave RegExp behind entirely; see `allChars` below
+    // (call sites in url.js / http.js).
     RegExpPrototypeExec: regExpExec,
+
+    // Bootstrap-captured free globals. See the capture block above the export table.
+    parseInt: parseIntG,
+    Number: NumberG,
+    NumberIsInteger: numberIsInteger,
+    NumberIsSafeInteger: numberIsSafeInteger,
+
+    // allChars(s, pred) is `/^[class]+$/` without a RegExp — true when s is non-empty
+    // and every code unit satisfies `pred`. It lives here for the reason RegExpMatches
+    // does, and because the alternative already happened: the commit that centralised
+    // RegExpMatches wrote `allDigits` privately into url.js AND http.js in the same
+    // change, and the two had diverged by the time they landed (one grew a radix-8 arm,
+    // the other inlined the hex test url.js had already factored out).
+    //
+    // A predicate, not a radix enum. The private copies branched on an integer PER
+    // CHARACTER and silently treated an unknown radix as decimal; `allChars(s, pred)`
+    // mirrors the shape of `stripChars(s, pred)` its callers already use.
+    //
+    // Empty is FALSE, matching the `+` in the patterns it replaces.
+    allChars: function (s, pred) {
+      var n = s.length;
+      if (n === 0) return false;
+      for (var i = 0; i < n; i++) {
+        if (!pred(stringCharCodeAt(s, i))) return false;
+      }
+      return true;
+    },
+
+    // The character classes those validators actually need, so a caller cannot get
+    // the boundaries subtly wrong in its own copy.
+    isAsciiDigit: function (c) {
+      return c >= 0x30 && c <= 0x39;
+    },
+    isAsciiHexDigit: function (c) {
+      return (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
+    },
+    isAsciiOctalDigit: function (c) {
+      return c >= 0x30 && c <= 0x37;
+    },
 
     // RegExpMatches is the PREDICATE form, and the only spelling a validator should
     // use. It lives here rather than in each consumer because three modules each
