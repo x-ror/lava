@@ -45,4 +45,38 @@ assert.equal(x, 10);
 assert.equal(shout('hi'), 'hi!');
 assert.equal(deflt, 'theDefault');
 
+// A clause on the line AFTER the keyword. The statement scanner treats a newline as a
+// continuation while no meaningful character has been seen yet — behavior that used to
+// fall out of `'…'.indexOf('')` returning 0 rather than -1, and is now an explicit
+// flag. Nothing exercised it, so deleting the flag changed no file in the corpus.
+// (The clause and its `from` stay on one line: a newline BETWEEN them ends the
+// statement early, which is a separate pre-existing limitation, not this flag.)
+// prettier-ignore
+import
+  lineBreakDefault from '../fixtures/esm96/dep.mjs';
+assert.equal(lineBreakDefault, 'theDefault');
+
+// The identifier alphabet: `$`, `_` and digits. No other fixture uses them, so the
+// `$`/digit arms of the code-unit predicates that replaced `[A-Za-z_$][\w$]*` were
+// unexercised — dropping either changed nothing in the corpus while breaking real code.
+export const _leading = 1,
+  $dollar = 2,
+  mixed3 = 3;
+assert.equal(_leading + $dollar + mixed3, 6);
+import { shout as _h$2 } from '../fixtures/esm96/dep.mjs';
+assert.equal(_h$2('y'), 'y!');
+
+// Non-ASCII whitespace between the declaration keyword and the name. `isSpace` keeps
+// the full ES `\s` set on purpose ("narrowing it would be a silent behavior change"),
+// and an ASCII-only version diverges here: the emitted key becomes "const".
+// prettier-ignore
+export const nbspSeparated = 'NBSP';
+assert.equal(nbspSeparated, 'NBSP');
+
+// `import.meta` inside a STRING is data, not code. The rewriter searches the mask, so
+// the blanked-out occurrence is not rewritten; searching the source instead would
+// silently corrupt this literal to '__import_meta.url'.
+export const metaText = 'import.meta.url';
+assert.equal(metaText, 'import.meta.url');
+
 console.log('ok');

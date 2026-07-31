@@ -162,6 +162,13 @@ The JS layer is substantial and high quality: `url.js` (2071 LOC, WHATWG URL),
   (`esm.js`) that rewrites ESM onto the CommonJS `require`, not by JSC's native
   module records (the classic C API only runs script-goal source). This is
   pragmatic and works, with documented divergences (named imports from CJS).
+  Its output is _executed source_, which is why it is the one internal module the
+  runtime hands `primordials` as a factory argument: it is deliberately not
+  registered as a requireable module (so user code cannot reach the transform),
+  and that also denies it a `require`, so `loader.js` exposes the already-built
+  table on the resolver object and `globals.odin` passes it in — failing closed if
+  it is absent, since a forged match group here is code injection into the module
+  body rather than a wrong answer.
 - Resolution (`module_resolution.odin`) covers file probes, directory `main`/
   `index`, and `node_modules` walking. **`package.json` `"exports"` conditional
   resolution is not yet implemented** — a real gap for modern packages.
@@ -360,7 +367,8 @@ routing a per-code-unit codec loop through it cost 1.43x — hence
 into a null-prototype array where the loop is the inner loop.
 The loader **eager-loads it first**, before any
 other internal module and before user code, so the captured references are
-pristine; modules consume it via `require('primordials')` and get the cached table.
+pristine; modules consume it via `require('primordials')` and get the cached table
+(one exception — `esm.js`, which has no `require`; see §3.4).
 This is the JS-layer analog of the native error-intrinsic capture (§4.3/§5.1).
 
 `events.js` (EventEmitter) is the first fully migrated consumer — its internal
@@ -433,8 +441,10 @@ than a counter: never `await` a caller-supplied value directly.
 `primordials` is internal-only: the loader serves it to internal factories but
 hides it from the public resolver native `require()` consults, so it neither
 shadows a user package named `primordials` nor answers `require('node:primordials')`
-(which Node rejects). Gating the other internal helper modules the same way is a
-future follow-up.
+(which Node rejects). The _specifier_ is what is hidden — the table itself also hangs
+off that resolver object as `publicReq.primordials`, which is how `esm.js` receives it
+(§3.4); the resolver is reachable only from Odin and never reaches user code. Gating
+the other internal helper modules the same way is a future follow-up.
 
 ### 5.6 [P2] Documentation & process gaps
 

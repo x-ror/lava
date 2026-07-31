@@ -195,6 +195,12 @@ Rules that keep this from becoming ceremony:
   code that can poison prototypes. `make check-primordials` is a **ratchet**: a
   hardened file (baseline 0) rejects any new pollutable call. `UPDATE=1` only to
   *lower* a baseline.
+  One exception, and do not add a second: `js/internal/esm.js` is evaluated
+  standalone and deliberately kept off the module table, so user code cannot reach
+  the transform — which also denies it a `require`. It takes the table as a factory
+  argument instead (`loader.js` publishes it on the resolver, `globals.odin` passes
+  it in and fails closed without it). The exception is affordable there because the
+  file emits executed source and had to be hardened regardless.
 - The ratchet parses with acorn and counts **four** classes, each baselined
   separately: `method` (`arr.push(x)`, and `RegExp`/`Promise`/`Function`
   prototype methods too), `invoke` (`fn.call/apply` — use `ReflectApply`),

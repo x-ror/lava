@@ -232,7 +232,10 @@
       "find": "    var src = StringG(str);\n    var n = src.length;\n    var out = '';",
       "replace": "    return StringG(str)\n      .replaceAll('-', '+')\n      .replaceAll('_', '/')\n      .replaceAll(/[^A-Za-z0-9+/]/g, '');\n    var src = StringG(str);\n    var n = src.length;\n    var out = '';",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": ["timed out", "got b64=THREW:RangeError"],
+      "expect_detail": [
+        "timed out",
+        "got b64=THREW:RangeError"
+      ],
       "timeout_ms": 30000
     },
     {
@@ -242,7 +245,10 @@
       "find": "    if (!hasSurrogate) return str;\n    var out = StringPrototypeSlice(str, 0, i);",
       "replace": "    if (!hasSurrogate) return str;\n    var SPOL = /([\\uD800-\\uDBFF])([\\uDC00-\\uDFFF])?|([\\uDC00-\\uDFFF])/g;\n    return StringPrototypeReplace(str, SPOL, function (m, h, l, lone) {\n      return lone !== undefined || l === undefined ? '\\uFFFD' : m;\n    });\n    var out = StringPrototypeSlice(str, 0, i);",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": ["timed out", "got usp=THREW:RangeError"],
+      "expect_detail": [
+        "timed out",
+        "got usp=THREW:RangeError"
+      ],
       "timeout_ms": 30000
     },
     {
@@ -271,6 +277,114 @@
       "replace": "        contentLengthRemaining = parseInt(contentLengthHeader, 10);",
       "gate": "make:test-http-smoke",
       "expect_detail": "malformed-poisoned-parseint"
+    },
+    {
+      "name": "58-esm-pollution targeted dies when the export-default name comes back through .match",
+      "why": "String.prototype.match re-reads R.exec off the receiver, so the declared name is attacker-chosen and the transform interpolates it into the emitted module body as an identifier \u2014 code injection, not a wrong answer.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "        var fn = RegExpPrototypeExec(RE_DEFAULT_FUNCTION, expr);",
+      "replace": "        var fn = expr.match(/^(?:async\\s+)?function\\b\\s*\\*?\\s*([A-Za-z_$][\\w$]*)/);",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "CODE INJECTED"
+    },
+    {
+      "name": "58-esm-pollution blunt dies when the keyword boundary test goes back to a regex",
+      "why": "A forged exec makes /[\\w$]/.test answer true for every character, so keywordAt rejects every import and export and the emitted source keeps raw module syntax JSC cannot parse.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "      if (after >= 0 && isIdentPart(after)) return null;",
+      "replace": "      if (after >= 0 && /[\\w$]/.test(String.fromCharCode(after))) return null;",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "blunt:"
+    },
+    {
+      "name": "58-esm-pollution charcodeat dies when the mask reads code units live",
+      "why": "Routing the scanner off charAt onto charCodeAt is only a fix if the read is captured: a gadget lying about quote characters makes a string body scan as code, so text the module wrote as DATA is spliced out and re-emitted.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "      var c = StringPrototypeCharCodeAt(src, i);",
+      "replace": "      var c = src.charCodeAt(i);",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "charcodeat:"
+    },
+    {
+      "name": "58-esm-pollution arrayat dies when the mask stack is read through Array.prototype.at",
+      "why": "The mode stack decides whether the scanner is inside a template literal; a forged at(-1) answering 'code' means it never enters template mode and statement-shaped template text becomes code.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "      var top = stack[stack.length - 1];",
+      "replace": "      var top = stack.at(-1);",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "arrayat:"
+    },
+    {
+      "name": "58-esm-pollution json dies when emitted literals go back through the live JSON.stringify",
+      "why": "Every string literal in the generated CommonJS \u2014 require specifiers, export keys, __filename/__dirname/import.meta.url \u2014 is produced here, so a replaced stringify writes the emitted source directly.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "    return JSONStringify(StringG(value));",
+      "replace": "    return JSON.stringify(String(value));",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "json:"
+    },
+    {
+      "name": "58-esm-pollution tail dies when the export result object inherits from Object.prototype",
+      "why": "transformExport carries an own `tail` on one of eight return shapes; without a null prototype the other seven read Object.prototype.tail and join it into the emitted source, so a data-only merge gadget is code execution in the module body.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "        return { __proto__: null, body: decl + ';' + assigns, tail: null };",
+      "replace": "        return { body: decl + ';' + assigns };",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "TAIL INJECTED"
+    },
+    {
+      "name": "58-esm-pollution join dies when the wrapper is assembled with a live Array.prototype.join",
+      "why": "The joins assemble the emitted module, so a gadget lying only for the '\\n' separator replaces the WHOLE output rather than one interpolated identifier \u2014 a strictly larger win than the export-default carrier. Mutating the capture rather than one call site keeps esm.js syntactically valid, so the gate measures the carrier and not a bootstrap parse error.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "  var ArrayPrototypeJoin = primordials.ArrayPrototypeJoin;",
+      "replace": "  var ArrayPrototypeJoin = function (a, s) {\n    return a.join(s);\n  };",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "join:"
+    },
+    {
+      "name": "58-esm-pollution strglobal dies when the source coercion reads the live String global",
+      "why": "transform() coerces its `source` argument with String(); the existing json entry reverts JSONStringify and StringG on one line, so the String capture on this line was never proven on its own.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "    source = StringG(source);",
+      "replace": "    source = String(source);",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "strglobal:"
+    },
+    {
+      "name": "29-esm-transform-edge dies when findStmtEnd drops the seenMeaningful flag",
+      "why": "The old code got this from `'+-*/%=<>&|^,.?:('.indexOf('')` returning 0, so a newline before any meaningful character continued the statement; without the flag an import whose clause starts on the next line ends early and reports an unsupported form.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "          if (!seenMeaningful || isContinuation(lastMeaningful)) continue;",
+      "replace": "          if (isContinuation(lastMeaningful)) continue;",
+      "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
+      "expect_detail": "unsupported import form"
+    },
+    {
+      "name": "29-esm-transform-edge dies when import.meta is rewritten by searching the source, not the mask",
+      "why": "The mask blanks strings and comments, so searching it leaves an `import.meta` written inside a string literal alone; searching the source rewrites it to __import_meta and silently corrupts module data.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "    var at = StringPrototypeIndexOf(mask, IMPORT_META);",
+      "replace": "    var at = StringPrototypeIndexOf(src, IMPORT_META);",
+      "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
+      "expect_detail": "Unexpected keyword 'export'"
+    },
+    {
+      "name": "29-esm-transform-edge dies when isSpace narrows to ASCII",
+      "why": "The `\\s*` strips these helpers replace accept the full ES whitespace set; narrowing to ASCII makes `export const<NBSP>name` emit the key \"const\", which is a silent behavior change the comment explicitly warns against.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "      c === 0xa0 ||",
+      "replace": "      false ||",
+      "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
+      "expect_detail": "Unexpected keyword 'const'"
+    },
+    {
+      "name": "29-esm-transform-edge dies when the identifier class drops `$`",
+      "why": "No other fixture uses `$`, `_` or digits in a binding name, so the `$` arm of the code-unit predicate that replaced [A-Za-z_$] was unexercised and could be dropped without any test noticing.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "    return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f || c === 0x24;",
+      "replace": "    return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f;",
+      "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
+      "expect_detail": "unsupported export declaration: $dollar"
     }
   ]
 }

@@ -72,7 +72,15 @@
   //      (a transitive dep of node-fetch), so answering require('encoding') from
   //      here would shadow it and break the ecosystem. Hiding the specifier leaves
   //      the globals intact while letting the filesystem resolver find the package.
+  // `__proto__: null` because this literal is indexed by a CALLER-SUPPLIED specifier
+  // (`INTERNAL_ONLY[normalize(name)]` below) — §5's one vector the ratchet cannot
+  // count. Inherited truthiness makes publicReq answer `undefined` for a real builtin,
+  // so `require('node:http')` falls through to filesystem resolution: a denial, or a
+  // shadow when an npm package of that name is installed (`os`, `path`, `url`, `util`
+  // and `events` all exist on the registry). The sibling lookup at `factories` above
+  // already guards this with hasOwn; this table was missed.
   var INTERNAL_ONLY = {
+    __proto__: null,
     primordials: true,
     parse_args: true,
     parse_env: true,
@@ -86,6 +94,22 @@
     if (INTERNAL_ONLY[normalize(name)]) return undefined;
     return req(name);
   }
+
+  // The ESM source transform is the one internal module that cannot
+  // require('primordials'): the runtime evaluates js/internal/esm.js standalone and
+  // keeps the resulting function on Runtime_State, deliberately NOT registering it
+  // as a requireable module (see globals.odin), so it never gets a `require`. It
+  // still needs the pristine table — it emits executed source, so a live intrinsic
+  // there is code injection, not a wrong answer.
+  //
+  // Hand the ALREADY-INSTANTIATED table out here rather than letting the runtime
+  // evaluate primordials a second time, which would capture a parallel set and quietly
+  // split the "captured once, before user code" guarantee in two.
+  //
+  // This is not a new user-visible surface: the resolver object never reaches user
+  // code. What user code calls is the native require callback, which consults this
+  // function through Runtime_State.builtin_require and returns only module exports.
+  publicReq.primordials = req('primordials');
 
   return publicReq;
 });
