@@ -20,9 +20,9 @@
 //   * the gate must be GREEN before mutating, or "it went red" proves nothing
 //   * red must be red for the RECORDED reason (expect_detail), or the mutation is
 //     not pinning what it names
-//   * sources are restored on every exit path — normal, thrown, process.exit, and
-//     SIGINT/SIGTERM/SIGHUP — and bin/lava is rebuilt whenever anything could have
-//     built it from patched source
+//   * sources are restored from the process `exit` listener (default SIGINT/SIGTERM
+//     still fire exit; SIGKILL does not) and bin/lava is rebuilt in `finally` when
+//     a mutation dirtied the binary
 // A runner that skipped the green baseline would report success for a gate that was
 // already broken, which is the same class of defect it exists to catch. That is not
 // hypothetical for this file: every rule above replaced a version that looked right
@@ -37,17 +37,24 @@
 //                                  real socket (the *-smoke targets) or a
 //                                  multi-step harness. RED = non-zero exit.
 //
-// `expect_detail` (REQUIRED): a substring the RED output must contain.
-// Going red is not enough — a mutation can break something unrelated and look like
-// it worked. That happened while seeding this manifest: a mis-escaped `\\d` in a
-// replacement produced the regex /^\\d+$/, which matches a literal backslash, so
-// EVERY request 400'd and the parity phase failed. The gate reported "killed" and
-// the smuggling phase it was supposed to pin never ran.
+// `expect_detail` (REQUIRED): a substring the RED output must contain, OR an
+// array of alternatives (any one match counts). Going red is not enough — a
+// mutation can break something unrelated and look like it worked. That happened
+// while seeding this manifest: a mis-escaped `\\d` in a replacement produced the
+// regex /^\\d+$/, which matches a literal backslash, so EVERY request 400'd and
+// the parity phase failed. The gate reported "killed" and the smuggling phase it
+// was supposed to pin never ran.
+//
+// Hang pins may fail as a timeout OR as a RangeError from runaway string growth
+// under a forged exec, depending on the runner — both prove the reintroduced
+// global replace is wrong; the array form records that.
 //
 // Usage:
 //   node scripts/run-mutations.mjs                 # all
 //   node scripts/run-mutations.mjs --filter=clone  # substring match on `name`
 //   node scripts/run-mutations.mjs --list
+//   MUTATION_TIMEOUT_MS=N                          # default per-gate bound (default 120000)
+//   manifest timeout_ms                            # per-entry override (hang pins use 30000)
 
 import { readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -100,15 +107,37 @@ if (!Array.isArray(manifest.mutations) || manifest.mutations.length === 0) {
 // added without it silently reverted to "any red counts" — the exact behaviour
 // 82d8a0e exists to remove. An entry that genuinely cannot name its failure text
 // should say so with an explicit empty-string opt-out, so the choice is visible in
-// the manifest rather than inferred from an absent key.
+// the manifest rather than inferred from an absent key. A non-empty string[] is
+// also allowed: any alternative may match (hang pins that sometimes timeout and
+// sometimes throw RangeError under forged exec).
 const REQUIRED = ['name', 'why', 'source', 'find', 'replace', 'gate', 'expect_detail'];
+function isValidExpectDetail(v) {
+  if (typeof v === 'string') return true;
+  if (!Array.isArray(v) || v.length === 0) return false;
+  return v.every((s) => typeof s === 'string' && s !== '');
+}
+function expectDetailMatches(expect, detail) {
+  if (expect === '') return true;
+  if (typeof expect === 'string') return detail.includes(expect);
+  return expect.some((s) => detail.includes(s));
+}
+function formatExpectDetail(expect) {
+  if (typeof expect === 'string') return expect;
+  return expect.join(' | ');
+}
 for (const [i, m] of manifest.mutations.entries()) {
   for (const field of REQUIRED) {
     // Two fields may legitimately be empty. `expect_detail: ''` is a deliberate,
     // visible opt-out. `replace: ''` is a DELETION — the canonical mutation for a
     // guard clause, and the shape the two format-guard entries need; rejecting it
     // forced a fake non-empty replacement that no longer described the break.
-    const mayBeEmpty = field === 'expect_detail' || field === 'replace';
+    if (field === 'expect_detail') {
+      if (!isValidExpectDetail(m.expect_detail)) {
+        die(`mutation #${i} is missing "expect_detail"`);
+      }
+      continue;
+    }
+    const mayBeEmpty = field === 'replace';
     if (typeof m[field] !== 'string' || (m[field] === '' && !mayBeEmpty)) {
       die(`mutation #${i} is missing "${field}"`);
     }
@@ -158,29 +187,51 @@ function runGate(gate) {
 // about memory. `set_fail_timeout` is NOT the fix: Odin implements terminate as
 // pthread_cancel, which in deferred mode never fires inside a JIT allocation loop,
 // and would unwind a thread holding JSC and malloc locks if it did.
+//
+// Default 120s so make:test-http-smoke (~40s both backends) still baselines green.
+// Hang pins set `timeout_ms: 30000` in the manifest — the spin is immediate under
+// forged exec, and three 120s hangs were burning CI budget and killing the job
+// mid-suite. MUTATION_TIMEOUT_MS overrides the default only (not per-entry).
 const GATE_TIMEOUT_MS = Number(process.env.MUTATION_TIMEOUT_MS ?? 120_000);
+let activeTimeoutMs = GATE_TIMEOUT_MS;
+
+function entryTimeoutMs(m) {
+  if (m && typeof m.timeout_ms === 'number' && m.timeout_ms > 0) return m.timeout_ms;
+  return GATE_TIMEOUT_MS;
+}
+
+function withTimeout(ms, fn) {
+  const prev = activeTimeoutMs;
+  activeTimeoutMs = ms;
+  try {
+    return fn();
+  } finally {
+    activeTimeoutMs = prev;
+  }
+}
 
 function capture(bin, argv, opts = {}) {
   const env = { ...(opts.env ?? process.env) };
   delete env.NODE_TEST_CONTEXT;
+  const timeout = opts.timeout ?? activeTimeoutMs;
   const r = spawnSync(bin, argv, {
-    timeout: GATE_TIMEOUT_MS,
     killSignal: 'SIGKILL',
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
     ...opts,
+    timeout,
     env,
   });
   if (r.error) {
     const timedOut = r.error.code === 'ETIMEDOUT' || r.signal === 'SIGKILL';
-    const note = timedOut ? `gate timed out after ${GATE_TIMEOUT_MS}ms` : String(r.error.message);
+    const note = timedOut ? `gate timed out after ${timeout}ms` : String(r.error.message);
     return { status: -1, stdout: r.stdout ?? '', stderr: note, timedOut };
   }
   if (r.signal === 'SIGKILL') {
     return {
       status: -1,
       stdout: r.stdout ?? '',
-      stderr: `gate timed out after ${GATE_TIMEOUT_MS}ms`,
+      stderr: `gate timed out after ${timeout}ms`,
       timedOut: true,
     };
   }
@@ -467,20 +518,22 @@ try {
     }
     try {
       if (m.rebuild || m.gate.startsWith('compat:')) build();
-      const r = runGate(m.gate);
+      const r = withTimeout(entryTimeoutMs(m), () => runGate(m.gate));
       if (r.ok) {
         failures++;
         console.log('SURVIVED');
         console.log(`           the gate still passes with this code broken.`);
         console.log(`           expected to catch: ${m.why}`);
         console.log(`           gate: ${m.gate}`);
-      } else if (m.expect_detail && !r.detail.includes(m.expect_detail)) {
+      } else if (m.expect_detail && !expectDetailMatches(m.expect_detail, r.detail)) {
         // Red, but not for the recorded reason — so this mutation is not pinning
         // what it claims to. Treated as a failure, because a mutation that breaks
         // something unrelated proves nothing about the test it names.
         failures++;
         console.log('WRONG REASON');
-        console.log(`           expected the failure to mention: ${m.expect_detail}`);
+        console.log(
+          `           expected the failure to mention: ${formatExpectDetail(m.expect_detail)}`,
+        );
         console.log(`           got: ${r.detail.split('\n')[0]}`);
       } else {
         console.log(`killed (${r.detail.split('\n')[0]})`);

@@ -150,6 +150,11 @@ lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed-poisoned-test 
 # into response splitting from a REMOTE request line — while phases 2a and 2b
 # passed throughout. node rejects the same request with ERR_INVALID_CHAR.
 lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed-poisoned-charcodeat "HTTP_POISON_REGEXP=charcodeat"
+# Phase 2d — conversion beside the validator. A sound digit check next to a live
+# globalThis.parseInt still desyncs Content-Length framing when the conversion
+# returns a gadget value. Applied before require('node:http') so a factory-time
+# capture would bind the poison; the fix is bootstrap capture on primordials.
+lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed-poisoned-parseint "HTTP_POISON_REGEXP=parseint"
 # Phase 3 — keep-alive: connection reuse, pipelining, Connection: close, HTTP/1.0.
 lava_assert "$ROOT_DIR/tests/runtime/http/keepalive.js" keepalive
 # Phase 4 — timeouts / slowloris: idle, slow-head, slow-body evicted; fast client OK.

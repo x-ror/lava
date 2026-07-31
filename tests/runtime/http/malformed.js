@@ -51,6 +51,25 @@ function check(name, cond, detail) {
   check('injection-rejected-500', statusOf(r) === 500, r.slice(0, 40));
   check('injection-no-split-header', !/Injected:/i.test(r));
 
+  // 1b. CRLF in a header NAME (isHttpToken), not only the value path.
+  // Under HTTP_POISON_REGEXP=charcodeat a live charCodeAt would accept the name and
+  // write real CR/LF onto the response head.
+  r = await raw('GET /set-name/a%0d%0aInjected HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+  check('injection-name-rejected-500', statusOf(r) === 500, r.slice(0, 40));
+  check('injection-name-no-split', !/Injected:/i.test(r));
+
+  // 1c. Content-Length conversion must use the real digit value, not a poisoned
+  // parseInt. Body is exactly 3 bytes; a gadget returning 7 would either hang
+  // waiting for 4 more or, with a pipelined second request, swallow it as body.
+  // Under HTTP_POISON_REGEXP=parseint this is the conversion pin; unpoisoned it is
+  // just a framing sanity check.
+  r = await raw('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc');
+  check(
+    'content-length-framing-3',
+    statusOf(r) === 200 && /L=3 B=abc\b/.test(r),
+    bodyOf(r).slice(0, 60),
+  );
+
   // 2. Content-Length + Transfer-Encoding together (CL.TE smuggling desync) -> 400.
   r = await raw(
     'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nhello',

@@ -80,10 +80,10 @@
       // as sound as the primitive it scans with — routing this file's validators
       // off RegExp said nothing about that. A gadget reporting 0x41 for CR and LF
       // is enough: measured, node rejects and Lava accepted
-      // `a\r\nInjected: yes` as a header value, and the same gadget turned
-      // `res.setHeader('Location', decodeURIComponent(req.url))` into a split
-      // response driven by a remote request line. Pinned by the charcodeat phase
-      // in run-http-smoke.sh.
+      // `a\r\nInjected: yes` as a header value. Pinned by `cc-value=` in
+      // cmd/lava/regexp_pollution_test.odin (and the fetch.js mutation-manifest
+      // entry). The same gadget on the HTTP response path is pinned by the
+      // charcodeat phase of run-http-smoke.sh against http.js.
       var code = StringPrototypeCharCodeAt(value, i);
       if (code === 0 || code === 10 || code === 13) {
         throw new TypeError('Invalid header value for "' + name + '": "' + value + '"');

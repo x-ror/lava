@@ -76,12 +76,12 @@
   var ArrayFrom = P.ArrayFrom;
   // Free globals / statics, captured pristine at module-eval.
   var StringG = String;
-  var NumberG = Number;
+  var NumberG = P.Number;
   var StringFromCharCode = String.fromCharCode;
   var StringFromCodePoint = String.fromCodePoint;
   var MathFloor = Math.floor;
   var MathPow = Math.pow;
-  var parseIntG = parseInt;
+  var parseIntG = P.parseInt;
   var decodeURIComponentG = decodeURIComponent;
   var isFiniteG = isFinite;
   var TextEncoderG = TextEncoder;
@@ -114,10 +114,6 @@
   // ------------------------------------------------------------------ //
   // Percent-encoding                                                    //
   // ------------------------------------------------------------------ //
-
-  function isHexDigit(c) {
-    return (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
-  }
 
   // stripChars: `replace(/[…]/g, '')` without a RegExp.
   //
@@ -279,8 +275,8 @@
       if (
         c === 0x25 &&
         i + 2 < str.length &&
-        isHexDigit(StringPrototypeCharCodeAt(str, i + 1)) &&
-        isHexDigit(StringPrototypeCharCodeAt(str, i + 2))
+        isAsciiHexDigit(StringPrototypeCharCodeAt(str, i + 1)) &&
+        isAsciiHexDigit(StringPrototypeCharCodeAt(str, i + 2))
       ) {
         ArrayPrototypePush(bytes, parseIntG(StringPrototypeSubstr(str, i + 1, 2), 16));
         i += 2;
@@ -624,7 +620,7 @@
       }
       var value = 0;
       var length = 0;
-      while (length < 4 && isHexDigit(c())) {
+      while (length < 4 && isAsciiHexDigit(c())) {
         value = value * 16 + parseIntG(StringFromCharCode(c()), 16);
         pointer++;
         length++;
@@ -895,11 +891,8 @@
   function isASCIIAlpha(cp) {
     return (cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a);
   }
-  function isASCIIDigit(cp) {
-    return cp >= 0x30 && cp <= 0x39;
-  }
   function isASCIIAlphanumeric(cp) {
-    return isASCIIAlpha(cp) || isASCIIDigit(cp);
+    return isASCIIAlpha(cp) || isAsciiDigit(cp);
   }
   function isSingleDot(seg) {
     return seg === '.' || StringPrototypeToLowerCase(seg) === '%2e';
@@ -1210,7 +1203,7 @@
           break;
 
         case PORT:
-          if (isASCIIDigit(c)) {
+          if (isAsciiDigit(c)) {
             buffer += StringFromCharCode(c);
           } else if (
             c === -1 ||

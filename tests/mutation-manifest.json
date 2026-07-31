@@ -138,7 +138,7 @@
       "name": "the runner's own tests die when WRONG REASON stops being enforced",
       "why": "This branch IS 82d8a0e. Without it a mutation that breaks something unrelated is reported as killed, which is how a mis-escaped replacement once looked like it worked.",
       "source": "scripts/run-mutations.mjs",
-      "find": "      } else if (m.expect_detail && !r.detail.includes(m.expect_detail)) {",
+      "find": "      } else if (m.expect_detail && !expectDetailMatches(m.expect_detail, r.detail)) {",
       "replace": "      } else if (false) {",
       "gate": "node-test:scripts/run-mutations.test.mjs",
       "expect_detail": "WRONG REASON"
@@ -195,7 +195,8 @@
       "find": "    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
       "replace": "    if (/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g.test(value)) value = value.replace(/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g, '');\n    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": "timed out"
+      "expect_detail": "timed out",
+      "timeout_ms": 30000
     },
     {
       "name": "57-format-single-arg dies when util.js drops the single-argument guard",
@@ -226,21 +227,23 @@
     },
     {
       "name": "the Lava-only test dies when normalizeBase64 goes back to a global replace",
-      "why": "A global replace under a forged exec never terminates. Buffer.from(x,'base64') is the Basic-auth/JWT path, so one unauthenticated request with an Authorization header wedged the event loop for good. The observable effect of this mutation IS the hang, so the recorded reason is the timeout verdict rather than a message: a spin produces no error text. The three spin entries share that detail by construction and are discriminated by `source`/`find` \u2014 each is applied on its own run, so the file named in the entry is the one that hung.",
+      "why": "A global replace under a forged exec never terminates (or, on some runners, blows up as RangeError from runaway string growth). Buffer.from(x,'base64') is the Basic-auth/JWT path. Either RED detail proves the reintroduced global replace; hang vs throw is runner-dependent, so expect_detail is an alternatives list.",
       "source": "pkg/runtime/js/internal/buffer.js",
       "find": "    var src = StringG(str);\n    var n = src.length;\n    var out = '';",
       "replace": "    return StringG(str)\n      .replaceAll('-', '+')\n      .replaceAll('_', '/')\n      .replaceAll(/[^A-Za-z0-9+/]/g, '');\n    var src = StringG(str);\n    var n = src.length;\n    var out = '';",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": "timed out"
+      "expect_detail": ["timed out", "got b64=THREW:RangeError"],
+      "timeout_ms": 30000
     },
     {
       "name": "the Lava-only test dies when toUSVString goes back to the global regex",
-      "why": "The surrogate pre-scan is not a guard against this: a VALID pair \u2014 any emoji in a remote query \u2014 sets hasSurrogate too, and the global replace then spins. new URLSearchParams(remoteQuery) is on the network path. The observable effect of this mutation IS the hang, so the recorded reason is the timeout verdict rather than a message: a spin produces no error text. The three spin entries share that detail by construction and are discriminated by `source`/`find` \u2014 each is applied on its own run, so the file named in the entry is the one that hung.",
+      "why": "The surrogate pre-scan is not a guard against this: a VALID pair \u2014 any emoji in a remote query \u2014 sets hasSurrogate too, and the global replace then spins (or throws RangeError from runaway growth). new URLSearchParams(remoteQuery) is on the network path. Hang vs throw is runner-dependent; expect_detail lists both.",
       "source": "pkg/runtime/js/internal/url.js",
       "find": "    if (!hasSurrogate) return str;\n    var out = StringPrototypeSlice(str, 0, i);",
       "replace": "    if (!hasSurrogate) return str;\n    var SPOL = /([\\uD800-\\uDBFF])([\\uDC00-\\uDFFF])?|([\\uDC00-\\uDFFF])/g;\n    return StringPrototypeReplace(str, SPOL, function (m, h, l, lone) {\n      return lone !== undefined || l === undefined ? '\\uFFFD' : m;\n    });\n    var out = StringPrototypeSlice(str, 0, i);",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": "timed out"
+      "expect_detail": ["timed out", "got usp=THREW:RangeError"],
+      "timeout_ms": 30000
     },
     {
       "name": "the poisoned http-smoke phases die when the header-char scan reads charCodeAt live",
@@ -250,6 +253,24 @@
       "replace": "      var code = value.charCodeAt(i);\n      if (code === 9 || (code >= 0x20 && code <= 0x7e) || (code >= 0x80 && code <= 0xff)) {",
       "gate": "make:test-http-smoke",
       "expect_detail": "malformed-poisoned-charcodeat"
+    },
+    {
+      "name": "the poisoned http-smoke phases die when isHttpToken reads charCodeAt live",
+      "why": "isHttpToken guards header NAMES. Live, a CR/LF-lying gadget accepts a name that still carries real CR/LF on the wire. The value-path mutation does not cover this site.",
+      "source": "pkg/runtime/js/internal/http.js",
+      "find": "      var code = StringPrototypeCharCodeAt(value, i);\n      if (code >= 128 || !HTTP_TCHAR[code]) return false;",
+      "replace": "      var code = value.charCodeAt(i);\n      if (code >= 128 || !HTTP_TCHAR[code]) return false;",
+      "gate": "make:test-http-smoke",
+      "expect_detail": "malformed-poisoned-charcodeat"
+    },
+    {
+      "name": "the poisoned http-smoke phases die when Content-Length conversion reads live parseInt",
+      "why": "A sound allChars digit check next to live parseInt still desyncs framing: contentLengthRemaining becomes the gadget value. Poison-before-require is the realistic order; bootstrap capture on primordials is the fix. The Odin pi= pin covers the eager URL port path; this entry covers the lazy http framing path.",
+      "source": "pkg/runtime/js/internal/http.js",
+      "find": "        contentLengthRemaining = parseIntG(contentLengthHeader, 10);",
+      "replace": "        contentLengthRemaining = parseInt(contentLengthHeader, 10);",
+      "gate": "make:test-http-smoke",
+      "expect_detail": "malformed-poisoned-parseint"
     }
   ]
 }

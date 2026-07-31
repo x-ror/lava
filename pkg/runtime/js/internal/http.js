@@ -46,13 +46,17 @@
   // driven by a REMOTE request line, while the exec and test poison phases passed
   // throughout because they never touch this carrier.
   var StringPrototypeCharCodeAt = primordials.StringPrototypeCharCodeAt;
-  // Captured at module-eval, as url.js already does. Hardening the VALIDATOR and
-  // leaving the CONVERSION beside it live closes nothing: with `globalThis.parseInt`
+  // Bootstrap-captured free globals from primordials — NOT `parseInt` at this
+  // factory's own eval. This module is lazy; a free `var parseIntG = parseInt`
+  // here binds whatever `globalThis.parseInt` is when the first `require('http')`
+  // runs, which is after a dependency can already have replaced it. Hardening the
+  // VALIDATOR and leaving the CONVERSION live closes nothing: with parseInt
   // replaced, the digit check still answers correctly and `contentLengthRemaining`
   // becomes whatever the gadget returns, so a crafted request's pipelined bytes are
   // framed as a second request. Measured as a desync against the real server.
-  var parseIntG = parseInt;
-  var NumberG = Number;
+  // Pinned by the parseint http-smoke phase and the parseIntG mutation entry.
+  var parseIntG = primordials.parseInt;
+  var NumberG = primordials.Number;
 
   // Hoisted so the literals are not re-created per request, and so every framing
   // pattern is visible in one place rather than inline at four call sites.

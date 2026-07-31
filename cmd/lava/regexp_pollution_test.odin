@@ -123,6 +123,11 @@ results.push(
 
 // --- the THIRD carrier: a replaced global used for CONVERSION -------------
 // A validator can be unpoisonable while the conversion beside it is not.
+// parseInt is captured on primordials at bootstrap (before this script runs), so
+// a post-load poison must not steer URL port / framing conversion. Buffer.from
+// base64 never called parseInt — the previous pin was decorative. Port parse is
+// a real consumer of the captured binding (url.js is eager; http.js is lazy and
+// is pinned by the parseint http-smoke phase instead).
 const realParseInt = globalThis.parseInt;
 results.push(
   'pi=' +
@@ -132,7 +137,7 @@ results.push(
       };
       let out;
       try {
-        out = String(Buffer.from('AAAA', 'base64').length);
+        out = new URL('http://h:8080/').port;
       } catch (e) {
         out = 'THREW:' + e.name;
       } finally {
@@ -153,7 +158,7 @@ const want = [
   'tab=http://example.com/x',
   'upper=http://example.com/',
   'cc-value=THREW:TypeError',
-  'pi=3',
+  'pi=8080',
   'b64=user:pass',
   'usp=1',
 ];

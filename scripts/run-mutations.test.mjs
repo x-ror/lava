@@ -391,6 +391,42 @@ test('a gate that hangs is RED with a timeout verdict, not a hang', () => {
   );
 });
 
+test('expect_detail as an array accepts any alternative', () => {
+  // Hang pins fail as timeout on some runners and RangeError on others; the
+  // manifest records both with a string[]. Any one match is a kill.
+  withTree(
+    [
+      entry({
+        replace: "export const VALUE = 'broken';",
+        expect_detail: ['NO-MATCH-A', 'THE-RECORDED-REASON', 'NO-MATCH-B'],
+      }),
+    ],
+    {},
+    (dir) => {
+      const { status, out } = run(dir);
+      assert.equal(status, 0, out);
+      assert.match(out, /killed/);
+    },
+  );
+});
+
+test('expect_detail as an array rejects when none match', () => {
+  withTree(
+    [
+      entry({
+        replace: "export const VALUE = 'broken';",
+        expect_detail: ['NO-MATCH-A', 'NO-MATCH-B'],
+      }),
+    ],
+    {},
+    (dir) => {
+      const { status, out } = run(dir);
+      assert.equal(status, 1, out);
+      assert.match(out, /WRONG REASON/);
+    },
+  );
+});
+
 test('--list reports without patching anything', () => {
   withTree([entry()], {}, (dir) => {
     const { status, out } = run(dir, ['--list']);

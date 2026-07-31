@@ -119,6 +119,16 @@
   var regExpExec = safeCaller1(RegExp.prototype.exec);
   var stringCharCodeAt = caller1(StringProto.charCodeAt);
 
+  // Free globals captured at primordials module-eval — the loader runs this before
+  // user code. A lazy consumer that writes `var parseIntG = parseInt` at ITS own
+  // factory time is not the same: http.js is not eager, so a dependency that
+  // poisons `globalThis.parseInt` before `require('node:http')` binds the gadget
+  // into Content-Length / chunk-size conversion and frames the body as whatever
+  // the gadget returns. url.js is eager and happened to be safe; http.js was not.
+  // Capture here once; every consumer reads the pristine binding.
+  var parseIntG = parseInt;
+  var NumberG = Number;
+
   // brandedAs is the UNFORGEABLE replacement for `value instanceof Ctor` on a
   // hardening path. `instanceof` dispatches through `Ctor[Symbol.hasInstance]`, a
   // configurable own property of the constructor, so a caller can flip the answer
@@ -441,8 +451,13 @@
     // is the count, not the unit: 1-2 of these per request against a ~17 us request
     // is under 0.6%, and two interleaved HTTP A/Bs plus a mem/conn A/B came back
     // neutral-to-positive. Where the count is NOT small — 4-7 per `new URL` — the
-    // right answer was to leave RegExp behind entirely; see `allDigits` in url.js.
+    // right answer was to leave RegExp behind entirely; see `allChars` below
+    // (call sites in url.js / http.js).
     RegExpPrototypeExec: regExpExec,
+
+    // Bootstrap-captured free globals. See the capture block above the export table.
+    parseInt: parseIntG,
+    Number: NumberG,
 
     // allChars(s, pred) is `/^[class]+$/` without a RegExp — true when s is non-empty
     // and every code unit satisfies `pred`. It lives here for the reason RegExpMatches

@@ -28,9 +28,15 @@
 // The gadget is deliberately NARROW: it reports 0x41 for CR, LF and NUL and the
 // true value for everything else. A blanket liar would break the server's own
 // parsing and the phase would fail for an unrelated reason.
+//
+// `parseint` is a FOURTH direction: a sound digit check next to a live
+// `globalThis.parseInt` still desyncs Content-Length / chunk framing when the
+// conversion returns a gadget value. Applied before `require('node:http')` so a
+// factory-time `var parseIntG = parseInt` would bind the gadget (the bug); the
+// fix captures parseInt on primordials at bootstrap instead.
 const POISON = process.env.HTTP_POISON_REGEXP;
 if (POISON) {
-  const VALID = new Set(['exec', 'test', 'charcodeat', 'both']);
+  const VALID = new Set(['exec', 'test', 'charcodeat', 'parseint', 'both']);
   if (!VALID.has(POISON)) {
     // A typo must fail loud rather than silently poisoning a direction nobody
     // asked for — the same rule the primordials ratchet applies to its markers.
@@ -57,6 +63,11 @@ if (POISON) {
       return c === 13 || c === 10 || c === 0 ? 0x41 : c;
     };
   }
+  if (POISON === 'parseint') {
+    globalThis.parseInt = function () {
+      return 7;
+    };
+  }
 }
 
 const http = require('node:http');
@@ -76,6 +87,20 @@ const server = http.createServer(opts, (req, res) => {
       res.setHeader('Location', decodeURIComponent(req.url));
       res.writeHead(302);
       res.end('r');
+    } catch (e) {
+      res.writeHead(500);
+      res.end('REJECTED ' + e.code);
+    }
+    return;
+  }
+  // /set-name/<token> reflects the (decoded) path into a header NAME — the isHttpToken
+  // sink. Under HTTP_POISON_REGEXP=charcodeat a live charCodeAt turns CR/LF into 0x41,
+  // so the token check accepts a name that still carries real CR/LF on the wire.
+  if (req.url.indexOf('/set-name/') === 0) {
+    try {
+      res.setHeader(decodeURIComponent(req.url.slice('/set-name/'.length)), 'v');
+      res.writeHead(200);
+      res.end('named');
     } catch (e) {
       res.writeHead(500);
       res.end('REJECTED ' + e.code);
