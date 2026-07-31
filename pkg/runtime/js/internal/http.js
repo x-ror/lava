@@ -57,6 +57,8 @@
   // Pinned by the parseint http-smoke phase and the parseIntG mutation entry.
   var parseIntG = primordials.parseInt;
   var NumberG = primordials.Number;
+  var NumberIsInteger = primordials.NumberIsInteger;
+  var NumberIsSafeInteger = primordials.NumberIsSafeInteger;
 
   // Hoisted so the literals are not re-created per request, and so every framing
   // pattern is visible in one place rather than inline at four call sites.
@@ -187,7 +189,7 @@
    */
   function validateStatusCode(statusCode) {
     var code = NumberG(statusCode);
-    if (!Number.isInteger(code) || code < 100 || code > 999) {
+    if (!NumberIsInteger(code) || code < 100 || code > 999) {
       var err = new RangeError('Invalid status code: ' + JSON.stringify(statusCode));
       err.code = 'ERR_HTTP_INVALID_STATUS_CODE';
       throw err;
@@ -281,7 +283,7 @@
           if (extensionSep >= 0 && !reTest(CHUNK_EXT_RE, sizeLine.slice(extensionSep)))
             return fail();
           var chunkSize = parseIntG(sizeToken, 16);
-          if (!Number.isSafeInteger(chunkSize) || chunkSize < 0) return fail();
+          if (!NumberIsSafeInteger(chunkSize) || chunkSize < 0) return fail();
           buffer = buffer.slice(lineEnd + 2);
           if (chunkSize === 0) state = 'trailer';
           else {

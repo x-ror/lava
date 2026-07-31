@@ -71,9 +71,19 @@ const argOf = (name) => {
 // throwaway fixture tree. They were hardcoded, which meant the only way to test
 // the gate was to write the real manifest — i.e. the gate that exists to catch
 // untested assertions could not itself be tested. See run-mutations.test.mjs.
-const ROOT = resolve(
+//
+// realpath once up front so containment checks and missing-source fallbacks
+// compare against the same canonical root (a lexical ROOT + realpath'd source
+// can disagree when the repo itself is reached through a symlink).
+const ROOT_LEXICAL = resolve(
   process.env.MUTATION_ROOT ?? argOf('root') ?? join(dirname(fileURLToPath(import.meta.url)), '..'),
 );
+let ROOT;
+try {
+  ROOT = realpathSync(ROOT_LEXICAL);
+} catch {
+  ROOT = ROOT_LEXICAL;
+}
 const MANIFEST = resolve(
   process.env.MUTATION_MANIFEST ??
     argOf('manifest') ??
@@ -192,7 +202,15 @@ function runGate(gate) {
 // Hang pins set `timeout_ms: 30000` in the manifest — the spin is immediate under
 // forged exec, and three 120s hangs were burning CI budget and killing the job
 // mid-suite. MUTATION_TIMEOUT_MS overrides the default only (not per-entry).
-const GATE_TIMEOUT_MS = Number(process.env.MUTATION_TIMEOUT_MS ?? 120_000);
+// Empty / non-numeric / non-positive env values fall back rather than producing
+// NaN or 0, which Node treats as "no timeout" / immediate kill respectively.
+function positiveIntMs(raw, fallback) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return fallback;
+  return n;
+}
+const GATE_TIMEOUT_MS = positiveIntMs(process.env.MUTATION_TIMEOUT_MS, 120_000);
 let activeTimeoutMs = GATE_TIMEOUT_MS;
 
 function entryTimeoutMs(m) {
@@ -214,20 +232,35 @@ function capture(bin, argv, opts = {}) {
   const env = { ...(opts.env ?? process.env) };
   delete env.NODE_TEST_CONTEXT;
   const timeout = opts.timeout ?? activeTimeoutMs;
+  // detached: on POSIX the child is a new process-group leader. spawnSync's own
+  // timeout only SIGKILLs that one PID; node --test workers (isolation=process)
+  // stay in the group and would otherwise orphan a for(;;){} spin. After a
+  // timeout we also kill the whole group via process.kill(-pid).
   const r = spawnSync(bin, argv, {
-    killSignal: 'SIGKILL',
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
-    ...opts,
-    timeout,
+    cwd: opts.cwd,
     env,
+    killSignal: 'SIGKILL',
+    timeout,
+    detached: process.platform !== 'win32',
   });
-  if (r.error) {
-    const timedOut = r.error.code === 'ETIMEDOUT' || r.signal === 'SIGKILL';
-    const note = timedOut ? `gate timed out after ${timeout}ms` : String(r.error.message);
-    return { status: -1, stdout: r.stdout ?? '', stderr: note, timedOut };
+
+  const wasTimeout =
+    (r.error && (r.error.code === 'ETIMEDOUT' || r.signal === 'SIGKILL')) || r.signal === 'SIGKILL';
+  if (wasTimeout && r.pid && process.platform !== 'win32') {
+    try {
+      process.kill(-r.pid, 'SIGKILL');
+    } catch {
+      // group already gone
+    }
   }
-  if (r.signal === 'SIGKILL') {
+
+  if (r.error) {
+    const note = wasTimeout ? `gate timed out after ${timeout}ms` : String(r.error.message);
+    return { status: -1, stdout: r.stdout ?? '', stderr: note, timedOut: wasTimeout };
+  }
+  if (wasTimeout) {
     return {
       status: -1,
       stdout: r.stdout ?? '',
@@ -241,7 +274,13 @@ function capture(bin, argv, opts = {}) {
 function gateCompat(relPath) {
   const file = join(ROOT, relPath);
   const n = capture(NODE_BIN, [file]);
+  // A timed-out arm is RED for the timeout, not for a partial stdout diff that
+  // can accidentally look identical (both empty) and report ok: true.
+  const nTo = timedOut(n);
+  if (nTo) return nTo;
   const l = capture(LAVA_BIN, ['run', file]);
+  const lTo = timedOut(l);
+  if (lTo) return lTo;
   // Accumulate every difference rather than returning on the first. Returning
   // early on an exit-status mismatch discarded the stdout/stderr diff, which left
   // a case that fails via an assertion MESSAGE with no reachable detail at all —
@@ -369,9 +408,20 @@ function gitClean(relPaths) {
 
 const originals = new Map(); // absolute path -> original text
 
+// Restore each file independently. A single writeFileSync throw used to abort the
+// loop, leave the remaining entries mutated on disk, and surface as an uncaught
+// exception instead of a list of unrestored paths.
 function restoreAll() {
-  for (const [file, text] of originals) writeFileSync(file, text);
-  originals.clear();
+  const failed = [];
+  for (const [file, text] of [...originals]) {
+    try {
+      writeFileSync(file, text);
+      originals.delete(file);
+    } catch (err) {
+      failed.push(`${file}: ${err.message}`);
+    }
+  }
+  return failed;
 }
 
 // `process.on('exit')` and NOTHING ELSE. This program's body is entirely
@@ -388,12 +438,12 @@ function restoreAll() {
 // process.exit() path, which is what restoring files needs. It does NOT run on
 // SIGKILL; the warning below is the residue detector for that case.
 process.on('exit', () => {
-  const leftover = [...originals.keys()];
-  restoreAll();
-  if (leftover.length > 0 && process.exitCode !== 0) {
-    // Not reachable on SIGKILL by construction — this is for the case where the
-    // restore itself is what failed.
-    console.error(`mutation gate: restored ${leftover.length} source(s) on exit`);
+  const failed = restoreAll();
+  if (failed.length > 0) {
+    console.error(
+      `mutation gate: failed to restore ${failed.length} source(s):\n  ${failed.join('\n  ')}`,
+    );
+    if (process.exitCode === 0 || process.exitCode === undefined) process.exitCode = 1;
   }
 });
 
@@ -556,8 +606,11 @@ try {
       build();
       console.log('ok');
     } catch (err) {
-      // Report rather than mask whatever is already propagating.
+      // Report rather than mask whatever is already propagating. A successful
+      // mutation loop with a failed rebuild would otherwise exit 0 while bin/lava
+      // still carries mutated source — CI treats that as a pass.
       console.error(`FAILED — bin/lava may be built from mutated source: ${err.message}`);
+      if (process.exitCode === 0 || process.exitCode === undefined) process.exitCode = 1;
     }
   }
 }

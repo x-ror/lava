@@ -81,7 +81,7 @@
     "method": 35,
     "invoke": 5,
     "accessor": 0,
-    "global": 32
+    "global": 30
   },
   "internal/https.js": {
     "method": 2,

@@ -128,6 +128,11 @@
   // Capture here once; every consumer reads the pristine binding.
   var parseIntG = parseInt;
   var NumberG = Number;
+  // Static predicates on Number are also writable data properties of the Number
+  // constructor. Capturing the functions (not the receiver) is enough: they do not
+  // re-read off Number at call time. Same reason parseInt is captured above.
+  var numberIsInteger = Number.isInteger;
+  var numberIsSafeInteger = Number.isSafeInteger;
 
   // brandedAs is the UNFORGEABLE replacement for `value instanceof Ctor` on a
   // hardening path. `instanceof` dispatches through `Ctor[Symbol.hasInstance]`, a
@@ -458,6 +463,8 @@
     // Bootstrap-captured free globals. See the capture block above the export table.
     parseInt: parseIntG,
     Number: NumberG,
+    NumberIsInteger: numberIsInteger,
+    NumberIsSafeInteger: numberIsSafeInteger,
 
     // allChars(s, pred) is `/^[class]+$/` without a RegExp — true when s is non-empty
     // and every code unit satisfies `pred`. It lives here for the reason RegExpMatches

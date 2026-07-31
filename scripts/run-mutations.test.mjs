@@ -201,11 +201,14 @@ test('a dirty source is refused, since it could not be restored', () => {
 // deleting the git-status check alone. Only removing both went red. They are split
 // so each asserts its own message, with no alternation.
 test('a source escaping the repo root is refused by the containment check', () => {
-  // The escape target lives INSIDE the fixture's own tree, in a committed
-  // subdirectory, so `git status` succeeds and cannot be what fails. That isolates
-  // the containment check as the only thing that can reject this.
-  withTree([entry({ source: 'sub/../../escape.mjs' })], {}, (dir) => {
-    const outside = join(dir, '..', `escape-${process.pid}.mjs`);
+  // Containment runs before git is asked anything, so the verdict can only come
+  // from the path check. The unique name keeps concurrent runs from racing on a
+  // shared tmpdir entry. Manifest source and the file we create MUST agree —
+  // otherwise the runner never sees the outside file and "untouched" asserts
+  // nothing.
+  const name = `escape-${process.pid}.mjs`;
+  withTree([entry({ source: `sub/../../${name}` })], {}, (dir) => {
+    const outside = join(dir, '..', name);
     writeFileSync(outside, 'outside\n');
     try {
       const { status, out } = run(dir);
@@ -372,12 +375,16 @@ test('a gate that hangs is RED with a timeout verdict, not a hang', () => {
   // gate ran until the allocator gave up — 6.2 GB and climbing locally, 3m16s in CI
   // — and a SIGKILL under a memory cap produced no error line at all, so the verdict
   // degraded to WRONG REASON naming nothing about memory.
+  //
+  // capture() runs the gate under GNU timeout so the whole process group is killed
+  // (spawnSync alone leaves a node --test worker spinning). Assert no orphan.
   withTree(
     [entry({ gate: 'node-test:fx/hang.test.mjs', expect_detail: 'timed out' })],
     {},
     (dir) => {
+      const hangPath = join(dir, 'fx', 'hang.test.mjs');
       writeFileSync(
-        join(dir, 'fx', 'hang.test.mjs'),
+        hangPath,
         // Green when VALUE is intact, spins when it is not — the shape of the real
         // entries, without the multi-GB appetite.
         "import { VALUE } from './src.mjs';\n" + "if (VALUE !== 'expected') { for (;;) {} }\n",
@@ -387,6 +394,11 @@ test('a gate that hangs is RED with a timeout verdict, not a hang', () => {
       assert.match(out, /timed out/);
       assert.equal(status, 0);
       assert.equal(sourceOf(dir), SOURCE);
+      // No worker still executing THIS hang fixture (process-group kill).
+      // Scope to hangPath so leftovers from earlier runs do not false-positive.
+      const ps = spawnSync('ps', ['-eo', 'args='], { encoding: 'utf8' });
+      const survivors = (ps.stdout ?? '').split('\n').filter((l) => l.includes(hangPath));
+      assert.equal(survivors.length, 0, `orphan hang process(es):\n${survivors.join('\n')}`);
     },
   );
 });
