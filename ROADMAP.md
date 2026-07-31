@@ -135,9 +135,13 @@ coupling.
       expression `exec`/`test`/`Symbol.match`/`Symbol.replace`/`lastIndex` all drop
       out at once instead of one of them. A live `.charCodeAt` is its own carrier —
       do not treat the loop as enough. Capture `parseInt`/`Number` used for
-      Content-Length / chunk-size conversion too. It is also faster — 0.82x-0.90x on
-      `new URL`, min of 7 interleaved pinned launches per arm — which reversed the
-      +6% to +20% regression the exec migration had introduced and that no benchmark
+      Content-Length / chunk-size conversion too. It is also faster: **elapsed-time
+      ratio** of `new URL(s)` over a fixed string pool (special / IPv4 / relative /
+      short absolute hosts, same inputs as the later `bench/micro/url.js` cases),
+      **char-loop + captured `StringPrototypeCharCodeAt`** vs the prior **captured
+      `RegExpMatches` / `re.test` form**, min of 7 interleaved pinned launches per
+      arm on Linux JSC — 0.82x–0.90x (lower is faster) — which reversed the +6% to
+      +20% regression the exec migration had introduced and that no benchmark
       covered.
 - [ ] **The rest of the regex surface, and `.test` was not the whole of
       it** — a poisoned `exec` steers **six** methods, not two: `re.test`, `re.exec`,

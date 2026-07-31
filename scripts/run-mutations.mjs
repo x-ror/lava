@@ -214,7 +214,11 @@ const GATE_TIMEOUT_MS = positiveIntMs(process.env.MUTATION_TIMEOUT_MS, 120_000);
 let activeTimeoutMs = GATE_TIMEOUT_MS;
 
 function entryTimeoutMs(m) {
-  if (m && typeof m.timeout_ms === 'number' && m.timeout_ms > 0) return m.timeout_ms;
+  // spawnSync requires an unsigned integer timeout; a fractional manifest value
+  // throws ERR_OUT_OF_RANGE before any structured gate result exists.
+  if (m && typeof m.timeout_ms === 'number' && Number.isInteger(m.timeout_ms) && m.timeout_ms > 0) {
+    return m.timeout_ms;
+  }
   return GATE_TIMEOUT_MS;
 }
 

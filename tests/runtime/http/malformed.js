@@ -56,6 +56,12 @@ function check(name, cond, detail) {
   // write real CR/LF onto the response head.
   r = await raw('GET /set-name/a%0d%0aInjected HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
   check('injection-name-rejected-500', statusOf(r) === 500, r.slice(0, 40));
+  // Server route embeds e.code; require the real isHttpToken error, not a generic 500.
+  check(
+    'injection-name-code',
+    bodyOf(r).includes('REJECTED ERR_INVALID_HTTP_TOKEN'),
+    bodyOf(r).slice(0, 60),
+  );
   check('injection-name-no-split', !/Injected:/i.test(r));
 
   // 1c. Content-Length conversion must use the real digit value, not a poisoned
