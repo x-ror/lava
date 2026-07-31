@@ -334,12 +334,12 @@
     },
     {
       "name": "58-esm-pollution join dies when the wrapper is assembled with a live Array.prototype.join",
-      "why": "The joins assemble the emitted module, so a gadget lying only for the '\\n' separator replaces the WHOLE output rather than one interpolated identifier \u2014 a strictly larger win than the export-default carrier.",
+      "why": "The joins assemble the emitted module, so a gadget lying only for the '\\n' separator replaces the WHOLE output rather than one interpolated identifier \u2014 a strictly larger win than the export-default carrier. Mutating the capture rather than one call site keeps esm.js syntactically valid, so the gate measures the carrier and not a bootstrap parse error.",
       "source": "pkg/runtime/js/internal/esm.js",
-      "find": "    return ArrayPrototypeJoin(\n      [",
-      "replace": "    return [",
+      "find": "  var ArrayPrototypeJoin = primordials.ArrayPrototypeJoin;",
+      "replace": "  var ArrayPrototypeJoin = function (a, s) {\n    return a.join(s);\n  };",
       "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
-      "expect_detail": "WRAPPER INJECTED"
+      "expect_detail": "join:"
     },
     {
       "name": "58-esm-pollution strglobal dies when the source coercion reads the live String global",
@@ -366,7 +366,7 @@
       "find": "    var at = StringPrototypeIndexOf(mask, IMPORT_META);",
       "replace": "    var at = StringPrototypeIndexOf(src, IMPORT_META);",
       "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
-      "expect_detail": "import.meta.url"
+      "expect_detail": "Unexpected keyword 'export'"
     },
     {
       "name": "29-esm-transform-edge dies when isSpace narrows to ASCII",
@@ -375,7 +375,7 @@
       "find": "      c === 0xa0 ||",
       "replace": "      false ||",
       "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
-      "expect_detail": "29-esm-transform-edge"
+      "expect_detail": "Unexpected keyword 'const'"
     },
     {
       "name": "29-esm-transform-edge dies when the identifier class drops `$`",
@@ -384,7 +384,7 @@
       "find": "    return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f || c === 0x24;",
       "replace": "    return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f;",
       "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
-      "expect_detail": "29-esm-transform-edge"
+      "expect_detail": "unsupported export declaration: $dollar"
     }
   ]
 }
