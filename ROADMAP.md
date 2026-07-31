@@ -246,6 +246,12 @@ coupling.
       node-vs-Lava divergence, so any case exercising it fails `test-compat-lava` by
       construction — and the `@deviates` tag previously credited a test that does not
       cover it. Closing it needs a Lava-only pin.
+      _Found while reviewing, not fixed:_ escape sequences inside an import specifier
+      are passed through raw rather than interpreted, so a line continuation
+      (`import d from './dep\`+LF+`.mjs'`) resolves in node and reports
+      `Cannot find module './dep\<LF>.mjs'` in Lava. Pre-existing and unrelated to the
+      hardening; the specifier reaches `require()` as source text via `jsonString`
+      instead of as the parsed string value.
       It also got **faster**, which is not the usual direction for a hardening pass —
       but only ONE change is responsible, and the first draft of this entry credited
       three equally. Ablating one optimization at a time on the same corpus:

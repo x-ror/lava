@@ -3,7 +3,7 @@
 //
 // Why this is a differential and not a Lava-only pin. node's ESM loader is native
 // C++ — none of the gadgets below reach it — so node is a real oracle here: it
-// loads every fixture correctly under all eleven, and Lava must print the same bytes.
+// loads every fixture correctly under all twelve, and Lava must print the same bytes.
 // That is stronger than a Lava-only test, because it pins Node parity at the same
 // time. (Contrast tests/node-compat/cases/54-url-pollution.js, where the same logic
 // applies for the same reason, and cmd/lava/regexp_pollution_test.odin, where it

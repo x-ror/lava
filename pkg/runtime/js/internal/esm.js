@@ -314,11 +314,21 @@
   var IMPORT_META_CJS = '__import_meta';
 
   // buildMask returns a copy of `src` with every character inside a string, a
-  // template literal, a line comment, or a block comment replaced by a space
-  // (newlines preserved, so indices/line structure are unchanged). Template
-  // `${ ... }` expressions are kept as code so nested braces/strings are tracked
-  // correctly. The result is used only for structural scanning; the original
+  // template literal, a line comment, or a block comment replaced by a space.
+  // Template `${ ... }` expressions are kept as code so nested braces/strings are
+  // tracked correctly. The result is used only for structural scanning; the original
   // source is what gets emitted.
+  //
+  // LENGTH parity is the invariant — every index into the mask means the same index
+  // into the source, which is what lets preReplaceMeta and the main scan slice one
+  // using offsets found in the other. NEWLINE parity is NOT, and the difference is
+  // deliberate: an escape pair inside a string emits two spaces even when the escaped
+  // character is a line terminator, so a line continuation loses its newline in the
+  // mask. Do not "fix" that — it is load-bearing in the opposite direction. Emitting
+  // the terminator instead puts a `\n` at depth 0 in the middle of an import
+  // statement, and findStmtEnd ends the statement there: `import d from './dep\<LF>
+  // .mjs';` degrades from a resolvable specifier to `unsupported import form`.
+  // Verified by applying that exact change and re-running.
   //
   // Code spans are copied one SLICE at a time rather than one character at a time:
   // the mask is identical to the source across a run of ordinary code, so the only

@@ -163,7 +163,7 @@ The JS layer is substantial and high quality: `url.js` (2071 LOC, WHATWG URL),
   module records (the classic C API only runs script-goal source). This is
   pragmatic and works, with documented divergences (named imports from CJS).
   Its output is _executed source_, which is why it is the one internal module the
-  runtime hands `primordials` as a constructor argument: it is deliberately not
+  runtime hands `primordials` as a factory argument: it is deliberately not
   registered as a requireable module (so user code cannot reach the transform),
   and that also denies it a `require`, so `loader.js` exposes the already-built
   table on the resolver object and `globals.odin` passes it in — failing closed if
