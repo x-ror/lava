@@ -162,6 +162,13 @@ The JS layer is substantial and high quality: `url.js` (2071 LOC, WHATWG URL),
   (`esm.js`) that rewrites ESM onto the CommonJS `require`, not by JSC's native
   module records (the classic C API only runs script-goal source). This is
   pragmatic and works, with documented divergences (named imports from CJS).
+  Its output is _executed source_, which is why it is the one internal module the
+  runtime hands `primordials` as a constructor argument: it is deliberately not
+  registered as a requireable module (so user code cannot reach the transform),
+  and that also denies it a `require`, so `loader.js` exposes the already-built
+  table on the resolver object and `globals.odin` passes it in — failing closed if
+  it is absent, since a forged match group here is code injection into the module
+  body rather than a wrong answer.
 - Resolution (`module_resolution.odin`) covers file probes, directory `main`/
   `index`, and `node_modules` walking. **`package.json` `"exports"` conditional
   resolution is not yet implemented** — a real gap for modern packages.

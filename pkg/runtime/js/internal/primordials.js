@@ -253,6 +253,11 @@
     Math: Math,
     Number: Number,
     RegExp: RegExp,
+    // The String CONSTRUCTOR, for `String(x)` coercion — a replaceable global like
+    // any other, and a load-bearing one where the coerced value is then emitted:
+    // esm.js builds every string literal in its generated CommonJS as
+    // JSONStringify(String(v)), so a replaced String reaches the emitted source.
+    String: String,
     Error: Error,
     TypeError: TypeError,
     RangeError: RangeError,

@@ -60,10 +60,10 @@
     "global": 0
   },
   "internal/esm.js": {
-    "method": 81,
+    "method": 0,
     "invoke": 0,
     "accessor": 0,
-    "global": 20
+    "global": 0
   },
   "internal/events.js": {
     "method": 0,

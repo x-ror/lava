@@ -87,5 +87,21 @@
     return req(name);
   }
 
+  // The ESM source transform is the one internal module that cannot
+  // require('primordials'): the runtime evaluates js/internal/esm.js standalone and
+  // keeps the resulting function on Runtime_State, deliberately NOT registering it
+  // as a requireable module (see globals.odin), so it never gets a `require`. It
+  // still needs the pristine table — it emits executed source, so a live intrinsic
+  // there is code injection, not a wrong answer.
+  //
+  // Hand the ALREADY-INSTANTIATED table out here rather than letting the runtime
+  // evaluate primordials a second time, which would capture a parallel set and quietly
+  // split the "captured once, before user code" guarantee in two.
+  //
+  // This is not a new user-visible surface: the resolver object never reaches user
+  // code. What user code calls is the native require callback, which consults this
+  // function through Runtime_State.builtin_require and returns only module exports.
+  publicReq.primordials = req('primordials');
+
   return publicReq;
 });

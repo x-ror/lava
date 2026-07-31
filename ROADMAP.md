@@ -166,8 +166,11 @@ coupling.
       matchAll,search,split}` with a regex argument in EITHER position — `s.replace(re, …)`
       and the primordial `StringPrototypeReplace(s, re, …)`, where the regex is the
       SECOND argument. Written for the first position only, this recipe scored zero on
-      `url.js`'s own residue sites, which the paragraph above names. `esm.js` dominates by a
-      wide margin and is the module loader, so it is next.
+      `url.js`'s own residue sites, which the paragraph above names.
+      **`esm.js` is done** — it dominated the remainder and was the sharpest of it, so
+      it went first; see the entry below. What is left is the long tail (`path.js`,
+      `mime.js`, `punycode.js`, `util.js`, `console.js`), none of it emitting source
+      and none of it on the network path.
       The claim that none of the remainder was on the network path was **false**, and
       the sites that were are now fixed rather than merely re-described:
       `fetch.js`'s header-value trim (which ran BEFORE the name validator on every
@@ -187,6 +190,45 @@ coupling.
       (Basic-auth / JWT) and `url.js` `toUSVString` (emoji in a remote query). Each
       has a Lava-only pin, an http-smoke phase where relevant, and a mutation-manifest
       entry.
+- [x] **`esm.js` — the module loader, and the one surface where a forged match is
+      code execution** — done: 101 counted sites (method 81, global 20) to 0 in all
+      four classes. This outranked the rest of the tail because the file's output is
+      _executed source_: `export default function foo` lifts the declared name out of a
+      match group and interpolates it into the emitted CommonJS as an identifier. A
+      gadget steering only that one pattern — every other regex answering honestly, so
+      the transform runs to completion — evaluated an attacker's expression at module
+      scope. Demonstrated before the fix, not argued: `pwned=CODE INJECTED` under Lava
+      where node printed `pwned=undefined`. Reachability is ordinary, since any CJS
+      dependency required before the first `.mjs` can assign `RegExp.prototype.exec`.
+      There were **no** global-flag regexes in the file, so the spin-forever class that
+      `url.js`/`fetch.js` hit is genuinely absent here — this was injection, not DoS.
+      The patterns became module-scope **literals** rather than captured-and-rebuilt
+      `new RegExp(...)`: a literal consults no `RegExp` global, so it cannot be pointed
+      at another constructor, and `.match`/`.test`/`.replace(re, …)` are all gone rather
+      than captured, since each re-reads `R.exec` off the receiver.
+      Two adjacent carriers came with it, both in the masking scanner that decides what
+      counts as string versus code — and therefore which spans are eligible to be
+      spliced out and re-emitted at all: 12 live `charAt` reads and an
+      `Array.prototype.at` on the mode stack. The `charCodeAt` they moved onto is
+      pinned too, because that is the same lesson `http.js` had already taught.
+      It cannot `require('primordials')` — the runtime evaluates it standalone and keeps
+      it off the module table precisely so user code cannot reach the transform — so it
+      takes the table as a factory argument, handed out by `loader.js` and passed in by
+      `globals.odin`, which fails closed when it is missing.
+      Pinned by `tests/node-compat/cases/58-esm-pollution.js` and five
+      `tests/mutation-manifest.json` entries. That case is a **real differential**, not
+      a Lava-only test: node's ESM loader is native C++ and immune to all seven gadgets,
+      so node is the oracle and the case pins Node parity at the same time — the
+      opposite conclusion from the one this file previously assumed for the loader.
+      It also got **faster**, which is not the usual direction for a hardening pass:
+      hoisting the per-specifier `new RegExp` compiles to literals, an `indexOf` fast
+      path in `preReplaceMeta` instead of rebuilding the whole source character by
+      character, and one slice per run of ordinary code in `buildMask` instead of one
+      concatenation per character. On a 61-module corpus (~670 bytes each, license block
+      comment, template literals with nested `${}`, five export forms), `lava run` cold,
+      medians of 15 interleaved launches per arm: 58.2 ms to 48.5 ms end to end
+      (**0.83x**, lower is faster). Startup is unchanged on the same harness (21.9 vs
+      22.0 ms), so the transform itself is 36.3 to 26.5 ms, **0.73x**.
 - [x] **`util.format` ignored Node's single-argument rule** — fixed: a string
       first argument with nothing after it is returned verbatim, directives and
       all. Lava ran the substitution loop regardless and folded `%%` to `%`;

@@ -1087,14 +1087,43 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	jsc.JSValueProtect(ctx, resolver)
 	state.builtin_require = resolver
 
-	// The ESM source transform (js/internal/esm.js) evaluates directly to a
-	// `transform(source, url, filename, dirname)` function. It is stored on the
-	// state — not registered as a requireable module — so native_require_cb can
-	// rewrite `.mjs` files to CommonJS without exposing it to user code.
-	esm := eval_internal(ctx, "lava:esm", INTERNAL_ESM)
-	if esm != nil && jsc.JSValueIsObject(ctx, esm) {
-		jsc.JSValueProtect(ctx, esm)
-		state.esm_transform = esm
+	// The ESM source transform (js/internal/esm.js) evaluates to a FACTORY —
+	// `factory(primordials) -> transform(source, url, filename, dirname)`. The
+	// transform is stored on the state, not registered as a requireable module, so
+	// native_require_cb can rewrite `.mjs` files to CommonJS without exposing it to
+	// user code.
+	//
+	// It takes primordials as an argument because that non-registration is exactly
+	// what denies it a `require`, and its output is EXECUTED SOURCE: a live
+	// `RegExp.prototype.exec` there hands an attacker the match groups the transform
+	// interpolates into the emitted module body as identifiers. The table comes off
+	// the loader's resolver (loader.js sets it) so there is one shared capture rather
+	// than a second evaluation of primordials.
+	//
+	// Fail CLOSED. Without the table the transform would run on live intrinsics, so a
+	// missing one leaves state.esm_transform nil and `.mjs` reports "ESM transform
+	// unavailable" instead of silently transforming with the poisonable path.
+	esm_factory := eval_internal(ctx, "lava:esm", INTERNAL_ESM)
+	if esm_factory != nil && jsc.JSValueIsObject(ctx, esm_factory) {
+		primordials := get_named(ctx, cast(jsc.JSObjectRef)resolver, "primordials")
+		if primordials != nil && jsc.JSValueIsObject(ctx, primordials) {
+			esm_args := [1]jsc.JSValueRef{primordials}
+			esm_exception: jsc.JSValueRef
+			transform := jsc.JSObjectCallAsFunction(
+				ctx,
+				cast(jsc.JSObjectRef)esm_factory,
+				nil,
+				1,
+				raw_data(esm_args[:]),
+				&esm_exception,
+			)
+			if esm_exception != nil {
+				report_internal_exception(ctx, "lava:esm", esm_exception)
+			} else if transform != nil && jsc.JSValueIsObject(ctx, transform) {
+				jsc.JSValueProtect(ctx, transform)
+				state.esm_transform = transform
+			}
+		}
 	}
 }
 
