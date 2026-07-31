@@ -232,7 +232,10 @@
       "find": "    var src = StringG(str);\n    var n = src.length;\n    var out = '';",
       "replace": "    return StringG(str)\n      .replaceAll('-', '+')\n      .replaceAll('_', '/')\n      .replaceAll(/[^A-Za-z0-9+/]/g, '');\n    var src = StringG(str);\n    var n = src.length;\n    var out = '';",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": ["timed out", "got b64=THREW:RangeError"],
+      "expect_detail": [
+        "timed out",
+        "got b64=THREW:RangeError"
+      ],
       "timeout_ms": 30000
     },
     {
@@ -242,7 +245,10 @@
       "find": "    if (!hasSurrogate) return str;\n    var out = StringPrototypeSlice(str, 0, i);",
       "replace": "    if (!hasSurrogate) return str;\n    var SPOL = /([\\uD800-\\uDBFF])([\\uDC00-\\uDFFF])?|([\\uDC00-\\uDFFF])/g;\n    return StringPrototypeReplace(str, SPOL, function (m, h, l, lone) {\n      return lone !== undefined || l === undefined ? '\\uFFFD' : m;\n    });\n    var out = StringPrototypeSlice(str, 0, i);",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": ["timed out", "got usp=THREW:RangeError"],
+      "expect_detail": [
+        "timed out",
+        "got usp=THREW:RangeError"
+      ],
       "timeout_ms": 30000
     },
     {
@@ -316,6 +322,69 @@
       "replace": "    return JSON.stringify(String(value));",
       "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
       "expect_detail": "json:"
+    },
+    {
+      "name": "58-esm-pollution tail dies when the export result object inherits from Object.prototype",
+      "why": "transformExport carries an own `tail` on one of eight return shapes; without a null prototype the other seven read Object.prototype.tail and join it into the emitted source, so a data-only merge gadget is code execution in the module body.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "        return { __proto__: null, body: decl + ';' + assigns, tail: null };",
+      "replace": "        return { body: decl + ';' + assigns };",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "TAIL INJECTED"
+    },
+    {
+      "name": "58-esm-pollution join dies when the wrapper is assembled with a live Array.prototype.join",
+      "why": "The joins assemble the emitted module, so a gadget lying only for the '\\n' separator replaces the WHOLE output rather than one interpolated identifier \u2014 a strictly larger win than the export-default carrier.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "    return ArrayPrototypeJoin(\n      [",
+      "replace": "    return [",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "WRAPPER INJECTED"
+    },
+    {
+      "name": "58-esm-pollution strglobal dies when the source coercion reads the live String global",
+      "why": "transform() coerces its `source` argument with String(); the existing json entry reverts JSONStringify and StringG on one line, so the String capture on this line was never proven on its own.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "    source = StringG(source);",
+      "replace": "    source = String(source);",
+      "gate": "compat:tests/node-compat/cases/58-esm-pollution.js",
+      "expect_detail": "strglobal:"
+    },
+    {
+      "name": "29-esm-transform-edge dies when findStmtEnd drops the seenMeaningful flag",
+      "why": "The old code got this from `'+-*/%=<>&|^,.?:('.indexOf('')` returning 0, so a newline before any meaningful character continued the statement; without the flag an import whose clause starts on the next line ends early and reports an unsupported form.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "          if (!seenMeaningful || isContinuation(lastMeaningful)) continue;",
+      "replace": "          if (isContinuation(lastMeaningful)) continue;",
+      "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
+      "expect_detail": "unsupported import form"
+    },
+    {
+      "name": "29-esm-transform-edge dies when import.meta is rewritten by searching the source, not the mask",
+      "why": "The mask blanks strings and comments, so searching it leaves an `import.meta` written inside a string literal alone; searching the source rewrites it to __import_meta and silently corrupts module data.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "    var at = StringPrototypeIndexOf(mask, IMPORT_META);",
+      "replace": "    var at = StringPrototypeIndexOf(src, IMPORT_META);",
+      "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
+      "expect_detail": "import.meta.url"
+    },
+    {
+      "name": "29-esm-transform-edge dies when isSpace narrows to ASCII",
+      "why": "The `\\s*` strips these helpers replace accept the full ES whitespace set; narrowing to ASCII makes `export const<NBSP>name` emit the key \"const\", which is a silent behavior change the comment explicitly warns against.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "      c === 0xa0 ||",
+      "replace": "      false ||",
+      "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
+      "expect_detail": "29-esm-transform-edge"
+    },
+    {
+      "name": "29-esm-transform-edge dies when the identifier class drops `$`",
+      "why": "No other fixture uses `$`, `_` or digits in a binding name, so the `$` arm of the code-unit predicate that replaced [A-Za-z_$] was unexercised and could be dropped without any test noticing.",
+      "source": "pkg/runtime/js/internal/esm.js",
+      "find": "    return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f || c === 0x24;",
+      "replace": "    return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f;",
+      "gate": "compat:tests/node-compat/cases/29-esm-transform-edge.mjs",
+      "expect_detail": "29-esm-transform-edge"
     }
   ]
 }

@@ -167,10 +167,15 @@ coupling.
       and the primordial `StringPrototypeReplace(s, re, …)`, where the regex is the
       SECOND argument. Written for the first position only, this recipe scored zero on
       `url.js`'s own residue sites, which the paragraph above names.
-      **`esm.js` is done** — it dominated the remainder and was the sharpest of it, so
-      it went first; see the entry below. What is left is the long tail (`path.js`,
-      `mime.js`, `punycode.js`, `util.js`, `console.js`), none of it emitting source
-      and none of it on the network path.
+      **`esm.js` is done** — 26 of the 60 sites the recipe scored before it, next
+      largest `mime.js` at 10, and it was the sharpest of them because it emits source;
+      see the entry below. Do NOT copy a remainder list from here: re-derive it with
+      the recipe above, which is the rule this entry has already broken three times.
+      As of the esm.js commit it returns 34 sites across 11 files, and two facts about
+      that tail are worth keeping because they contradict the obvious assumption —
+      `net.js` still carries one (`/^connect ([A-Z]+)/`), so the tail is **not** off the
+      network path, and `buffer.js`, `querystring.js` and `punycode.js` still carry
+      global-flag replaces, so the spin-forever class is **not** gone from it either.
       The claim that none of the remainder was on the network path was **false**, and
       the sites that were are now fixed rather than merely re-described:
       `fetch.js`'s header-value trim (which ran BEFORE the name validator on every
@@ -208,27 +213,64 @@ coupling.
       than captured, since each re-reads `R.exec` off the receiver.
       Two adjacent carriers came with it, both in the masking scanner that decides what
       counts as string versus code — and therefore which spans are eligible to be
-      spliced out and re-emitted at all: 12 live `charAt` reads and an
-      `Array.prototype.at` on the mode stack. The `charCodeAt` they moved onto is
-      pinned too, because that is the same lesson `http.js` had already taught.
+      spliced out and re-emitted at all: 10 live `charAt` reads and two
+      `Array.prototype.at` reads on the mode stack (`at(-1)` for the current frame,
+      `at(-2)` for the `${}` close). The `charCodeAt` they moved onto is pinned too,
+      because that is the same lesson `http.js` had already taught.
       It cannot `require('primordials')` — the runtime evaluates it standalone and keeps
       it off the module table precisely so user code cannot reach the transform — so it
       takes the table as a factory argument, handed out by `loader.js` and passed in by
       `globals.odin`, which fails closed when it is missing.
-      Pinned by `tests/node-compat/cases/58-esm-pollution.js` and five
-      `tests/mutation-manifest.json` entries. That case is a **real differential**, not
-      a Lava-only test: node's ESM loader is native C++ and immune to all seven gadgets,
-      so node is the oracle and the case pins Node parity at the same time — the
-      opposite conclusion from the one this file previously assumed for the loader.
-      It also got **faster**, which is not the usual direction for a hardening pass:
-      hoisting the per-specifier `new RegExp` compiles to literals, an `indexOf` fast
-      path in `preReplaceMeta` instead of rebuilding the whole source character by
-      character, and one slice per run of ordinary code in `buildMask` instead of one
-      concatenation per character. On a 61-module corpus (~670 bytes each, license block
-      comment, template literals with nested `${}`, five export forms), `lava run` cold,
-      medians of 15 interleaved launches per arm: 58.2 ms to 48.5 ms end to end
-      (**0.83x**, lower is faster). Startup is unchanged on the same harness (21.9 vs
-      22.0 ms), so the transform itself is 36.3 to 26.5 ms, **0.73x**.
+      A **fourth carrier** was found by the merge gate after the first pass, and it was
+      the cheapest of the set and invisible to the ratchet: `transformExport` carries an
+      own `tail` on ONE of eight return shapes, so on the other seven `ex.tail` resolved
+      off `Object.prototype` — and that value is joined into the emitted source. A
+      data-only `{"__proto__":{"tail":["…"]}}` merge was therefore full code execution
+      in the module body, needing no function value at all, i.e. strictly cheaper than
+      the forged `exec` the pass was written for. `esm.js` read 0/0/0/0 in all four
+      classes while it was open, because an absent-property read is none of the four —
+      the sharpest instance yet of "the ratchet is a floor, not a proof". Closed with
+      `__proto__: null` and an own `tail` on every branch. The same review found
+      `INTERNAL_ONLY` in `loader.js` missing `__proto__: null` while being indexed by a
+      caller-supplied specifier: `Object.prototype.http = true` made
+      `require('node:http')` fall through to filesystem resolution — builtin denial, or
+      a shadow where an npm package of that name exists.
+      Pinned by `tests/node-compat/cases/58-esm-pollution.js` (eleven gadgets and an
+      unpoisoned control) and twelve `tests/mutation-manifest.json` entries. That case
+      is a **real differential**, not a Lava-only test: node's ESM loader is native C++
+      and immune to every gadget, so node is the oracle and the case pins Node parity at
+      the same time — the opposite conclusion from the one this file previously assumed
+      for the loader.
+      _Still open, deliberately:_ the value-copy deviation (named imports are not live
+      bindings) has **no** pin. It cannot be an oracle case — the deviation _is_ the
+      node-vs-Lava divergence, so any case exercising it fails `test-compat-lava` by
+      construction — and the `@deviates` tag previously credited a test that does not
+      cover it. Closing it needs a Lava-only pin.
+      It also got **faster**, which is not the usual direction for a hardening pass —
+      but only ONE change is responsible, and the first draft of this entry credited
+      three equally. Ablating one optimization at a time on the same corpus:
+      `preReplaceMeta`'s `indexOf` fast path is essentially all of it (the old code
+      rebuilt **both** the source and the mask character by character on every module,
+      whether or not `import.meta` appeared, and most modules do not); `buildMask`'s run
+      batching is ~1 ms here though 2.4x on a 1 MB code-dominated module; and hoisting
+      the regexes to literals is **not resolvable against the noise floor** despite
+      removing 660 `new RegExp` compiles per run — it is a security change and must not
+      be sold as the speedup.
+      On a 61-module corpus (~600 bytes each, license block comment, template literals
+      with nested `${}`, five export forms), `lava run` cold, medians of 21 interleaved
+      launches per arm against a build of `origin/master`: **0.83x** end to end (86.0 to
+      71.7 ms loaded, 58.2 to 48.5 ms quiet — the ratio is stable across sessions, the
+      absolute ms are not).
+      The transform's own ratio needs a **control**, and subtracting only process
+      startup — what this entry originally did — leaves resolution, JSC compile and
+      evaluation in the number (14.1 ms, against 25.9 ms of transform). Measured against
+      a pre-transformed CommonJS twin of the same corpus instead, the twin is unchanged
+      between builds (0.99x, so nothing outside the transform moved) and the transform
+      is 39.7 to 25.9 ms, **0.65x**; an independent harness on a differently generated
+      corpus put it at 0.52x, so read it as 0.5–0.65x, not a third significant figure.
+      Not yet recheckable from the tree: there is no `bench/micro/esm.js`, so this
+      number has no floor and a future `buildMask` change can give it back silently —
+      the same gap that let a +6% to +20% `new URL` regression ship.
 - [x] **`util.format` ignored Node's single-argument rule** — fixed: a string
       first argument with nothing after it is returned verbatim, directives and
       all. Lava ran the substitution loop regardless and folded `%%` to `%`;
@@ -495,14 +537,15 @@ coupling.
       plus the `make check-primordials` ratchet over
       `tests/node-compat/pollution-baseline.json`. Done in the `method` column:
       `events.js`, `dns_promises.js`, and the encoding-name path of `buffer.js`;
-      `encoding.js` sits at 1, not 0. Six files are 0 in all four classes, but
-      none of them is evidence of hardening — every one is a 6–19 line re-export
-      shim (`console.js`, `dns_promises.js`, `path_posix.js`, `path_win32.js`,
-      `process.js`, `timers.js`). No file with real logic is clean in all four.
+      `encoding.js` sits at 1, not 0. Seven files are 0 in all four classes. Six of
+      them are no evidence of hardening — each is a 6–19 line re-export shim
+      (`console.js`, `dns_promises.js`, `path_posix.js`, `path_win32.js`,
+      `process.js`, `timers.js`). The seventh, `esm.js`, is 917 lines of real logic
+      and is the first such file to reach 0 in all four.
       Remaining in `method`: `url.js` (the type-ambiguous
       `slice`/`indexOf`/`includes` sites, plus its percent-decode byte arrays,
       which are still plain arrays and so reachable via an `Array.prototype[0]`
-      accessor), `buffer.js`, `path.js`, `esm.js`, `util.js`, and the newly
+      accessor), `buffer.js`, `path.js`, `util.js`, and the newly
       in-scope `console.js`.
       **Unblocked**: the ratchet counts four classes separately, so that list is
       the `method` column only; the other three are recorded per file in

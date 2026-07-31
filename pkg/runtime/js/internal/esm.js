@@ -33,16 +33,23 @@
 // ordinary rather than exotic — `exec` is a writable data property, and any CJS
 // dependency required before the first `.mjs` can assign it.
 //
-// Three carriers, all closed here, and the second is the one a RegExp-only pass
-// would have left open:
+// Four carriers, and the count is deliberately not "three": the first review of this
+// file said three, and the fourth is both the cheapest to reach and the one the
+// ratchet is structurally blind to. Carrier 2 is the one a RegExp-only pass would
+// have left open.
 //
 //   1. The regexes. Every pattern is a LITERAL (a literal consults no `RegExp`
 //      global, so it cannot be swapped) matched through the captured
 //      `RegExpPrototypeExec`. `.match`/`.test`/`.replace(re, …)` are all gone:
 //      each of them re-reads `R.exec` off the receiver per RegExpExec, so
 //      capturing them would look like a fix and not be one. None of the patterns
-//      were global-flagged, so the spin-forever class that url.js and fetch.js hit
-//      is absent here — this is a correctness and injection surface, not a DoS one.
+//      is global-flagged, so the `lastIndex` spin url.js and fetch.js hit is absent.
+//      That is NOT the same as "no DoS here", which an earlier version of this
+//      comment claimed: `RE_IMPORT_FROM`'s lazy `[\s\S]+?` backtracks superlinearly,
+//      measured through `bin/lava run` at 0.10 s / 0.30 s / 2.80 s for a whitespace
+//      run of 500 / 1000 / 2000 after `import` (~8x per doubling). Accepted, not
+//      fixed: the input is a local `.mjs`, and a `.mjs` you can write is one you can
+//      execute. It is written down so the next reader does not re-derive "no DoS".
 //   2. The scanner's character reads. buildMask decides what counts as string
 //      versus code, so it decides which spans are eligible to be spliced out and
 //      re-emitted at all. It read every character through a live
@@ -54,26 +61,71 @@
 //   3. Emission. Every string literal in the output — require specifiers, export
 //      keys, `__filename`/`__dirname`/`import.meta.url` — comes out of
 //      `JSON.stringify` after a `String()` coercion. Both are captured; a replaced
-//      `JSON.stringify` writes the emitted literals directly.
+//      `JSON.stringify` writes the emitted literals directly. The joins that assemble
+//      the output are captured for the same reason: with `Array.prototype.join`
+//      lying only for `'\n'`, the wrapper join hands an attacker the WHOLE emitted
+//      module, which is strictly worse than carrier 1.
+//   4. The transform's own result objects, which is the one the four-class ratchet
+//      cannot count. `transformExport` carries an own `tail` on ONE of eight return
+//      shapes, so `ex.tail` used to resolve off `Object.prototype` on the other
+//      seven — and that value is joined into `tailStr` and emitted as executed
+//      source. A data-only `{"__proto__":{"tail":["…"]}}` merge is therefore code
+//      execution in the module body, needing no function value at all, i.e. a
+//      CHEAPER gadget than carrier 1's forged `exec`. An absent-property read is
+//      none of the four counted classes, so `esm.js` read 0/0/0/0 while this was
+//      open. Closed by `__proto__: null` plus an own `tail` on every branch.
 //
 // It got FASTER, which is not the usual direction for a hardening pass and is worth
-// recording so nobody "optimizes" it back. Three changes carry it: the per-call
-// `new RegExp('^(' + IDENT + ')...')` patterns became module-scope literals (they
-// were recompiled once per import specifier and per export statement), preReplaceMeta
-// gained an indexOf fast path instead of rebuilding the whole source one character at
-// a time whether or not `import.meta` appeared, and buildMask copies each run of
-// ordinary code as one slice rather than one `out += c` per character. Measured on a
-// 61-module corpus (~670 bytes each, license block comment, template literals with
-// nested `${}`, five export forms), `lava run` cold, medians of 15 interleaved
-// launches per arm: 58.2 ms -> 48.5 ms end to end, 0.83x. Startup is unchanged at
-// 21.9 vs 22.0 ms on the same harness, so subtracting it puts the transform itself at
-// 36.3 -> 26.5 ms, 0.73x.
+// recording so nobody "optimizes" it back — but only ONE of the three changes is
+// responsible, and the first draft of this comment credited all three equally.
+// Ablations reverting exactly one optimization at a time, same corpus:
+//
+//   preReplaceMeta's indexOf fast path   ~all of it. The old code rebuilt BOTH the
+//                                        source and the mask one character at a time
+//                                        on every module, whether or not
+//                                        `import.meta` appeared. Most modules do not.
+//   buildMask's run batching             ~1 ms here, but 2.4x on a 1 MB code-dominated
+//                                        module — it earns its keep off this corpus,
+//                                        not on it.
+//   hoisting the regexes to literals     NOT resolvable against the noise floor, even
+//                                        though it removes 660 `new RegExp` compiles
+//                                        per run. It is a SECURITY change; do not
+//                                        sell it as the speedup.
+//
+// Method, because a ratio without one is folklore: 61-module corpus (~600 bytes each,
+// license block comment, template literals with nested `${}`, five export forms),
+// `lava run` cold, medians of 21 interleaved launches per arm, this branch vs a build
+// of origin/master. End to end 0.83x (86.0 -> 71.7 ms on a loaded box; 58.2 -> 48.5 ms
+// quiet — the ratio is stable across sessions, the absolute ms are not, so trust the
+// ratio).
+//
+// The transform's OWN ratio needs a control, and an earlier version of this comment
+// got it wrong by subtracting only process startup: what survives that subtraction is
+// transform + module resolution + JSC compile + evaluation, and the remainder is not
+// small (14.1 ms here, against 25.9 ms of transform). Measured instead against a
+// pre-transformed CommonJS twin of the same corpus — same module count, same bodies,
+// no import/export syntax, so the transform never runs — the twin is unchanged between
+// the two builds (0.99x, i.e. nothing outside the transform moved) and the transform
+// itself is 39.7 -> 25.9 ms, 0.65x. An independent reviewer's harness on a
+// differently generated corpus put it at 0.52x, so treat this as 0.5-0.65x rather than
+// a third significant figure.
 //
 // RESIDUAL, deliberately out of scope: the wrapper text below calls
 // `Object.defineProperty` and `require` in the TRANSFORMED module's own scope. Those
 // run as part of the user's module, not as part of the transform, and every
 // ESM-to-CJS compiler (Babel, tsc, esbuild) emits the same shape — hardening them
 // would mean emitting a different program than the toolchain consensus.
+//
+// RESIDUAL, dormant rather than closed: `StringPrototypeSplit(inner, ',')` in
+// splitSpecs. Per spec, `String.prototype.split` does `GetMethod(separator, @@split)`
+// even for a primitive-string separator, so `String.prototype[Symbol.split]` steers it
+// — a well-known SYMBOL, so there is no named property for the ratchet to count. It is
+// inert on Lava only because JSC skips that lookup on the primitive-separator fast
+// path (verified: the same gadget steers node and does not steer bin/lava), so it is
+// engine behavior holding it shut, not this file. The blast radius if a WebKit bump
+// changes that is identifier substitution, not arbitrary code — every element is
+// gated by `isIdent`/`RE_SPEC_AS` — which is why it is recorded here rather than
+// rewritten into a code-unit scan.
 //
 // This module cannot `require('primordials')`: the runtime evaluates it standalone
 // and keeps the result on Runtime_State rather than registering it as a requireable
@@ -226,10 +278,18 @@
   // LITERALS, hoisted to module scope. Two reasons, and the first is the load-bearing
   // one: a literal is compiled by the parser and consults no `RegExp` global, so
   // unlike `new RegExp(...)` it cannot be pointed at a different constructor. The
-  // second is cost — these used to be rebuilt from string concatenation on every
-  // import specifier and every export statement, which compiled a fresh regex per
-  // binding. None carries the `g` flag, and non-global `exec` neither reads nor
-  // writes `lastIndex`, so sharing one object across calls is safe.
+  // second is hygiene — these used to be rebuilt from string concatenation on every
+  // import specifier and every export statement, compiling a fresh regex per binding
+  // (660 `new RegExp` per run of the 61-module bench corpus). Do not sell that as the
+  // speedup: an ablation that reverts ONLY the hoisting is not resolvable against the
+  // noise floor, so this is a security change that happens to remove work.
+  //
+  // Sharing one object across calls is safe because none carries the `g` flag. The
+  // precise reason is not "non-global exec ignores lastIndex" — RegExpBuiltinExec does
+  // `Get(R, "lastIndex")` unconditionally and merely DISCARDS it when the regex is
+  // neither global nor sticky, and it skips only the write-back. What makes sharing
+  // safe is that discard plus the fact that `lastIndex` is a non-configurable own data
+  // property of a literal, on objects unreachable from user code.
   //
   // Every `[A-Za-z_$][\w$]*` below is the identifier pattern that used to be spliced
   // in as the `IDENT` variable; isIdent()/identLength() above are the same class.
@@ -442,7 +502,7 @@
   // character at a time whether or not there was anything to replace.
   function preReplaceMeta(src, mask) {
     var at = StringPrototypeIndexOf(mask, IMPORT_META);
-    if (at === -1) return { src: src, mask: mask };
+    if (at === -1) return { __proto__: null, src: src, mask: mask };
     var srcParts = [];
     var maskParts = [];
     var from = 0;
@@ -457,6 +517,7 @@
     ArrayPrototypePush1(srcParts, StringPrototypeSlice(src, from));
     ArrayPrototypePush1(maskParts, StringPrototypeSlice(mask, from));
     return {
+      __proto__: null,
       src: ArrayPrototypeJoin(srcParts, ''),
       mask: ArrayPrototypeJoin(maskParts, ''),
     };
@@ -558,7 +619,13 @@
    *       tests/node-compat/cases/58-esm-pollution.js, so its output is the answer
    *       Lava must match.
    * @deviates Named imports/exports are value copies, not live bindings (see the
-   *       header). Pinned by tests/node-compat/cases/12-esm-features.mjs.
+   *       header): after `bump()`, node reports the mutated `counter` and Lava
+   *       reports the value at import time. UNPINNED, stated plainly rather than
+   *       credited to a test that does not cover it — an earlier version of this tag
+   *       named 12-esm-features.mjs, which exports only `const`/`function` and
+   *       cannot pin it. No oracle case can: the deviation IS a node-vs-Lava byte
+   *       divergence, so any case exercising it would fail test-compat-lava by
+   *       construction. Closing it needs a Lava-only pin; tracked in ROADMAP.
    */
   function transform(source, url, filename, dirname) {
     source = StringG(source);
@@ -714,13 +781,21 @@
         // than turning it into an anonymous expression that loses `foo`.
         var fn = RegExpPrototypeExec(RE_DEFAULT_FUNCTION, expr);
         if (fn) {
-          return { body: expr + '; module.exports["default"] = ' + fn[1] + ';' };
+          return {
+            __proto__: null,
+            body: expr + '; module.exports["default"] = ' + fn[1] + ';',
+            tail: null,
+          };
         }
         var cls = RegExpPrototypeExec(RE_DEFAULT_CLASS, expr);
         if (cls) {
-          return { body: expr + '; module.exports["default"] = ' + cls[1] + ';' };
+          return {
+            __proto__: null,
+            body: expr + '; module.exports["default"] = ' + cls[1] + ';',
+            tail: null,
+          };
         }
-        return { body: 'module.exports["default"] = ' + expr + ';' };
+        return { __proto__: null, body: 'module.exports["default"] = ' + expr + ';', tail: null };
       }
       // export { ... } from 'spec'  (re-export named)
       m = RegExpPrototypeExec(RE_EXPORT_NAMED_FROM, stmt);
@@ -738,13 +813,15 @@
             jsonString(pairs[i].local) +
             '];';
         }
-        return { body: s + ' }' };
+        return { __proto__: null, body: s + ' }', tail: null };
       }
       // export * from 'spec'  (re-export all but default)
       m = RegExpPrototypeExec(RE_EXPORT_STAR_FROM, stmt);
       if (m) {
         var ta = nextTemp('__lava_reexp_');
         return {
+          __proto__: null,
+          tail: null,
           body:
             '{ var ' +
             ta +
@@ -769,7 +846,7 @@
             'module.exports[' + jsonString(locals[j].exported) + '] = ' + locals[j].local + ';',
           );
         }
-        return { body: '', tail: t2 };
+        return { __proto__: null, body: '', tail: t2 };
       }
       // export const|let|var NAME = ... (possibly multiple declarators) — declare
       // and assign each exported name in place, so a multi-declarator list exports
@@ -782,13 +859,15 @@
         for (var d = 0; d < names.length; d++) {
           assigns += ' module.exports[' + jsonString(names[d]) + '] = ' + names[d] + ';';
         }
-        return { body: decl + ';' + assigns };
+        return { __proto__: null, body: decl + ';' + assigns, tail: null };
       }
       // export [async] function NAME / export class NAME — declare and assign in
       // place (function declarations hoist, so the export is visible eagerly).
       m = RegExpPrototypeExec(RE_EXPORT_FUNCTION, stmt);
       if (m) {
         return {
+          __proto__: null,
+          tail: null,
           body:
             stripTrailingSemi(m[1]) + '; module.exports[' + jsonString(m[2]) + '] = ' + m[2] + ';',
         };
@@ -855,6 +934,16 @@
             if (ex === null) {
               throw new ErrorG('lava ESM transform: unsupported export form: ' + firstLine(stmt));
             }
+            // `ex` is null-prototype and carries an own `tail` on every branch, which
+            // is load-bearing rather than tidy: `tail` is present on ONE of the eight
+            // return shapes, so on the other seven this read used to walk the chain to
+            // `Object.prototype.tail` — and whatever it found was joined into `tailStr`
+            // and emitted as executed source. A data-only `{"__proto__":{"tail":[…]}}`
+            // merge was therefore full code execution in the module body, a CHEAPER
+            // gadget than the forged `exec` this file was hardened against (that one
+            // needs a function value). The ratchet cannot see it: an absent-property
+            // read is none of the four counted classes. Probe `tail:` in
+            // tests/node-compat/cases/58-esm-pollution.js, with a mutation entry.
             if (ex.body) ArrayPrototypePush1(pieces, ex.body);
             if (ex.tail) {
               for (var ti = 0; ti < ex.tail.length; ti++) {

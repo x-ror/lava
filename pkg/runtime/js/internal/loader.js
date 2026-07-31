@@ -72,7 +72,15 @@
   //      (a transitive dep of node-fetch), so answering require('encoding') from
   //      here would shadow it and break the ecosystem. Hiding the specifier leaves
   //      the globals intact while letting the filesystem resolver find the package.
+  // `__proto__: null` because this literal is indexed by a CALLER-SUPPLIED specifier
+  // (`INTERNAL_ONLY[normalize(name)]` below) — §5's one vector the ratchet cannot
+  // count. Inherited truthiness makes publicReq answer `undefined` for a real builtin,
+  // so `require('node:http')` falls through to filesystem resolution: a denial, or a
+  // shadow when an npm package of that name is installed (`os`, `path`, `url`, `util`
+  // and `events` all exist on the registry). The sibling lookup at `factories` above
+  // already guards this with hasOwn; this table was missed.
   var INTERNAL_ONLY = {
+    __proto__: null,
     primordials: true,
     parse_args: true,
     parse_env: true,

@@ -3,7 +3,7 @@
 //
 // Why this is a differential and not a Lava-only pin. node's ESM loader is native
 // C++ — none of the gadgets below reach it — so node is a real oracle here: it
-// loads every fixture correctly under all six, and Lava must print the same bytes.
+// loads every fixture correctly under all eleven, and Lava must print the same bytes.
 // That is stronger than a Lava-only test, because it pins Node parity at the same
 // time. (Contrast tests/node-compat/cases/54-url-pollution.js, where the same logic
 // applies for the same reason, and cmd/lava/regexp_pollution_test.odin, where it
@@ -42,6 +42,10 @@ const realCharCodeAt = String.prototype.charCodeAt;
 const realAt = Array.prototype.at;
 const realStringify = JSON.stringify;
 const realString = globalThis.String;
+const realJoinSaved = Array.prototype.join;
+const realSliceSaved = String.prototype.slice;
+const realSplitSaved = String.prototype.split;
+const realIndexOfSaved = String.prototype.indexOf;
 
 // 1. The blunt gadget: every regex answers with the same forged match. This is the
 // shape #322 used, and it is the one a poisoned-`exec` dependency produces by
@@ -193,6 +197,106 @@ probe(
   () => {
     const m = require('../fixtures/esm-pollution/strglobal.mjs');
     return m.ok;
+  },
+);
+
+// 7. The carrier the four-class ratchet is structurally blind to, and the cheapest of
+// the set: a plain DATA property on Object.prototype, no function value needed — the
+// shape a JSON/config merge gadget produces. `transformExport` carries an own `tail`
+// on one of eight return paths, so on the other seven `ex.tail` resolved off the
+// prototype chain and was joined into the emitted source. `esm.js` read 0/0/0/0 in the
+// ratchet the whole time this was open, which is the "floor, not a proof" case.
+probe(
+  'tail:',
+  () => {
+    Object.prototype.tail = ['globalThis.__esm_tail_pwned = "TAIL INJECTED";'];
+  },
+  () => {
+    delete Object.prototype.tail;
+  },
+  () => {
+    const m = require('../fixtures/esm-pollution/tail.mjs');
+    return m.ok + ' pwned=' + globalThis.__esm_tail_pwned;
+  },
+);
+
+// 8. Emission again, one layer out from `json:`. The transform assembles its output
+// with joins, so a gadget that lies only for the separator the wrapper uses hands the
+// attacker the WHOLE emitted module rather than one interpolated identifier — a
+// strictly larger win than probe 2. Narrow on purpose: a blanket join gadget would
+// break the runtime's own machinery and this would go red for an unrelated reason.
+probe(
+  'join:',
+  () => {
+    const realJoin = Array.prototype.join;
+    Array.prototype.join = function (sep) {
+      if (sep === '\n') {
+        return 'globalThis.__esm_join_pwned = "WRAPPER INJECTED";';
+      }
+      return realJoin.call(this, sep);
+    };
+  },
+  () => {
+    Array.prototype.join = realJoinSaved;
+  },
+  () => {
+    const m = require('../fixtures/esm-pollution/join.mjs');
+    return m.named + ' ' + m.ok + ' pwned=' + globalThis.__esm_join_pwned;
+  },
+);
+
+// 9-11. The remaining scanning/emission intrinsics, each narrow so it steers only
+// esm.js: `slice` decides whether a keyword was seen, `split` produces the binding
+// list, `indexOf` finds `import.meta` in the mask. Unhardened, each corrupts the
+// emitted source; node is unaffected by all three.
+probe(
+  'slice:',
+  () => {
+    String.prototype.slice = function (a, b) {
+      const s = realSliceSaved.call(this, a, b);
+      return s === 'export' ? 'import' : s;
+    };
+  },
+  () => {
+    String.prototype.slice = realSliceSaved;
+  },
+  () => {
+    const m = require('../fixtures/esm-pollution/slice.mjs');
+    return m.named + ' ' + m.ok;
+  },
+);
+
+probe(
+  'split:',
+  () => {
+    String.prototype.split = function (sep, lim) {
+      if (sep === ',') return ['EVIL1', 'EVIL2'];
+      return realSplitSaved.call(this, sep, lim);
+    };
+  },
+  () => {
+    String.prototype.split = realSplitSaved;
+  },
+  () => {
+    const m = require('../fixtures/esm-pollution/split.mjs');
+    return m.named + ' ' + m.ok;
+  },
+);
+
+probe(
+  'indexof:',
+  () => {
+    String.prototype.indexOf = function (needle, from) {
+      if (needle === 'import.meta') return 0;
+      return realIndexOfSaved.call(this, needle, from);
+    };
+  },
+  () => {
+    String.prototype.indexOf = realIndexOfSaved;
+  },
+  () => {
+    const m = require('../fixtures/esm-pollution/indexof.mjs');
+    return m.named + ' ' + m.ok;
   },
 );
 

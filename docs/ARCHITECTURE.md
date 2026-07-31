@@ -367,7 +367,8 @@ routing a per-code-unit codec loop through it cost 1.43x — hence
 into a null-prototype array where the loop is the inner loop.
 The loader **eager-loads it first**, before any
 other internal module and before user code, so the captured references are
-pristine; modules consume it via `require('primordials')` and get the cached table.
+pristine; modules consume it via `require('primordials')` and get the cached table
+(one exception — `esm.js`, which has no `require`; see §3.4).
 This is the JS-layer analog of the native error-intrinsic capture (§4.3/§5.1).
 
 `events.js` (EventEmitter) is the first fully migrated consumer — its internal
@@ -440,8 +441,10 @@ than a counter: never `await` a caller-supplied value directly.
 `primordials` is internal-only: the loader serves it to internal factories but
 hides it from the public resolver native `require()` consults, so it neither
 shadows a user package named `primordials` nor answers `require('node:primordials')`
-(which Node rejects). Gating the other internal helper modules the same way is a
-future follow-up.
+(which Node rejects). The _specifier_ is what is hidden — the table itself also hangs
+off that resolver object as `publicReq.primordials`, which is how `esm.js` receives it
+(§3.4); the resolver is reachable only from Odin and never reaches user code. Gating
+the other internal helper modules the same way is a future follow-up.
 
 ### 5.6 [P2] Documentation & process gaps
 
