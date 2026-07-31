@@ -16,18 +16,45 @@
 // Applied before `require('node:http')` so the server's own module-eval captures
 // see the poisoned prototype, which is the realistic order: a dependency required
 // earlier than the server.
-if (process.env.HTTP_POISON_REGEXP) {
+//
+// `charcodeat` is a THIRD direction, and it exists because the first two were not
+// the whole threat. Routing a validator off `RegExp` says nothing about what the
+// validator reads instead: `assertValidHeaderChar` and `isHttpToken` scan with a
+// live `String.prototype.charCodeAt`, which is a writable data property like any
+// other. A gadget that lies only about CR/LF turns `res.setHeader('Location', …)`
+// into response splitting, triggered by a remote request line — and the exec/test
+// phases pass throughout, because they never touch that carrier.
+//
+// The gadget is deliberately NARROW: it reports 0x41 for CR, LF and NUL and the
+// true value for everything else. A blanket liar would break the server's own
+// parsing and the phase would fail for an unrelated reason.
+const POISON = process.env.HTTP_POISON_REGEXP;
+if (POISON) {
+  const VALID = new Set(['exec', 'test', 'charcodeat', 'both']);
+  if (!VALID.has(POISON)) {
+    // A typo must fail loud rather than silently poisoning a direction nobody
+    // asked for — the same rule the primordials ratchet applies to its markers.
+    console.error('HTTP_POISON_REGEXP: unknown value ' + JSON.stringify(POISON));
+    process.exit(2);
+  }
   const forged = ['forged'];
   forged.index = 0;
   forged.input = '';
-  if (process.env.HTTP_POISON_REGEXP !== 'test') {
+  if (POISON === 'exec' || POISON === 'both') {
     RegExp.prototype.exec = function () {
       return forged;
     };
   }
-  if (process.env.HTTP_POISON_REGEXP !== 'exec') {
+  if (POISON === 'test' || POISON === 'both') {
     RegExp.prototype.test = function () {
       return true;
+    };
+  }
+  if (POISON === 'charcodeat') {
+    const realCharCodeAt = String.prototype.charCodeAt;
+    String.prototype.charCodeAt = function (i) {
+      const c = realCharCodeAt.call(this, i);
+      return c === 13 || c === 10 || c === 0 ? 0x41 : c;
     };
   }
 }

@@ -156,7 +156,10 @@ coupling.
       under the rule six entries up that forbids exactly this. Derive it instead:
       an acorn pass over `pkg/runtime/js` counting `re.test`/`re.exec` on a
       regex-shaped receiver plus `String.prototype.{replace,replaceAll,match,
-      matchAll,search,split}` with a regex first argument. `esm.js` dominates by a
+      matchAll,search,split}` with a regex argument in EITHER position — `s.replace(re, …)`
+      and the primordial `StringPrototypeReplace(s, re, …)`, where the regex is the
+      SECOND argument. Written for the first position only, this recipe scored zero on
+      `url.js`'s own residue sites, which the paragraph above names. `esm.js` dominates by a
       wide margin and is the module loader, so it is next.
       The claim that none of the remainder was on the network path was **false**, and
       the four that were are now fixed rather than merely re-described:
@@ -362,7 +365,7 @@ coupling.
       even under `--gate` (spawn noise is one-sided, so min-of-N is the right
       estimator there, unlike the in-process benches). Do NOT "fix" the
       remaining variance by pinning: pinning shifts the ratio level 25-40% (it
-      hurts node more than Lava) and would invalidate all 22 caps.
+      hurts node more than Lava) and would invalidate every cap in bench/thresholds.json.
 - [ ] **Host-native registry: consider moving `g_host_native_fns` onto
       `Runtime_State`** — it is read only at registration and in the sweep, never
       on the dispatch path (only `g_host_native_cbs` is), so keying it by the

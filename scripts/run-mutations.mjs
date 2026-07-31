@@ -49,7 +49,7 @@
 //   node scripts/run-mutations.mjs --filter=clone  # substring match on `name`
 //   node scripts/run-mutations.mjs --list
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -148,16 +148,42 @@ function runGate(gate) {
 // This runner is spawned from a node:test file by its own tests, and `make
 // test-mutation` can be invoked from any harness that sets it, so the fix belongs
 // here rather than in the caller.
+// A mutation may reintroduce a spin — several in this manifest deliberately do,
+// since the bug class they pin is "a global regex replace never terminates". Odin's
+// test runner has no default per-test timeout and no test here calls
+// set_fail_timeout, so without a bound at THIS level a spinning gate runs until the
+// allocator gives up: measured at 6.2 GB RSS and still climbing after 39 s locally,
+// 3m16s on a CI runner, and SIGKILL at 17 s under a 4 GB cap — where the kill
+// leaves no [ERROR] line, so the verdict degraded to WRONG REASON naming nothing
+// about memory. `set_fail_timeout` is NOT the fix: Odin implements terminate as
+// pthread_cancel, which in deferred mode never fires inside a JIT allocation loop,
+// and would unwind a thread holding JSC and malloc locks if it did.
+const GATE_TIMEOUT_MS = Number(process.env.MUTATION_TIMEOUT_MS ?? 120_000);
+
 function capture(bin, argv, opts = {}) {
   const env = { ...(opts.env ?? process.env) };
   delete env.NODE_TEST_CONTEXT;
   const r = spawnSync(bin, argv, {
+    timeout: GATE_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
     ...opts,
     env,
   });
-  if (r.error) return { status: -1, stdout: '', stderr: String(r.error.message) };
+  if (r.error) {
+    const timedOut = r.error.code === 'ETIMEDOUT' || r.signal === 'SIGKILL';
+    const note = timedOut ? `gate timed out after ${GATE_TIMEOUT_MS}ms` : String(r.error.message);
+    return { status: -1, stdout: r.stdout ?? '', stderr: note, timedOut };
+  }
+  if (r.signal === 'SIGKILL') {
+    return {
+      status: -1,
+      stdout: r.stdout ?? '',
+      stderr: `gate timed out after ${GATE_TIMEOUT_MS}ms`,
+      timedOut: true,
+    };
+  }
   return { status: r.status ?? -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
@@ -203,6 +229,12 @@ function firstDiff(a, b) {
 }
 const trunc = (s) => (s === undefined ? '(absent)' : s.length > 140 ? s.slice(0, 137) + '...' : s);
 
+// A timed-out gate is RED with a detail that says so, never a silent hang and never
+// a verdict about something else.
+function timedOut(r) {
+  return r.timedOut ? { ok: false, detail: r.stderr } : null;
+}
+
 function gateOdin(pkg, testName) {
   const out = join(ROOT, 'bin', '.mutation-odin.bin');
   const r = capture(ODIN, [
@@ -213,6 +245,8 @@ function gateOdin(pkg, testName) {
     `-define:ODIN_TEST_NAMES=${testName}`,
     `-out:${out}`,
   ]);
+  const to = timedOut(r);
+  if (to) return to;
   const text = r.stdout + r.stderr;
   // The Odin runner exits 0 on a build failure in some versions, so read the
   // summary line rather than trusting the status alone.
@@ -228,18 +262,33 @@ function gateOdin(pkg, testName) {
 // target's own `build` prerequisite picks the patched source up.
 function gateMake(target) {
   const r = capture('make', [target], { cwd: ROOT });
+  const to = timedOut(r);
+  if (to) return to;
   if (r.status === 0) return { ok: true, detail: `make ${target} passed` };
   const text = r.stdout + r.stderr;
-  // Prefer the line naming WHICH phase failed over the first generic error, so
-  // expect_detail can distinguish "the phase I meant" from "something else broke".
+  // Keep the phase label AND the tail of the target's own output. Preferring the
+  // labelled line alone was tuned to run-http-smoke.sh's "FAILED: <phase> checks
+  // failed" shape, and every other target fell through to make's generic
+  // `*** [Makefile:N: target] Error 1` — which names the target but never the
+  // reason, so `expect_detail` on such an entry could assert nothing better than
+  // "make failed", which RED already means.
   const lines = text.split('\n');
-  const labelled = lines.find((l) => /FAILED: .* checks failed/.test(l));
-  const fail = labelled ?? lines.find((l) => /^FAIL |FAILED|Error \d/.test(l));
-  return { ok: false, detail: fail ? fail.trim() : `make ${target} exited ${r.status}` };
+  const labelled = lines.filter((l) => /FAILED: .* checks failed/.test(l));
+  const generic = lines.filter((l) => /^FAIL |FAILED|Error \d/.test(l));
+  // The last few non-empty, non-make-noise lines are where a target that prints its
+  // own diagnosis puts it.
+  const tail = lines.filter((l) => l.trim() !== '' && !/^make(\[\d+\])?:/.test(l)).slice(-4);
+  const parts = [...new Set([...labelled, ...generic, ...tail])].map((l) => l.trim());
+  return {
+    ok: false,
+    detail: parts.length ? parts.join(' | ') : `make ${target} exited ${r.status}`,
+  };
 }
 
 function gateNodeTest(relPath) {
   const r = capture(NODE_BIN, ['--test', join(ROOT, relPath)]);
+  const to = timedOut(r);
+  if (to) return to;
   const text = r.stdout + r.stderr;
   if (r.status === 0) return { ok: true, detail: 'node:test passed' };
   // BOTH the failing test name and the assertion message. Returning only the `✖`
@@ -274,35 +323,34 @@ function restoreAll() {
   originals.clear();
 }
 
-// `process.on('exit')`, not a signal handler. This program's body is entirely
-// SYNCHRONOUS (spawnSync throughout), so a registered SIGINT listener never gets
-// a turn to run — while its mere presence removes node's default terminate-on-
-// SIGINT. The net effect of the previous version was that Ctrl-C did nothing at
-// all, and escalating to SIGTERM skipped the restore, leaving a source patched
-// with deliberately-reintroduced vulnerable code in the working tree.
+// `process.on('exit')` and NOTHING ELSE. This program's body is entirely
+// SYNCHRONOUS (spawnSync throughout), so a registered signal listener never gets a
+// turn to run — while its mere presence REMOVES node's default terminate
+// disposition. A previous version registered SIGINT/SIGTERM/SIGHUP handlers for
+// safety and made things strictly worse: measured, Ctrl-C and `kill -TERM` were
+// both swallowed, the run continued to completion and exited 0 with "mutation gate
+// ok", so `kill -9` became the only way to stop it — and SIGKILL is the one path
+// where no restore runs at all. Registering nothing means TERM and INT kill the
+// process as they always did.
 //
-// An 'exit' listener runs on every normal and thrown path including
-// process.exit(), and is synchronous, which is exactly what restoring files
-// needs. The signals are then re-raised with the default disposition so the
-// caller still sees a real signal death.
-process.on('exit', restoreAll);
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-  process.on(sig, () => {
-    console.error(`\nmutation gate: ${sig} — restoring sources`);
-    restoreAll();
-    process.removeAllListeners(sig);
-    process.kill(process.pid, sig);
-  });
-}
+// An 'exit' listener is synchronous and runs on every normal, thrown and
+// process.exit() path, which is what restoring files needs. It does NOT run on
+// SIGKILL; the warning below is the residue detector for that case.
+process.on('exit', () => {
+  const leftover = [...originals.keys()];
+  restoreAll();
+  if (leftover.length > 0 && process.exitCode !== 0) {
+    // Not reachable on SIGKILL by construction — this is for the case where the
+    // restore itself is what failed.
+    console.error(`mutation gate: restored ${leftover.length} source(s) on exit`);
+  }
+});
 
 function applyMutation(m) {
-  // Containment: `join(ROOT, '../../.bashrc')` resolves happily outside the repo,
-  // and this function reads and REWRITES whatever it is handed before make spawns
-  // shells over the result.
+  // Containment is enforced up front for every selected source; see the pre-flight
+  // loop. Doing it here as well was unreachable — gitClean rejects an escaping path
+  // first — which is why the check moved rather than being duplicated.
   const file = resolve(ROOT, m.source);
-  if (file !== ROOT && !file.startsWith(ROOT + sep)) {
-    throw new Error(`"source" escapes the repo root: ${m.source} -> ${file}`);
-  }
   const text = readFileSync(file, 'utf8');
   const hits = text.split(m.find).length - 1;
   if (hits === 0) {
@@ -330,6 +378,31 @@ function build() {
 // --- run --------------------------------------------------------------------
 
 const touched = [...new Set(selected.map((m) => m.source))];
+
+// Containment is checked HERE, before git is asked anything. It used to live inside
+// applyMutation, where it was unreachable: gitClean runs first over the same paths
+// and `git status -- ../outside` already exits 128, so the containment branch could
+// never fire and its test could only pass by matching git's message instead. A
+// security check that another check always shadows is not a check.
+//
+// realpathSync, not just resolve: resolve is lexical and does not follow symlinks,
+// while readFileSync and writeFileSync do — so a committed in-repo symlink pointing
+// outside passed the prefix test, and the runner then rewrote the target.
+for (const rel of touched) {
+  const lexical = resolve(ROOT, rel);
+  let real;
+  try {
+    real = realpathSync(lexical);
+  } catch {
+    // A source that does not exist yet is caught later, by applyMutation's read,
+    // with a message about the file rather than about paths.
+    real = lexical;
+  }
+  if (real !== ROOT && !real.startsWith(ROOT + sep)) {
+    die(`"source" escapes the repo root: ${rel} -> ${real}`);
+  }
+}
+
 const dirty = gitClean(touched);
 if (dirty) {
   die(
@@ -416,16 +489,24 @@ try {
       restoreAll();
     }
   }
-
-  // Unconditional when anything could have rebuilt from patched source. Leaving a
-  // vulnerable binary behind is worse than an extra 25s build, and it is silent.
-  if (dirtiesBinary) {
-    process.stdout.write('\n  restore build ... ');
-    build();
-    console.log('ok');
-  }
 } finally {
   restoreAll();
+  // In the FINALLY, not as the last statement of the try. It was the latter, so any
+  // throw out of the loop — a `replace` that does not compile, a transient build
+  // failure — skipped it while `restoreAll` still tidied the sources, leaving a
+  // clean git tree and a bin/lava built from the mutated source with nothing on
+  // screen. That is the exact state the needsBuild/dirtiesBinary split exists to
+  // prevent, re-entered through the exception path.
+  if (dirtiesBinary) {
+    process.stdout.write('\n  restore build ... ');
+    try {
+      build();
+      console.log('ok');
+    } catch (err) {
+      // Report rather than mask whatever is already propagating.
+      console.error(`FAILED — bin/lava may be built from mutated source: ${err.message}`);
+    }
+  }
 }
 
 console.log('');

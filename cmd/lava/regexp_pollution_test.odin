@@ -87,12 +87,75 @@ results.push('tab=' + under(() => new URL('http://exa\tmple.com/x').href));
 // And the IDNA separator fold, which an uppercase host reaches.
 results.push('upper=' + under(() => new URL('http://EXAMPLE.com/').href));
 
+// --- the SECOND carrier: String.prototype.charCodeAt ---------------------
+//
+// Routing a validator off RegExp says nothing about what it reads instead. These
+// scans are hand-rolled charCode loops, which reads as safe and is not: charCodeAt
+// is a writable data property like any other. node cannot oracle this — it rejects
+// the injected value for its own reasons — so it belongs here, not in a case.
+const realCCA = String.prototype.charCodeAt;
+function underCharCode(fn) {
+  // Lies ONLY about CR/LF/NUL. A blanket liar would break the runtime's own parsing
+  // and the assertion would pass for an unrelated reason.
+  String.prototype.charCodeAt = function (i) {
+    const c = realCCA.call(this, i);
+    return c === 13 || c === 10 || c === 0 ? 0x41 : c;
+  };
+  let out;
+  try {
+    out = fn();
+  } catch (e) {
+    out = 'THREW:' + e.name;
+  } finally {
+    String.prototype.charCodeAt = realCCA;
+  }
+  return out;
+}
+
+results.push(
+  'cc-value=' +
+    underCharCode(() => {
+      const h = new Headers();
+      h.set('x-ok', 'a\r\nInjected: yes');
+      return 'ACCEPTED';
+    }),
+);
+
+// --- the THIRD carrier: a replaced global used for CONVERSION -------------
+// A validator can be unpoisonable while the conversion beside it is not.
+const realParseInt = globalThis.parseInt;
+results.push(
+  'pi=' +
+    (() => {
+      globalThis.parseInt = function () {
+        return 7;
+      };
+      let out;
+      try {
+        out = String(Buffer.from('AAAA', 'base64').length);
+      } catch (e) {
+        out = 'THREW:' + e.name;
+      } finally {
+        globalThis.parseInt = realParseInt;
+      }
+      return out;
+    })(),
+);
+
+// --- two more global-replace spins, on carriers the first pass missed -----
+results.push('b64=' + under(() => Buffer.from('dXNlcjpwYXNz', 'base64').toString()));
+results.push('usp=' + under(() => String([...new URLSearchParams('a=😀')].length)));
+
 const want = [
   'inject=THREW:TypeError',
   'space=THREW:TypeError',
   'valid=v',
   'tab=http://example.com/x',
   'upper=http://example.com/',
+  'cc-value=THREW:TypeError',
+  'pi=3',
+  'b64=user:pass',
+  'usp=1',
 ];
 for (let i = 0; i < want.length; i++) {
   if (results[i] !== want[i]) {

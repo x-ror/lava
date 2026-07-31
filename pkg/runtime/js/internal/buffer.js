@@ -56,6 +56,8 @@
   var P = require('primordials');
   var StringG = String;
   var StringPrototypeToLowerCase = P.StringPrototypeToLowerCase;
+  var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
+  var StringFromCharCode = String.fromCharCode;
   var ObjectPrototypeHasOwnProperty = P.ObjectPrototypeHasOwnProperty;
   var TypedArrayPrototypeGetLength = P.TypedArrayPrototypeGetLength;
 
@@ -246,15 +248,42 @@
     );
   }
 
-  /** Lenient Node base64/base64url normalization before native decode. */
+  /**
+   * Lenient Node base64/base64url normalization before native decode.
+   *
+   * A charCode filter, not `replaceAll(/[^A-Za-z0-9+/]/g, '')`. That was a GLOBAL
+   * regex replace, and a global replace under a forged `RegExp.prototype.exec` does
+   * not answer wrongly — it never returns, because `Symbol.replace` advances
+   * `lastIndex` only on an empty match. Measured: `Buffer.from('dXNlcjpwYXNz',
+   * 'base64')` hung indefinitely on `bin/lava` where node answered promptly, and
+   * this is the Basic-auth / JWT decode path, so one unauthenticated request with an
+   * `Authorization` header was enough to wedge the event loop for good.
+   *
+   * The `-`/`_` folds are plain string arguments, not regexes, so they were never
+   * part of the vector; they are folded into the same pass because the pass is free.
+   */
   function normalizeBase64(str) {
-    str = StringG(str)
-      .replaceAll('-', '+')
-      .replaceAll('_', '/')
-      .replaceAll(/[^A-Za-z0-9+/]/g, '');
-    if (str.length % 4 === 1) str = str.slice(0, str.length - 1);
-    while (str.length % 4 !== 0) str += '=';
-    return str;
+    var src = StringG(str);
+    var n = src.length;
+    var out = '';
+    for (var i = 0; i < n; i++) {
+      var c = StringPrototypeCharCodeAt(src, i);
+      if (c === 0x2d)
+        c = 0x2b; // '-' -> '+'
+      else if (c === 0x5f) c = 0x2f; // '_' -> '/'
+      if (
+        (c >= 0x41 && c <= 0x5a) || // A-Z
+        (c >= 0x61 && c <= 0x7a) || // a-z
+        (c >= 0x30 && c <= 0x39) || // 0-9
+        c === 0x2b || // +
+        c === 0x2f // /
+      ) {
+        out += StringFromCharCode(c);
+      }
+    }
+    if (out.length % 4 === 1) out = out.slice(0, out.length - 1);
+    while (out.length % 4 !== 0) out += '=';
+    return out;
   }
 
   /** @returns {Uint8Array} */

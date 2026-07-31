@@ -37,8 +37,13 @@
   // NOT a complete rule for this file: the `StringPrototypeReplace(…, /re/, …)`
   // sites below route through the same RegExpExec re-read and are still steerable —
   // and a GLOBAL one spins rather than answering wrongly, because a forged result
-  // never advances lastIndex. Tracked in ROADMAP; see the note on TAB_NEWLINE_RE_G.
+  // never advances lastIndex. Tracked in ROADMAP. The last global regex in this file
+  // was toUSVString's, now a code-unit walk; LEADING_SLASHES_RE is non-global.
   var reTest = P.RegExpMatches;
+  var allChars = P.allChars;
+  var isAsciiDigit = P.isAsciiDigit;
+  var isAsciiHexDigit = P.isAsciiHexDigit;
+  var isAsciiOctalDigit = P.isAsciiOctalDigit;
   var PERCENT_2F_RE = /%2f/i;
   var PERCENT_5C_RE = /%5c/i;
   var LEADING_SLASHES_RE = /^\/+/;
@@ -168,33 +173,6 @@
       out += isIdnaSeparator(c) ? '.' : StringFromCharCode(c);
     }
     return out;
-  }
-
-  // allDigits: `/^[0-9]+$/` and friends without a RegExp, for the three validators
-  // that are nothing but a character class over a short token.
-  //
-  // Two reasons, and the second is the better one.
-  // SAFER: with no RegExp in the expression there is nothing to steer — `exec`,
-  // `test`, `Symbol.match`, `Symbol.replace` and `lastIndex` are all out of reach at
-  // once, where routing through a captured `exec` closes exactly one of them.
-  // FASTER: end to end on `new URL`, charCode/exec = 0.82x on a dotted quad, 0.83x
-  // on an octal quad, 0.90x on a plain special-scheme URL — min of 7 interleaved
-  // pinned launches per arm, each launch itself the min of 5 reps of 300k parses.
-  // `new URL` runs 4-7 of these per parse, which is where the +6% to +20% regression
-  // the exec migration introduced came from; this more than reverses it.
-  // Empty input is FALSE, matching `+` in the patterns it replaces.
-  function allDigits(s, radix) {
-    var n = s.length;
-    if (n === 0) return false;
-    for (var i = 0; i < n; i++) {
-      var c = StringPrototypeCharCodeAt(s, i);
-      if (radix === 16) {
-        if (!isHexDigit(c)) return false;
-      } else if (radix === 8) {
-        if (c < 0x30 || c > 0x37) return false;
-      } else if (c < 0x30 || c > 0x39) return false;
-    }
-    return true;
   }
 
   // The WHATWG percent-encode sets, each a predicate over a code point. Every set
@@ -559,7 +537,13 @@
     if (input === '') return 0;
     // Was three regex literals re-created per call (4-5x per dotted-quad parse) plus
     // an exec crossing each; now neither.
-    if (!allDigits(input, radix)) return FAILURE;
+    if (
+      !allChars(
+        input,
+        radix === 10 ? isAsciiDigit : radix === 16 ? isAsciiHexDigit : isAsciiOctalDigit,
+      )
+    )
+      return FAILURE;
     var n = parseIntG(input, radix);
     if (!isFiniteG(n)) return FAILURE;
     return n;
@@ -572,7 +556,7 @@
       ArrayPrototypePop(parts);
     }
     var last = parts[parts.length - 1];
-    if (allDigits(last, 10)) return true;
+    if (allChars(last, isAsciiDigit)) return true;
     return parseIPv4Number(last) !== FAILURE;
   }
 
@@ -950,12 +934,6 @@
         rest[2] === '#')
     );
   }
-
-  // Hoisted: a non-global regex for the cheap has-any test (a /g regex is
-  // stateful via lastIndex and unsafe to share for .test) and a global one for
-  // the actual strip.
-  var TAB_NEWLINE_RE = /[\t\n\r]/;
-  var TAB_NEWLINE_RE_G = /[\t\n\r]/g;
 
   // Returns a url record on success, or FAILURE. `base` is a url record or
   // undefined; `url`/`stateOverride` drive the setter path.
@@ -1567,12 +1545,22 @@
 
   // Convert to a USVString: stringify, then replace any unpaired surrogate with
   // U+FFFD (per WHATWG). The fast path skips strings with no surrogate at all.
-  var SURROGATE_PAIR_OR_LONE = /([\uD800-\uDBFF])([\uDC00-\uDFFF])?|([\uDC00-\uDFFF])/g;
+  //
+  // A code-unit walk, not a GLOBAL regex replace. The pre-scan below is not a guard
+  // against the poison it looks like one against: a VALID pair — any emoji in a
+  // remote query string — sets `hasSurrogate` too, and the global replace then
+  // never terminates under a forged `RegExp.prototype.exec`, because
+  // `Symbol.replace` advances `lastIndex` only on an empty match. Measured:
+  // `new URLSearchParams('a=<emoji>')` and `url.hash = 'x<emoji>'` both hung, and
+  // `new URLSearchParams(remoteQuery)` is on the network path.
+  //
+  // The pre-scan stays because it is the common case and it now decides a real fast
+  // path — most strings have no surrogate at all and are returned untouched.
   function toUSVString(value) {
     var str = typeof value === 'string' ? value : StringG(value);
-    // Quick reject: no surrogate code unit means it is already a USVString.
+    var n = str.length;
     var hasSurrogate = false;
-    for (var i = 0; i < str.length; i++) {
+    for (var i = 0; i < n; i++) {
       var c = StringPrototypeCharCodeAt(str, i);
       if (c >= 0xd800 && c <= 0xdfff) {
         hasSurrogate = true;
@@ -1580,11 +1568,25 @@
       }
     }
     if (!hasSurrogate) return str;
-    return StringPrototypeReplace(str, SURROGATE_PAIR_OR_LONE, function (match, high, low, lone) {
-      if (lone !== undefined) return '\uFFFD'; // lone low surrogate
-      if (low === undefined) return '\uFFFD'; // lone high surrogate
-      return match; // valid pair, keep as-is
-    });
+    var out = StringPrototypeSlice(str, 0, i);
+    for (; i < n; i++) {
+      var cu = StringPrototypeCharCodeAt(str, i);
+      if (cu < 0xd800 || cu > 0xdfff) {
+        out += StringFromCharCode(cu);
+        continue;
+      }
+      if (cu <= 0xdbff && i + 1 < n) {
+        var lo = StringPrototypeCharCodeAt(str, i + 1);
+        if (lo >= 0xdc00 && lo <= 0xdfff) {
+          // A valid pair is kept verbatim.
+          out += StringFromCharCode(cu) + StringFromCharCode(lo);
+          i++;
+          continue;
+        }
+      }
+      out += '\uFFFD'; // lone high or lone low surrogate
+    }
+    return out;
   }
 
   function spUpdate(sp) {

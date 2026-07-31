@@ -75,7 +75,16 @@
   }
   function assertValidHeaderValue(name, value) {
     for (var i = 0; i < value.length; i++) {
-      var code = value.charCodeAt(i);
+      // The CAPTURED read, not `value.charCodeAt(i)`. `String.prototype.charCodeAt`
+      // is a writable data property like any other, so a hand-rolled scan is only
+      // as sound as the primitive it scans with — routing this file's validators
+      // off RegExp said nothing about that. A gadget reporting 0x41 for CR and LF
+      // is enough: measured, node rejects and Lava accepted
+      // `a\r\nInjected: yes` as a header value, and the same gadget turned
+      // `res.setHeader('Location', decodeURIComponent(req.url))` into a split
+      // response driven by a remote request line. Pinned by the charcodeat phase
+      // in run-http-smoke.sh.
+      var code = StringPrototypeCharCodeAt(value, i);
       if (code === 0 || code === 10 || code === 13) {
         throw new TypeError('Invalid header value for "' + name + '": "' + value + '"');
       }

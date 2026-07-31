@@ -143,6 +143,13 @@ lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed
 # under the same poison. That is fail-closed, and Lava's was fail-open.
 lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed-poisoned-exec "HTTP_POISON_REGEXP=exec"
 lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed-poisoned-test "HTTP_POISON_REGEXP=test"
+# Phase 2c — the carrier the first two phases do not touch. Routing a validator off
+# RegExp says nothing about what it reads instead: assertValidHeaderChar and
+# isHttpToken scanned with a live String.prototype.charCodeAt, so a gadget lying
+# only about CR/LF turned `res.setHeader('Location', decodeURIComponent(req.url))`
+# into response splitting from a REMOTE request line — while phases 2a and 2b
+# passed throughout. node rejects the same request with ERR_INVALID_CHAR.
+lava_assert "$ROOT_DIR/tests/runtime/http/malformed.js" malformed-poisoned-charcodeat "HTTP_POISON_REGEXP=charcodeat"
 # Phase 3 — keep-alive: connection reuse, pipelining, Connection: close, HTTP/1.0.
 lava_assert "$ROOT_DIR/tests/runtime/http/keepalive.js" keepalive
 # Phase 4 — timeouts / slowloris: idle, slow-head, slow-body evicted; fast client OK.

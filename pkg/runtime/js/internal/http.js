@@ -31,31 +31,31 @@
   // `RegExpPrototypeTest` in primordials; `RegExpMatches` is the only spelling, and
   // it lives there rather than here because this file, url.js and fetch.js each
   // grew a private copy during the migration and fetch.js's was inverted.
+  // The character-class validators route through ONE shared predicate. They were
+  // written privately into this file and url.js in the same commit that centralised
+  // RegExpMatches to stop exactly that, and had already diverged when they landed.
   var reTest = primordials.RegExpMatches;
+  var allChars = primordials.allChars;
+  var isAsciiDigit = primordials.isAsciiDigit;
+  var isAsciiHexDigit = primordials.isAsciiHexDigit;
+  // The CAPTURED read. `String.prototype.charCodeAt` is a writable data property
+  // like any other, so a hand-rolled charCode scan is only as sound as the
+  // primitive it scans with — routing this file's validators off RegExp said
+  // nothing about that. Measured: a gadget reporting 0x41 for CR and LF turned
+  // `res.setHeader('Location', decodeURIComponent(req.url))` into a split response
+  // driven by a REMOTE request line, while the exec and test poison phases passed
+  // throughout because they never touch this carrier.
+  var StringPrototypeCharCodeAt = primordials.StringPrototypeCharCodeAt;
+  // Captured at module-eval, as url.js already does. Hardening the VALIDATOR and
+  // leaving the CONVERSION beside it live closes nothing: with `globalThis.parseInt`
+  // replaced, the digit check still answers correctly and `contentLengthRemaining`
+  // becomes whatever the gadget returns, so a crafted request's pipelined bytes are
+  // framed as a second request. Measured as a desync against the real server.
+  var parseIntG = parseInt;
+  var NumberG = Number;
+
   // Hoisted so the literals are not re-created per request, and so every framing
   // pattern is visible in one place rather than inline at four call sites.
-  // allDigits replaces `/^[0-9a-fA-F]+$/` and `/^\d+$/` for the two framing
-  // validators that are nothing but a character class. With no RegExp in the
-  // expression there is nothing to steer at all — `exec`, `test`, `Symbol.match`
-  // and `lastIndex` all drop out together, where routing through a captured `exec`
-  // closes one of them. It is also cheaper — the same swap measured 0.82x-0.90x end
-  // to end on `new URL` (min of 7 interleaved pinned launches per arm) — and the
-  // chunk-size check runs once per CHUNK, not once per request. Empty input is
-  // false, matching the `+` it replaces.
-  var StringPrototypeCharCodeAt = primordials.StringPrototypeCharCodeAt;
-  function allDigits(s, radix) {
-    var n = s.length;
-    if (n === 0) return false;
-    for (var i = 0; i < n; i++) {
-      var c = StringPrototypeCharCodeAt(s, i);
-      if (radix === 16) {
-        if (!((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66)))
-          return false;
-      } else if (c < 0x30 || c > 0x39) return false;
-    }
-    return true;
-  }
-
   var CHUNK_EXT_RE = /^;[^\s;]/;
   var TE_CHUNKED_RE = /^\s*chunked\s*$/i;
   var CONNECTION_CLOSE_RE = /\bclose\b/i;
@@ -118,7 +118,7 @@
   var HTTP_TCHAR = new Uint8Array(128);
   (function initHttpTchar() {
     var chars = "!#$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz|~";
-    for (var i = 0; i < chars.length; i++) HTTP_TCHAR[chars.charCodeAt(i)] = 1;
+    for (var i = 0; i < chars.length; i++) HTTP_TCHAR[StringPrototypeCharCodeAt(chars, i)] = 1;
   })();
 
   /**
@@ -128,7 +128,7 @@
   function isHttpToken(value) {
     if (typeof value !== 'string' || value.length === 0) return false;
     for (var i = 0; i < value.length; i++) {
-      var code = value.charCodeAt(i);
+      var code = StringPrototypeCharCodeAt(value, i);
       if (code >= 128 || !HTTP_TCHAR[code]) return false;
     }
     return true;
@@ -157,7 +157,7 @@
    */
   function assertValidHeaderChar(value, what) {
     for (var i = 0; i < value.length; i++) {
-      var code = value.charCodeAt(i);
+      var code = StringPrototypeCharCodeAt(value, i);
       if (code === 9 || (code >= 0x20 && code <= 0x7e) || (code >= 0x80 && code <= 0xff)) {
         continue;
       }
@@ -172,7 +172,7 @@
    * @returns {boolean}
    */
   function statusHasNoBody(statusCode) {
-    var code = Number(statusCode);
+    var code = NumberG(statusCode);
     return code === 204 || code === 304 || (code >= 100 && code < 200);
   }
 
@@ -182,7 +182,7 @@
    * @throws {RangeError} ERR_HTTP_INVALID_STATUS_CODE
    */
   function validateStatusCode(statusCode) {
-    var code = Number(statusCode);
+    var code = NumberG(statusCode);
     if (!Number.isInteger(code) || code < 100 || code > 999) {
       var err = new RangeError('Invalid status code: ' + JSON.stringify(statusCode));
       err.code = 'ERR_HTTP_INVALID_STATUS_CODE';
@@ -273,10 +273,10 @@
           var sizeLine = buffer.toString('latin1', 0, lineEnd);
           var extensionSep = sizeLine.indexOf(';');
           var sizeToken = extensionSep >= 0 ? sizeLine.slice(0, extensionSep) : sizeLine;
-          if (!allDigits(sizeToken, 16)) return fail();
+          if (!allChars(sizeToken, isAsciiHexDigit)) return fail();
           if (extensionSep >= 0 && !reTest(CHUNK_EXT_RE, sizeLine.slice(extensionSep)))
             return fail();
-          var chunkSize = parseInt(sizeToken, 16);
+          var chunkSize = parseIntG(sizeToken, 16);
           if (!Number.isSafeInteger(chunkSize) || chunkSize < 0) return fail();
           buffer = buffer.slice(lineEnd + 2);
           if (chunkSize === 0) state = 'trailer';
@@ -978,8 +978,8 @@
           onRequestBodyComplete,
         );
       } else if (contentLengthHeader !== undefined) {
-        if (!allDigits(contentLengthHeader, 10)) return sendErrorAndClose(400);
-        contentLengthRemaining = parseInt(contentLengthHeader, 10);
+        if (!allChars(contentLengthHeader, isAsciiDigit)) return sendErrorAndClose(400);
+        contentLengthRemaining = parseIntG(contentLengthHeader, 10);
       }
 
       var hasEntityBody = chunkedDecoder !== null || contentLengthRemaining > 0;
