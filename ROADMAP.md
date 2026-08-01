@@ -245,9 +245,11 @@ coupling.
       `stream.Writable`, not a lookalike: node's is a Writable in all three of its fd
       shapes and libraries feature-detect with `instanceof`, so a hand-rolled object would
       answer false and take the wrong branch in a logger.
-      `isTTY`/`columns`/`rows` answer **undefined** off a terminal, which is what node
-      reports — not `false`/`80`/`24`. `tty.js`'s own `WriteStream` still gets that wrong
-      and is the follow-up below.
+      `isTTY` answers **undefined** off a terminal, which is what node reports — not
+      `false`. `columns`/`rows` are **not implemented**: they read undefined everywhere,
+      which is right off a terminal and wrong on one, and they are deliberately not faked
+      to 80x24 because that is the `tty.js` bug in the follow-up below. Both need the
+      TIOCGWINSZ ioctl that entry describes.
       Writes go through `process_write`, so `console.log` and `process.stdout.write` share
       one mutex and cannot interleave mid-line, and both inherit the retry loop from #325.
       _Deviation:_ `write()` always returns `true`. node queues PIPE writes and can answer

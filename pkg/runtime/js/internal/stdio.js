@@ -17,8 +17,14 @@
 // `stream.columns || 80` are the two idioms in the wild, and reporting `false`/`80` off a
 // terminal makes the second one silently disagree with node. tty.js's WriteStream gets
 // this wrong today (it reports isTTY false and columns 80 on a pipe); this module does
-// not inherit that — it defines the three as getters that answer undefined unless the fd
-// really is a terminal.
+// not inherit that.
+//
+// SCOPE: only `isTTY` is implemented. `columns` and `rows` are absent from the prototype,
+// so they read `undefined` on a terminal too — correct off one, WRONG on one, where node
+// reports numbers. Supplying them needs a TIOCGWINSZ ioctl that does not exist in the
+// tree yet (`linux.ioctl` and `linux.TIOCGWINSZ` are both in core:sys/linux; only the
+// `winsize` struct needs declaring). Deliberately not faked to 80x24 — that is exactly
+// the tty.js bug named above. Tracked in ROADMAP beside the getWindowSize entry.
 (function (require, module, exports, native) {
   'use strict';
 

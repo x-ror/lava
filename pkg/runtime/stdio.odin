@@ -66,13 +66,19 @@ stdio_write_sync_cb :: proc "c" (
 	}
 
 	fd_num := jsc.JSValueToNumber(ctx, arguments[0], nil)
+	// Compare BEFORE converting: a float->int conversion is undefined in Odin for NaN,
+	// +/-Inf and out-of-range values, so `int(fd_num)` could land on any switch arm —
+	// including 1 or 2. Reachable from JS, because stdio.js passes `this.fd` and that is a
+	// plain writable property (`process.stdout.fd = NaN`). Same guard clear_timer_cb and
+	// process_exit_cb already apply in globals.odin for the same reason.
+	//
 	// Only the two standard descriptors. A JS-supplied fd reaching a raw write is a
 	// capability leak, and this binding is not a general fs.writeSync.
 	target: ^os.File
-	switch int(fd_num) {
-	case 1:
+	switch {
+	case fd_num == 1:
 		target = os.stdout
-	case 2:
+	case fd_num == 2:
 		target = os.stderr
 	case:
 		if exception != nil {
