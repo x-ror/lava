@@ -585,6 +585,17 @@
       "expect_detail": [
         "out-of-bounds read"
       ]
+    },
+    {
+      "name": "stdio_fd_guard dies when the fd is converted before it is compared",
+      "why": "`this.fd` is a plain writable property, so process.stdout.fd = 1.5 reaches this native. A float->int conversion is undefined in Odin for NaN, +/-Inf and out-of-range values, and truncation lands 1.5 and 2.9 squarely on fd 1 and 2 — so converting first turns the guard into a no-op for exactly the values it exists to catch. NaN and Infinity do NOT catch this on x86 (cvttsd2si yields INT_MIN, rejected either way), which is why the fractional cases are in the list.",
+      "source": "pkg/runtime/stdio.odin",
+      "find": "\tswitch {\n\tcase fd_num == 1:\n\t\ttarget = os.stdout\n\tcase fd_num == 2:\n\t\ttarget = os.stderr",
+      "replace": "\tfd_int := int(fd_num)\n\tswitch fd_int {\n\tcase 1:\n\t\ttarget = os.stdout\n\tcase 2:\n\t\ttarget = os.stderr",
+      "gate": "odin:cmd/lava:main.stdio_write_sync_rejects_every_fd_but_1_and_2",
+      "expect_detail": [
+        "writeSync(1.5, ...) was not rejected"
+      ]
     }
   ]
 }
