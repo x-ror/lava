@@ -176,11 +176,15 @@ coupling.
       `net.js` still carries one (`/^connect ([A-Z]+)/`), so the tail is **not** off the
       network path.
       _(That sentence used to also claim `buffer.js`, `querystring.js` and `punycode.js`
-      "still carry global-flag replaces". Two-thirds right, and wrong in both directions:
-      `punycode.js` has none, while `path.js` and `util.js` — named nowhere — had five
-      between them. That was the FOURTH copied claim in this entry to go stale, written
-      in the same commit that added the "do not copy, re-derive" rule above. The
-      spin-forever class is now closed tree-wide; see the entry below.)_
+      "still carry global-flag replaces". It was RIGHT about all three; its only defect
+      was omitting `path.js` and `util.js`, which carried six more between them. The
+      "correction" that replaced it — "`punycode.js` has none" — was itself false, and
+      became the FIFTH stale claim in this entry, written in the same commit that added
+      the "do not copy, re-derive" rule above. The recipe behind it was blinder than the
+      prose: it matched a regex literal written at the call site and missed every regex
+      held in a variable. There is now a gate instead of a sentence — `make check-js`
+      runs `scripts/check-global-replace.mjs`, whose own fixtures pin the three shapes
+      the hand-rolled passes missed.)_
       The claim that none of the remainder was on the network path was **false**, and
       the sites that were are now fixed rather than merely re-described:
       `fetch.js`'s header-value trim (which ran BEFORE the name validator on every
@@ -200,10 +204,18 @@ coupling.
       (Basic-auth / JWT) and `url.js` `toUSVString` (emoji in a remote query). Each
       has a Lava-only pin, an http-smoke phase where relevant, and a mutation-manifest
       entry.
-- [x] **The global-flag replaces — the spin-forever class, closed tree-wide** — done:
-      an acorn pass for a `/g` regex reaching a method that loops on RegExpExec returns
-      **0 sites**, from 8 across 4 files (`buffer.js` 2, `path.js` 2, `querystring.js` 1,
-      `util.js` 3). Derived, not copied — the entry above had named the wrong files.
+- [x] **The global-flag replaces — the spin-forever class, down to one declared
+      exception** — `scripts/check-global-replace.mjs` reports **1 site, allowlisted with
+      a reason**, from **11 across 6 files**: `buffer.js` 2, `path.js` 2, `querystring.js`
+      1, `util.js` 4, `mime.js` 1, `punycode.js` 1.
+      The first version of this entry claimed **0 from 8**, and both numbers came from a
+      pass that only saw a regex literal written at the call site. Three sites held their
+      `/g` regex in a variable and were invisible to it — `mime.js:143`, `punycode.js:50`
+      and `util.js:572` — and the merge gate caught all three, each verified to hang.
+      `mime.js` was the sharp one: **node answers and Lava hung**, on `MIMEType#toString`
+      reachable from a remote `Content-Type`, i.e. the same Lava-only tier as the
+      querystring bug this entry was written about. That is why the recipe is now a
+      script with its own fixtures rather than a sentence.
       The sharpest was remote-reachable and had been sitting in a public API the whole
       time: `querystring.parse` rewrites `+` to `%20` with a global replace, so a single
       `+` in a query string wedged any server doing

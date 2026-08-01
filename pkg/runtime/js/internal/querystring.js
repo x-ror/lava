@@ -116,7 +116,7 @@
     // under the same poison, so this was a Lava-only defect; pinned by
     // tests/node-compat/cases/59-global-replace-hangs.js. replaceCharAll returns `s`
     // unchanged when there is no '+', which is why the old indexOf guard is gone.
-    s = replaceCharAll(s, 0x2b, '%20'); // 0x2b '+'
+    s = replaceCharAll(s, '+', '%20');
     try {
       return decode(s);
     } catch {

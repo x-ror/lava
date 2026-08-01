@@ -64,7 +64,28 @@ console.log('noplus=' + under(() => qs.parse('a=1&b=2').b));
 // terminate for every occurrence, not just the first.
 console.log('many=' + under(() => qs.parse('a+b+c=1+2+3')['a b c']));
 
-// escape/unescape are the same decoder reached directly.
+// `unescape` is a DIFFERENT decoder — it percent-decodes only and never maps '+'
+// (querystring.js:22), so it never reached the replace. Kept as a Node-parity pin, not
+// as coverage of this class: it prints `a+b` with the fix, without it, and with
+// decodeComponent deleted. An earlier comment here claimed it was "the same decoder
+// reached directly", which is what a reader would have trusted.
 console.log('unesc=' + under(() => qs.unescape('a+b')));
+
+// The boundaries replaceCharAll's own callers never exercise: a '+' at index 0, at the
+// end of a key, and two consecutive. The rewrite is a hand-written scan, so these are
+// where an off-by-one lives.
+console.log('edges=' + under(() => JSON.stringify(qs.parse('+a=1&b+=2&c++d=3'))));
+
+// Zero-length components hit the `s.length === 0` early return above the replace.
+console.log('empty=' + under(() => JSON.stringify(qs.parse('a=&=b'))));
+
+// The MIMEType serializer escapes quotes and backslashes. It was a global replace too,
+// reachable from a remote Content-Type, and node answers correctly under this same
+// gadget — so it belongs in the oracle half, not the Lava-only pins. Constructed clean
+// so the poison lands on toString(), which is where the spin was.
+const mimeVal = new (require('node:util').MIMEType)('text/plain;charset="a b"');
+console.log('mime=' + under(() => String(mimeVal)));
+const mimeEsc = new (require('node:util').MIMEType)('text/plain;p="a\\"b"');
+console.log('mime-esc=' + under(() => String(mimeEsc)));
 
 console.log('done');

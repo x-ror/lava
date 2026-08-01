@@ -102,7 +102,7 @@
     "global": 2
   },
   "internal/mime.js": {
-    "method": 29,
+    "method": 27,
     "invoke": 0,
     "accessor": 0,
     "global": 5
@@ -162,7 +162,7 @@
     "global": 0
   },
   "internal/punycode.js": {
-    "method": 25,
+    "method": 24,
     "invoke": 0,
     "accessor": 0,
     "global": 2

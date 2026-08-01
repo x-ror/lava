@@ -1262,8 +1262,8 @@
       // the string until the engine gave up. node 24 hangs here too, so this is a
       // deviation in Lava's favour rather than a parity fix; pinned Lava-only by
       // cmd/lava/regexp_pollution_test.odin.
-      pattern = replaceCharAll(pattern, BACKSLASH, '/');
-      if (winSep) path = replaceCharAll(path, BACKSLASH, '/');
+      pattern = replaceCharAll(pattern, '\\', '/');
+      if (winSep) path = replaceCharAll(path, '\\', '/');
       var pathIsEmpty = path === '';
       var pathInfo = globNormalize(path);
       var patterns = globExpandBraces(pattern);

@@ -175,15 +175,44 @@ results.push('blob=' + under(() => String(new Blob(['x\r\ny'], { endings: 'nativ
 // instead — the outputs cannot match however the spin is fixed. What this pins is
 // availability only: THREW means it returned, where before it consumed the string until
 // the engine gave up. The missing process.stderr is a separate gap, recorded in ROADMAP.
-process.env.NODE_DEBUG = 'foo*,bar';
-const debugLog = require('node:util').debuglog('foo');
-results.push(
-  'debuglog=' +
-    under(() => {
-      debugLog('x');
-      return 'called';
-    }),
-);
+// One env value for every debuglog assertion below: initDebugEnv compiles the pattern
+// on the FIRST call and latches, so a later re-assignment is silently ignored. 'a.b'
+// carries the regex special that must be escaped; 'foo*' carries the wildcard.
+process.env.NODE_DEBUG = 'a.b,foo*';
+const nodeUtil2 = require('node:util');
+const debugLog = nodeUtil2.debuglog('foo');
+// Asserts LIVENESS, not an error name: 'THREW:TypeError' would also match a captured
+// primordial having gone undefined, and it inverts the day process.stderr lands (an open
+// ROADMAP item), turning a pollution test red for a stdio change. Either outcome proves
+// the pattern compile returned, which is the property under test.
+const dl = under(() => {
+  debugLog('x');
+  return 'called';
+});
+results.push('debuglog=' + (dl === 'called' || dl === 'THREW:TypeError' ? 'returned' : dl));
+
+// The enablement decision, UNPOISONED. Without this nothing observes debugEnvPattern at
+// all: under the poison testEnabled reads the forged exec and answers true for every
+// section, so the assertion above passes even with NODE_DEBUG unset — i.e. when the
+// pattern is never compiled. These two lines are what make the poisoned probe honest,
+// and they cover the escape branch ('.' is a regex special that must be escaped, so
+// 'a.b' must not enable 'axb').
+results.push('dbg-dot=' + String(nodeUtil2.debuglog('a.b').enabled));
+results.push('dbg-nodot=' + String(nodeUtil2.debuglog('axb').enabled));
+results.push('dbg-star=' + String(nodeUtil2.debuglog('foobar').enabled));
+results.push('dbg-miss=' + String(nodeUtil2.debuglog('nope').enabled));
+
+// punycode's RFC 3490 separator fold was the same global-replace shape. node hangs on it
+// too, so it is Lava-only. new URL() does not route here (url.js has its own IDNA
+// path), so this needs an explicit require to reach.
+const puny = require('node:punycode');
+results.push('puny-clean=' + puny.toASCII('münchen.de'));
+// Availability only under the poison, deliberately. The separator fold no longer spins,
+// but punycode.js still decides PER LABEL with live regexNonASCII/regexPunycode .test
+// reads, so a forged exec makes it encode every label ('.de' becomes '.xn--de-'). That
+// is the steering class, not the spin class this entry closes, and it is left to the
+// file's own hardening pass — asserting the garbage value would pin the bug, not the fix.
+results.push('puny=' + (typeof under(() => puny.toASCII('münchen.de')) === 'string' ? 'returned' : 'BROKEN'));
 
 const want = [
   'inject=THREW:TypeError',
@@ -198,8 +227,17 @@ const want = [
   'glob=true',
   'inspect=<Buffer 01 02 03>',
   'blob=3',
-  'debuglog=THREW:TypeError',
+  'debuglog=returned',
+  'dbg-dot=true',
+  'dbg-nodot=false',
+  'dbg-star=true',
+  'dbg-miss=false',
+  'puny-clean=xn--mnchen-3ya.de',
+  'puny=returned',
 ];
+if (results.length !== want.length) {
+  throw new Error('results ' + results.length + ' vs want ' + want.length);
+}
 for (let i = 0; i < want.length; i++) {
   if (results[i] !== want[i]) {
     throw new Error('want ' + want[i] + ' got ' + results[i]);

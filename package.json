@@ -1,10 +1,11 @@
 {
   "private": true,
   "scripts": {
-    "js:check": "vp fmt 'pkg/runtime/js/**/*.js' 'tests/**/*.js' 'tests/**/*.mjs' 'tests/**/*.cjs' 'scripts/**/*.{js,mjs}' 'bench/**/*.js' 'bench/**/*.mjs' --check && vp lint pkg/runtime/js tests scripts bench && bun run js:deadcode && bun run js:scripttests && bun run js:primordials",
+    "js:check": "vp fmt 'pkg/runtime/js/**/*.js' 'tests/**/*.js' 'tests/**/*.mjs' 'tests/**/*.cjs' 'scripts/**/*.{js,mjs}' 'bench/**/*.js' 'bench/**/*.mjs' --check && vp lint pkg/runtime/js tests scripts bench && bun run js:deadcode && bun run js:scripttests && bun run js:primordials && bun run js:globalreplace",
     "js:deadcode": "bun run scripts/check-orphan-js.mjs",
     "js:fix": "vp lint pkg/runtime/js tests scripts bench --fix && vp fmt 'pkg/runtime/js/**/*.js' 'tests/**/*.js' 'tests/**/*.mjs' 'tests/**/*.cjs' 'scripts/**/*.{js,mjs}' 'bench/**/*.js' 'bench/**/*.mjs' --write",
     "js:primordials": "bun run scripts/check-primordials.mjs",
+    "js:globalreplace": "bun run scripts/check-global-replace.mjs",
     "actions:check": "bun run scripts/check-actions.mjs",
     "md:check": "markdownlint-cli2",
     "md:fix": "markdownlint-cli2 --fix",
