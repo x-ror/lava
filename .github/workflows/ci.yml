@@ -74,6 +74,14 @@ jobs:
       - name: Test (differential property suite)
         run: make test-property
 
+      # Runs AFTER build, deliberately: it spawns bin/lava through a parent-held
+      # non-blocking pipe, which is the only way to reproduce the truncation it pins
+      # (the O_NONBLOCK flag has to come from the parent). It lived under scripts/ at
+      # first, which put it in the buildless check-js step and made it fail on a fresh
+      # checkout for want of a binary.
+      - name: Test (stdio writer)
+        run: make test-stdio
+
       # MUTATION GATE. Breaks the code each recorded test claims to pin and requires
       # the test to go red. It exists because three tests in #321 passed for the
       # wrong reason and every one was caught only by doing this by hand: an oracle

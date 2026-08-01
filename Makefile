@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property test-mutation check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
+.PHONY: test-stdio help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property test-mutation check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface vendor-bun-report bun-buffer-report bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -46,6 +46,7 @@ help:
 	@printf '%s\n' '  make check-primordials  Prototype-pollution ratchet over embedded JS (UPDATE=1 to lower; RAISE=--allow-raise to record new ground)'
 	@printf '%s\n' '  make test-scripts       node:test over scripts/ (the ratchet detector fixtures)'
 	@printf '%s\n' '  make test-mutation      Prove each recorded test dies when its code is broken'
+	@printf '%s\n' '  make test-stdio        node:test over tests/stdio (needs a built bin/lava)'
 	@printf '%s\n' '  make test-property      Differential property tests node-vs-Lava (fast-check; PROPERTY_RUNS=N)'
 	@printf '%s\n' '  make check-jsc          Locate JavaScriptCore dev files (macOS framework or GTK) with install hints'
 	@printf '%s\n' '  make check-native       Verify native build dependencies via pkg-config'
@@ -185,6 +186,9 @@ test-mutation: build
 # affordable (~1s) where the per-input shape cost 64s for 200 and had to stay out
 # of CI. Needs bin/lava, hence its own target rather than part of the
 # always-block. PROPERTY_RUNS raises the count for a deeper local run.
+test-stdio: build
+	LAVA_BIN="$(LAVA)" node --test 'tests/stdio/**/*.test.mjs'
+
 test-property: build
 	LAVA_BIN="$(LAVA)" node --test 'tests/property/**/*.property.test.mjs'
 

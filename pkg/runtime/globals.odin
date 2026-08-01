@@ -651,11 +651,79 @@ clear_timer_cb :: proc "c" (
 @(private = "file")
 output_mutex: sync.Mutex
 
+// process_write_all writes every byte of `data` to `fd`, or reports why it could not.
+//
+// Params:
+//   fd     Destination file; the caller must already hold output_mutex.
+//   data   Bytes to write; an empty slice is a no-op success.
+// Returns:
+//   written  Bytes actually delivered — equal to len(data) on success.
+//   err      The error that stopped the loop; nil when everything was written.
+// Node:
+//   node writes files and TTYs synchronously on POSIX and QUEUES pipes on its loop,
+//   flushing before a natural exit. On a natural exit `console.log('x'.repeat(300000))`
+//   delivers 300001 bytes where Lava delivered 65536 (node 24.18.1, parent-set O_NONBLOCK
+//   pipe). It is not a blanket "node never truncates": across `process.exit(0)` node drops
+//   its queued write and delivers 65536 on the same harness — the exact signature this
+//   fix removes from Lava.
+// Deviates:
+//   Two, both from writing synchronously where node queues, and both measured on that
+//   harness. (1) A full stdout parks the loop thread in poll(2) until the reader drains:
+//   during a 2s stall node fired 19 timer ticks and Lava fired 0. Lava already behaved
+//   this way for a BLOCKING pipe; the fix makes it reachable for a non-blocking one too.
+//   (2) `console.log(big); process.exit(0)` delivers everything here and 65536 under node.
+//   Blocking was chosen over dropping bytes. Pinned by tests/stdio/stdio-write.test.mjs.
+//
+// Two distinct failures are folded in here, and only the first is obvious. `os.write`
+// loops on a SHORT write but abandons the loop on any errno (core/os/file_linux.odin),
+// and the previous caller discarded both `n` and `err` — so a full pipe ended the write
+// and reported success. Nothing in Lava sets O_NONBLOCK on fd 1/2, which is exactly why
+// this was invisible: the flag is INHERITED from whatever launched the process, so an
+// ordinary shell pipe never reproduces it and a process manager does.
+//
+// The EAGAIN retry deliberately blocks rather than spins. A busy loop on a full pipe
+// burns a core until the reader drains; waiting for writability is what the kernel
+// interface is for. EINTR carries no information about the fd and is simply retried.
+process_write_all :: proc(fd: ^os.File, data: []byte) -> (written: int, err: os.Error) {
+	rest := data
+	for len(rest) > 0 {
+		n, werr := os.write(fd, rest)
+		if n > 0 {
+			written += n
+			rest = rest[n:]
+		}
+		// A successful write of zero bytes would loop forever holding output_mutex.
+		// Unreachable on Linux/darwin (core:os forces an error), but Windows'
+		// WriteFile on a PIPE_NOWAIT handle returns TRUE with 0 written and
+		// GetLastError() 0, which core:os maps to a nil error. Bail rather than spin.
+		if werr == nil {
+			if n == 0 do return written, .Unexpected_EOF
+			continue
+		}
+		if !stdio_retryable(werr) do return written, werr
+		// A retryable error with no progress means the fd is full (or a signal landed).
+		// Wait for it to become writable instead of spinning; on the platforms where
+		// this cannot be expressed the wait is a no-op and the loop simply retries.
+		if n == 0 do stdio_wait_writable(fd)
+	}
+	return written, nil
+}
+
+// process_write serializes a whole message under output_mutex so a line lands atomically
+// relative to other workers. It now writes every byte across a retryable stall instead of
+// stopping at one buffer-full.
+//
+// A NON-retryable failure is still swallowed, and deliberately: there is no channel to
+// report it on from a `proc "c"` callback, and node's own stdout error is equally
+// invisible for console.log — `lava run big.js | head -c 100` and the node equivalent both
+// exit 0 in ~0.04s. An earlier version of this comment claimed it "gives up loudly", which
+// was never true; the returns are discarded.
 process_write :: proc(fd: ^os.File, parts: ..string) {
 	sync.lock(&output_mutex)
 	defer sync.unlock(&output_mutex)
 	for p in parts {
-		os.write_string(fd, p)
+		if len(p) == 0 do continue
+		process_write_all(fd, transmute([]byte)p)
 	}
 }
 

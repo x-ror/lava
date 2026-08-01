@@ -93,13 +93,20 @@ run_command :: proc(args: []string) {
 	os.exit(exit_code)
 }
 
+// print_result routes through lava_runtime.process_write rather than fmt.println for the
+// reason globals.odin states about itself: fmt goes to core:os directly, which abandons
+// its write loop on the first errno, so `lava eval` output and the synchronous throw
+// report truncated to one pipe buffer and exited 0 on a non-blocking stdout. Measured
+// before this change: `lava eval "'x'.repeat(300000)"` delivered 65536 bytes where node -p
+// delivered 300001. The async report already went through process_write and was fine,
+// which is what made the two error paths disagree on the same input.
 print_result :: proc(result: lava_runtime.Result) {
 	if lava_runtime.is_success(result) {
 		if len(result.message) > 0 {
-			fmt.println(result.message)
+			lava_runtime.process_write(os.stdout, result.message, "\n")
 		}
 		return
 	}
 
-	fmt.eprintln(result.message)
+	lava_runtime.process_write(os.stderr, result.message, "\n")
 }
