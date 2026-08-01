@@ -255,14 +255,30 @@ coupling.
       _Deviation:_ `write()` always returns `true`. node queues PIPE writes and can answer
       `false` under backpressure; nothing is buffered here, so there is no drain to wait
       for. Matches node for the file and tty cases, 2 of its 3.
-      Chunk validation lives in this module rather than `stream.js`: Lava's `Writable`
-      accepts `write(5)` and throws asynchronously with no code on `write(null)`, where
-      node reports `ERR_INVALID_ARG_TYPE` and `ERR_STREAM_NULL_VALUES` synchronously.
-      Fixing that generally is a wider change than this one.
+      Chunk-type validation is NOT addressed here. Lava's `Writable` produces the right
+      codes (`ERR_INVALID_ARG_TYPE`, `ERR_STREAM_NULL_VALUES`) but delivers them as an
+      async `'error'` where node throws synchronously — an earlier claim that it threw
+      "with no code" was wrong. Fixing it reaches every Writable in the tree; see the
+      open entry below for why the attempt inside this change was reverted.
       Pinned by `tests/node-compat/cases/60-process-stdio.js` (byte-identical to node).
       `util.debuglog` was the concrete casualty of the absence — with `NODE_DEBUG`
       matching, node printed and Lava threw, which is why the debuglog spin in #324 could
       not be pinned as an oracle case. That blocker is gone.
+- [ ] **`stream.js` reports chunk-type errors asynchronously where node throws** — node
+      throws `ERR_INVALID_ARG_TYPE` / `ERR_STREAM_NULL_VALUES` synchronously from
+      `Writable#write`; Lava produces the right codes but delivers them as an async
+      `'error'` and returns false. It also rejects `DataView`/`Int16Array`, which node
+      accepts (node converts the view to a Buffer with `encoding: 'buffer'` in the same
+      step), and its message says "Buffer or Uint8Array" where node says "Buffer,
+      TypedArray, or DataView".
+      Attempted inside #326 and **reverted**, because the change reaches every Writable in
+      the tree and produced two regressions the merge gate caught: porting node's accept
+      set without its conversion left `chunk.length` undefined, so `writableLength` became
+      `NaN` and the stream never emitted `'drain'` again — permanently stalling
+      `src.pipe(process.stdout)` on a process-lifetime singleton — and the bare `throw`
+      moved the `pipe()` error from the writable onto the readable. Needs its own change
+      with a `61-stream-write-validation` oracle case covering the accept set, the
+      message template, and which stream the `pipe()` error lands on.
 - [ ] **`process.on` does not exist**, so `process.on('exit', …)` throws — found while
       pinning the above, which had to use a timer instead. Also still missing:
       `process.hrtime` (`hrtime.bigint()` throws; `JSBigIntCreateWithUInt64` IS exported by

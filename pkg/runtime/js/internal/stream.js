@@ -14,7 +14,6 @@
 
   var EventEmitter = require('events');
   var Buffer = require('buffer').Buffer;
-  var describeType = require('buffer').describeType;
   var StringDecoder = require('string_decoder').StringDecoder;
   var nextTick = process.nextTick;
 
@@ -52,19 +51,12 @@
     return codedError(
       TypeError,
       'ERR_INVALID_ARG_TYPE',
-      'The "' + name + '" argument must be ' + expected + '. Received ' + describeType(actual),
+      'The "' + name + '" argument must be ' + expected + '. Received ' + typeof actual,
     );
   }
 
   function isUint8(chunk) {
     return chunk instanceof Uint8Array;
-  }
-
-  // What node's Writable actually accepts as a chunk: a Buffer/TypedArray OR a DataView.
-  // `isUint8` alone rejects DataView and Int16Array, both of which node takes (verified
-  // on process.stdout, node 24.18.1).
-  function isBytesChunk(chunk) {
-    return chunk instanceof Uint8Array || ArrayBuffer.isView(chunk);
   }
 
   // --- Stream base ---------------------------------------------------------------
@@ -723,13 +715,10 @@
     encoding = encoding || w.defaultEncoding;
     if (typeof cb !== 'function') cb = noop;
 
-    // node THROWS both of these synchronously rather than reporting them on the stream.
-    // This used to route through writeErrorNextTick and return false, which meant the
-    // right code arrived on the wrong turn — `assert.throws(() => s.write(null))` passed
-    // under node and failed here. Verified against node 24.18.1 for both a bare Writable
-    // and process.stdout.
     if (chunk === null) {
-      throw errNullValues();
+      var nullErr = errNullValues();
+      writeErrorNextTick(this, nullErr, cb);
+      return false;
     }
     if (!w.objectMode) {
       if (typeof chunk === 'string') {
@@ -737,15 +726,14 @@
           chunk = Buffer.from(chunk, encoding);
           encoding = 'buffer';
         }
-      } else if (!isBytesChunk(chunk)) {
-        // node's exact expected-type string, and node accepts any ArrayBuffer view here
-        // (DataView and Int16Array both return true on process.stdout) — `isUint8` alone
-        // rejected those.
-        throw errInvalidArg(
+      } else if (!isUint8(chunk)) {
+        var typeErr = errInvalidArg(
           'chunk',
-          'of type string or an instance of Buffer, TypedArray, or DataView',
+          'of type string or an instance of Buffer or Uint8Array',
           chunk,
         );
+        writeErrorNextTick(this, typeErr, cb);
+        return false;
       }
     }
     if (w.ending) {

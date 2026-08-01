@@ -1571,10 +1571,6 @@
 
   var exported = {
     Buffer: Buffer,
-    // Internal: node's "Received ..." clause. Exported so stream.js (and any other
-    // internal module building an ERR_INVALID_ARG_TYPE) stops re-deriving it — there were
-    // five near-copies in the tree and only this one matched node for every type.
-    describeType: describeType,
     SlowBuffer: SlowBuffer,
     Blob: Blob,
     File: File,
