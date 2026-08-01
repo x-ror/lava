@@ -161,8 +161,9 @@ results.push('usp=' + under(() => String([...new URLSearchParams('a=😀')].leng
 //
 // So hardening Lava here is a DEVIATION IN LAVA'S FAVOUR, and CLAUDE.md §1 requires a
 // Lava-only test rather than a comment. The assertion is timing-free: the script simply
-// has to finish. The two node-oracle surfaces (querystring, util.debuglog) live in
-// tests/node-compat/cases/59-global-replace-hangs.js instead.
+// has to finish. querystring is the ONLY one of the five that node oracles, and it is
+// the only one in tests/node-compat/cases/59-global-replace-hangs.js; util.debuglog is
+// Lava-only too and sits directly below, for a different reason.
 results.push('glob=' + under(() => String(require('node:path').matchesGlob('a/b.txt', 'a/*.txt'))));
 results.push('inspect=' + under(() => require('node:util').inspect(Buffer.from([1, 2, 3]))));
 results.push('blob=' + under(() => String(new Blob(['x\r\ny'], { endings: 'native' }).size)));
