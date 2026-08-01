@@ -574,6 +574,17 @@
       "expect_detail": [
         "_isStdio marker"
       ]
+    },
+    {
+      "name": "fs_write_payload dies when the buffer length is sampled before the window getters",
+      "why": "byteOffset/byteLength on a DataView may be OWN accessors, so reading them runs arbitrary JS that can resize the backing ArrayBuffer. Sampling the buffer's length first validates the window against a size that no longer exists, and the resolver hands back a slice past the allocation — 4088 bytes of out-of-bounds heap written into a caller-named file.",
+      "source": "pkg/runtime/fs.odin",
+      "find": "\t\t\t\toff_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteOffset\"), nil)\n\t\t\t\tlen_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteLength\"), nil)\n\t\t\t\t// Now that no further JS can run, sample the authoritative length and take\n\t\t\t\t// the base pointer back to back: the pointer is only valid until the next\n\t\t\t\t// JSC API call (a GC/realloc can move it), so nothing may come between them\n\t\t\t\t// but the pure-Odin validation below.\n\t\t\t\tab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))",
+      "replace": "\t\t\t\tab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))\n\t\t\t\toff_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteOffset\"), nil)\n\t\t\t\tlen_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteLength\"), nil)",
+      "gate": "odin:cmd/lava:main.fs_write_payload_rejects_a_window_resized_by_its_own_getter",
+      "expect_detail": [
+        "out-of-bounds read"
+      ]
     }
   ]
 }

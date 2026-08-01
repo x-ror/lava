@@ -81,6 +81,45 @@ coupling.
 
 ### High priority (the Odin / native part)
 
+- [x] **`fs.writeFileSync(path, dataView)` could write out-of-bounds heap into a
+      caller-named file** — fixed. JSC's C API has no DataView byte accessor, so
+      `fs_resolve_write_payload` reads `.byteOffset`/`.byteLength` off the object. Those
+      are ordinary property reads, and on an object carrying its OWN accessors they run
+      arbitrary JS — which can `resize()` the backing ArrayBuffer before returning. The
+      resolver sampled the buffer's length BEFORE those reads and validated the window
+      against that stale number, then took the base pointer after.
+      Measured on a 4096-byte resizable buffer whose `byteOffset` getter calls
+      `ab.resize(8)`: node writes 4096 bytes of the real buffer (its getters never run —
+      internal slots), Lava wrote 4096 bytes over an 8-byte live allocation, so **4088
+      bytes of adjacent heap landed in a file the script chose**. An arbitrary-length
+      disclosure, not just a crash.
+      The fix is ordering: read the claimed window first — the only step that can run user
+      JS — then sample the authoritative length and take the pointer back to back, with
+      only pure-Odin validation between them. Same family as the coercion re-entrancy in
+      `cmd/lava/buffer_reentrancy_test.odin`, reached through a property read rather than
+      a `valueOf`. Pinned by `cmd/lava/fs_write_payload_test.odin` plus a
+      `tests/mutation-manifest.json` entry that restores the stale ordering.
+- [ ] **A DataView's window is read from forgeable properties, not its internal slots** —
+      the residual half of the entry above, and a parity gap rather than a safety one.
+      Node reads a DataView's `byteOffset`/`byteLength` from internal slots and ignores
+      own accessors entirely; Lava reads the properties, so a forged pair selects a
+      different window (and now rejects, where node writes the real bytes). `is_data_view`
+      is the same shape — it compares `constructor.name` to `"DataView"`, which any object
+      can claim. Neither is exploitable: every window that survives validation is in
+      bounds of a buffer the caller already holds a reference to. Closing it needs the
+      pristine `DataView.prototype` getters callable from native — a cached, protected
+      `JSObjectRef` per context, swept from `destroy_runtime_state` like every other
+      handle-keyed cache — which is a design decision of its own and was deliberately not
+      bolted onto #326.
+- [ ] **`fs.readFileSync` returns a plain `Uint8Array`, not a `Buffer`** — so
+      `Buffer.isBuffer(fs.readFileSync(p))` is `false`, `constructor.name` is
+      `"Uint8Array"`, and every Buffer method silently does the wrong thing or is absent:
+      `.toString('hex')` falls through to `Uint8Array.prototype.toString` and returns
+      comma-joined decimals (`"116,121"` where node gives `"7479"`), and `.equals`,
+      `.readUInt32BE`, `.subarray().toString('base64')` and friends are missing outright.
+      Found while checking that a benign `DataView` write still round-tripped after the
+      TOCTOU fix; unrelated to it and pre-existing. Wide blast radius for how ordinary the
+      call is — hashing a file, base64-ing an image, comparing two files all break.
 - [x] **The primordials ratchet cannot see accessor reads, and reports 0
       anyway** — fixed: it parses with acorn and counts four classes, each
       baselined separately — `method`, `invoke` (`.call`/`.apply`), `accessor`
