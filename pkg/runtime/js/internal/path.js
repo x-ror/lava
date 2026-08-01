@@ -6,6 +6,10 @@
 (function (require, module, _exports) {
   'use strict';
 
+  // Captured for matchesGlob, which replaced two global-flag replaces. This file is not
+  // otherwise hardened — see the ratchet baseline.
+  var replaceCharAll = require('primordials').replaceCharAll;
+
   var SLASH = 47; // '/'
   var BACKSLASH = 92; // '\'
   var DOT = 46; // '.'
@@ -1252,8 +1256,14 @@
     return function matchesGlob(path, pattern) {
       if (typeof path !== 'string') throw globArgError('path', path);
       if (typeof pattern !== 'string') throw globArgError('pattern', pattern);
-      pattern = pattern.replace(/\\/g, '/'); // windowsPathsNoEscape: '\' is a separator
-      if (winSep) path = path.replace(/\\/g, '/');
+      // windowsPathsNoEscape: '\' is a separator. No regex — these were global-flag
+      // replaces, and a global replace under a forged `RegExp.prototype.exec` never
+      // returns (it only advances `lastIndex` on an empty match), so `matchesGlob` span
+      // the string until the engine gave up. node 24 hangs here too, so this is a
+      // deviation in Lava's favour rather than a parity fix; pinned Lava-only by
+      // cmd/lava/regexp_pollution_test.odin.
+      pattern = replaceCharAll(pattern, '\\', '/');
+      if (winSep) path = replaceCharAll(path, '\\', '/');
       var pathIsEmpty = path === '';
       var pathInfo = globNormalize(path);
       var patterns = globExpandBraces(pattern);

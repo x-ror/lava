@@ -6,6 +6,13 @@
 (function (require, module) {
   'use strict';
 
+  // Captured for encodeValue, which replaced a global-flag replace reachable from a
+  // remote Content-Type. This file is not otherwise hardened — see the ratchet baseline.
+  var P = require('primordials');
+  var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
+  var StringPrototypeSlice = P.StringPrototypeSlice;
+  var RegExpMatches = P.RegExpMatches;
+
   var kData = Symbol('data'); // MIMEParams: the Map of name -> value
   var kType = Symbol('type');
   var kSubtype = Symbol('subtype');
@@ -28,7 +35,6 @@
   // stripped, and a `\f` in a value keeps it (so the value fails the quoted-string check).
   var LEADING_HTTP_WS = /^[\t\n\r ]+/;
   var TRAILING_HTTP_WS = /[\t\n\r ]+$/;
-  var ESCAPE_QUOTE_OR_BACKSLASH = /[\\"]/g;
 
   function isHTTPWhitespace(c) {
     return c === '\t' || c === '\n' || c === '\r' || c === ' ';
@@ -138,9 +144,35 @@
     }
   }
 
+  // escapeQuoted is `value.replace(/[\\"]/g, '\\$&')` without the RegExp. A GLOBAL
+  // replace under a forged `RegExp.prototype.exec` never returns — it only advances
+  // `lastIndex` on an empty match — and this one is reachable from a remote
+  // `Content-Type`: `new MIMEType(header)` then `String(m)` wedged the process. node
+  // answers correctly under the same poison, so it was a Lava-only defect.
+  //
+  // It also fires more often than it looks: the `NotHTTPTokenCodePoint.test` guard on
+  // the caller is itself forced truthy under the poison, so EVERY parameter took the
+  // quoting branch, not just values that need quotes.
+  //
+  // Two escaped units, so `replaceCharAll` (single needle) does not fit; a scan is the
+  // straightforward shape and avoids two passes over the value.
+  function escapeQuoted(value) {
+    var out = '';
+    var from = 0;
+    for (var i = 0; i < value.length; i++) {
+      var c = StringPrototypeCharCodeAt(value, i);
+      if (c !== 0x5c && c !== 0x22) continue; // \ "
+      if (i > from) out += StringPrototypeSlice(value, from, i);
+      out += '\\' + StringPrototypeSlice(value, i, i + 1);
+      from = i + 1;
+    }
+    if (from === 0) return value;
+    return from < value.length ? out + StringPrototypeSlice(value, from) : out;
+  }
+
   function encodeValue(value) {
-    if (value.length === 0 || NotHTTPTokenCodePoint.test(value)) {
-      return '"' + value.replace(ESCAPE_QUOTE_OR_BACKSLASH, '\\$&') + '"';
+    if (value.length === 0 || RegExpMatches(NotHTTPTokenCodePoint, value)) {
+      return '"' + escapeQuoted(value) + '"';
     }
     return value;
   }

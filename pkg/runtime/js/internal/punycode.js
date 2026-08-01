@@ -5,6 +5,12 @@
 (function (require, module, exports) {
   'use strict';
 
+  // Captured for foldSeparators below, which replaced a global-flag replace. This file is
+  // not otherwise hardened — see the ratchet baseline.
+  var P = require('primordials');
+  var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
+  var StringPrototypeSlice = P.StringPrototypeSlice;
+
   var maxInt = 2147483647; // 0x7FFFFFFF
   var base = 36;
   var tMin = 1;
@@ -17,7 +23,28 @@
 
   var regexPunycode = /^xn--/;
   var regexNonASCII = /[^\0-\x7E]/; // unprintable ASCII chars + non-ASCII chars
-  var regexSeparators = /[\x2E。．｡]/g; // RFC 3490 separators
+  // The RFC 3490 separator set, as code units. This was `/[\x2E。．｡]/g` reached by
+  // `domain.replace(...)` in mapDomain — a GLOBAL replace, which under a forged
+  // `RegExp.prototype.exec` never returns, so `punycode.toASCII`/`toUnicode` on any
+  // caller-supplied hostname wedged the process. node hangs on the same input, so this is
+  // a deviation in Lava's favour; pinned Lava-only by cmd/lava/regexp_pollution_test.odin.
+  // (`new URL()` is unaffected — url.js carries its own IDNA path and does not call here.)
+  function isRFC3490Separator(c) {
+    return c === 0x2e || c === 0x3002 || c === 0xff0e || c === 0xff61;
+  }
+
+  function foldSeparators(domain) {
+    var out = '';
+    var from = 0;
+    for (var i = 0; i < domain.length; i++) {
+      if (!isRFC3490Separator(StringPrototypeCharCodeAt(domain, i))) continue;
+      if (i > from) out += StringPrototypeSlice(domain, from, i);
+      out += '.';
+      from = i + 1;
+    }
+    if (from === 0) return domain;
+    return from < domain.length ? out + StringPrototypeSlice(domain, from) : out;
+  }
 
   var baseMinusTMin = base - tMin;
   var floor = Math.floor;
@@ -47,7 +74,7 @@
       result = parts[0] + '@';
       domain = parts[1];
     }
-    domain = domain.replace(regexSeparators, '\x2E');
+    domain = foldSeparators(domain);
     var labels = domain.split('.');
     var encoded = map(labels, fn).join('.');
     return result + encoded;
