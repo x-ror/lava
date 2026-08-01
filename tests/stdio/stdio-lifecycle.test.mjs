@@ -103,6 +103,31 @@ test('pipe shape: node dies on the write after end(), lava recovers (declared de
   assert.equal(l.code, 0, 'lava must not die on the post-end() write');
 });
 
+const DESTROY = `
+const s = process.stdout;
+s.write('A\\n');
+s.destroy();
+setTimeout(function () {
+  try { s.write('C\\n'); } catch (e) { /* surfaces as a nonzero exit either way */ }
+}, 20);
+`;
+
+// destroy() is shape-INDEPENDENT on node, unlike end(): `_destroy` is the dummy, and it
+// never touches the socket, so nothing is half-closed and the stream comes back in both
+// shapes. Measured: node prints A, C and exits 0 on a file AND on a pipe. No deviation
+// here — Lava must match node exactly in both.
+for (const shape of ['file', 'pipe']) {
+  test(`${shape} shape: destroy() is undone, on node and lava alike`, async () => {
+    const file = scriptFile(DESTROY);
+    const n = await run(NODE, file, shape);
+    const l = await run(LAVA, file, shape);
+    assert.equal(n.stdout, 'A\nC\n', `node recovers from destroy() on a ${shape}`);
+    assert.equal(n.code, 0);
+    assert.equal(l.stdout, n.stdout, `lava must match node on a ${shape}`);
+    assert.equal(l.code, n.code);
+  });
+}
+
 const PIPE_TO_STDOUT = `
 const stream = require('node:stream');
 const src = new stream.Readable({ read() {} });
