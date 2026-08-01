@@ -450,6 +450,44 @@
         "THREW:RangeError"
       ],
       "timeout_ms": 30000
+    },
+    {
+      "name": "59-global-replace-hangs mime dies when the MIME value escape goes back to a global replace",
+      "why": "MIMEType#toString is reachable from a remote Content-Type and node answers correctly under the same poison, so this is a Lava-only spin of the same tier as the querystring bug. The merge gate found it after the first pass claimed the class was closed.",
+      "source": "pkg/runtime/js/internal/mime.js",
+      "find": "  function escapeQuoted(value) {",
+      "replace": "  var ESCAPE_QUOTE_OR_BACKSLASH = /[\\\\\"]/g;\n  function escapeQuoted(value) {\n    return value.replace(ESCAPE_QUOTE_OR_BACKSLASH, '\\\\$&');",
+      "gate": "compat:tests/node-compat/cases/59-global-replace-hangs.js",
+      "expect_detail": [
+        "timed out",
+        "mime="
+      ],
+      "timeout_ms": 30000
+    },
+    {
+      "name": "regexp_pollution_immunity puny dies when the RFC 3490 separator fold goes back to a global replace",
+      "why": "punycode.toASCII on a caller-supplied hostname spun; node hangs identically so it cannot be an oracle case. Pins availability only, because other live .test reads in punycode.js still steer the per-label encode decision.",
+      "source": "pkg/runtime/js/internal/punycode.js",
+      "find": "    domain = foldSeparators(domain);",
+      "replace": "    domain = domain.replace(/[\\x2E\\u3002\\uFF0E\\uFF61]/g, '\\x2E');",
+      "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
+      "expect_detail": [
+        "timed out",
+        "THREW:RangeError"
+      ],
+      "timeout_ms": 30000
+    },
+    {
+      "name": "regexp_pollution_immunity dbg-nodot dies when the NODE_DEBUG escaper stops escaping '.'",
+      "why": "Nothing observed debugEnvPattern's OUTPUT before: the poisoned probe passes with NODE_DEBUG unset, i.e. when the function is never called. Dropping the '.' branch makes 'a.b' enable 'axb', which is the escape the compile exists to do.",
+      "source": "pkg/runtime/js/internal/util.js",
+      "find": "      c === 0x2e //    .",
+      "replace": "      false //    .",
+      "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
+      "expect_detail": [
+        "want dbg-nodot=false got"
+      ],
+      "timeout_ms": 30000
     }
   ]
 }
