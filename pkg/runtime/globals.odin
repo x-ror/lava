@@ -651,11 +651,59 @@ clear_timer_cb :: proc "c" (
 @(private = "file")
 output_mutex: sync.Mutex
 
+// process_write_all writes every byte of `data` to `fd`, or reports why it could not.
+//
+// Params:
+//   fd     Destination file; the caller must already hold output_mutex.
+//   data   Bytes to write; an empty slice is a no-op success.
+// Returns:
+//   written  Bytes actually delivered — equal to len(data) on success.
+//   err      The error that stopped the loop; nil when everything was written.
+// Node:
+//   node never truncates stdout. On POSIX it writes files and TTYs synchronously and
+//   buffers pipes, flushing at exit; `console.log('x'.repeat(300000))` delivers 300001
+//   bytes through a non-blocking pipe where Lava delivered 65536 (verified against
+//   node 24.18.1 with a parent-set O_NONBLOCK pipe).
+// Deviates:
+//   None intended. Pinned by scripts/stdio-write.test.mjs.
+//
+// Two distinct failures are folded in here, and only the first is obvious. `os.write`
+// loops on a SHORT write but abandons the loop on any errno (core/os/file_linux.odin),
+// and the previous caller discarded both `n` and `err` — so a full pipe ended the write
+// and reported success. Nothing in Lava sets O_NONBLOCK on fd 1/2, which is exactly why
+// this was invisible: the flag is INHERITED from whatever launched the process, so an
+// ordinary shell pipe never reproduces it and a process manager does.
+//
+// The EAGAIN retry deliberately blocks rather than spins. A busy loop on a full pipe
+// burns a core until the reader drains; waiting for writability is what the kernel
+// interface is for. EINTR carries no information about the fd and is simply retried.
+process_write_all :: proc(fd: ^os.File, data: []byte) -> (written: int, err: os.Error) {
+	rest := data
+	for len(rest) > 0 {
+		n, werr := os.write(fd, rest)
+		if n > 0 {
+			written += n
+			rest = rest[n:]
+		}
+		if werr == nil do continue
+		if !stdio_retryable(werr) do return written, werr
+		// A retryable error with no progress means the fd is full (or a signal landed).
+		// Wait for it to become writable instead of spinning; on the platforms where
+		// this cannot be expressed the wait is a no-op and the loop simply retries.
+		if n == 0 do stdio_wait_writable(fd)
+	}
+	return written, nil
+}
+
+// process_write serializes a whole message under output_mutex so a line lands atomically
+// relative to other workers. It writes every byte or gives up loudly rather than
+// truncating: a dropped chunk used to be indistinguishable from success.
 process_write :: proc(fd: ^os.File, parts: ..string) {
 	sync.lock(&output_mutex)
 	defer sync.unlock(&output_mutex)
 	for p in parts {
-		os.write_string(fd, p)
+		if len(p) == 0 do continue
+		process_write_all(fd, transmute([]byte)p)
 	}
 }
 

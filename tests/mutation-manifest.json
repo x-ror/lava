@@ -488,6 +488,16 @@
         "want dbg-nodot=false got"
       ],
       "timeout_ms": 30000
+    },
+    {
+      "name": "stdio-write dies when the writer stops retrying a partial/EAGAIN write",
+      "why": "os.write abandons its loop on any errno and the old caller discarded n and err, so a full non-blocking pipe ended the write and reported success: console.log('x'.repeat(300000)) delivered 65536 bytes and exited 0. The flag is inherited from the parent, which is why an ordinary shell pipe never reproduces it.",
+      "source": "pkg/runtime/globals.odin",
+      "find": "\t\tif werr == nil do continue\n\t\tif !stdio_retryable(werr) do return written, werr",
+      "replace": "\t\tif werr != nil do return written, werr",
+      "gate": "node-test:scripts/stdio-write.test.mjs",
+      "expect_detail": "65536",
+      "rebuild": true
     }
   ]
 }
