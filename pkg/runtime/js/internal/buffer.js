@@ -57,6 +57,7 @@
   var StringG = String;
   var StringPrototypeToLowerCase = P.StringPrototypeToLowerCase;
   var StringPrototypeCharCodeAt = P.StringPrototypeCharCodeAt;
+  var StringPrototypeSlice = P.StringPrototypeSlice;
   var StringFromCharCode = String.fromCharCode;
   var ObjectPrototypeHasOwnProperty = P.ObjectPrototypeHasOwnProperty;
   var TypedArrayPrototypeGetLength = P.TypedArrayPrototypeGetLength;
@@ -740,9 +741,20 @@
     var shown = buf.length > max ? max : buf.length;
     var hex = '';
     if (shown > 0) {
-      hex = hexEncodeNative(shown === buf.length ? buf : buf.subarray(0, shown))
-        .replaceAll(/(.{2})/g, '$1 ')
-        .trim();
+      // Group the hex into byte pairs. This was `.replaceAll(/(.{2})/g, '$1 ').trim()`,
+      // and a GLOBAL replace under a forged `RegExp.prototype.exec` never returns — it
+      // only advances `lastIndex` on an empty match — so `console.log(buf)` on a Buffer
+      // holding remote bytes wedged the process. node 24 hangs here too, so this is a
+      // deviation in Lava's favour, pinned Lava-only by
+      // cmd/lava/regexp_pollution_test.odin.
+      //
+      // Slicing straight out of the encoder's output also drops the trailing-space +
+      // trim() round trip the regex form needed.
+      var raw = hexEncodeNative(shown === buf.length ? buf : buf.subarray(0, shown));
+      for (var h = 0; h < raw.length; h += 2) {
+        if (h > 0) hex += ' ';
+        hex += StringPrototypeSlice(raw, h, h + 2);
+      }
     }
     var remaining = buf.length - shown;
     if (remaining > 0)
@@ -1306,6 +1318,29 @@
     return globalThis.process && globalThis.process.platform === 'win32' ? '\r\n' : '\n';
   }
 
+  // toNativeEndings is `str.replace(/\r?\n/g, nativeEol())` — every CRLF or lone LF
+  // becomes the platform terminator. No regex: a GLOBAL replace under a forged
+  // `RegExp.prototype.exec` never returns, so `new Blob([text], {endings:'native'})`
+  // spun on any text at all. node 24 hangs here too, so hardening it is a deviation in
+  // Lava's favour; pinned Lava-only by cmd/lava/regexp_pollution_test.odin.
+  //
+  // `\r?\n` means a CR is consumed only when an LF follows it: a lone CR is left alone,
+  // which is why this scans for LF and looks back rather than scanning for CR.
+  function toNativeEndings(str) {
+    var eol = nativeEol();
+    var out = '';
+    var from = 0;
+    for (var i = 0; i < str.length; i++) {
+      if (StringPrototypeCharCodeAt(str, i) !== 0x0a) continue; // LF
+      var cut = i > from && StringPrototypeCharCodeAt(str, i - 1) === 0x0d ? i - 1 : i; // CR
+      if (cut > from) out += StringPrototypeSlice(str, from, cut);
+      out += eol;
+      from = i + 1;
+    }
+    if (from === 0) return str;
+    return from < str.length ? out + StringPrototypeSlice(str, from) : out;
+  }
+
   function blobPartToChunks(part, nativeEndings) {
     if (part instanceof Blob) return part._parts;
     if (part instanceof ArrayBuffer) return [new Uint8Array(part.slice(0))];
@@ -1315,7 +1350,7 @@
       ];
     }
     var str = StringG(part);
-    if (nativeEndings) str = str.replace(/\r?\n/g, nativeEol());
+    if (nativeEndings) str = toNativeEndings(str);
     return [new Uint8Array(Buffer.from(str, 'utf8'))];
   }
 

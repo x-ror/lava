@@ -118,6 +118,9 @@
   // there is exactly one wrapper object rather than a fresh closure per call.
   var regExpExec = safeCaller1(RegExp.prototype.exec);
   var stringCharCodeAt = caller1(StringProto.charCodeAt);
+  // Captured for the same reason as stringCharCodeAt: the helpers in the export table
+  // below run before the table exists, so they cannot reach it through `module.exports`.
+  var StringPrototypeSliceP = caller2(StringProto.slice);
 
   // Free globals captured at primordials module-eval — the loader runs this before
   // user code. A lazy consumer that writes `var parseIntG = parseInt` at ITS own
@@ -490,6 +493,36 @@
         if (!pred(stringCharCodeAt(s, i))) return false;
       }
       return true;
+    },
+
+    // replaceCharAll(s, code, repl) is `s.replace(/<c>/g, repl)` without a RegExp —
+    // every occurrence of the single code unit `code` becomes the string `repl`.
+    //
+    // It exists because a GLOBAL-flag replace is the shape that does not answer wrongly
+    // under a forged `exec`, it never RETURNS: `RegExp.prototype[Symbol.replace]` loops
+    // on RegExpExec and only advances `lastIndex` on an EMPTY match, so a forged
+    // non-empty result spins until the string exhausts memory (observed as either a hang
+    // or a RangeError, depending on how fast the runner hits the cap). Capturing the
+    // replace does nothing, because the re-read of `R.exec` is inside it — so the fix is
+    // to have no regex in the expression at all, which drops exec / test / @@replace /
+    // lastIndex together. Same reasoning as `allChars` above, and the same reason there
+    // is deliberately no `RegExpPrototypeTest`.
+    //
+    // Returns `s` itself when the code unit is absent, so the common case allocates
+    // nothing and the callers that used to guard the replace with their own `indexOf`
+    // no longer need to.
+    replaceCharAll: function (s, code, repl) {
+      var n = s.length;
+      var out = '';
+      var from = 0;
+      for (var i = 0; i < n; i++) {
+        if (stringCharCodeAt(s, i) !== code) continue;
+        if (i > from) out += StringPrototypeSliceP(s, from, i);
+        out += repl;
+        from = i + 1;
+      }
+      if (from === 0) return s;
+      return from < n ? out + StringPrototypeSliceP(s, from) : out;
     },
 
     // The character classes those validators actually need, so a caller cannot get

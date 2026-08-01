@@ -171,11 +171,16 @@ coupling.
       largest `mime.js` at 10, and it was the sharpest of them because it emits source;
       see the entry below. Do NOT copy a remainder list from here: re-derive it with
       the recipe above, which is the rule this entry has already broken three times.
-      As of the esm.js commit it returns 34 sites across 11 files, and two facts about
-      that tail are worth keeping because they contradict the obvious assumption —
+      As of the esm.js commit it returns 34 sites across 11 files, and one fact about
+      that tail is worth keeping because it contradicts the obvious assumption:
       `net.js` still carries one (`/^connect ([A-Z]+)/`), so the tail is **not** off the
-      network path, and `buffer.js`, `querystring.js` and `punycode.js` still carry
-      global-flag replaces, so the spin-forever class is **not** gone from it either.
+      network path.
+      _(That sentence used to also claim `buffer.js`, `querystring.js` and `punycode.js`
+      "still carry global-flag replaces". Two-thirds right, and wrong in both directions:
+      `punycode.js` has none, while `path.js` and `util.js` — named nowhere — had five
+      between them. That was the FOURTH copied claim in this entry to go stale, written
+      in the same commit that added the "do not copy, re-derive" rule above. The
+      spin-forever class is now closed tree-wide; see the entry below.)_
       The claim that none of the remainder was on the network path was **false**, and
       the sites that were are now fixed rather than merely re-described:
       `fetch.js`'s header-value trim (which ran BEFORE the name validator on every
@@ -195,6 +200,39 @@ coupling.
       (Basic-auth / JWT) and `url.js` `toUSVString` (emoji in a remote query). Each
       has a Lava-only pin, an http-smoke phase where relevant, and a mutation-manifest
       entry.
+- [x] **The global-flag replaces — the spin-forever class, closed tree-wide** — done:
+      an acorn pass for a `/g` regex reaching a method that loops on RegExpExec returns
+      **0 sites**, from 8 across 4 files (`buffer.js` 2, `path.js` 2, `querystring.js` 1,
+      `util.js` 3). Derived, not copied — the entry above had named the wrong files.
+      The sharpest was remote-reachable and had been sitting in a public API the whole
+      time: `querystring.parse` rewrites `+` to `%20` with a global replace, so a single
+      `+` in a query string wedged any server doing
+      `parse(req.url.split('?')[1])` once a dependency had assigned
+      `RegExp.prototype.exec`. Measured: node returns `{'a b':'1'}`, Lava did not return.
+      The fix is the one this class always wants — no regex in the expression at all, so
+      `exec`/`test`/`@@replace`/`lastIndex` drop out together. `replaceCharAll(s, code,
+      repl)` on `primordials` covers the three single-character sites (it returns `s`
+      unchanged when the unit is absent, so the callers' own `indexOf` guards went away);
+      the hex grouping, the CRLF fold and the NODE_DEBUG pattern get purpose-built
+      code-unit loops.
+      **node is the oracle for exactly one of the five surfaces.** Verified by running
+      it: node answers correctly for `querystring`, and **hangs itself** on
+      `path.matchesGlob`, `util.inspect` of a Buffer and `new Blob([…],
+      {endings:'native'})` — its own implementations run the same shape. So hardening
+      those three is a deviation in Lava's favour and is pinned Lava-only, per §1;
+      `util.debuglog` is Lava-only for an unrelated reason (see the gap below). Pinned by
+      `tests/node-compat/cases/59-global-replace-hangs.js` (the oracle half), four new
+      assertions in `cmd/lava/regexp_pollution_test.odin`, and five
+      `tests/mutation-manifest.json` entries. That Odin test ran **2m49s** while the
+      sites spun — failing with `RangeError` from runaway string growth rather than a
+      clean hang — and runs in **23.7ms** now.
+- [ ] **`process.stdout` / `process.stderr` do not exist** — found while pinning the
+      above, undocumented until now. Both are `undefined`, so anything writing through
+      them throws `TypeError: undefined is not an object`. `util.debuglog` is the
+      concrete casualty: with `NODE_DEBUG` matching, node prints and Lava throws, which
+      is why the debuglog hang could not be pinned as an oracle case. `console.log`
+      works (it goes through the native console binding, not `process.stdout`), which is
+      why this stayed invisible.
 - [x] **`esm.js` — the module loader, and the one surface where a forged match is
       code execution** — done: 101 counted sites (method 81, global 20) to 0 in all
       four classes. This outranked the rest of the tail because the file's output is

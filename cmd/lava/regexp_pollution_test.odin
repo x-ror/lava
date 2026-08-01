@@ -151,6 +151,39 @@ results.push(
 results.push('b64=' + under(() => Buffer.from('dXNlcjpwYXNz', 'base64').toString()));
 results.push('usp=' + under(() => String([...new URLSearchParams('a=😀')].length)));
 
+// --- global-replace spins where node is NOT the oracle --------------------
+//
+// These three are here rather than in a compat case for the reason the file header
+// gives: node 24 hangs on all of them under this same gadget, because its own
+// path.matchesGlob, util.inspect-of-a-Buffer and Blob endings:'native' each run a
+// global replace over JavaScript it does not route through primordials. Verified, not
+// assumed — each was run under node with the poison installed and timed out.
+//
+// So hardening Lava here is a DEVIATION IN LAVA'S FAVOUR, and CLAUDE.md §1 requires a
+// Lava-only test rather than a comment. The assertion is timing-free: the script simply
+// has to finish. The two node-oracle surfaces (querystring, util.debuglog) live in
+// tests/node-compat/cases/59-global-replace-hangs.js instead.
+results.push('glob=' + under(() => String(require('node:path').matchesGlob('a/b.txt', 'a/*.txt'))));
+results.push('inspect=' + under(() => require('node:util').inspect(Buffer.from([1, 2, 3]))));
+results.push('blob=' + under(() => String(new Blob(['x\r\ny'], { endings: 'native' }).size)));
+
+// util.debuglog compiles NODE_DEBUG with three chained global replaces on the first
+// CALL, so the poison goes in after the require. It is here rather than in the compat
+// case for a reason unrelated to the spin: Lava has no process.stderr (nor
+// process.stdout), so an ENABLED debuglog throws before it can write, and node prints
+// instead — the outputs cannot match however the spin is fixed. What this pins is
+// availability only: THREW means it returned, where before it consumed the string until
+// the engine gave up. The missing process.stderr is a separate gap, recorded in ROADMAP.
+process.env.NODE_DEBUG = 'foo*,bar';
+const debugLog = require('node:util').debuglog('foo');
+results.push(
+  'debuglog=' +
+    under(() => {
+      debugLog('x');
+      return 'called';
+    }),
+);
+
 const want = [
   'inject=THREW:TypeError',
   'space=THREW:TypeError',
@@ -161,6 +194,10 @@ const want = [
   'pi=8080',
   'b64=user:pass',
   'usp=1',
+  'glob=true',
+  'inspect=<Buffer 01 02 03>',
+  'blob=3',
+  'debuglog=THREW:TypeError',
 ];
 for (let i = 0; i < want.length; i++) {
   if (results[i] !== want[i]) {

@@ -18,7 +18,7 @@
     "global": 52
   },
   "internal/buffer.js": {
-    "method": 44,
+    "method": 41,
     "invoke": 7,
     "accessor": 22,
     "global": 130
@@ -132,7 +132,7 @@
     "global": 2
   },
   "internal/path.js": {
-    "method": 163,
+    "method": 161,
     "invoke": 0,
     "accessor": 0,
     "global": 9
@@ -168,7 +168,7 @@
     "global": 2
   },
   "internal/querystring.js": {
-    "method": 8,
+    "method": 6,
     "invoke": 1,
     "accessor": 0,
     "global": 6
@@ -234,7 +234,7 @@
     "global": 24
   },
   "internal/util.js": {
-    "method": 57,
+    "method": 53,
     "invoke": 14,
     "accessor": 15,
     "global": 72

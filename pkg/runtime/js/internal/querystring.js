@@ -11,6 +11,8 @@
 (function (require, module, exports) {
   'use strict';
 
+  var replaceCharAll = require('primordials').replaceCharAll;
+
   var hasOwn = Object.prototype.hasOwnProperty;
 
   function escape(str) {
@@ -105,7 +107,16 @@
     // The query-string convention maps '+' to a space. Node rewrites '+' to '%20'
     // (not a literal space) before decoding, so the default decoder turns it into a
     // space AND a custom decodeURIComponent still sees an encoded space.
-    if (s.indexOf('+') !== -1) s = s.replace(/\+/g, '%20');
+    //
+    // No regex: this was `s.replace(/\+/g, '%20')`, and a GLOBAL replace under a forged
+    // `RegExp.prototype.exec` never returns — it is the most remote-reachable instance
+    // of that class in the tree, because `parse` is public `node:querystring` and a
+    // single '+' in a query string is the whole trigger. A server doing
+    // `parse(req.url.split('?')[1])` wedged on a crafted request. node answers correctly
+    // under the same poison, so this was a Lava-only defect; pinned by
+    // tests/node-compat/cases/59-global-replace-hangs.js. replaceCharAll returns `s`
+    // unchanged when there is no '+', which is why the old indexOf guard is gone.
+    s = replaceCharAll(s, 0x2b, '%20'); // 0x2b '+'
     try {
       return decode(s);
     } catch {
