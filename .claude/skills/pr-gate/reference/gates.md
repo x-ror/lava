@@ -50,7 +50,8 @@ catches what a YAML parse cannot: a context used where it is not available, a ba
 | `pkg/std/sqlite/**`, `sqlite.odin`, `js/internal/sqlite.js` | `make test-sqlite-odin`, `make test-sqlite-lava` |
 | `pkg/runtime/dns.odin`, `fetch_dns.odin`, `js/internal/dns*.js` | `make test-compat-lava`, `make test-fetch-smoke` |
 | `pkg/runtime/workers*.odin` | `make test-multicore-smoke` |
-| `pkg/runtime/stdio*.odin`, `js/internal/stdio.js`, `tests/stdio/**` | `make test-stdio` — pins the non-blocking-fd retry loop that `console.log`, `lava eval` and `process.stdout.write` all share |
+| `pkg/runtime/stdio*.odin`, `js/internal/stdio.js`, `tests/stdio/**` | `make test-stdio` — pins the non-blocking-fd retry loop that `console.log`, `lava eval` and `process.stdout.write` all share, plus the lifecycle/backpressure deviations in node's PIPE shape (the oracle harness only ever gives a case a FILE) |
+| `js/internal/stream.js` | `make test-http-smoke`, `make test-net-smoke`, `make test-stdio` — nothing else routes here, and this is the base layer `net`/`http`/`stdio` compose on. Added after #326: a change to the `write()` accept set passed `check-js` and `test-compat-lava` while stalling `pipe()` forever, because a DataView made `writableLength` NaN and `'drain'` could never fire. The suites that would have caught it were not on anyone's list |
 | `require.odin`, `module_resolution.odin`, `js/internal/{loader,esm}.js` | `make test-compat-lava-strict` |
 | `crypto.odin`, `js/internal/crypto.js` | `make test-odin`, `make test-compat-lava`, `make api-surface` |
 | `pkg/runtime/js/**.js` (any — the scan root is the whole tree, `console.js` included) | `make check-js`, `make check-primordials`, `make test-compat-lava` |

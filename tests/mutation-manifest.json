@@ -501,6 +501,76 @@
         "payload must round-trip exactly"
       ],
       "rebuild": true
+    },
+    {
+      "name": "61-stdio-lifecycle dies when pipe() stops excluding the stdio singletons",
+      "why": "Without node's `dest !== process.stdout/stderr` exclusion, `src.pipe(process.stdout)` calls end() on a process-lifetime singleton: every later write on stdout is dropped and raises 'write after end'. This is the most common pipe in Node, so the whole of process.stdout dies on the idiomatic use.",
+      "source": "pkg/runtime/js/internal/stream.js",
+      "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
+      "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
+      "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
+      "expect_detail": [
+        "write after end",
+        "pipe() must not end stdout"
+      ]
+    },
+    {
+      "name": "stdio-lifecycle dies when pipe() stops excluding the stdio singletons (pipe shape)",
+      "why": "Same defect as the compat entry, gated on the node:test instead, because the oracle harness redirects stdout to a FILE and node's stdout is a different class on a pipe. This proves the pipe half is pinned too — the shape a CLI tool actually runs under.",
+      "source": "pkg/runtime/js/internal/stream.js",
+      "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
+      "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
+      "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
+      "expect_detail": [
+        "leaves stdout writable",
+        "lava must match node on a pipe"
+      ]
+    },
+    {
+      "name": "61-stdio-lifecycle dies when _destroy stops undoing the teardown",
+      "why": "node's stdio _destroy is a dummy that runs the callback and then calls _undestroy(). Drop the undo and a single process.stdout.end() anywhere in a dependency is permanent: the stream stays ended for the rest of the run and silently drops every later write.",
+      "source": "pkg/runtime/js/internal/stdio.js",
+      "find": "    cb(err);\n    this._undestroy();",
+      "replace": "    cb(err);",
+      "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
+      "expect_detail": [
+        "writable again after end()",
+        "ended flag must be undone"
+      ]
+    },
+    {
+      "name": "61-stdio-lifecycle dies when _undestroy stops clearing the ending flag",
+      "why": "The `writable` getter is `!destroyed && !ending`, so leaving `ending` set makes the stream report unwritable forever even though destroyed was cleared — the recovery looks applied and is not. Pins the individual field, not just the presence of the call.",
+      "source": "pkg/runtime/js/internal/stream.js",
+      "find": "      w.ended = false;\n      w.ending = false;\n      w.finished = false;",
+      "replace": "      w.ended = false;\n      w.finished = false;",
+      "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
+      "expect_detail": [
+        "writable again after end()"
+      ]
+    },
+    {
+      "name": "stdio-lifecycle dies when the stdio stream pins autoDestroy/emitClose off",
+      "why": "The recovery is reached THROUGH autoDestroy (end() -> 'finish' -> destroy() -> _undestroy). Setting autoDestroy:false — as the first revision of this file did — leaves _destroy unreached, so end() is permanent even with the dummy in place, and 'close' never fires.",
+      "source": "pkg/runtime/js/internal/stdio.js",
+      "find": "    ReflectApply(Writable, this, [{ decodeStrings: false }]);",
+      "replace": "    ReflectApply(Writable, this, [{ decodeStrings: false, autoDestroy: false, emitClose: false }]);",
+      "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
+      "expect_detail": [
+        "keep writing after end()",
+        "lava must match node byte-for-byte on a file"
+      ]
+    },
+    {
+      "name": "61-stdio-lifecycle dies when the _isStdio marker is dropped",
+      "why": "node sets an own _isStdio on both singletons and its own stream/net code feature-detects on it, so ecosystem code reads it too. Absent, a library's 'is this stdio?' check silently takes the wrong branch.",
+      "source": "pkg/runtime/js/internal/stdio.js",
+      "find": "    this._isStdio = true;",
+      "replace": "    this._isStdio = undefined;",
+      "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
+      "expect_detail": [
+        "_isStdio marker"
+      ]
     }
   ]
 }

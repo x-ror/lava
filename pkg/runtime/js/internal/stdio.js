@@ -55,16 +55,46 @@
    * @node Mirrors process.stdout/stderr's observable surface for the non-tty case. On a
    *       terminal node also exposes `columns`/`rows`/`getWindowSize`; this stream does
    *       NOT — see the SCOPE note in the file header.
-   * @deviates `write()` always returns true. node queues PIPE writes and answers false
-   *       under backpressure, but nothing is buffered here — the byte is on the fd before
-   *       write() returns — so there is no drain to wait for and true is the honest
-   *       answer. Matches node exactly for the file and tty cases, which are 2 of its 3.
-   *       NOT pinned: case 60 runs under a harness that redirects to a file, where node
-   *       returns true anyway, so nothing in the tree currently exercises the pipe case.
+   * @deviates Two, both confined to node's PIPE shape, because this stream is one shape
+   *       for every fd where node has three. Neither is visible when stdout is a file or
+   *       a terminal.
+   *
+   *       1. No backpressure. `write()` always returns true; nothing is buffered here —
+   *       the byte is on the fd before write() returns — so there is no drain to wait
+   *       for. Measured against node on a pipe, the full extent (an earlier version of
+   *       this block declared only the first of the five):
+   *         write(300KB)/write(1MB)  node false/false   lava true/true
+   *         writableLength           node 1348576       lava 0
+   *         writableNeedDrain        node true          lava false
+   *         'drain'                  node emitted       lava never
+   *       `if (!s.write(x)) await once(s,'drain')` therefore never waits here. It also
+   *       never hangs: the answer is true, so the await is skipped, not pending.
+   *
+   *       2. Lifecycle is forgiving where node's pipe shape is fatal. On a FILE node
+   *       recovers from end()/destroy() (see the header on _destroy) and this stream
+   *       matches it exactly. On a PIPE node's stdout is a net.Socket, so end() closes
+   *       the write side and the next write raises an unhandled EPIPE and exits 1;
+   *       verified on node 24.18.1 (`node x.js | cat` prints A, B and dies where
+   *       `node x.js > f` prints A, B, C, D). This stream recovers in both cases: it
+   *       holds no socket, writes go straight to the fd, and there is nothing an end()
+   *       could half-close. Deliberate — the alternative is closing fd 1 and losing
+   *       every later byte in the process, to reproduce a crash.
+   *
+   *       Pinned by tests/stdio/stdio-lifecycle.test.mjs, which drives both shapes as
+   *       subprocesses; the oracle case 61 covers the file shape only, because the compat
+   *       harness redirects stdout to a file (`>"$node_stdout"` in scripts/lib/compare.sh).
    */
   function StdioWriteStream(fd) {
-    ReflectApply(Writable, this, [{ decodeStrings: false, autoDestroy: false, emitClose: false }]);
+    // autoDestroy/emitClose are left at their defaults (both true) because that is what
+    // node reports for process.stdout, and because the recovery in `_destroy` below is
+    // reached THROUGH autoDestroy: end() -> 'finish' -> destroy() -> undestroy. Pinning
+    // them to false — as an earlier revision did — is what made end() permanent.
+    ReflectApply(Writable, this, [{ decodeStrings: false }]);
     this.fd = fd;
+    // node sets an own `_isStdio` on both singletons, and its own stream/net code
+    // feature-detects on it, so ecosystem code reads it too. Own, not inherited, matching
+    // `hasOwnProperty(process.stdout, '_isStdio') === true` on node 24.18.1.
+    this._isStdio = true;
     // `_isTTY` rather than a stored `isTTY`: the public one is a getter below so that a
     // non-terminal answers undefined instead of false, which is what node reports.
     this._isTTY = isatty(fd);
@@ -72,6 +102,20 @@
 
   ObjectSetPrototypeOf(StdioWriteStream.prototype, Writable.prototype);
   ObjectSetPrototypeOf(StdioWriteStream, Writable);
+
+  // node's `dummyDestroy`: let the teardown run — the destroy callback, 'finish' and
+  // 'close' all still fire, so code awaiting them is not left hanging — and then take it
+  // back, leaving the stream writable again on the next tick.
+  //
+  // stdout is a process-lifetime singleton, so a teardown that stuck would be permanent:
+  // one `process.stdout.end()` anywhere in a dependency and every later write on it is
+  // dropped for the rest of the run. Node treats the stdio streams as un-closable for
+  // exactly that reason, and this is the mechanism it uses (verified: node 24.18.1's
+  // `process.stdout._destroy.name === 'dummyDestroy'`).
+  StdioWriteStream.prototype._destroy = function (err, cb) {
+    cb(err);
+    this._undestroy();
+  };
 
   StdioWriteStream.prototype._write = function (chunk, encoding, callback) {
     try {

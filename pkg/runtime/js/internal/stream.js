@@ -16,6 +16,11 @@
   var Buffer = require('buffer').Buffer;
   var StringDecoder = require('string_decoder').StringDecoder;
   var nextTick = process.nextTick;
+  // Captured at module eval, before user code runs (§5) — `pipe` needs to reach
+  // `process.stdout`/`stderr` at call time, but must not read the `process` global live.
+  // The properties are read late on purpose: they are lazy getters installed after this
+  // module loads, so there is nothing to capture here yet.
+  var processRef = process;
 
   // --- Node-shaped coded errors -------------------------------------------------
 
@@ -445,7 +450,21 @@
     var src = this;
     var s = this._readableState;
     s.pipes.push(dest);
-    var doEnd = !pipeOpts || pipeOpts.end !== false;
+    // node excludes the stdio singletons from the automatic `dest.end()`, and the
+    // omission is not cosmetic: `src.pipe(process.stdout)` is the most common pipe in
+    // Node, and ending stdout ends it for the whole process — every later write is
+    // dropped and raises 'write after end'.
+    //
+    // Identity, exactly as node does it (`dest !== process.stdout && dest !==
+    // process.stderr`), rather than testing a `_isStdio` property: an absent-property
+    // read walks Object.prototype, so `Object.prototype._isStdio = true` would stop
+    // pipe() from ending ANY destination — §5's uncounted-vector case. Reading the getter
+    // builds the stdout stream on first pipe even when piping elsewhere; node pays the
+    // same cost, it is once per process, and the getter caches.
+    var doEnd =
+      (!pipeOpts || pipeOpts.end !== false) &&
+      dest !== processRef.stdout &&
+      dest !== processRef.stderr;
 
     function ondata(chunk) {
       var ret = dest.write(chunk);
@@ -944,6 +963,44 @@
   };
 
   // --- shared destroy / error ----------------------------------------------------
+
+  // `_undestroy` takes a teardown back: the stream has already emitted its 'finish' /
+  // 'close' and run its callbacks, and this returns it to a usable state. Node exposes it
+  // on both prototypes (internal/streams/destroy.js's `undestroy`; verified present on
+  // node 24.18.1's Writable, Readable AND process.stdout, so it is reachable API, not an
+  // invention here). It has exactly one caller shape — a `_destroy` that wants the
+  // teardown undone — which is how node keeps the stdio singletons alive across an
+  // `end()`; see js/internal/stdio.js. Nothing in this file calls it, so an existing
+  // stream is unaffected by its presence.
+  //
+  // The reset list mirrors node's: enough to make the stream writable/readable again and
+  // to let a later 'close' emit, without touching buffers, encodings or the high-water
+  // mark, which the stream keeps across the round trip.
+  function undestroy() {
+    var r = this._readableState;
+    var w = this._writableState;
+    if (r) {
+      r.destroyed = false;
+      r.closeEmitted = false;
+      r.errored = null;
+      r.errorEmitted = false;
+      r.reading = false;
+      r.ended = false;
+      r.endEmitted = false;
+    }
+    if (w) {
+      w.destroyed = false;
+      w.closeEmitted = false;
+      w.errored = null;
+      w.errorEmitted = false;
+      w.prefinished = false;
+      w.ended = false;
+      w.ending = false;
+      w.finished = false;
+    }
+  }
+  Readable.prototype._undestroy = undestroy;
+  Writable.prototype._undestroy = undestroy;
 
   function noop() {}
 

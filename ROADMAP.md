@@ -252,15 +252,45 @@ coupling.
       TIOCGWINSZ ioctl that entry describes.
       Writes go through `process_write`, so `console.log` and `process.stdout.write` share
       one mutex and cannot interleave mid-line, and both inherit the retry loop from #325.
-      _Deviation:_ `write()` always returns `true`. node queues PIPE writes and can answer
-      `false` under backpressure; nothing is buffered here, so there is no drain to wait
-      for. Matches node for the file and tty cases, 2 of its 3.
+      Both singletons are **unkillable**, which node goes to two separate lengths to
+      guarantee and which the first revision of this change got wrong in both places.
+      `pipe()` excludes them from its automatic `dest.end()` (node compares identity with
+      `process.stdout`/`stderr`), and `_destroy` is a dummy that runs the callback and then
+      calls `_undestroy()` — so `end()` still emits `'finish'`/`'close'` and still runs its
+      callback, but the stream is writable again on the next tick. Without the first,
+      `src.pipe(process.stdout)` — the most common pipe in Node — ended stdout for the rest
+      of the process: every later write dropped, `write after end` raised, exit code 0 to 1.
+      Without the second, one `process.stdout.end()` in any dependency was permanent.
+      `_undestroy` is node API (present on its `Writable`, `Readable` and `process.stdout`),
+      so adding it raised parity rather than inventing a surface.
+      _Deviations, both confined to node's PIPE shape_ — this stream is one shape for every
+      fd where node has three, so neither is visible on a file or a terminal:
+      (1) no backpressure. Measured against node on a pipe, all five facts, where an
+      earlier revision of this entry declared only the first: `write(300KB)`/`write(1MB)`
+      `false`/`false` vs `true`/`true`, `writableLength` `1348576` vs `0`,
+      `writableNeedDrain` `true` vs `false`, `'drain'` emitted vs never. Nothing is
+      buffered here — the byte is on the fd before `write()` returns — so there is no drain
+      to wait for, and `if (!s.write(x)) await once(s,'drain')` skips the await rather than
+      hanging on it. (2) The lifecycle is forgiving where node's pipe shape is fatal: on a
+      pipe node's stdout is a `net.Socket`, so `end()` half-closes it and the next write is
+      an unhandled `EPIPE` and exit 1 (`node x.js | cat` prints A, B and dies where
+      `node x.js > f` prints A, B, C, D). Lava recovers in both shapes — it holds no socket,
+      and the alternative is closing fd 1 and losing every later byte to reproduce a crash.
+      Both are pinned by `tests/stdio/stdio-lifecycle.test.mjs`, which drives both shapes as
+      subprocesses and asserts **node's** side too, so the pin goes red if node ever changes
+      rather than quietly becoming wrong.
       Chunk-type validation is NOT addressed here. Lava's `Writable` produces the right
       codes (`ERR_INVALID_ARG_TYPE`, `ERR_STREAM_NULL_VALUES`) but delivers them as an
       async `'error'` where node throws synchronously — an earlier claim that it threw
       "with no code" was wrong. Fixing it reaches every Writable in the tree; see the
       open entry below for why the attempt inside this change was reverted.
-      Pinned by `tests/node-compat/cases/60-process-stdio.js` (byte-identical to node).
+      Pinned by `tests/node-compat/cases/60-process-stdio.js` and
+      `61-stdio-lifecycle.js` (both byte-identical to node), by
+      `tests/stdio/stdio-lifecycle.test.mjs` for the pipe shape the oracle harness cannot
+      reach, and by six `tests/mutation-manifest.json` entries: the pipe exclusion twice
+      (once per gate, because the oracle case and the node:test cover different fd shapes),
+      the `_destroy` undo, the individual `ending` field it clears, the `autoDestroy`
+      option the undo is reached through, and the `_isStdio` marker.
       `util.debuglog` was the concrete casualty of the absence — with `NODE_DEBUG`
       matching, node printed and Lava threw, which is why the debuglog spin in #324 could
       not be pinned as an oracle case. That blocker is gone.
@@ -277,7 +307,8 @@ coupling.
       `NaN` and the stream never emitted `'drain'` again — permanently stalling
       `src.pipe(process.stdout)` on a process-lifetime singleton — and the bare `throw`
       moved the `pipe()` error from the writable onto the readable. Needs its own change
-      with a `61-stream-write-validation` oracle case covering the accept set, the
+      with a `62-stream-write-validation` oracle case (61 is taken) covering the accept
+      set, the
       message template, and which stream the `pipe()` error lands on.
 - [ ] **`process.on` does not exist**, so `process.on('exit', …)` throws — found while
       pinning the above, which had to use a timer instead. Also still missing:
