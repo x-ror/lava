@@ -709,15 +709,7 @@ process_write_all :: proc(fd: ^os.File, data: []byte) -> (written: int, err: os.
 	return written, nil
 }
 
-// process_write serializes a whole message under output_mutex so a line lands atomically
-// relative to other workers. It now writes every byte across a retryable stall instead of
-// stopping at one buffer-full.
-//
-// A NON-retryable failure is still swallowed, and deliberately: there is no channel to
-// report it on from a `proc "c"` callback, and node's own stdout error is equally
-// invisible for console.log — `lava run big.js | head -c 100` and the node equivalent both
-// exit 0 in ~0.04s. An earlier version of this comment claimed it "gives up loudly", which
-// was never true; the returns are discarded.
+
 // process_write_bytes is process_write for an already-resolved byte slice, so a caller
 // holding Buffer bytes does not have to launder them through a string. Same mutex, same
 // retry loop — which is what keeps process.stdout.write and console.log from interleaving
@@ -729,6 +721,15 @@ process_write_bytes :: proc(fd: ^os.File, data: []byte) {
 	process_write_all(fd, data)
 }
 
+// process_write serializes a whole message under output_mutex so a line lands atomically
+// relative to other workers. It now writes every byte across a retryable stall instead of
+// stopping at one buffer-full.
+//
+// A NON-retryable failure is still swallowed, and deliberately: there is no channel to
+// report it on from a `proc "c"` callback, and node's own stdout error is equally
+// invisible for console.log — `lava run big.js | head -c 100` and the node equivalent both
+// exit 0 in ~0.04s. An earlier version of this comment claimed it "gives up loudly", which
+// was never true; the returns are discarded.
 process_write :: proc(fd: ^os.File, parts: ..string) {
 	sync.lock(&output_mutex)
 	defer sync.unlock(&output_mutex)

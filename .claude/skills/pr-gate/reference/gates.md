@@ -50,6 +50,7 @@ catches what a YAML parse cannot: a context used where it is not available, a ba
 | `pkg/std/sqlite/**`, `sqlite.odin`, `js/internal/sqlite.js` | `make test-sqlite-odin`, `make test-sqlite-lava` |
 | `pkg/runtime/dns.odin`, `fetch_dns.odin`, `js/internal/dns*.js` | `make test-compat-lava`, `make test-fetch-smoke` |
 | `pkg/runtime/workers*.odin` | `make test-multicore-smoke` |
+| `pkg/runtime/stdio*.odin`, `js/internal/stdio.js`, `tests/stdio/**` | `make test-stdio` — pins the non-blocking-fd retry loop that `console.log`, `lava eval` and `process.stdout.write` all share |
 | `require.odin`, `module_resolution.odin`, `js/internal/{loader,esm}.js` | `make test-compat-lava-strict` |
 | `crypto.odin`, `js/internal/crypto.js` | `make test-odin`, `make test-compat-lava`, `make api-surface` |
 | `pkg/runtime/js/**.js` (any — the scan root is the whole tree, `console.js` included) | `make check-js`, `make check-primordials`, `make test-compat-lava` |

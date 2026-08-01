@@ -33,8 +33,6 @@
   var ObjectSetPrototypeOf = P.ObjectSetPrototypeOf;
   var TypeErrorG = P.TypeError;
   var ReflectApply = P.ReflectApply;
-  var Uint8ArrayG = P.Uint8Array;
-  var ArrayBufferIsView = P.ArrayBufferIsView;
 
   var Writable = require('stream').Writable;
   var BufferG = require('buffer').Buffer;
@@ -54,13 +52,15 @@
   /**
    * A synchronous Writable over fd 1 or 2.
    * @param {number} fd
-   * @node Mirrors process.stdout/stderr's observable surface for the non-tty case; the
-   *       tty extras (columns/rows/getWindowSize) appear only when isatty(fd).
+   * @node Mirrors process.stdout/stderr's observable surface for the non-tty case. On a
+   *       terminal node also exposes `columns`/`rows`/`getWindowSize`; this stream does
+   *       NOT — see the SCOPE note in the file header.
    * @deviates `write()` always returns true. node queues PIPE writes and answers false
    *       under backpressure, but nothing is buffered here — the byte is on the fd before
    *       write() returns — so there is no drain to wait for and true is the honest
    *       answer. Matches node exactly for the file and tty cases, which are 2 of its 3.
-   *       Pinned by tests/node-compat/cases/60-process-stdio.js.
+   *       NOT pinned: case 60 runs under a harness that redirects to a file, where node
+   *       returns true anyway, so nothing in the tree currently exercises the pipe case.
    */
   function StdioWriteStream(fd) {
     ReflectApply(Writable, this, [{ decodeStrings: false, autoDestroy: false, emitClose: false }]);
@@ -91,9 +91,11 @@
     callback();
   };
 
-  // `isTTY`, `columns` and `rows` are undefined off a terminal, matching node. Defined as
-  // getters so the answer cannot be stale if a future SIGWINCH handler lands, and so the
-  // absent case is a genuine `undefined` rather than a property holding undefined.
+  // `isTTY` is undefined off a terminal, matching node — a getter rather than a stored
+  // property so the absent case is a genuine `undefined` rather than a property holding
+  // it. It is captured once in the constructor: an earlier comment claimed the getter
+  // made the answer immune to going stale, which was never true, and an fd cannot change
+  // what it is attached to anyway.
   ObjectDefineProperty(StdioWriteStream.prototype, 'isTTY', {
     configurable: true,
     get: function () {
@@ -101,49 +103,23 @@
     },
   });
 
-  // Node validates the chunk BEFORE queueing, and reports two distinct errors: null gets
-  // ERR_STREAM_NULL_VALUES (checked first), anything not a string/Buffer/view gets
-  // ERR_INVALID_ARG_TYPE. Lava's Writable does neither today — `write(5)` is accepted and
-  // `write(null)` throws asynchronously with no code — so the check lives here rather
-  // than in stream.js, which is a wider surface than this change should move.
-  StdioWriteStream.prototype.write = function (chunk, encoding, callback) {
-    if (chunk === null) {
-      var nullErr = new TypeErrorG('May not write null values to stream');
-      nullErr.code = 'ERR_STREAM_NULL_VALUES';
-      throw nullErr;
-    }
-    if (typeof chunk !== 'string' && !isBytes(chunk)) {
-      var typeErr = new TypeErrorG(
-        'The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. ' +
-          'Received ' +
-          inspectType(chunk),
-      );
-      typeErr.code = 'ERR_INVALID_ARG_TYPE';
-      throw typeErr;
-    }
-    return ReflectApply(Writable.prototype.write, this, [chunk, encoding, callback]);
-  };
-
-  function isBytes(v) {
-    return v instanceof Uint8ArrayG || ArrayBufferIsView(v);
-  }
-
-  function inspectType(v) {
-    if (v === undefined) return 'undefined';
-    if (typeof v === 'number' || typeof v === 'boolean') return 'type ' + typeof v + ' (' + v + ')';
-    return 'type ' + typeof v;
-  }
-
   function makeStream(fd) {
     return new StdioWriteStream(fd);
   }
 
-  // Attach as LAZY, configurable getters, which is what node does — building both
-  // streams eagerly would cost an isatty() per startup for a process that may never
-  // print. Configurable so a test harness can replace them, as node allows.
+  // Attach as LAZY getters with NO setter, which is node's descriptor exactly:
+  // `Object.getOwnPropertyDescriptor(process, 'stdout')` reports
+  // `{get: fn, set: undefined, configurable: true, enumerable: true}` on node 24.18.1.
+  // A setter was here briefly and was wrong three ways — sloppy-mode `process.stdout = x`
+  // is DISCARDED by node (identity preserved) where it took effect here, and strict mode
+  // throws there and silently succeeded here. Harnesses swap stdout with
+  // `Object.defineProperty`, which `configurable: true` already allows.
   //
-  // Done here rather than natively because JSObjectSetProperty cannot express a getter;
-  // the loader eager-requires this module, so the properties exist before user code runs.
+  // Lazy because building both streams eagerly costs an isatty() per startup for a
+  // process that may never print. Done in JS rather than natively because
+  // JSObjectSetProperty cannot express a getter; `globals.odin`'s `install_stdio` calls
+  // this through the loader's `installStdio` closure, after `process` and
+  // `process.nextTick` exist (loader.js explains why it cannot be eager-required).
   function install(proc) {
     if (!proc || typeof proc !== 'object') return;
     var cached = { __proto__: null, 1: null, 2: null };
@@ -154,11 +130,6 @@
         get: function () {
           if (cached[fd] === null) cached[fd] = makeStream(fd);
           return cached[fd];
-        },
-        set: function (v) {
-          // node allows assignment (harnesses swap stdout); keep that, and keep the
-          // property configurable rather than turning it into a data property.
-          cached[fd] = v;
         },
       });
     };

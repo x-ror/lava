@@ -9,9 +9,9 @@
 //   tty        WriteStream        true           true        <number>
 //
 // This case runs under the compat harness, which redirects both streams to files, so it
-// pins the NON-TTY half. The TTY half needs a pty and is pinned Lava-only in
-// cmd/lava/process_stdio_test.odin — node cannot be the oracle for it here because the
-// harness has no terminal to give either runtime.
+// pins the NON-TTY half only. The TTY half needs a pty and is NOT pinned anywhere yet —
+// an earlier version of this comment cited cmd/lava/process_stdio_test.odin, which does
+// not exist. Tracked in ROADMAP beside the TIOCGWINSZ entry.
 //
 // `instanceof stream.Writable` is true for node in all three cases, which is why this is
 // built on the real Writable rather than a lookalike: libraries feature-detect with it.
