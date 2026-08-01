@@ -238,13 +238,36 @@ coupling.
       `tests/mutation-manifest.json` entries. That Odin test ran **2m49s** while the
       sites spun — failing with `RangeError` from runaway string growth rather than a
       clean hang — and runs in **23.7ms** now.
-- [ ] **`process.stdout` / `process.stderr` do not exist** — found while pinning the
-      above, undocumented until now. Both are `undefined`, so anything writing through
-      them throws `TypeError: undefined is not an object`. `util.debuglog` is the
-      concrete casualty: with `NODE_DEBUG` matching, node prints and Lava throws, which
-      is why the debuglog hang could not be pinned as an oracle case. `console.log`
-      works (it goes through the native console binding, not `process.stdout`), which is
-      why this stayed invisible.
+- [x] **`process.stdout` / `process.stderr` do not exist** — implemented. Both are now
+      lazy, configurable getters on `process` (node's own shape; a plain
+      `JSObjectSetProperty` cannot express a getter, so the loader hands `globals.odin` a
+      closure it calls after `process` and `process.nextTick` exist). Each is a real
+      `stream.Writable`, not a lookalike: node's is a Writable in all three of its fd
+      shapes and libraries feature-detect with `instanceof`, so a hand-rolled object would
+      answer false and take the wrong branch in a logger.
+      `isTTY`/`columns`/`rows` answer **undefined** off a terminal, which is what node
+      reports — not `false`/`80`/`24`. `tty.js`'s own `WriteStream` still gets that wrong
+      and is the follow-up below.
+      Writes go through `process_write`, so `console.log` and `process.stdout.write` share
+      one mutex and cannot interleave mid-line, and both inherit the retry loop from #325.
+      _Deviation:_ `write()` always returns `true`. node queues PIPE writes and can answer
+      `false` under backpressure; nothing is buffered here, so there is no drain to wait
+      for. Matches node for the file and tty cases, 2 of its 3.
+      Chunk validation lives in this module rather than `stream.js`: Lava's `Writable`
+      accepts `write(5)` and throws asynchronously with no code on `write(null)`, where
+      node reports `ERR_INVALID_ARG_TYPE` and `ERR_STREAM_NULL_VALUES` synchronously.
+      Fixing that generally is a wider change than this one.
+      Pinned by `tests/node-compat/cases/60-process-stdio.js` (byte-identical to node).
+      `util.debuglog` was the concrete casualty of the absence — with `NODE_DEBUG`
+      matching, node printed and Lava threw, which is why the debuglog spin in #324 could
+      not be pinned as an oracle case. That blocker is gone.
+- [ ] **`process.on` does not exist**, so `process.on('exit', …)` throws — found while
+      pinning the above, which had to use a timer instead. Also still missing:
+      `process.hrtime` (`hrtime.bigint()` throws; `JSBigIntCreateWithUInt64` IS exported by
+      the JSC we link, so the in-repo "no BigInt constructor" comment is stale), and
+      `tty.js`'s `getWindowSize()` fakes 80x24 from env vars with no `TIOCGWINSZ` ioctl —
+      `linux.ioctl` and `linux.TIOCGWINSZ` both exist in `core:sys/linux`; only the
+      `winsize` struct needs declaring.
 - [x] **`esm.js` — the module loader, and the one surface where a forged match is
       code execution** — done: 101 counted sites (method 81, global 20) to 0 in all
       four classes. This outranked the rest of the tail because the file's output is

@@ -718,6 +718,17 @@ process_write_all :: proc(fd: ^os.File, data: []byte) -> (written: int, err: os.
 // invisible for console.log — `lava run big.js | head -c 100` and the node equivalent both
 // exit 0 in ~0.04s. An earlier version of this comment claimed it "gives up loudly", which
 // was never true; the returns are discarded.
+// process_write_bytes is process_write for an already-resolved byte slice, so a caller
+// holding Buffer bytes does not have to launder them through a string. Same mutex, same
+// retry loop — which is what keeps process.stdout.write and console.log from interleaving
+// mid-line under workers.
+process_write_bytes :: proc(fd: ^os.File, data: []byte) {
+	if len(data) == 0 do return
+	sync.lock(&output_mutex)
+	defer sync.unlock(&output_mutex)
+	process_write_all(fd, data)
+}
+
 process_write :: proc(fd: ^os.File, parts: ..string) {
 	sync.lock(&output_mutex)
 	defer sync.unlock(&output_mutex)
@@ -860,6 +871,10 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 	install_performance(ctx, global)
 	// process.nextTick + queueMicrotask are a JS shim (needs `process` to exist).
 	install_microtasks(ctx, global)
+	// process.stdout / process.stderr LAST of the process bits: the loader hands out a
+	// closure rather than eager-requiring stdio, because stdio builds on `stream`, which
+	// needs both the `process` global and `process.nextTick` to already be there.
+	install_stdio(ctx, global)
 	install_rejection_tracker(ctx)
 }
 
@@ -1100,6 +1115,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"parse_args", INTERNAL_PARSE_ARGS},
 		{"parse_env", INTERNAL_PARSE_ENV},
 		{"mime", INTERNAL_MIME},
+		{"stdio", INTERNAL_STDIO},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -1135,6 +1151,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "https", cast(jsc.JSValueRef)make_https_bindings(ctx))
 	set_named(ctx, natives, "os", cast(jsc.JSValueRef)make_os_bindings(ctx))
 	set_named(ctx, natives, "tty", cast(jsc.JSValueRef)make_tty_bindings(ctx))
+	set_named(ctx, natives, "stdio", cast(jsc.JSValueRef)make_stdio_bindings(ctx))
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef
@@ -1224,6 +1241,30 @@ require_builtin :: proc(
 	}
 	if result == nil || jsc.JSValueIsUndefined(ctx, result) do return nil
 	return result
+}
+
+// install_stdio calls the loader's installStdio(process), which defines process.stdout
+// and process.stderr as lazy configurable getters — node's own shape, and one
+// JSObjectSetProperty cannot express. Silent no-op when the resolver is absent: a missing
+// stdio leaves the properties undefined, which is exactly the pre-existing behavior.
+install_stdio :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef) {
+	state := get_state_from_ctx(ctx)
+	if state == nil || state.builtin_require == nil do return
+	installer := get_named(ctx, cast(jsc.JSObjectRef)state.builtin_require, "installStdio")
+	if installer == nil || !jsc.JSValueIsObject(ctx, installer) do return
+	proc_obj := get_named(ctx, global, "process")
+	if proc_obj == nil || !jsc.JSValueIsObject(ctx, proc_obj) do return
+	args := [1]jsc.JSValueRef{proc_obj}
+	exception: jsc.JSValueRef
+	jsc.JSObjectCallAsFunction(
+		ctx,
+		cast(jsc.JSObjectRef)installer,
+		nil,
+		1,
+		raw_data(args[:]),
+		&exception,
+	)
+	if exception != nil do report_internal_exception(ctx, "internal:stdio", exception)
 }
 
 // install_console builds the full `console` object. CONSOLE_PRELUDE evaluates
@@ -1430,6 +1471,7 @@ INTERNAL_DIAGNOSTICS_CHANNEL :: #load("js/internal/diagnostics_channel.js", stri
 INTERNAL_PARSE_ARGS :: #load("js/internal/parse_args.js", string)
 INTERNAL_PARSE_ENV :: #load("js/internal/parse_env.js", string)
 INTERNAL_MIME :: #load("js/internal/mime.js", string)
+INTERNAL_STDIO :: #load("js/internal/stdio.js", string)
 
 // ESM-to-CommonJS source transform. Stored on Runtime_State rather than handed to
 // the module resolver (see install_internal_modules); evaluates to a function.
