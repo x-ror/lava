@@ -487,6 +487,29 @@ coupling.
 
 ### Low priority / correctness polish
 
+- [x] **`console.log` truncated to one pipe buffer on a non-blocking stdout** — fixed
+      (#325). `os.write` abandons its loop on any errno and `process_write` discarded both
+      the count and the error, so a full pipe ended the write and exited 0:
+      `console.log('x'.repeat(300000))` delivered 65536 of 300001 bytes where node 24.18.1
+      delivered all. Nothing in Lava sets `O_NONBLOCK` on fd 1/2 — the flag is inherited —
+      so a shell pipe never reproduced it and a process manager did, which is why a 1 MB
+      blocking-pipe check passed while the bug was live. `process_write_all` re-slices by
+      the bytes actually written and waits on `POLLOUT` rather than spinning.
+      The merge gate found the first cut incomplete: `lava eval` and the synchronous throw
+      report go through `fmt.println`/`fmt.eprintln`, not `process_write`, and still
+      truncated — so the two error paths disagreed on the same input. `print_result` now
+      routes through the fixed writer.
+      _Accepted cost, measured:_ a full stdout parks the loop thread until the reader
+      drains (node fires 19 timer ticks during a 2s stall, Lava 0). Lava already behaved
+      that way for a **blocking** pipe; the fix makes a non-blocking one join that shape
+      instead of dropping 99.94% of the payload. Bulk output afterwards is 231.8 MB/s
+      against node's 397.7 on the same harness.
+      _Still open:_ darwin is unfixed — `core:os` collapses a failed write to
+      `General_Error` there, so the errno never reaches the retry classifier. Recorded at
+      the site rather than left to read as covered.
+      Pinned by `tests/stdio/stdio-write.test.mjs` (`make test-stdio`, post-build in CI)
+      and a mutation entry.
+
 - [x] **Host-native dispatch answered a miss with `undefined`** — fixed (#320):
       the registry fails closed. A miss meant our own tables were inconsistent,
       and several natives write through a caller-supplied buffer and signal

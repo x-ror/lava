@@ -12,6 +12,13 @@ import "core:sys/posix"
 // them fails the windows_amd64 check `make check` runs. Same split as
 // fs_fd_posix.odin / fs_fd_windows.odin.
 
+// LINUX IS THE ONLY TARGET WHERE THIS ACTUALLY CLASSIFIES. On darwin core:os collapses a
+// failed write to General_Error .Unknown (core/os/file_posix.odin, the `.Write` arm does
+// `err = .Unknown` and discards errno), never a Platform_Error — so the assertion below
+// fails for EAGAIN too and darwin still abandons on a full pipe. Acceptable under the
+// Linux-first direction, recorded here so a future darwin build does not read the
+// `#+build linux, darwin` tag as coverage.
+//
 // stdio_retryable reports whether a failed write should be retried rather than abandoned.
 //
 // EINTR is a signal arriving mid-write and carries no information about the fd. EAGAIN is
@@ -22,6 +29,9 @@ import "core:sys/posix"
 stdio_retryable :: proc(err: os.Error) -> bool {
 	perr, ok := err.(os.Platform_Error)
 	if !ok do return false
+	// Cross-package enum reinterpret: on Linux `perr` is a linux.Errno and this reads it as
+	// a posix.Errno. Sound only because Linux's posix.Errno is defined from the same ABI —
+	// verified equal for the two that matter (EAGAIN 11, EINTR 4). On darwin it is identity.
 	#partial switch posix.Errno(perr) {
 	case .EAGAIN, .EINTR:
 		return true
