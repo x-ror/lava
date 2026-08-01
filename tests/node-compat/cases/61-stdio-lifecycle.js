@@ -43,6 +43,13 @@ assert.equal(
 assert.equal(typeof out._undestroy, 'function', 'Writable must expose _undestroy');
 assert.equal(typeof new stream.Readable({ read() {} })._undestroy, 'function');
 
+// The EVENT COUNT is what pins the pipe exclusion, and the state assertions below are
+// not enough on their own — which is only true because of the other half of this fix.
+// Once `_destroy` undoes the teardown, a pipe that wrongly calls `end()` no longer leaves
+// stdout dead: 'finish' fires, autoDestroy runs `_destroy`, and the stream is writable
+// again a tick later. So `out.writable` reads true either way, and the only surviving
+// evidence that end() was reached at all is that it emitted. Verified by mutation —
+// deleting the exclusion fails on `finishes`, not on any of the state checks.
 const finishes = [];
 out.on('finish', () => finishes.push(1));
 

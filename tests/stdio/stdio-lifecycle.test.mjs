@@ -130,25 +130,32 @@ for (const shape of ['file', 'pipe']) {
 
 const PIPE_TO_STDOUT = `
 const stream = require('node:stream');
+var finished = 0;
+process.stdout.on('finish', function () { finished++; });
 const src = new stream.Readable({ read() {} });
 src.push('one\\n');
 src.push(null);
 src.pipe(process.stdout);
 src.on('end', function () {
-  setTimeout(function () { process.stdout.write('two\\n'); }, 20);
+  setTimeout(function () { process.stdout.write('two finished=' + finished + '\\n'); }, 20);
 });
 `;
 
 // The P0 this file was added for: node's pipe() excludes the stdio singletons from the
-// automatic dest.end(), so `src.pipe(process.stdout)` leaves stdout alive. Without that
-// exclusion the pipe ends stdout and 'two' is lost in BOTH shapes — no deviation here,
-// Lava must match node exactly.
+// automatic dest.end(), so `src.pipe(process.stdout)` leaves stdout alive. No deviation
+// here — Lava must match node exactly in both shapes.
+//
+// The `finished=` counter is load-bearing, and the obvious version of this test does not
+// work. Because `_destroy` now undoes the teardown, a pipe that wrongly ends stdout
+// recovers before the 20ms write lands, so 'two' arrives either way and the byte
+// comparison alone passes with the exclusion deleted — confirmed by mutation. What does
+// not recover is the fact that 'finish' was emitted at all.
 for (const shape of ['file', 'pipe']) {
   test(`${shape} shape: src.pipe(process.stdout) leaves stdout writable`, async () => {
     const file = scriptFile(PIPE_TO_STDOUT);
     const n = await run(NODE, file, shape);
     const l = await run(LAVA, file, shape);
-    assert.equal(n.stdout, 'one\ntwo\n', 'node keeps stdout alive across a pipe');
+    assert.equal(n.stdout, 'one\ntwo finished=0\n', 'node never reaches end() on stdout');
     assert.equal(n.code, 0);
     assert.equal(l.stdout, n.stdout, `lava must match node on a ${shape}`);
     assert.equal(l.code, n.code);

@@ -504,27 +504,27 @@
     },
     {
       "name": "61-stdio-lifecycle dies when pipe() stops excluding the stdio singletons",
-      "why": "Without node's `dest !== process.stdout/stderr` exclusion, `src.pipe(process.stdout)` calls end() on a process-lifetime singleton: every later write on stdout is dropped and raises 'write after end'. This is the most common pipe in Node, so the whole of process.stdout dies on the idiomatic use.",
+      "why": "Without node's `dest !== process.stdout/stderr` exclusion, `src.pipe(process.stdout)` calls end() on a process-lifetime singleton. Note what the assertion keys off: since `_destroy` undoes the teardown, the stream RECOVERS a tick later, so `writable` reads true either way and only the spurious 'finish' event proves end() was reached. Before that half existed this dropped every later write and raised 'write after end'.",
       "source": "pkg/runtime/js/internal/stream.js",
       "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
       "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
       "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
       "expect_detail": [
-        "write after end",
-        "pipe() must not end stdout"
+        "pipe() must not even reach end(), so no finish"
       ]
     },
     {
       "name": "stdio-lifecycle dies when pipe() stops excluding the stdio singletons (pipe shape)",
-      "why": "Same defect as the compat entry, gated on the node:test instead, because the oracle harness redirects stdout to a FILE and node's stdout is a different class on a pipe. This proves the pipe half is pinned too — the shape a CLI tool actually runs under.",
+      "why": "Same defect as the compat entry, gated on the node:test so both fd shapes are covered — node's stdout is a different class on a pipe. The script counts 'finish' events rather than comparing bytes, because the recovery makes the bytes identical with the exclusion deleted; a byte-only version of this test SURVIVED this mutation.",
       "source": "pkg/runtime/js/internal/stream.js",
       "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
       "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
       "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
       "expect_detail": [
-        "leaves stdout writable",
+        "two finished=0",
         "lava must match node on a pipe"
-      ]
+      ],
+      "rebuild": true
     },
     {
       "name": "stdio-lifecycle dies when _destroy stops undoing the teardown",
@@ -536,7 +536,8 @@
       "expect_detail": [
         "recovers from destroy()",
         "lava must match node byte-for-byte on a file"
-      ]
+      ],
+      "rebuild": true
     },
     {
       "name": "stdio-lifecycle dies when _undestroy stops clearing the ending flag",
@@ -547,7 +548,8 @@
       "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
       "expect_detail": [
         "lava must match node byte-for-byte on a file"
-      ]
+      ],
+      "rebuild": true
     },
     {
       "name": "stdio-lifecycle dies when the stdio stream pins autoDestroy/emitClose off",
@@ -559,7 +561,8 @@
       "expect_detail": [
         "keep writing after end()",
         "lava must match node byte-for-byte on a file"
-      ]
+      ],
+      "rebuild": true
     },
     {
       "name": "61-stdio-lifecycle dies when the _isStdio marker is dropped",
