@@ -390,7 +390,7 @@
       "name": "59-global-replace-hangs dies when querystring's '+' decode goes back to a global replace",
       "why": "parse is public node:querystring and a single '+' in a query string reaches it, so a server doing parse(req.url.split('?')[1]) wedges on a crafted request: a global replace under a forged exec only advances lastIndex on an empty match and never returns. node answers correctly under the same poison, so this is a Lava-only defect.",
       "source": "pkg/runtime/js/internal/querystring.js",
-      "find": "    s = replaceCharAll(s, 0x2b, '%20'); // 0x2b '+'",
+      "find": "    s = replaceCharAll(s, '+', '%20');",
       "replace": "    if (s.indexOf('+') !== -1) s = s.replace(/\\+/g, '%20');",
       "gate": "compat:tests/node-compat/cases/59-global-replace-hangs.js",
       "expect_detail": [
@@ -403,7 +403,7 @@
       "name": "regexp_pollution_immunity glob dies when matchesGlob strips backslashes with a global replace",
       "why": "Both arguments are caller-supplied, and the global replace spins under a forged exec. node hangs here too, so this is a deviation in Lava's favour and cannot be an oracle case.",
       "source": "pkg/runtime/js/internal/path.js",
-      "find": "      pattern = replaceCharAll(pattern, BACKSLASH, '/');",
+      "find": "      pattern = replaceCharAll(pattern, '\\\\', '/');",
       "replace": "      pattern = pattern.replace(/\\\\/g, '/');",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
       "expect_detail": [
