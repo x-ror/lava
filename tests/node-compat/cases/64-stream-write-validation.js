@@ -62,8 +62,13 @@ const TYPE_MSG =
     message: TYPE_MSG + ' Received an instance of ArrayBuffer',
   });
 
-  // A symbol must not be stringified on the way into the message.
-  assert.throws(() => w.write(Symbol('s')), { code: 'ERR_INVALID_ARG_TYPE' });
+  // A symbol must not be stringified on the way into the message — asserted, not just
+  // claimed in a comment: `describeType` renders it through `value.toString()`, and only
+  // the message pins that arm.
+  assert.throws(() => w.write(Symbol('s')), {
+    code: 'ERR_INVALID_ARG_TYPE',
+    message: TYPE_MSG + ' Received type symbol (Symbol(s))',
+  });
 }
 
 // --- encoding is validated BEFORE the chunk type ----------------------------------------
@@ -190,7 +195,14 @@ async function main() {
   pt.write(new Int16Array([0x4241]));
   pt.write(new DataView(new ArrayBuffer(3)));
   pt.end();
-  await new Promise((r) => pt.on('end', r));
+  // Resolve on 'error' as well as 'end'. If the readable half refuses a chunk the stream
+  // never ends, and awaiting 'end' alone turns a FAILURE into a HANG — in CI that is a
+  // job timeout with no diff, strictly worse than a red assertion. The error is already
+  // captured in `out`, so the assertion below still reports what went wrong.
+  await new Promise((resolve) => {
+    pt.on('end', resolve);
+    pt.on('error', resolve);
+  });
   assert.deepEqual(out, [
     [true, 2],
     [true, 3],

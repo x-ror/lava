@@ -606,8 +606,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "readFileSync must return a Buffer"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when the encoding is dropped instead of decoded in JS",
@@ -618,8 +617,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "an encoding must be decoded, not returned as a Buffer"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when an unknown encoding is not rejected",
@@ -630,8 +628,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "Unknown encoding: bogus"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "57-format-single-arg dies when util.inspect stops quoting a top-level string",
@@ -642,8 +639,7 @@
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
       "expect_detail": [
         "'x'"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "57-format-single-arg dies when inspect stops choosing the quote character",
@@ -654,8 +650,7 @@
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
       "expect_detail": [
         "it\\'s"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when the pristine Buffer capture moves back into fs.js",
@@ -667,8 +662,7 @@
       "expect_detail": [
         "must not steer the read",
         "must not observe the file contents"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when falsy encodings stop meaning binary",
@@ -679,8 +673,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "invalid encoding. Received ''"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when 'buffer' is validated like an ordinary encoding",
@@ -691,8 +684,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "invalid encoding. Received 'buffer'"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when ERR_INVALID_ARG_TYPE loses node's object branch",
@@ -703,8 +695,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "Received {}"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when the Received string stops being truncated",
@@ -715,8 +706,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when the read result is copied instead of shared",
@@ -728,8 +718,7 @@
       "expect_detail": [
         "shared not copied",
         "must not be an offset into a pool"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when path type validation is dropped",
@@ -740,8 +729,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "ENOENT: no such file or directory, open 'null'"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when the error callback regains its second argument",
@@ -752,8 +740,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "the error callback takes one argument on node"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when cb validation moves after options validation",
@@ -764,8 +751,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "invalid encoding. Received 'bogus'"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "62-fs-read-buffer dies when a function in the options slot is rejected",
@@ -776,8 +762,7 @@
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
       "expect_detail": [
         "Received type function"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "57-format-single-arg dies when inspect drops node's ${ guard",
@@ -788,8 +773,7 @@
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
       "expect_detail": [
         "${d}"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "57-format-single-arg dies when the backtick branch is removed",
@@ -800,8 +784,7 @@
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
       "expect_detail": [
         "both ' and \""
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "57-format-single-arg dies when inspect stops escaping control characters",
@@ -812,8 +795,7 @@
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
       "expect_detail": [
         "\\\\x1B"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "57-format-single-arg dies when a lone surrogate is not escaped",
@@ -824,8 +806,7 @@
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
       "expect_detail": [
         "\\\\ud800"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "57-format-single-arg dies when Symbol.for is read off the captured Symbol object",
@@ -836,8 +817,7 @@
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
       "expect_detail": [
         "<Buffer 61 62>"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "64-stream-write dies when write() reports errors async instead of throwing",
@@ -848,8 +828,7 @@
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
       "expect_detail": [
         "write(null) must throw SYNCHRONOUSLY"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "64-stream-write dies when the accept set goes back to instanceof Uint8Array",
@@ -861,8 +840,7 @@
       "expect_detail": [
         "Receiver should be a typed array view",
         "must be of type string"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "64-stream-write dies when a view is not normalized to a Buffer",
@@ -873,20 +851,18 @@
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
       "expect_detail": [
         "false, undefined"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "64-stream-write dies when Readable.push does not accept what write does",
-      "why": "Widening only the writable half makes a PassThrough take a view on one side and error on the other — which is how the first attempt shipped.",
+      "why": "Widening only the writable half makes a PassThrough take a view on one side and error on the other — which is how the first attempt shipped. The replacement KEEPS the normalization so the entry pins the brand widening alone — changing both at once would leave a kill ambiguous about which half the case detects.",
       "source": "pkg/runtime/js/internal/stream.js",
       "find": "      } else if (isBytesChunk(chunk)) {\n        // The readable half must accept exactly what the writable half does, or a\n        // PassThrough takes a view on one side and errors on the other — which is how the\n        // first attempt at this shipped.\n        chunk = bytesToBuffer(chunk);",
-      "replace": "      } else if (chunk instanceof Uint8Array) {",
+      "replace": "      } else if (chunk instanceof Uint8Array) {\n        chunk = bytesToBuffer(chunk);",
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
       "expect_detail": [
         "async:ERR_INVALID_ARG_TYPE"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "64-stream-write dies when the encoding is not validated before the chunk type",
@@ -897,8 +873,7 @@
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
       "expect_detail": [
         "must be of type string or an instance of Buffer"
-      ],
-      "rebuild": true
+      ]
     },
     {
       "name": "64-stream-write dies when setDefaultEncoding accepts an unknown name",
@@ -909,8 +884,7 @@
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
       "expect_detail": [
         "setDefaultEncoding must validate"
-      ],
-      "rebuild": true
+      ]
     }
   ]
 }
