@@ -1296,3 +1296,38 @@ fs_exists_sync_cb :: proc "c" (
 
 	return jsc.JSValueMakeBoolean(ctx, b32(module_file_exists(path_str)))
 }
+
+// make_fs_bindings returns the Odin-backed primitives behind `node:fs`, for
+// js/internal/fs.js to wrap.
+//
+// Returns:
+//   A fresh object carrying one native function per primitive; the loader hands it to the
+//   fs factory as its fourth argument, so nothing lands on globalThis.
+// Node:
+//   The set is unchanged from what require.odin installed directly before the JS layer
+//   existed — this moved the same callbacks behind a factory, it did not add or drop one.
+//   fs.js re-exports the pass-through entries by identity, so their `.name`/`.length` and
+//   object identity are still whatever inject_native_function produced.
+//
+// The read primitives are the reason the layer exists: they return a bare Uint8Array and
+// node returns a Buffer, which is a re-tag JS can do zero-copy but a native would need a
+// protected, swept Buffer.prototype handle to do at all (issue #329).
+make_fs_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
+	bindings := jsc.JSObjectMake(ctx, nil, nil)
+	inject_native_function(ctx, bindings, "readFile", fs_read_file_cb)
+	inject_native_function(ctx, bindings, "readFileSync", fs_read_file_sync_cb)
+	inject_native_function(ctx, bindings, "writeFile", fs_write_file_cb)
+	inject_native_function(ctx, bindings, "writeFileSync", fs_write_file_sync_cb)
+	inject_native_function(ctx, bindings, "openSync", fs_open_sync_cb)
+	inject_native_function(ctx, bindings, "closeSync", fs_close_sync_cb)
+	inject_native_function(ctx, bindings, "existsSync", fs_exists_sync_cb)
+	inject_native_function(ctx, bindings, "mkdirSync", fs_mkdir_sync_cb)
+	inject_native_function(ctx, bindings, "mkdtempSync", fs_mkdtemp_sync_cb)
+	inject_native_function(ctx, bindings, "rmSync", fs_rm_sync_cb)
+	inject_native_function(ctx, bindings, "rmdirSync", fs_rmdir_sync_cb)
+	inject_native_function(ctx, bindings, "unlinkSync", fs_unlink_sync_cb)
+	inject_native_function(ctx, bindings, "renameSync", fs_rename_sync_cb)
+	inject_native_function(ctx, bindings, "statSync", fs_stat_sync_cb)
+	inject_native_function(ctx, bindings, "readdirSync", fs_readdir_sync_cb)
+	return bindings
+}

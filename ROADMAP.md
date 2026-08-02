@@ -26,12 +26,10 @@ The original runtime plan (PR #1) is complete:
       (`LavaGlobal` JSClass), not a writable `__loop_ptr__` JS global.
 - [x] **Module cache** — modules run once; `require` throws `MODULE_NOT_FOUND`
       instead of returning `undefined`.
-- [x] **`fs.readFileSync`** returns a `Uint8Array` (no encoding) or string (with
-      encoding); no more lossy UTF-8 on binary data.
-      **This entry is half wrong and stayed wrong for a year:** node returns a
-      **`Buffer`**, so `Buffer.isBuffer` is false here and `.toString('hex')` returns
-      comma-joined decimals. Fixing the lossy-UTF-8 bug was real; calling the result
-      correct was not. See [#329](https://github.com/x-ror/lava/issues/329).
+- [x] **`fs.readFileSync`** returns a **`Buffer`** (no encoding) or a string (with
+      encoding), decoded through Buffer's own codecs — see the `node:fs` JS layer entry
+      below. This entry claimed completion for a year while returning a bare `Uint8Array`
+      and ignoring the encoding argument outright.
 - [x] **`fs.readFile`** (async callback form) — `(path[, options], cb)`, delivered
       on the event loop's poll phase via a new `queue_io_callback`, so the callback
       runs before a same-turn `setImmediate` (matches Node; passes the
@@ -116,16 +114,31 @@ coupling.
       `JSObjectRef` per context, swept from `destroy_runtime_state` like every other
       handle-keyed cache — which is a design decision of its own and was deliberately not
       bolted onto #326.
-- [ ] **`fs.readFileSync` returns a plain `Uint8Array`, not a `Buffer`**
-      ([#329](https://github.com/x-ror/lava/issues/329)) — so
-      `Buffer.isBuffer(fs.readFileSync(p))` is `false`, `constructor.name` is
-      `"Uint8Array"`, and every Buffer method silently does the wrong thing or is absent:
-      `.toString('hex')` falls through to `Uint8Array.prototype.toString` and returns
-      comma-joined decimals (`"116,121"` where node gives `"7479"`), and `.equals`,
-      `.readUInt32BE`, `.subarray().toString('base64')` and friends are missing outright.
-      Found while checking that a benign `DataView` write still round-tripped after the
-      TOCTOU fix; unrelated to it and pre-existing. Wide blast radius for how ordinary the
-      call is — hashing a file, base64-ing an image, comparing two files all break.
+- [x] **`node:fs` had no JS layer, and three read bugs lived in the gap**
+      ([#329](https://github.com/x-ror/lava/issues/329)) — fixed by adding
+      `js/internal/fs.js` over `make_fs_bindings`, so `node:fs` is no longer the
+      native-direct outlier ARCHITECTURE.md §3.3 named. All three were pre-existing and
+      none threw — each returned plausible-looking wrong output:
+      1. **Reads returned a bare `Uint8Array`, not a `Buffer`.** `Buffer.isBuffer` was
+         false and `.toString('hex')` fell through to `Uint8Array.prototype.toString`,
+         which ignores its argument: `"116,121"` where node gives `"7479"`. `.equals`,
+         `.compare`, `.readUInt32BE`, `.toString('base64')` and `.indexOf(string)` were
+         all wrong or missing on every file read.
+      2. **The encoding argument was ignored.** Every read decoded as UTF-8, so
+         `readFileSync(p, 'hex')` returned the file's text instead of its hex.
+      3. **Undecodable bytes produced `""`.** Invalid UTF-8 yielded an empty string where
+         node substitutes U+FFFD — the shape of bug that reads as an empty file.
+      The layer fixes all three by never asking the native for a string: it takes bytes and
+      decodes through `Buffer#toString`, reusing codecs the buffer oracle cases already
+      cover instead of maintaining a second implementation. The re-tag is **zero copy**
+      (`Buffer.from(arrayBuffer, byteOffset, length)` shares memory by spec), which matters
+      because this is the hottest fs call there is. The other 13 primitives are re-exported
+      by identity, so their `.name`, `.length` and object identity are unchanged.
+      Encoding validation now matches node exactly (`ERR_INVALID_ARG_VALUE` for an unknown
+      name, `ERR_INVALID_ARG_TYPE` for a non-string/object, both with node's message
+      templates, and the async form throwing synchronously).
+      Pinned by `tests/node-compat/cases/62-fs-read-buffer.js` (byte-identical to node) and
+      three `tests/mutation-manifest.json` entries.
 - [x] **The primordials ratchet cannot see accessor reads, and reports 0
       anyway** — fixed: it parses with acorn and counts four classes, each
       baselined separately — `method`, `invoke` (`.call`/`.apply`), `accessor`
@@ -353,7 +366,7 @@ coupling.
       `NaN` and the stream never emitted `'drain'` again — permanently stalling
       `src.pipe(process.stdout)` on a process-lifetime singleton — and the bare `throw`
       moved the `pipe()` error from the writable onto the readable. Needs its own change
-      with a `62-stream-write-validation` oracle case (61 is taken) covering the accept
+      with a `63-stream-write-validation` oracle case (62 is taken) covering the accept
       set, the
       message template, and which stream the `pipe()` error lands on.
 - [ ] **`process.stdout`/`stderr` surface holes and the tty half**

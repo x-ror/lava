@@ -596,6 +596,43 @@
       "expect_detail": [
         "writeSync(1.5, ...) was not rejected"
       ]
+    },
+    {
+      "name": "62-fs-read-buffer dies when the read result is not re-tagged as a Buffer",
+      "why": "The native returns a plain Uint8Array where node returns a Buffer. Without the re-tag, Buffer.isBuffer is false and `.toString('hex')` falls through to Uint8Array.prototype.toString — comma-joined decimals instead of hex, with no throw. That shipped for a year.",
+      "source": "pkg/runtime/js/internal/fs.js",
+      "find": "    return BufferFrom(\n      TypedArrayPrototypeGetBuffer(value),\n      TypedArrayPrototypeGetByteOffset(value),\n      TypedArrayPrototypeGetByteLength(value),\n    );",
+      "replace": "    return value;",
+      "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
+      "expect_detail": [
+        "readFileSync must return a Buffer"
+      ],
+      "rebuild": true
+    },
+    {
+      "name": "62-fs-read-buffer dies when the encoding is dropped instead of decoded in JS",
+      "why": "Reads must be decoded through Buffer's codecs here, because the native ignored the encoding argument entirely and decoded everything as UTF-8 — readFileSync(p,'hex') returned the file's text instead of its hex.",
+      "source": "pkg/runtime/js/internal/fs.js",
+      "find": "    return encoding === null ? buf : BufferPrototypeToString(buf, encoding);",
+      "replace": "    return buf;",
+      "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
+      "expect_detail": [
+        "strictEqual",
+        "string"
+      ],
+      "rebuild": true
+    },
+    {
+      "name": "62-fs-read-buffer dies when an unknown encoding is not rejected",
+      "why": "node throws ERR_INVALID_ARG_VALUE for an unrecognized encoding. Without the check the name reaches Buffer#toString, which throws a differently-coded error, and a caller catching by code sees the wrong one. expect_detail keys off the error that ESCAPES (Buffer#toString's uncoded 'Unknown encoding: bogus'), not the code the case asserts: assert.throws swallows the mismatch into an AssertionError, so the coded name never reaches the diff.",
+      "source": "pkg/runtime/js/internal/fs.js",
+      "find": "    if (!BufferIsEncoding(encoding)) {",
+      "replace": "    if (false) {",
+      "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
+      "expect_detail": [
+        "Unknown encoding: bogus"
+      ],
+      "rebuild": true
     }
   ]
 }

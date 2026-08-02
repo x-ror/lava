@@ -1117,6 +1117,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 		{"parse_env", INTERNAL_PARSE_ENV},
 		{"mime", INTERNAL_MIME},
 		{"stdio", INTERNAL_STDIO},
+		{"fs", INTERNAL_FS},
 	}
 
 	factories := jsc.JSObjectMake(ctx, nil, nil)
@@ -1153,6 +1154,7 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "os", cast(jsc.JSValueRef)make_os_bindings(ctx))
 	set_named(ctx, natives, "tty", cast(jsc.JSValueRef)make_tty_bindings(ctx))
 	set_named(ctx, natives, "stdio", cast(jsc.JSValueRef)make_stdio_bindings(ctx))
+	set_named(ctx, natives, "fs", cast(jsc.JSValueRef)make_fs_bindings(ctx))
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef
@@ -1465,6 +1467,7 @@ INTERNAL_PUNYCODE :: #load("js/internal/punycode.js", string)
 INTERNAL_PROCESS :: #load("js/internal/process.js", string)
 INTERNAL_CONSOLE :: #load("js/internal/console.js", string)
 INTERNAL_TTY :: #load("js/internal/tty.js", string)
+INTERNAL_FS :: #load("js/internal/fs.js", string)
 INTERNAL_NET :: #load("js/internal/net.js", string)
 INTERNAL_HTTP :: #load("js/internal/http.js", string)
 INTERNAL_HTTPS :: #load("js/internal/https.js", string)
