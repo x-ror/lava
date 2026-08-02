@@ -35,7 +35,7 @@ const PRIMORDIAL_RE = /^StringPrototype(Replace|ReplaceAll|Match|MatchAll|Split|
 // check is that the count is enforced — a NEW site cannot hide behind an old one.
 const ALLOWED = new Map([
   [
-    'internal/util.js:609',
+    'internal/util.js:660',
     'stripVTControlCharacters: the ANSI pattern is two alternations (OSC terminated by ' +
       'BEL/ST, CSI terminated by a final byte), not a character class, so it has no ' +
       'code-unit rewrite. node hangs on it identically, so Lava is not diverging. ' +

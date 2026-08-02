@@ -17,8 +17,8 @@
   // Through the primordials table rather than the live `Symbol` global: this file is
   // evaluated lazily, so a module-eval read here is not the pre-user-code read §5's
   // exemption assumes (the same reasoning that moved fs.js's Buffer capture to loader.js).
-  var SymbolG = UtilPrimordials.Symbol;
-  var customInspect = SymbolG && SymbolG.for ? SymbolG.for('nodejs.util.inspect.custom') : null;
+  var SymbolFor = UtilPrimordials.SymbolFor;
+  var customInspect = SymbolFor ? SymbolFor('nodejs.util.inspect.custom') : null;
 
   // node PICKS the quote character to avoid escaping rather than always using single
   // quotes. Its strEscape tests, in order: single by default; DOUBLE when the string
@@ -34,13 +34,38 @@
   // live template substitution. That revision also made this comment state the rule
   // without it, so the comment agreed with the code and neither agreed with node.
   //
-  // Known gap, deliberately not closed here: node also escapes \t, \r, \f, \b and other
-  // control characters (`\x00`, `\x1B` — uppercase hex), where this escapes only \n and
-  // the backslash. Tracked as #331 (which also covers the missing maxArrayLength /
-  // maxStringLength caps): widening the escape table is its own change with its own
-  // contract probe, and every value it affects is one this already renders readably
-  // rather than wrongly-quoted. An earlier revision of this comment said "tracked
-  // separately" while nothing tracked it.
+  // ESCAPES, matching node's strEscape exactly. Measured on node 24.18.1 across the whole
+  // C0 range, DEL/C1 and surrogates:
+  //   \b \t \n \f \r      the five with short forms — note 0x0B is `\x0B`, NOT `\v`
+  //   other c < 0x20        `\xNN`, UPPERCASE hex
+  //   0x7F..0x9F            `\xNN` (DEL and the C1 block); 0xA0 stays literal
+  //   unpaired surrogate    `\udXXX`, LOWERCASE hex — node ESCAPES it rather than
+  //                         replacing it with U+FFFD, so the value stays lossless
+  //   a valid pair          literal (an emoji prints as itself)
+  //
+  // This used to escape only the backslash and \n, which was a security gap and not a
+  // cosmetic one: an unescaped `\x1B` makes any line built with util.inspect an
+  // ANSI-injection vector, and a lone surrogate came back as U+FFFD — lossy, not merely
+  // rendered differently. Raised on #330 review; #331 keeps the remaining half, the
+  // missing maxArrayLength / maxStringLength caps.
+  //
+  // A code-unit loop rather than a regex, per §5, batching literal runs so the common case
+  // (nothing to escape) costs one slice instead of per-character concatenation.
+  var HEX_UPPER = '0123456789ABCDEF';
+  var HEX_LOWER = '0123456789abcdef';
+  function escByte(c) {
+    return '\\x' + HEX_UPPER[(c >> 4) & 0xf] + HEX_UPPER[c & 0xf];
+  }
+  function escUnit(c) {
+    return (
+      '\\u' +
+      HEX_LOWER[(c >> 12) & 0xf] +
+      HEX_LOWER[(c >> 8) & 0xf] +
+      HEX_LOWER[(c >> 4) & 0xf] +
+      HEX_LOWER[c & 0xf]
+    );
+  }
+
   function quote(s) {
     var q = "'";
     if (StringPrototypeIndexOf(s, "'") !== -1) {
@@ -48,12 +73,38 @@
       else if (StringPrototypeIndexOf(s, '`') === -1 && StringPrototypeIndexOf(s, '${') === -1)
         q = '`';
     }
-    var out = StringPrototypeReplaceAll(s, '\\', '\\\\');
-    out = StringPrototypeReplaceAll(out, '\n', '\\n');
-    // Only the delimiter needs escaping, and it can only ever be the single quote: the
-    // other two are chosen precisely because they are absent from the string.
-    if (q === "'") out = StringPrototypeReplaceAll(out, "'", "\\'");
-    return q + out + q;
+    var delim = StringPrototypeCharCodeAt(q, 0);
+    var out = '';
+    var runStart = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = StringPrototypeCharCodeAt(s, i);
+      var esc = null;
+      if (c === 0x5c) esc = '\\\\';
+      // Only the single quote can ever need this: the other two delimiters are chosen
+      // precisely because they are absent from the string.
+      else if (c === delim) esc = '\\' + q;
+      else if (c === 0x08) esc = '\\b';
+      else if (c === 0x09) esc = '\\t';
+      else if (c === 0x0a) esc = '\\n';
+      else if (c === 0x0c) esc = '\\f';
+      else if (c === 0x0d) esc = '\\r';
+      else if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) esc = escByte(c);
+      else if (c >= 0xd800 && c <= 0xdbff) {
+        // A high surrogate is literal only when a low one follows; otherwise it is lone.
+        var next = i + 1 < s.length ? StringPrototypeCharCodeAt(s, i + 1) : 0;
+        if (next >= 0xdc00 && next <= 0xdfff)
+          i++; // consume the pair
+        else esc = escUnit(c);
+      } else if (c >= 0xdc00 && c <= 0xdfff) {
+        // Reached only when no high surrogate preceded — a paired low was consumed above.
+        esc = escUnit(c);
+      }
+      if (esc !== null) {
+        out += StringPrototypeSlice(s, runStart, i) + esc;
+        runStart = i + 1;
+      }
+    }
+    return q + out + StringPrototypeSlice(s, runStart) + q;
   }
 
   function inspect(v, opts, seen, depth) {
