@@ -117,7 +117,7 @@ coupling.
 - [x] **`node:fs` had no JS layer, and three read bugs lived in the gap**
       ([#329](https://github.com/x-ror/lava/issues/329)) — fixed by adding
       `js/internal/fs.js` over `make_fs_bindings`, so `node:fs` is no longer the
-      native-direct outlier ARCHITECTURE.md §3.3 named. All three were pre-existing and
+      native-direct outlier ARCHITECTURE.md §3.4 named. All three were pre-existing and
       none threw — each returned plausible-looking wrong output:
       1. **Reads returned a bare `Uint8Array`, not a `Buffer`.** `Buffer.isBuffer` was
          false and `.toString('hex')` fell through to `Uint8Array.prototype.toString`,
@@ -134,11 +134,61 @@ coupling.
       (`Buffer.from(arrayBuffer, byteOffset, length)` shares memory by spec), which matters
       because this is the hottest fs call there is. The other 13 primitives are re-exported
       by identity, so their `.name`, `.length` and object identity are unchanged.
-      Encoding validation now matches node exactly (`ERR_INVALID_ARG_VALUE` for an unknown
-      name, `ERR_INVALID_ARG_TYPE` for a non-string/object, both with node's message
-      templates, and the async form throwing synchronously).
-      Pinned by `tests/node-compat/cases/62-fs-read-buffer.js` (byte-identical to node) and
-      three `tests/mutation-manifest.json` entries.
+      Encoding validation follows node's own shape, which took two passes to get right:
+      every FALSY encoding means binary (node guards `if (encoding && ...)`, so `''`,
+      `false`, `0` and `NaN` all return a Buffer — an earlier revision threw for them and
+      broke code that worked before the layer existed), `'buffer'` is passed through
+      validation so `Buffer#toString` rejects it with `ERR_UNKNOWN_ENCODING` rather than
+      `ERR_INVALID_ARG_VALUE`, and `ERR_INVALID_ARG_TYPE` renders an object receiver as
+      `an instance of <Ctor>` with strings over 28 chars cut to 25 plus `...`.
+      `path` is type-checked too (a number is a file DESCRIPTOR on node, not a bad path),
+      and the async error callback takes one argument as node's does.
+      _Measured cost, and it is a regression:_ routing decoding through Buffer's codecs
+      costs **1.31x at 1 KB, 2.72x at 100 KB, 1.34x at 10 MB** on `readFileSync(p,'utf8')`
+      versus the old native conversion (medians of 7 interleaved launches per arm, both
+      built with `scripts/build.sh`; a JSC sampling profile attributes 64.8% of the new
+      wall time to the `utf8Decode` crossing that did not exist on this path). Binary reads
+      are +5–6% at small sizes and 0.78x at 10 MB. That buys criterion 1 — the old path
+      returned the wrong string for every non-UTF-8 encoding — but it is not free, and
+      `bench/macro/fs.js` did not cover it. Recovering it means passing the VALIDATED
+      encoding to the native and decoding from bytes with the in-tree Odin codecs.
+      Pinned by `tests/node-compat/cases/62-fs-read-buffer.js` and
+      `63-fs-buffer-capture.js` (both byte-identical to node) and thirteen
+      `tests/mutation-manifest.json` entries.
+- [x] **`util.inspect` did not quote a top-level string, and always used single quotes** —
+      fixed alongside the fs layer, which needed correct rendering for node's error
+      messages. `util.inspect('x')` returned `x` where node returns `'x'`: `inspect()`'s
+      `depth === 0` branch exists to serve `format`/`console.log`, which print a string
+      ARGUMENT raw, and the public entry was inheriting it (that branch is now deleted —
+      `stringify` short-circuits strings before `inspect` is reached, so nothing else
+      relied on it). The delimiter is now chosen node's way: double quotes when the string
+      contains `'` but no `"`, backticks when it contains both AND neither a backtick nor
+      `${`, single-with-escapes otherwise. The `${` guard is not cosmetic — inspect output
+      is meant to read back as a literal, and a backtick-delimited `${` is a live template
+      substitution; omitting it regressed output that was correct before.
+      Pinned by `tests/node-compat/cases/57-format-single-arg.js` beside its
+      "a lone string argument is returned VERBATIM" rules, because the fix for one is a
+      plausible-looking break of the other, plus four mutation entries.
+- [ ] **Encoded `fs` reads are 6.3x node** ([#332](https://github.com/x-ror/lava/issues/332))
+      — the cost of moving decoding into `Buffer#toString`, measured above. Recovering it
+      means passing the validated encoding to the native and decoding from bytes with the
+      in-tree Odin codecs; correctness is already pinned by case 62, so that case going
+      byte-identical is the acceptance test. Gated now by `fs-read-utf8-1k` /
+      `fs-read-utf8-64k` / `fs-read-bin-1k`, which did not exist before.
+- [ ] **Lazy internal modules capture mutable module exports**
+      ([#333](https://github.com/x-ror/lava/issues/333)) — §5's "capture at module-eval"
+      rule holds only for the modules `loader.js` instantiates eagerly. `http.js`,
+      `net.js`, `stream.js`, `https.js` and `os.js` each capture `require('buffer').Buffer`
+      at their own lazy eval, so user code that runs first can steer them. `fs.js` had the
+      same defect and is fixed; the ratchet cannot see this class.
+- [ ] **`util.inspect` does not escape control characters**
+      ([#331](https://github.com/x-ror/lava/issues/331)) — `\t`, `\r`, `\f`, `\b`, `\v`,
+      `\x00`, `\x1B`, `\x7F` and lone surrogates are emitted raw where node escapes them
+      (uppercase hex, `\x0B` not `\v`). An unescaped `\x1B` makes any `util.inspect` log
+      line an ANSI-injection vector, and a lone surrogate is replaced with U+FFFD rather
+      than escaped, so the value is lossy. Also missing node's `maxArrayLength` (100) and
+      `maxStringLength` (10000) caps: inspecting a 300 000-element array yields 900 KB
+      where node yields 345 bytes, which an fs error message can carry.
 - [x] **The primordials ratchet cannot see accessor reads, and reports 0
       anyway** — fixed: it parses with acorn and counts four classes, each
       baselined separately — `method`, `invoke` (`.call`/`.apply`), `accessor`

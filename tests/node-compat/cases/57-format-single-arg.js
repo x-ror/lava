@@ -136,3 +136,17 @@ console.log(util.inspect('a%%b'));
 console.log(util.format('%s', 'x'), util.format('%o', 'x'), util.format('%O', 'x'));
 console.log(util.inspect(123), util.inspect(true), util.inspect(null), util.inspect(1n));
 console.log(util.inspect({ a: 'x' }), util.inspect(['x']), util.inspect({}));
+
+// The delimiter rule's remaining branches. `it's` (above) only exercises the DOUBLE-quote
+// arm; these two were unpinned, and a mutation deleting the backtick line survived the
+// case until they were added.
+//
+// The `${` row is the one that matters most: inspect output is meant to read back as a
+// literal, and a backtick-delimited string containing `${` is a live template
+// substitution. node's strEscape refuses the backtick for exactly that reason.
+console.log('--- util.inspect delimiter branches ---');
+console.log(util.inspect('both \' and "'));
+console.log(util.inspect('a\'b"c${d}'));
+console.log(util.inspect({ 'a\'b"c${d}': 1 }));
+console.log(util.inspect('all ` \' " '));
+console.log(util.inspect("tick ` and ' only"));
