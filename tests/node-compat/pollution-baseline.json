@@ -195,7 +195,7 @@
     "method": 42,
     "invoke": 9,
     "accessor": 25,
-    "global": 37
+    "global": 32
   },
   "internal/stream_promises.js": {
     "method": 1,

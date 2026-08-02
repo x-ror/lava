@@ -428,6 +428,10 @@
     // equally configurable. encoding.js re-wraps a non-Uint8Array view as a
     // Uint8Array over the same range, so a forged answer here selects a window
     // out of the shared Buffer pool — reproduced through a DataView input.
+    // The prototype itself, for a brand check that does not depend on `instanceof`
+    // (forgeable through Symbol.hasInstance) or on a try/catch around a getter. Captured
+    // here rather than in the consumer because stream.js is a LAZY module — see #333.
+    DataViewPrototype: DataView.prototype,
     DataViewPrototypeGetBuffer: safeGetter(
       Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get,
     ),

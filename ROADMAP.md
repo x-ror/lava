@@ -423,23 +423,32 @@ coupling.
       `util.debuglog` was the concrete casualty of the absence — with `NODE_DEBUG`
       matching, node printed and Lava threw, which is why the debuglog spin in #324 could
       not be pinned as an oracle case. That blocker is gone.
-- [ ] **`stream.js` reports chunk-type errors asynchronously where node throws**
-      ([#327](https://github.com/x-ror/lava/issues/327)) — node
-      throws `ERR_INVALID_ARG_TYPE` / `ERR_STREAM_NULL_VALUES` synchronously from
-      `Writable#write`; Lava produces the right codes but delivers them as an async
-      `'error'` and returns false. It also rejects `DataView`/`Int16Array`, which node
-      accepts (node converts the view to a Buffer with `encoding: 'buffer'` in the same
-      step), and its message says "Buffer or Uint8Array" where node says "Buffer,
-      TypedArray, or DataView".
-      Attempted inside #326 and **reverted**, because the change reaches every Writable in
-      the tree and produced two regressions the merge gate caught: porting node's accept
-      set without its conversion left `chunk.length` undefined, so `writableLength` became
-      `NaN` and the stream never emitted `'drain'` again — permanently stalling
-      `src.pipe(process.stdout)` on a process-lifetime singleton — and the bare `throw`
-      moved the `pipe()` error from the writable onto the readable. Needs its own change
-      with a `63-stream-write-validation` oracle case (62 is taken) covering the accept
-      set, the
-      message template, and which stream the `pipe()` error lands on.
+- [x] **`stream.js` reported chunk-type errors asynchronously and refused views node
+      accepts** ([#327](https://github.com/x-ror/lava/issues/327)) — relanded after the
+      #326 revert, with the two things that attempt was missing.
+      `Writable#write` now throws `ERR_STREAM_NULL_VALUES` / `ERR_INVALID_ARG_TYPE`
+      **synchronously** as node does (routing them a tick later delivered the right code on
+      the wrong turn), validates an explicit encoding BEFORE the chunk type (so
+      `write(5, 'bogus')` reports the encoding, which is node's order), and accepts any
+      ArrayBuffer view. `ArrayBuffer.isView` replaced `instanceof Uint8Array`, which was
+      wrong in both directions: it rejected `DataView`/`Int16Array` that node takes, and
+      accepted `Object.create(Uint8Array.prototype)` that node refuses.
+      Every view is **normalized to a Buffer with encoding `'buffer'`** before `_write`
+      sees it. That step is why the first attempt was reverted: without it `chunk.length`
+      is undefined for a `DataView`, `writableLength` went NaN, `'drain'` could never fire
+      again (`NaN === 0` is false) and `pipe()` stalled forever. `Readable#push` was widened
+      to match, or a `PassThrough` accepts a view on one side and errors on the other — and
+      its refusal stays an ASYNC `'error'`, which is node's asymmetry with `write`, not an
+      oversight. `setDefaultEncoding` validates too.
+      The DataView and `%TypedArray%` window getters are NOT interchangeable — a
+      `%TypedArray%` getter throws on a DataView receiver, which is what the in-flight fix
+      hit last time — so a prototype-chain brand check picks the family.
+      `describeType` is now shared from `buffer.js` through a NON-ENUMERABLE export rather
+      than becoming a seventh near-copy of node's "Received …" clause;
+      `Object.keys(require('buffer'))` is unchanged.
+      Pinned by `tests/node-compat/cases/64-stream-write-validation.js` (byte-identical to
+      node) and six mutation entries. Converting the coded-error constructors to captured
+      globals LOWERED the ratchet 1595 -> 1590.
 - [ ] **`process.stdout`/`stderr` surface holes and the tty half**
       ([#328](https://github.com/x-ror/lava/issues/328)) — `constructor.name`, `pipe`
       (absent on every Writable, not just stdio — `stream.js` defines only
