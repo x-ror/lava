@@ -169,6 +169,27 @@ coupling.
       Pinned by `tests/node-compat/cases/57-format-single-arg.js` beside its
       "a lone string argument is returned VERBATIM" rules, because the fix for one is a
       plausible-looking break of the other, plus four mutation entries.
+- [ ] **`fs` options and path forms that are accepted and ignored**
+      ([#334](https://github.com/x-ror/lava/issues/334)) — `options.signal` and
+      `options.flag` are taken and dropped, so a bad value returns a Buffer where node
+      throws AND a real `AbortSignal` never aborts the read; a `file:` URL path is
+      stringified rather than resolved (ENOENT where node reads); a NUMBER path is a file
+      descriptor on node but reaches the native as the filename `"123"`. The last two are
+      deliberately let through `validatePath` — rejecting them would be a worse divergence
+      than the current one. Also: nothing asserts that `fs.js`'s `PASSTHROUGH` list still
+      matches `make_fs_bindings`, so dropping or adding a native fails silently in both
+      directions.
+- [ ] **Coded errors omit `[CODE]` from `toString()`/`stack`**
+      ([#335](https://github.com/x-ror/lava/issues/335)) — node renders
+      `TypeError [ERR_INVALID_ARG_VALUE]: …` while keeping `name === 'TypeError'`; Lava
+      renders `TypeError: …`. `err.code` is correct on both, so this only shows where an
+      error is logged or stringified — which is most crash output. Repo-wide, not fs.
+- [ ] **`make bench-gate` is red on master**
+      ([#336](https://github.com/x-ror/lava/issues/336)) — `urlsearchparams-get` sits at
+      1.00x against a 0.9x cap, i.e. the cap asserts Lava is faster than node and it no
+      longer is. Either a real cost from `url.js`'s hardening passes or a cap that was
+      never achievable on this hardware; nobody has distinguished them. A permanently-red
+      gate stops being read, which is the actual risk.
 - [ ] **Encoded `fs` reads are 6.3x node** ([#332](https://github.com/x-ror/lava/issues/332))
       — the cost of moving decoding into `Buffer#toString`, measured above. Recovering it
       means passing the validated encoding to the native and decoding from bytes with the

@@ -52,12 +52,11 @@
   // comes out quoted and everything else bare. Verified against node 24.18.1:
   //   'bogus' -> 'bogus'     123 -> 123        true -> true      1n -> 1n
   //   {}      -> {}          {a:1} -> { a: 1 } [] -> []         Symbol(x) -> Symbol(x)
-  //   Object.create(null)    -> [Object: null prototype] {}
   // An earlier version of this quoted everything, which was wrong for every non-string.
+  // NOT matched: node renders a null-prototype object as `[Object: null prototype] {}`
+  // where Lava's inspect gives `{}` — a util.inspect gap, listed in #331, so this line
+  // does not claim parity for it.
   //
-  // `util` is required lazily, on the error path only: pulling it in at module eval would
-  // load util (and parse_args/mime/util-types behind it) on the first require('fs'), for a
-  // string that is only ever built when a call is already failing.
   // Memoized on first use. `util` is not eager-loaded (instantiating it costs ~3.5 ms of
   // startup for a string only ever built when a call is already failing), so this cannot
   // get the loader-time guarantee the Buffer capture above has. The residual is bounded to
@@ -144,7 +143,8 @@
    *       rejecting them would be a NEW divergence: a `file:` URL is stringified rather
    *       than resolved (ENOENT where node reads the file), and a number is a file
    *       DESCRIPTOR on node (`readFileSync(123)` -> EBADF) but reaches the native as the
-   *       filename "123". Both pre-date this layer; tracked in ROADMAP.
+   *       filename "123". Both pre-date this layer; tracked as #334, together with
+   *       `options.signal`/`flag` being accepted and ignored.
    */
   function validatePath(path) {
     if (typeof path === 'string') return;

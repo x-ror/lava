@@ -36,9 +36,11 @@
   //
   // Known gap, deliberately not closed here: node also escapes \t, \r, \f, \b and other
   // control characters (`\x00`, `\x1B` — uppercase hex), where this escapes only \n and
-  // the backslash. Tracked separately; widening the escape table is its own change with
-  // its own contract probe, and every value it affects is one this already renders
-  // readably rather than wrongly-quoted.
+  // the backslash. Tracked as #331 (which also covers the missing maxArrayLength /
+  // maxStringLength caps): widening the escape table is its own change with its own
+  // contract probe, and every value it affects is one this already renders readably
+  // rather than wrongly-quoted. An earlier revision of this comment said "tracked
+  // separately" while nothing tracked it.
   function quote(s) {
     var q = "'";
     if (StringPrototypeIndexOf(s, "'") !== -1) {
