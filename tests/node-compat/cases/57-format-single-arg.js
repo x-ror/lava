@@ -119,3 +119,20 @@ console.log();
 console.log(5);
 console.log(null);
 console.log('plain');
+
+// util.inspect is the CONTRAST to everything above, and the two are easy to conflate:
+// format/console.log print a string argument raw, but `util.inspect` QUOTES a top-level
+// string. Lava returned it unquoted — inspect()'s internal `depth === 0` branch exists to
+// serve format, and the public entry was inheriting it.
+//
+// Pinned here, next to the verbatim rules, precisely because the fix for one is a
+// plausible-looking break of the other: making format quote, or making inspect not, both
+// turn this block red.
+console.log('--- util.inspect quoting vs format verbatim ---');
+console.log(util.inspect('x'));
+console.log(util.inspect(''));
+console.log(util.inspect("it's"));
+console.log(util.inspect('a%%b'));
+console.log(util.format('%s', 'x'), util.format('%o', 'x'), util.format('%O', 'x'));
+console.log(util.inspect(123), util.inspect(true), util.inspect(null), util.inspect(1n));
+console.log(util.inspect({ a: 'x' }), util.inspect(['x']), util.inspect({}));

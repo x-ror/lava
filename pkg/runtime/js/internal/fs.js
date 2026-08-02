@@ -28,7 +28,6 @@
 
   var P = require('primordials');
   var TypeErrorG = P.TypeError;
-  var StringG = P.String;
   var TypedArrayPrototypeGetBuffer = P.TypedArrayPrototypeGetBuffer;
   var TypedArrayPrototypeGetByteOffset = P.TypedArrayPrototypeGetByteOffset;
   var TypedArrayPrototypeGetByteLength = P.TypedArrayPrototypeGetByteLength;
@@ -41,17 +40,32 @@
   var BufferIsEncoding = BufferG.isEncoding;
   var BufferPrototypeToString = P.uncurryThis(BufferG.prototype.toString);
 
-  // Node renders the received value inline in the ERR_INVALID_ARG_TYPE message —
-  // `Received type number (123)`. Only the primitives can reach here (an object takes the
-  // encoding branch), so this stays a switch on typeof rather than pulling in inspect.
-  function inspectReceived(value) {
-    if (typeof value === 'string') return quote(value);
-    if (typeof value === 'bigint') return StringG(value) + 'n';
-    // StringG() is the one conversion that accepts a symbol; `'' + sym` throws.
-    return StringG(value);
+  // Node renders the offending value with util.inspect in BOTH templates, so a string
+  // comes out quoted and everything else bare. Verified against node 24.18.1:
+  //   'bogus' -> 'bogus'     123 -> 123        true -> true      1n -> 1n
+  //   {}      -> {}          {a:1} -> { a: 1 } [] -> []         Symbol(x) -> Symbol(x)
+  //   Object.create(null)    -> [Object: null prototype] {}
+  // An earlier version of this quoted everything, which was wrong for every non-string.
+  //
+  // `util` is required lazily, on the error path only: pulling it in at module eval would
+  // load util (and parse_args/mime/util-types behind it) on the first require('fs'), for a
+  // string that is only ever built when a call is already failing.
+  function inspectValue(value) {
+    return require('util').inspect(value);
   }
-  function quote(value) {
-    return "'" + value + "'";
+
+  // Node's ERR_INVALID_ARG_TYPE "Received" clause names null and undefined bare, and
+  // renders everything else as `type <typeof> (<inspected>)`.
+  function received(value) {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    return 'type ' + typeof value + ' (' + inspectValue(value) + ')';
+  }
+
+  function errInvalidArgType(message) {
+    var err = new TypeErrorG(message);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
   }
 
   /**
@@ -92,7 +106,14 @@
    * @deviates none
    */
   function readEncoding(options) {
-    if (options === null || options === undefined) return null;
+    // node's getOptions treats null, undefined AND a function as "no options" — a callback
+    // sitting in the options slot is not an error, and neither is an array (it takes the
+    // object branch and has no `.encoding`). Verified: readFileSync(p, function(){}) and
+    // readFileSync(p, []) both return a Buffer on node 24.18.1. An earlier version of this
+    // threw for both.
+    if (options === null || options === undefined || typeof options === 'function') {
+      return null;
+    }
     var encoding;
     if (typeof options === 'string') {
       encoding = options;
@@ -100,19 +121,14 @@
       encoding = options.encoding;
       if (encoding === null || encoding === undefined) return null;
     } else {
-      var err = new TypeErrorG(
-        'The "options" argument must be one of type string or object. Received type ' +
-          typeof options +
-          ' (' +
-          inspectReceived(options) +
-          ')',
+      throw errInvalidArgType(
+        'The "options" argument must be one of type string or object. Received ' +
+          received(options),
       );
-      err.code = 'ERR_INVALID_ARG_TYPE';
-      throw err;
     }
     if (!BufferIsEncoding(encoding)) {
       var e2 = new TypeErrorG(
-        "The argument 'encoding' is invalid encoding. Received " + quote(encoding),
+        "The argument 'encoding' is invalid encoding. Received " + inspectValue(encoding),
       );
       e2.code = 'ERR_INVALID_ARG_VALUE';
       throw e2;
@@ -140,15 +156,22 @@
   }
 
   function readFile(path, options, callback) {
-    var cb = callback;
-    var opts = options;
-    if (typeof opts === 'function') {
-      cb = opts;
-      opts = null;
+    // node is `callback = maybeCallback(callback || options)`, and it validates the
+    // callback BEFORE the options — which is why `readFile(p, 'bogus')` reports the
+    // STRING as a bad callback rather than complaining about the encoding. Verified:
+    //   readFile(p, 'bogus')       -> cb argument must be of type function. Received
+    //                                 type string ('bogus')
+    //   readFile(p, 'bogus', 123)  -> same, Received type number (123)
+    //   readFile(p, 123, fn)       -> options must be one of type string or object
+    // Getting the order backwards would report a plausible but different error for the
+    // commonest mistake there is: forgetting the callback.
+    var cb = callback || options;
+    if (typeof cb !== 'function') {
+      throw errInvalidArgType(
+        'The "cb" argument must be of type function. Received ' + received(cb),
+      );
     }
-    // Validate before dispatching, as node does — a bad encoding throws synchronously
-    // rather than surfacing in the callback.
-    var encoding = readEncoding(opts);
+    var encoding = readEncoding(typeof options === 'function' ? null : options);
     return native.readFile(path, function (err, data) {
       if (err) {
         cb(err, data);

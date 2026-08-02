@@ -89,6 +89,54 @@ assert.throws(() => fs.readFileSync(file, true), { code: 'ERR_INVALID_ARG_TYPE' 
 // the callback.
 assert.throws(() => fs.readFile(file, 'bogus', () => {}), { code: 'ERR_INVALID_ARG_VALUE' });
 
+// Node renders the offending value with util.inspect, so only a STRING is quoted. Getting
+// this wrong is invisible until someone matches on the message.
+assert.throws(() => fs.readFileSync(file, { encoding: 123 }), {
+  message: "The argument 'encoding' is invalid encoding. Received 123",
+});
+assert.throws(() => fs.readFileSync(file, { encoding: {} }), {
+  message: "The argument 'encoding' is invalid encoding. Received {}",
+});
+assert.throws(() => fs.readFileSync(file, { encoding: { a: 1 } }), {
+  message: "The argument 'encoding' is invalid encoding. Received { a: 1 }",
+});
+assert.throws(() => fs.readFileSync(file, { encoding: [] }), {
+  message: "The argument 'encoding' is invalid encoding. Received []",
+});
+assert.throws(() => fs.readFileSync(file, { encoding: true }), {
+  message: "The argument 'encoding' is invalid encoding. Received true",
+});
+
+// NOT an error on node: a function or an array in the options slot both mean "no options"
+// (getOptions treats a callback there as absent, and an array has no `.encoding`).
+assert.equal(Buffer.isBuffer(fs.readFileSync(file, function () {})), true);
+assert.equal(Buffer.isBuffer(fs.readFileSync(file, [])), true);
+
+// The callback is validated BEFORE the options, which is why a forgotten callback reports
+// the encoding string as the bad callback rather than complaining about the encoding.
+assert.throws(() => fs.readFile(file), {
+  code: 'ERR_INVALID_ARG_TYPE',
+  message: 'The "cb" argument must be of type function. Received undefined',
+});
+assert.throws(() => fs.readFile(file, 'bogus'), {
+  code: 'ERR_INVALID_ARG_TYPE',
+  message: 'The "cb" argument must be of type function. Received type string (\'bogus\')',
+});
+assert.throws(() => fs.readFile(file, 'bogus', 123), {
+  code: 'ERR_INVALID_ARG_TYPE',
+  message: 'The "cb" argument must be of type function. Received type number (123)',
+});
+assert.throws(() => fs.readFile(file, null), {
+  code: 'ERR_INVALID_ARG_TYPE',
+  message: 'The "cb" argument must be of type function. Received null',
+});
+// ...but a bad options type still wins once the callback is valid.
+assert.throws(() => fs.readFile(file, 123, () => {}), {
+  code: 'ERR_INVALID_ARG_TYPE',
+  message:
+    'The "options" argument must be one of type string or object. Received type number (123)',
+});
+
 // --- readFile (callback form) ---------------------------------------------------------
 fs.readFile(file, (err, data) => {
   assert.equal(err, null, 'readFile must not error');
@@ -98,6 +146,9 @@ fs.readFile(file, (err, data) => {
   fs.readFile(file, 'latin1', (err2, text) => {
     assert.equal(err2, null);
     assert.equal(typeof text, 'string', 'readFile with an encoding delivers a string');
+    // The VALUE, not just the type: a `typeof` check alone passes just as well when the
+    // encoding is ignored and the bytes come back decoded as UTF-8.
+    assert.equal(text, 'Þ­¾ïty', 'and it is latin1-decoded');
 
     fs.rmSync(dir, { recursive: true });
     console.log('ok');

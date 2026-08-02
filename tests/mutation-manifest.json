@@ -633,6 +633,31 @@
         "Unknown encoding: bogus"
       ],
       "rebuild": true
+    },
+    {
+      "name": "57-format-single-arg dies when util.inspect stops quoting a top-level string",
+      "why": "node's util.inspect QUOTES a top-level string ('x' -> \"'x'\") while console.log/format print a string argument raw. inspect()'s depth-0 branch serves the latter, and the public entry was inheriting it — so every message built with util.inspect lost its quotes, which is how fs.js's ERR_INVALID_ARG_VALUE read `Received bogus` instead of `Received 'bogus'`.",
+      "source": "pkg/runtime/js/internal/util.js",
+      "find": "    if (typeof v === 'string') return inspect(v, opts, [], 1);\n    return inspect(v, opts, [], 0);",
+      "replace": "    return inspect(v, opts, [], 0);",
+      "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
+      "expect_detail": [
+        "'x'"
+      ],
+      "rebuild": true
+    },
+    {
+      "name": "57-format-single-arg dies when inspect stops choosing the quote character",
+      "why": "node picks the delimiter to avoid escaping — a string containing a single quote is rendered with DOUBLE quotes (\"it's\", not 'it\\'s'). Always using single quotes escapes where node does not, so any inspected value containing an apostrophe differs.",
+      "source": "pkg/runtime/js/internal/util.js",
+      "find": "    var q = \"'\";\n    if (StringPrototypeIndexOf(s, \"'\") !== -1) {\n      if (StringPrototypeIndexOf(s, '\"') === -1) q = '\"';\n      else if (StringPrototypeIndexOf(s, '`') === -1) q = '`';\n    }",
+      "replace": "    var q = \"'\";",
+      "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
+      "expect_detail": [
+        "it\\'s",
+        "it's"
+      ],
+      "rebuild": true
     }
   ]
 }

@@ -11,12 +11,37 @@
   var StringPrototypeCharCodeAt = UtilPrimordials.StringPrototypeCharCodeAt;
   var StringPrototypeSlice = UtilPrimordials.StringPrototypeSlice;
   var StringPrototypeToUpperCase = UtilPrimordials.StringPrototypeToUpperCase;
+  var StringPrototypeIndexOf = UtilPrimordials.StringPrototypeIndexOf;
+  var StringPrototypeReplaceAll = UtilPrimordials.StringPrototypeReplaceAll;
 
   var customInspect =
     typeof Symbol !== 'undefined' && Symbol.for ? Symbol.for('nodejs.util.inspect.custom') : null;
 
+  // node PICKS the quote character to avoid escaping rather than always using single
+  // quotes: single by default, DOUBLE when the string contains a single quote but no
+  // double, BACKTICK when it contains both, and single-with-escapes only when all three
+  // are present. Verified on node 24.18.1:
+  //   plain        -> 'plain'          it's      -> "it's"
+  //   say "hi"     -> 'say "hi"'       ' and "   -> `both ' and "`
+  //   ` and ' and " -> 'all ` \' " '
+  //
+  // Known gap, deliberately not closed here: node also escapes \t, \r, \f, \b and other
+  // control characters (`\x00`, `\x1B` — uppercase hex), where this escapes only \n and
+  // the backslash. Tracked separately; widening the escape table is its own change with
+  // its own contract probe, and every value it affects is one this already renders
+  // readably rather than wrongly-quoted.
   function quote(s) {
-    return "'" + s.replaceAll('\\', '\\\\').replaceAll("'", "\\'").replaceAll('\n', '\\n') + "'";
+    var q = "'";
+    if (StringPrototypeIndexOf(s, "'") !== -1) {
+      if (StringPrototypeIndexOf(s, '"') === -1) q = '"';
+      else if (StringPrototypeIndexOf(s, '`') === -1) q = '`';
+    }
+    var out = StringPrototypeReplaceAll(s, '\\', '\\\\');
+    out = StringPrototypeReplaceAll(out, '\n', '\\n');
+    // Only the delimiter needs escaping, and it can only ever be the single quote: the
+    // other two are chosen precisely because they are absent from the string.
+    if (q === "'") out = StringPrototypeReplaceAll(out, "'", "\\'");
+    return q + out + q;
   }
 
   function inspect(v, opts, seen, depth) {
@@ -791,6 +816,16 @@
   }
 
   function inspectPublic(v, opts) {
+    // node QUOTES a top-level string here — `util.inspect('x') === "'x'"` — while
+    // console.log and util.format print a string ARGUMENT raw. inspect()'s `depth === 0`
+    // branch serves the latter, and every internal caller that wants node's quoting
+    // already passes depth 1 (see the %o/%O branch and format's default arg handling).
+    // The public entry was the only caller passing 0, so the unquoted top-level string
+    // was reachable through util.inspect and nothing else.
+    //
+    // Found from fs.js, which builds node's ERR_INVALID_ARG_VALUE message with this —
+    // `Received 'bogus'` came out as `Received bogus`.
+    if (typeof v === 'string') return inspect(v, opts, [], 1);
     return inspect(v, opts, [], 0);
   }
   // util.inspect.colors is the live style table (styleText reads it); util.inspect.custom
