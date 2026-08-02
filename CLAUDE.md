@@ -260,8 +260,10 @@ Rules that keep this from becoming ceremony:
   argument.
 - Errors are Node-shaped coded errors (`ERR_INVALID_ARG_TYPE`, `ERR_OUT_OF_RANGE`)
   with Node's exact message template.
-- Native byte ops stay behind the size threshold (`NATIVE_BYTEOP_MIN`) so small
-  inputs skip FFI overhead.
+- Native byte ops should stay behind a size threshold so small inputs skip FFI
+  overhead. NOTE: the constant this rule used to name (`NATIVE_BYTEOP_MIN`) does not
+  exist — `bytesToString` crosses to a native codec at every size. Treat the rule as
+  the intent, not as something the tree already enforces.
 - **Contract comments** use JSDoc, already the convention in `buffer.js`, so the
   same block serves editors and any future generator. Same scope rule as §4 —
   exported spec surface, not every closure:

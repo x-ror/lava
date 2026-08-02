@@ -140,7 +140,8 @@ Built-ins are JS factories `#load`-embedded at compile time (the `EMBEDDED_*`
 constants in `globals.odin`) and instantiated by `loader.js`. Each factory
 receives `(require, module, exports,
 native)`; the native fourth argument carries Odin-backed bindings (crypto, buffer,
-fetch, sqlite, dns) so **nothing transient lands on `globalThis`**
+fetch, sqlite, dns, fs, net, http(s), os, tty, stdio — twelve today, see
+`install_internal_modules`) so **nothing transient lands on `globalThis`**
 (`install_internal_modules`, `globals.odin`). This is an elegant boundary:
 the spec surface is readable JS, the sharp edges are native, and the seam is one
 well-defined argument.
@@ -149,13 +150,19 @@ The JS layer is substantial and high quality: `url.js` (2071 LOC, WHATWG URL),
 `streams.js` (2027, Web Streams), `buffer.js` (1646), `fetch.js` (1054),
 `crypto.js` (917). Errors use Node-shaped coded errors (`ERR_INVALID_ARG_TYPE`,
 `ERR_OUT_OF_RANGE`, …). Native byte ops are gated by a size threshold
-(`NATIVE_BYTEOP_MIN`) so small inputs avoid FFI overhead — a thoughtful perf call.
+so small inputs avoid FFI overhead — except that the threshold this sentence used to
+name (`NATIVE_BYTEOP_MIN`) does not exist in the tree: `bytesToString` dispatches to a
+native codec at every size. Removed rather than left as folklore steering review.
 
 ### 3.4 Module system (`require.odin`, `module_resolution.odin`)
 
 - CommonJS is the substrate. `native_require_cb` consults, in order: the module
-  cache → JS internal builtins (`require_builtin`) → native `fs` → filesystem
-  resolution. Circular requires terminate via a pre-registered partial-exports
+  cache → JS internal builtins (`require_builtin`) → filesystem resolution.
+  `node:fs` used to sit between the last two as a natively-assembled object, the one
+  built-in with no JS layer; it is now an ordinary internal builtin
+  (`js/internal/fs.js` over `make_fs_bindings`). Nothing may rebuild it in
+  `native_require_cb`: `require_builtin` runs first, so a second construction would be
+  dead code silently disagreeing with the live one. Circular requires terminate via a pre-registered partial-exports
   entry (`__lava_precache`), and a module that throws while loading is _removed_
   from the cache so a later require re-runs it (Node parity).
 - `.mjs`/static `import`/`export` are handled by a **source transform**

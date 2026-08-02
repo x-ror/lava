@@ -85,36 +85,12 @@ native_require_cb :: proc "c" (
 
 	// node:path is served by the JS internal-module loader above (require_builtin).
 
-	// The native fs module answers both the bare and node:-prefixed specifiers;
-	// `require('fs')` is the dominant real-world form. A bare specifier never
-	// resolves to a filesystem path (only "./", "../" and absolute do), so this
-	// cannot shadow a user file named fs.js.
-	if specifier == "node:fs" || specifier == "fs" {
-		fs_obj := jsc.JSObjectMake(ctx, nil, nil)
-
-		inject_native_function(ctx, fs_obj, "readFile", fs_read_file_cb)
-		inject_native_function(ctx, fs_obj, "readFileSync", fs_read_file_sync_cb)
-		inject_native_function(ctx, fs_obj, "writeFile", fs_write_file_cb)
-		inject_native_function(ctx, fs_obj, "writeFileSync", fs_write_file_sync_cb)
-		inject_native_function(ctx, fs_obj, "openSync", fs_open_sync_cb)
-		inject_native_function(ctx, fs_obj, "closeSync", fs_close_sync_cb)
-		inject_native_function(ctx, fs_obj, "existsSync", fs_exists_sync_cb)
-		inject_native_function(ctx, fs_obj, "mkdirSync", fs_mkdir_sync_cb)
-		inject_native_function(ctx, fs_obj, "mkdtempSync", fs_mkdtemp_sync_cb)
-		inject_native_function(ctx, fs_obj, "rmSync", fs_rm_sync_cb)
-		inject_native_function(ctx, fs_obj, "rmdirSync", fs_rmdir_sync_cb)
-		inject_native_function(ctx, fs_obj, "unlinkSync", fs_unlink_sync_cb)
-		inject_native_function(ctx, fs_obj, "renameSync", fs_rename_sync_cb)
-		inject_native_function(ctx, fs_obj, "statSync", fs_stat_sync_cb)
-		inject_native_function(ctx, fs_obj, "readdirSync", fs_readdir_sync_cb)
-
-		value := cast(jsc.JSValueRef)fs_obj
-		// Cache under both specifiers so require('fs') and require('node:fs')
-		// return the identical object (Node memoizes the builtin once).
-		module_cache_put(ctx, state, "fs", value)
-		module_cache_put(ctx, state, "node:fs", value)
-		return value
-	}
+	// node:fs is served by the JS internal-module loader above (require_builtin), like
+	// node:path — js/internal/fs.js wraps the Odin primitives from make_fs_bindings. It
+	// used to be assembled here instead, the one built-in with no JS layer, and that is
+	// what let fs.readFileSync return a bare Uint8Array where node returns a Buffer for a
+	// year (issue #329). Nothing may rebuild it here: require_builtin runs FIRST, so a
+	// second construction would be dead code that silently disagrees with the live one.
 
 	// Relative specifiers resolve against the requiring module's own directory,
 	// which its bound require passes as args[1] (see the wrapper in the .cjs/.js

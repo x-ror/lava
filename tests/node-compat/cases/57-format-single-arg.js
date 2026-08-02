@@ -119,3 +119,67 @@ console.log();
 console.log(5);
 console.log(null);
 console.log('plain');
+
+// util.inspect is the CONTRAST to everything above, and the two are easy to conflate:
+// format/console.log print a string argument raw, but `util.inspect` QUOTES a top-level
+// string. Lava returned it unquoted — inspect()'s internal `depth === 0` branch exists to
+// serve format, and the public entry was inheriting it.
+//
+// Pinned here, next to the verbatim rules, precisely because the fix for one is a
+// plausible-looking break of the other: making format quote, or making inspect not, both
+// turn this block red.
+console.log('--- util.inspect quoting vs format verbatim ---');
+console.log(util.inspect('x'));
+console.log(util.inspect(''));
+console.log(util.inspect("it's"));
+console.log(util.inspect('a%%b'));
+console.log(util.format('%s', 'x'), util.format('%o', 'x'), util.format('%O', 'x'));
+console.log(util.inspect(123), util.inspect(true), util.inspect(null), util.inspect(1n));
+console.log(util.inspect({ a: 'x' }), util.inspect(['x']), util.inspect({}));
+
+// The delimiter rule's remaining branches. `it's` (above) only exercises the DOUBLE-quote
+// arm; these two were unpinned, and a mutation deleting the backtick line survived the
+// case until they were added.
+//
+// The `${` row is the one that matters most: inspect output is meant to read back as a
+// literal, and a backtick-delimited string containing `${` is a live template
+// substitution. node's strEscape refuses the backtick for exactly that reason.
+console.log('--- util.inspect delimiter branches ---');
+console.log(util.inspect('both \' and "'));
+console.log(util.inspect('a\'b"c${d}'));
+console.log(util.inspect({ 'a\'b"c${d}': 1 }));
+console.log(util.inspect('all ` \' " '));
+console.log(util.inspect("tick ` and ' only"));
+
+// The escape table, matching node's strEscape. This was a security gap, not a cosmetic
+// one: an unescaped \x1B makes any line built with util.inspect an ANSI-injection vector,
+// and a lone surrogate used to come back as U+FFFD — lossy, not merely rendered
+// differently. Note 0x0B is `\x0B`, not `\v`, and node uses UPPERCASE hex for \xNN but
+// LOWERCASE for \uXXXX.
+console.log('--- util.inspect escapes ---');
+// JSON.stringify around every row on purpose: when the escape table is broken the raw
+// control bytes make the output a binary blob, and `diff` then reports "binary files
+// differ" instead of the bytes — unreadable for a human AND unkeyable for the mutation
+// runner. Wrapping keeps both sides printable whatever the code does.
+const codes = [];
+for (let i = 0; i < 0x20; i++) codes.push(JSON.stringify(util.inspect(String.fromCharCode(i))));
+console.log(codes.join(' '));
+console.log(
+  [0x7f, 0x80, 0x9b, 0x9f, 0xa0]
+    .map((i) => JSON.stringify(util.inspect(String.fromCharCode(i))))
+    .join(' '),
+);
+console.log(
+  JSON.stringify(util.inspect('\ud800')),
+  JSON.stringify(util.inspect('\udfff')),
+  JSON.stringify(util.inspect('\u{1F600}')),
+);
+console.log(
+  JSON.stringify(util.inspect('a\tb\x1Bc\\d')),
+  JSON.stringify(util.inspect({ 'k\ty': 1 })),
+  JSON.stringify(util.inspect(['a\x00b'])),
+);
+// A Buffer exercises the util.inspect.custom hook, which is looked up through the
+// Symbol.for captured in primordials. Capturing the Symbol OBJECT is not enough — `.for`
+// is writable on it — and without the hook a Buffer renders as a plain Uint8Array.
+console.log(util.inspect(Buffer.from('ab')), util.inspect({ b: Buffer.alloc(1) }));

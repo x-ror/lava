@@ -164,7 +164,7 @@
     {
       "page": "fs",
       "status": "partial",
-      "implemented": "13 fns: readFile/writeFile(Sync)/stat/readdir/mkdir/rm/...",
+      "implemented": "15 fns: readFile/writeFile(Sync)/open/closeSync/stat/readdir/mkdir/rm/...; reads return Buffer and honor the encoding (JS layer, #330)",
       "gaps": "no promises/streams/watch/copyFile/access/chmod/open"
     },
     {

@@ -36,24 +36,13 @@ fs_read_file_sync_cb :: proc "c" (
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
-	// With an explicit encoding (readFileSync(path, 'utf8') or {encoding:'utf8'})
-	// Node returns a string; with no encoding it returns a Buffer. We model the
-	// latter as a Uint8Array so binary data survives intact.
-	as_string := false
-	if argument_count >= 2 {
-		opt := args[1]
-		if jsc.JSValueIsString(ctx, opt) {
-			as_string = true
-		} else if jsc.JSValueIsObject(ctx, opt) {
-			enc := get_named(ctx, cast(jsc.JSObjectRef)opt, "encoding")
-			if enc != nil && jsc.JSValueIsString(ctx, enc) do as_string = true
-		}
-	}
-	if as_string {
-		defer delete(data, context.allocator)
-		return js_string_value(ctx, string(data))
-	}
-
+	// BYTES ONLY. This native used to decode here when an encoding was supplied, and that
+	// branch was deleted rather than merely bypassed: it honored the PRESENCE of an
+	// encoding but never its value (every name decoded as UTF-8), and its conversion
+	// returned an empty string for input it could not decode. js/internal/fs.js owns
+	// decoding now, through Buffer's codecs. Leaving the branch in place would have left
+	// the defective implementation reachable-looking for the next reader (#329).
+	//
 	// Hand ownership of `data` to JavaScriptCore as a Uint8Array (make_uint8_array
 	// owns it and frees it on collection).
 	return make_uint8_array(ctx, data)
@@ -73,7 +62,6 @@ FS_Read_Request :: struct {
 	path:      string, // owned clone; the worker reads this file off-loop (also the error path)
 	data:      []byte, // file contents on success (ownership handed to JSC for a Buffer result)
 	ok:        bool,
-	as_string: bool, // an encoding was supplied → deliver a string, else a Uint8Array
 	err_msg:   string,
 	err_code:  string, // static literal (not freed)
 	err_errno: int,
@@ -113,18 +101,6 @@ fs_read_file_cb :: proc "c" (
 	path_str, path_alloc := jsc_value_to_string_or_default(ctx, args[0])
 	defer if path_alloc do delete(path_str, context.allocator)
 
-	// Options sit between path and callback: a string encoding, or { encoding }.
-	as_string := false
-	if argument_count >= 3 {
-		opt := args[1]
-		if jsc.JSValueIsString(ctx, opt) {
-			as_string = true
-		} else if jsc.JSValueIsObject(ctx, opt) {
-			enc := get_named(ctx, cast(jsc.JSObjectRef)opt, "encoding")
-			if enc != nil && jsc.JSValueIsString(ctx, enc) do as_string = true
-		}
-	}
-
 	// context is runtime.default_context here (proc "c"), so context.allocator is the
 	// heap allocator — capture it so the off-loop worker and the completion agree, and
 	// so a Buffer result freed by jsc_buffer_deallocator (also heap) matches.
@@ -133,7 +109,6 @@ fs_read_file_cb :: proc "c" (
 	req.ctx = ctx
 	req.callback = callback
 	req.allocator = alloc
-	req.as_string = as_string
 	req.path = strings.clone(path_str, alloc)
 	jsc.JSValueProtect(ctx, cast(jsc.JSValueRef)callback)
 
@@ -219,18 +194,16 @@ fs_read_complete_cb :: proc(loop: ^eventloop.Loop, user_data: rawptr) {
 	call_args: [2]jsc.JSValueRef
 	if req.ok {
 		call_args[0] = jsc.JSValueMakeNull(ctx)
-		if req.as_string {
-			call_args[1] = js_string_value(ctx, string(req.data))
-			// req.data is freed by fs_read_request_free below (still owned here).
-		} else {
-			// Async completion runs from the event loop (not a JSC callback), so this
-			// must go through make_uint8_array, which enters the VM around the creation
-			// (see typed_array.odin) — a bare C-API typed-array call here would abort on
-			// a GC. make_uint8_array takes ownership of req.data, so nil it to keep
-			// fs_read_request_free from double-freeing what JSC now owns.
-			call_args[1] = make_uint8_array(ctx, req.data)
-			req.data = nil
-		}
+		// Async completion runs from the event loop (not a JSC callback), so this must go
+		// through make_uint8_array, which enters the VM around the creation (see
+		// typed_array.odin) — a bare C-API typed-array call here would abort on a GC.
+		// make_uint8_array takes ownership of req.data, so nil it to keep
+		// fs_read_request_free from double-freeing what JSC now owns.
+		//
+		// Always bytes: the encoding-aware string branch that used to sit here was deleted
+		// with its sync twin, for the reasons in fs_read_file_sync_cb (#329).
+		call_args[1] = make_uint8_array(ctx, req.data)
+		req.data = nil
 	} else {
 		err := make_js_error(ctx, req.err_msg)
 		if jsc.JSValueIsObject(ctx, err) {
@@ -1295,4 +1268,39 @@ fs_exists_sync_cb :: proc "c" (
 	defer if alloc do delete(path_str, context.allocator)
 
 	return jsc.JSValueMakeBoolean(ctx, b32(module_file_exists(path_str)))
+}
+
+// make_fs_bindings returns the Odin-backed primitives behind `node:fs`, for
+// js/internal/fs.js to wrap.
+//
+// Returns:
+//   A fresh object carrying one native function per primitive; the loader hands it to the
+//   fs factory as its fourth argument, so nothing lands on globalThis.
+// Node:
+//   The set is unchanged from what require.odin installed directly before the JS layer
+//   existed — this moved the same callbacks behind a factory, it did not add or drop one.
+//   fs.js re-exports the pass-through entries by identity, so their `.name`/`.length` and
+//   object identity are still whatever inject_native_function produced.
+//
+// The read primitives are the reason the layer exists: they return a bare Uint8Array and
+// node returns a Buffer, which is a re-tag JS can do zero-copy but a native would need a
+// protected, swept Buffer.prototype handle to do at all (issue #329).
+make_fs_bindings :: proc(ctx: jsc.JSContextRef) -> jsc.JSObjectRef {
+	bindings := jsc.JSObjectMake(ctx, nil, nil)
+	inject_native_function(ctx, bindings, "readFile", fs_read_file_cb)
+	inject_native_function(ctx, bindings, "readFileSync", fs_read_file_sync_cb)
+	inject_native_function(ctx, bindings, "writeFile", fs_write_file_cb)
+	inject_native_function(ctx, bindings, "writeFileSync", fs_write_file_sync_cb)
+	inject_native_function(ctx, bindings, "openSync", fs_open_sync_cb)
+	inject_native_function(ctx, bindings, "closeSync", fs_close_sync_cb)
+	inject_native_function(ctx, bindings, "existsSync", fs_exists_sync_cb)
+	inject_native_function(ctx, bindings, "mkdirSync", fs_mkdir_sync_cb)
+	inject_native_function(ctx, bindings, "mkdtempSync", fs_mkdtemp_sync_cb)
+	inject_native_function(ctx, bindings, "rmSync", fs_rm_sync_cb)
+	inject_native_function(ctx, bindings, "rmdirSync", fs_rmdir_sync_cb)
+	inject_native_function(ctx, bindings, "unlinkSync", fs_unlink_sync_cb)
+	inject_native_function(ctx, bindings, "renameSync", fs_rename_sync_cb)
+	inject_native_function(ctx, bindings, "statSync", fs_stat_sync_cb)
+	inject_native_function(ctx, bindings, "readdirSync", fs_readdir_sync_cb)
+	return bindings
 }

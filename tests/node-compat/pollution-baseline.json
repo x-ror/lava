@@ -77,6 +77,12 @@
     "accessor": 6,
     "global": 75
   },
+  "internal/fs.js": {
+    "method": 0,
+    "invoke": 0,
+    "accessor": 0,
+    "global": 0
+  },
   "internal/http.js": {
     "method": 35,
     "invoke": 5,
@@ -179,6 +185,12 @@
     "accessor": 3,
     "global": 22
   },
+  "internal/stdio.js": {
+    "method": 0,
+    "invoke": 0,
+    "accessor": 0,
+    "global": 0
+  },
   "internal/stream.js": {
     "method": 42,
     "invoke": 9,
@@ -234,7 +246,7 @@
     "global": 24
   },
   "internal/util.js": {
-    "method": 53,
+    "method": 50,
     "invoke": 14,
     "accessor": 15,
     "global": 72

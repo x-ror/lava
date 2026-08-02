@@ -254,6 +254,10 @@
     Set: Set,
     WeakMap: WeakMap,
     Symbol: Symbol,
+    // The METHOD, not just the object. Capturing `Symbol` alone is not enough: `.for` is a
+    // writable property on it, so a lazily-evaluated module reading `P.Symbol.for` at its
+    // own module-eval still reads whatever user code left there.
+    SymbolFor: Symbol.for,
     Reflect: Reflect,
     JSON: JSON,
     Math: Math,

@@ -52,6 +52,28 @@
   // Other modules require('primordials') and get this cached, pristine table.
   req('primordials');
   req('buffer');
+
+  // Hand `fs` a PRISTINE Buffer, captured here rather than inside fs.js.
+  //
+  // fs.js is a lazy module: its factory does not run until user code calls require('fs'),
+  // which is arbitrarily late. A `require('buffer').Buffer` capture at ITS module-eval
+  // therefore reads whatever the exports object holds by then, and that object is the one
+  // user code holds too — so a dependency's top-level `require('buffer').Buffer = shim`
+  // makes every later fs read return, and disclose, whatever the shim wants. Node's fs
+  // builds its result from an internal binding user code cannot reach.
+  //
+  // §5's "capture at module-eval" rule is only sound because the LOADER runs before user
+  // code, and that is true of the eager list above, not of a lazy module. So the capture
+  // belongs here, one line after buffer is instantiated, where the ordering is provable.
+  // fs receives it through its natives argument like any other binding.
+  var pristineBuffer = req('buffer').Buffer;
+  if (natives.fs) {
+    natives.fs.Buffer = pristineBuffer;
+    natives.fs.bufferFrom = pristineBuffer.from;
+    natives.fs.bufferIsEncoding = pristineBuffer.isEncoding;
+    natives.fs.bufferToString = pristineBuffer.prototype.toString;
+  }
+
   req('stream/web');
   req('fetch');
   req('abort');
