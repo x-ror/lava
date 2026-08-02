@@ -13,7 +13,29 @@
   'use strict';
 
   var EventEmitter = require('events');
-  var Buffer = require('buffer').Buffer;
+  var bufferModule = require('buffer');
+  var Buffer = bufferModule.Buffer;
+  // node's "Received …" clause, shared rather than re-derived — see the non-enumerable
+  // export in buffer.js for why this is not a seventh local copy.
+  var describeType = bufferModule.describeType;
+  var BufferIsEncoding = Buffer.isEncoding;
+
+  // Through primordials, NOT captured here: this module is lazy, so a module-eval capture
+  // runs after user code and is steerable (#333). `ArrayBuffer.isView` in particular is a
+  // security decision — read live, `globalThis.ArrayBuffer = {isView: () => true}` walks a
+  // plain object straight into the byte path.
+  var StreamPrimordials = require('primordials');
+  var ArrayBufferIsView = StreamPrimordials.ArrayBufferIsView;
+  var ErrorG = StreamPrimordials.Error;
+  var TypeErrorG = StreamPrimordials.TypeError;
+  var ObjectGetPrototypeOf = StreamPrimordials.ObjectGetPrototypeOf;
+  var DataViewPrototype = StreamPrimordials.DataViewPrototype;
+  var DataViewPrototypeGetBuffer = StreamPrimordials.DataViewPrototypeGetBuffer;
+  var DataViewPrototypeGetByteOffset = StreamPrimordials.DataViewPrototypeGetByteOffset;
+  var DataViewPrototypeGetByteLength = StreamPrimordials.DataViewPrototypeGetByteLength;
+  var TypedArrayPrototypeGetBuffer = StreamPrimordials.TypedArrayPrototypeGetBuffer;
+  var TypedArrayPrototypeGetByteOffset = StreamPrimordials.TypedArrayPrototypeGetByteOffset;
+  var TypedArrayPrototypeGetByteLength = StreamPrimordials.TypedArrayPrototypeGetByteLength;
   var StringDecoder = require('string_decoder').StringDecoder;
   var nextTick = process.nextTick;
   // Captured at module eval, before user code runs (§5) — `pipe` needs to reach
@@ -30,7 +52,7 @@
     return err;
   }
   function errWriteAfterEnd() {
-    return codedError(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end');
+    return codedError(ErrorG, 'ERR_STREAM_WRITE_AFTER_END', 'write after end');
   }
   function errDestroyed(what) {
     return codedError(
@@ -40,7 +62,7 @@
     );
   }
   function errNullValues() {
-    return codedError(TypeError, 'ERR_STREAM_NULL_VALUES', 'May not write null values to stream');
+    return codedError(TypeErrorG, 'ERR_STREAM_NULL_VALUES', 'May not write null values to stream');
   }
   function errMethodNotImplemented(name) {
     return codedError(
@@ -50,18 +72,68 @@
     );
   }
   function errPrematureClose() {
-    return codedError(Error, 'ERR_STREAM_PREMATURE_CLOSE', 'Premature close');
+    return codedError(ErrorG, 'ERR_STREAM_PREMATURE_CLOSE', 'Premature close');
   }
   function errInvalidArg(name, expected, actual) {
     return codedError(
       TypeError,
       'ERR_INVALID_ARG_TYPE',
-      'The "' + name + '" argument must be ' + expected + '. Received ' + typeof actual,
+      'The "' + name + '" argument must be ' + expected + '. Received ' + describeType(actual),
+    );
+  }
+  function errUnknownEncoding(encoding) {
+    return codedError(TypeErrorG, 'ERR_UNKNOWN_ENCODING', 'Unknown encoding: ' + encoding);
+  }
+
+  // node's chunk contract, verified on 24.18.1: a string, or ANY ArrayBuffer view —
+  // Buffer, every TypedArray, and DataView. `instanceof Uint8Array` is wrong in both
+  // directions: it rejects DataView and Int16Array, which node accepts, and it accepts
+  // `Object.create(Uint8Array.prototype)`, which node rejects. ArrayBuffer.isView is the
+  // whole test, and it also refuses a bare ArrayBuffer.
+  var CHUNK_EXPECTED = 'of type string or an instance of Buffer, TypedArray, or DataView';
+  function isBytesChunk(chunk) {
+    return ArrayBufferIsView(chunk);
+  }
+
+  function isDataViewChunk(value) {
+    // Prototype-chain walk rather than `instanceof` (forgeable through Symbol.hasInstance)
+    // or a try/catch around a getter (an exception per write on the hot path).
+    var proto = ObjectGetPrototypeOf(value);
+    while (proto !== null) {
+      if (proto === DataViewPrototype) return true;
+      proto = ObjectGetPrototypeOf(proto);
+    }
+    return false;
+  }
+
+  // THE STEP WHOSE ABSENCE CAUSED #326's REGRESSION. node hands `_write` a Buffer with
+  // encoding 'buffer' for every view, so widening the accept set without converting left
+  // `chunk.length` undefined for a DataView: `writableLength` went NaN, `'drain'` could
+  // never fire again (NaN === 0 is false), and pipe() stalled forever.
+  //
+  // The two getter families are NOT interchangeable — a %TypedArray% getter throws on a
+  // DataView receiver, which is exactly what the in-flight fix hit last time — so the
+  // brand decides which set to read the window through.
+  function bytesToBuffer(chunk) {
+    if (isDataViewChunk(chunk)) {
+      return Buffer.from(
+        DataViewPrototypeGetBuffer(chunk),
+        DataViewPrototypeGetByteOffset(chunk),
+        DataViewPrototypeGetByteLength(chunk),
+      );
+    }
+    return Buffer.from(
+      TypedArrayPrototypeGetBuffer(chunk),
+      TypedArrayPrototypeGetByteOffset(chunk),
+      TypedArrayPrototypeGetByteLength(chunk),
     );
   }
 
-  function isUint8(chunk) {
-    return chunk instanceof Uint8Array;
+  // node validates an EXPLICIT encoding before it looks at the chunk, which is why
+  // `write(5, 'bogus')` reports the encoding and not the chunk type. 'buffer' is node's
+  // internal marker and is always allowed through.
+  function validateEncoding(encoding) {
+    if (encoding !== 'buffer' && !BufferIsEncoding(encoding)) throw errUnknownEncoding(encoding);
   }
 
   // --- Stream base ---------------------------------------------------------------
@@ -170,11 +242,15 @@
       if (typeof chunk === 'string') {
         encoding = encoding || s.defaultEncoding;
         chunk = Buffer.from(chunk, encoding);
-      } else if (!isUint8(chunk)) {
-        errorOrDestroy(
-          this,
-          errInvalidArg('chunk', 'of type string or an instance of Buffer or Uint8Array', chunk),
-        );
+      } else if (isBytesChunk(chunk)) {
+        // The readable half must accept exactly what the writable half does, or a
+        // PassThrough takes a view on one side and errors on the other — which is how the
+        // first attempt at this shipped.
+        chunk = bytesToBuffer(chunk);
+      } else {
+        // Unlike write(), a bad push is an ASYNC 'error' on node, not a throw. The
+        // asymmetry is node's; do not "fix" it into a throw.
+        errorOrDestroy(this, errInvalidArg('chunk', CHUNK_EXPECTED, chunk));
         return false;
       }
       if (s.decoder) chunk = s.decoder.write(chunk);
@@ -731,28 +807,29 @@
       encoding = null;
     }
     var w = this._writableState;
+    // An explicit encoding is validated FIRST — before null, before the chunk type. That
+    // ordering is node's and it is observable: `write(5, 'bogus')` reports the encoding.
+    if (encoding) validateEncoding(encoding);
     encoding = encoding || w.defaultEncoding;
     if (typeof cb !== 'function') cb = noop;
 
-    if (chunk === null) {
-      var nullErr = errNullValues();
-      writeErrorNextTick(this, nullErr, cb);
-      return false;
-    }
+    // node THROWS both of these synchronously rather than reporting them on the stream.
+    // Routing them through writeErrorNextTick delivered the right code on the wrong turn,
+    // so `assert.throws(() => s.write(null))` passed under node and failed here.
+    if (chunk === null) throw errNullValues();
     if (!w.objectMode) {
       if (typeof chunk === 'string') {
         if (w.decodeStrings) {
           chunk = Buffer.from(chunk, encoding);
           encoding = 'buffer';
         }
-      } else if (!isUint8(chunk)) {
-        var typeErr = errInvalidArg(
-          'chunk',
-          'of type string or an instance of Buffer or Uint8Array',
-          chunk,
-        );
-        writeErrorNextTick(this, typeErr, cb);
-        return false;
+      } else if (isBytesChunk(chunk)) {
+        // Normalize every view to a Buffer, as node does, so downstream length accounting
+        // and `_write` see the same shape they always have.
+        chunk = bytesToBuffer(chunk);
+        encoding = 'buffer';
+      } else {
+        throw errInvalidArg('chunk', CHUNK_EXPECTED, chunk);
       }
     }
     if (w.ending) {
@@ -877,6 +954,7 @@
   };
 
   Writable.prototype.setDefaultEncoding = function (encoding) {
+    validateEncoding(encoding);
     this._writableState.defaultEncoding = encoding;
     return this;
   };
@@ -1063,12 +1141,12 @@
   function addAbortSignal(signal, stream) {
     if (signal.aborted) {
       nextTick(function () {
-        stream.destroy(codedError(Error, 'ABORT_ERR', 'The operation was aborted'));
+        stream.destroy(codedError(ErrorG, 'ABORT_ERR', 'The operation was aborted'));
       });
       return;
     }
     signal.addEventListener('abort', function () {
-      stream.destroy(codedError(Error, 'ABORT_ERR', 'The operation was aborted'));
+      stream.destroy(codedError(ErrorG, 'ABORT_ERR', 'The operation was aborted'));
     });
   }
 
@@ -1250,7 +1328,7 @@
     if (typeof cb !== 'function') throw errInvalidArg('callback', 'of type function', cb);
     if (Array.isArray(args[0]) && args.length === 1) args = args[0];
     if (args.length < 2) {
-      throw codedError(Error, 'ERR_MISSING_ARGS', 'The "streams" argument is required');
+      throw codedError(ErrorG, 'ERR_MISSING_ARGS', 'The "streams" argument is required');
     }
 
     var streams = args;

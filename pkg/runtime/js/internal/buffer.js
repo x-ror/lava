@@ -1592,5 +1592,18 @@
       inspectMaxBytes = value;
     },
   });
+  // Internal, and deliberately NON-ENUMERABLE so `Object.keys(require('buffer'))` still
+  // matches node exactly: stream.js builds the same ERR_INVALID_ARG_TYPE "Received …"
+  // clause, there is no shared errors module to host it, and the alternative is a seventh
+  // near-copy in a tree where the six that exist already disagree with each other (fs.js's
+  // was missing node's object branch until #330). An earlier revision exported it
+  // enumerably, which silently added a key node does not have.
+  P.ObjectDefineProperty(exported, 'describeType', {
+    value: describeType,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+
   module.exports = exported;
 });
