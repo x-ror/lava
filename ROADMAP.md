@@ -28,6 +28,10 @@ The original runtime plan (PR #1) is complete:
       instead of returning `undefined`.
 - [x] **`fs.readFileSync`** returns a `Uint8Array` (no encoding) or string (with
       encoding); no more lossy UTF-8 on binary data.
+      **This entry is half wrong and stayed wrong for a year:** node returns a
+      **`Buffer`**, so `Buffer.isBuffer` is false here and `.toString('hex')` returns
+      comma-joined decimals. Fixing the lossy-UTF-8 bug was real; calling the result
+      correct was not. See [#329](https://github.com/x-ror/lava/issues/329).
 - [x] **`fs.readFile`** (async callback form) — `(path[, options], cb)`, delivered
       on the event loop's poll phase via a new `queue_io_callback`, so the callback
       runs before a same-turn `setImmediate` (matches Node; passes the
@@ -99,7 +103,8 @@ coupling.
       `cmd/lava/buffer_reentrancy_test.odin`, reached through a property read rather than
       a `valueOf`. Pinned by `cmd/lava/fs_write_payload_test.odin` plus a
       `tests/mutation-manifest.json` entry that restores the stale ordering.
-- [ ] **A DataView's window is read from forgeable properties, not its internal slots** —
+- [ ] **A DataView's window is read from forgeable properties, not its internal slots**
+      ([#242](https://github.com/x-ror/lava/issues/242)) —
       the residual half of the entry above, and a parity gap rather than a safety one.
       Node reads a DataView's `byteOffset`/`byteLength` from internal slots and ignores
       own accessors entirely; Lava reads the properties, so a forged pair selects a
@@ -111,7 +116,8 @@ coupling.
       `JSObjectRef` per context, swept from `destroy_runtime_state` like every other
       handle-keyed cache — which is a design decision of its own and was deliberately not
       bolted onto #326.
-- [ ] **`fs.readFileSync` returns a plain `Uint8Array`, not a `Buffer`** — so
+- [ ] **`fs.readFileSync` returns a plain `Uint8Array`, not a `Buffer`**
+      ([#329](https://github.com/x-ror/lava/issues/329)) — so
       `Buffer.isBuffer(fs.readFileSync(p))` is `false`, `constructor.name` is
       `"Uint8Array"`, and every Buffer method silently does the wrong thing or is absent:
       `.toString('hex')` falls through to `Uint8Array.prototype.toString` and returns
@@ -333,7 +339,8 @@ coupling.
       `util.debuglog` was the concrete casualty of the absence — with `NODE_DEBUG`
       matching, node printed and Lava threw, which is why the debuglog spin in #324 could
       not be pinned as an oracle case. That blocker is gone.
-- [ ] **`stream.js` reports chunk-type errors asynchronously where node throws** — node
+- [ ] **`stream.js` reports chunk-type errors asynchronously where node throws**
+      ([#327](https://github.com/x-ror/lava/issues/327)) — node
       throws `ERR_INVALID_ARG_TYPE` / `ERR_STREAM_NULL_VALUES` synchronously from
       `Writable#write`; Lava produces the right codes but delivers them as an async
       `'error'` and returns false. It also rejects `DataView`/`Int16Array`, which node
@@ -349,6 +356,13 @@ coupling.
       with a `62-stream-write-validation` oracle case (61 is taken) covering the accept
       set, the
       message template, and which stream the `pipe()` error lands on.
+- [ ] **`process.stdout`/`stderr` surface holes and the tty half**
+      ([#328](https://github.com/x-ror/lava/issues/328)) — `constructor.name`, `pipe`
+      (absent on every Writable, not just stdio — `stream.js` defines only
+      `Readable.prototype.pipe`), `writableCorked`, `closed`, `errored`, `_writev`; the
+      write-callback err arg (`undefined` where node passes `null`); `end(cb)` running
+      after `'finish'` instead of before; a swallowed EPIPE where node dies noisily; and
+      `columns`/`rows`/`getWindowSize`/`hasColors` on a terminal, which need TIOCGWINSZ.
 - [ ] **`process.on` does not exist**, so `process.on('exit', …)` throws — found while
       pinning the above, which had to use a timer instead. Also still missing:
       `process.hrtime` (`hrtime.bigint()` throws; `JSBigIntCreateWithUInt64` IS exported by
