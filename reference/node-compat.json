@@ -512,7 +512,9 @@
       "platform",
       "arch",
       "version",
-      "versions"
+      "versions",
+      "stdout",
+      "stderr"
     ],
     "missing": [
       "hrtime",
@@ -521,8 +523,6 @@
       "memoryUsage",
       "resourceUsage",
       "uptime",
-      "stdout",
-      "stderr",
       "stdin",
       "execPath",
       "argv0",

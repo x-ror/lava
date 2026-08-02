@@ -467,12 +467,22 @@ fs_resolve_write_payload :: proc(
 			buffer_val := get_named(ctx, obj, "buffer")
 			if buffer_val != nil && jsc.JSValueGetTypedArrayType(ctx, buffer_val, nil) == .ArrayBuffer {
 				ab := cast(jsc.JSObjectRef)buffer_val
-				// Read offsets/length FIRST and validate them in f64; the ArrayBuffer backing
-				// pointer JSC returns is only valid until the next JSC API call (a GC/realloc
-				// can move it), so fetch it LAST — with no JSC call between it and the return.
-				ab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))
+				// Read the claimed window FIRST, because these two reads are the only step
+				// here that can run user JS: `byteOffset`/`byteLength` may be OWN accessors,
+				// and such a getter can resize or transfer the backing buffer before it
+				// returns. Anything sampled before them is stale by the time they finish —
+				// which is exactly the bug this ordering fixes. A getter that shrank the
+				// buffer used to pass a bounds check against the pre-shrink size, and the
+				// resolver then handed back a slice reaching past the allocation: 4088 bytes
+				// of out-of-bounds heap written into a caller-named file.
+				// Pinned by cmd/lava/fs_write_payload_test.odin.
 				off_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, "byteOffset"), nil)
 				len_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, "byteLength"), nil)
+				// Now that no further JS can run, sample the authoritative length and take
+				// the base pointer back to back: the pointer is only valid until the next
+				// JSC API call (a GC/realloc can move it), so nothing may come between them
+				// but the pure-Odin validation below.
+				ab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))
 				// NaN/Infinity fail every comparison, so an invalid window rejects to an empty
 				// payload here rather than truncating to an undefined int. len_f > 0 also folds
 				// the zero-length DataView into the empty-file path.

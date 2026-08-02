@@ -28,6 +28,10 @@ The original runtime plan (PR #1) is complete:
       instead of returning `undefined`.
 - [x] **`fs.readFileSync`** returns a `Uint8Array` (no encoding) or string (with
       encoding); no more lossy UTF-8 on binary data.
+      **This entry is half wrong and stayed wrong for a year:** node returns a
+      **`Buffer`**, so `Buffer.isBuffer` is false here and `.toString('hex')` returns
+      comma-joined decimals. Fixing the lossy-UTF-8 bug was real; calling the result
+      correct was not. See [#329](https://github.com/x-ror/lava/issues/329).
 - [x] **`fs.readFile`** (async callback form) — `(path[, options], cb)`, delivered
       on the event loop's poll phase via a new `queue_io_callback`, so the callback
       runs before a same-turn `setImmediate` (matches Node; passes the
@@ -81,6 +85,47 @@ coupling.
 
 ### High priority (the Odin / native part)
 
+- [x] **`fs.writeFileSync(path, dataView)` could write out-of-bounds heap into a
+      caller-named file** — fixed. JSC's C API has no DataView byte accessor, so
+      `fs_resolve_write_payload` reads `.byteOffset`/`.byteLength` off the object. Those
+      are ordinary property reads, and on an object carrying its OWN accessors they run
+      arbitrary JS — which can `resize()` the backing ArrayBuffer before returning. The
+      resolver sampled the buffer's length BEFORE those reads and validated the window
+      against that stale number, then took the base pointer after.
+      Measured on a 4096-byte resizable buffer whose `byteOffset` getter calls
+      `ab.resize(8)`: node writes 4096 bytes of the real buffer (its getters never run —
+      internal slots), Lava wrote 4096 bytes over an 8-byte live allocation, so **4088
+      bytes of adjacent heap landed in a file the script chose**. An arbitrary-length
+      disclosure, not just a crash.
+      The fix is ordering: read the claimed window first — the only step that can run user
+      JS — then sample the authoritative length and take the pointer back to back, with
+      only pure-Odin validation between them. Same family as the coercion re-entrancy in
+      `cmd/lava/buffer_reentrancy_test.odin`, reached through a property read rather than
+      a `valueOf`. Pinned by `cmd/lava/fs_write_payload_test.odin` plus a
+      `tests/mutation-manifest.json` entry that restores the stale ordering.
+- [ ] **A DataView's window is read from forgeable properties, not its internal slots**
+      ([#242](https://github.com/x-ror/lava/issues/242)) —
+      the residual half of the entry above, and a parity gap rather than a safety one.
+      Node reads a DataView's `byteOffset`/`byteLength` from internal slots and ignores
+      own accessors entirely; Lava reads the properties, so a forged pair selects a
+      different window (and now rejects, where node writes the real bytes). `is_data_view`
+      is the same shape — it compares `constructor.name` to `"DataView"`, which any object
+      can claim. Neither is exploitable: every window that survives validation is in
+      bounds of a buffer the caller already holds a reference to. Closing it needs the
+      pristine `DataView.prototype` getters callable from native — a cached, protected
+      `JSObjectRef` per context, swept from `destroy_runtime_state` like every other
+      handle-keyed cache — which is a design decision of its own and was deliberately not
+      bolted onto #326.
+- [ ] **`fs.readFileSync` returns a plain `Uint8Array`, not a `Buffer`**
+      ([#329](https://github.com/x-ror/lava/issues/329)) — so
+      `Buffer.isBuffer(fs.readFileSync(p))` is `false`, `constructor.name` is
+      `"Uint8Array"`, and every Buffer method silently does the wrong thing or is absent:
+      `.toString('hex')` falls through to `Uint8Array.prototype.toString` and returns
+      comma-joined decimals (`"116,121"` where node gives `"7479"`), and `.equals`,
+      `.readUInt32BE`, `.subarray().toString('base64')` and friends are missing outright.
+      Found while checking that a benign `DataView` write still round-tripped after the
+      TOCTOU fix; unrelated to it and pre-existing. Wide blast radius for how ordinary the
+      call is — hashing a file, base64-ing an image, comparing two files all break.
 - [x] **The primordials ratchet cannot see accessor reads, and reports 0
       anyway** — fixed: it parses with acorn and counts four classes, each
       baselined separately — `method`, `invoke` (`.call`/`.apply`), `accessor`
@@ -238,13 +283,93 @@ coupling.
       `tests/mutation-manifest.json` entries. That Odin test ran **2m49s** while the
       sites spun — failing with `RangeError` from runaway string growth rather than a
       clean hang — and runs in **23.7ms** now.
-- [ ] **`process.stdout` / `process.stderr` do not exist** — found while pinning the
-      above, undocumented until now. Both are `undefined`, so anything writing through
-      them throws `TypeError: undefined is not an object`. `util.debuglog` is the
-      concrete casualty: with `NODE_DEBUG` matching, node prints and Lava throws, which
-      is why the debuglog hang could not be pinned as an oracle case. `console.log`
-      works (it goes through the native console binding, not `process.stdout`), which is
-      why this stayed invisible.
+- [x] **`process.stdout` / `process.stderr` do not exist** — implemented. Both are now
+      lazy, configurable getters on `process` (node's own shape; a plain
+      `JSObjectSetProperty` cannot express a getter, so the loader hands `globals.odin` a
+      closure it calls after `process` and `process.nextTick` exist). Each is a real
+      `stream.Writable`, not a lookalike: node's is a Writable in all three of its fd
+      shapes and libraries feature-detect with `instanceof`, so a hand-rolled object would
+      answer false and take the wrong branch in a logger.
+      `isTTY` answers **undefined** off a terminal, which is what node reports — not
+      `false`. `columns`/`rows` are **not implemented**: they read undefined everywhere,
+      which is right off a terminal and wrong on one, and they are deliberately not faked
+      to 80x24 because that is the `tty.js` bug in the follow-up below. Both need the
+      TIOCGWINSZ ioctl that entry describes.
+      Writes go through `process_write`, so `console.log` and `process.stdout.write` share
+      one mutex and cannot interleave mid-line, and both inherit the retry loop from #325.
+      Both singletons are **unkillable**, which node goes to two separate lengths to
+      guarantee and which the first revision of this change got wrong in both places.
+      `pipe()` excludes them from its automatic `dest.end()` (node compares identity with
+      `process.stdout`/`stderr`), and `_destroy` is a dummy that runs the callback and then
+      calls `_undestroy()` — so `end()` still emits `'finish'`/`'close'` and still runs its
+      callback, but the stream is writable again on the next tick. Without the first,
+      `src.pipe(process.stdout)` — the most common pipe in Node — ended stdout for the rest
+      of the process: every later write dropped, `write after end` raised, exit code 0 to 1.
+      Without the second, one `process.stdout.end()` in any dependency was permanent.
+      `_undestroy` is node API (present on its `Writable`, `Readable` and `process.stdout`),
+      so adding it raised parity rather than inventing a surface.
+      _Deviations, both confined to node's PIPE shape_ — this stream is one shape for every
+      fd where node has three, so neither is visible on a file or a terminal:
+      (1) no backpressure. Measured against node on a pipe, all five facts, where an
+      earlier revision of this entry declared only the first: `write(300KB)`/`write(1MB)`
+      `false`/`false` vs `true`/`true`, `writableLength` `1348576` vs `0`,
+      `writableNeedDrain` `true` vs `false`, `'drain'` emitted vs never. Nothing is
+      buffered here — the byte is on the fd before `write()` returns — so there is no drain
+      to wait for, and `if (!s.write(x)) await once(s,'drain')` skips the await rather than
+      hanging on it. (2) The lifecycle is forgiving where node's pipe shape is fatal: on a
+      pipe node's stdout is a `net.Socket`, so `end()` half-closes it and the next write is
+      an unhandled `EPIPE` and exit 1 (`node x.js | cat` prints A, B and dies where
+      `node x.js > f` prints A, B, C, D). Lava recovers in both shapes — it holds no socket,
+      and the alternative is closing fd 1 and losing every later byte to reproduce a crash.
+      Both are pinned by `tests/stdio/stdio-lifecycle.test.mjs`, which drives both shapes as
+      subprocesses and asserts **node's** side too, so the pin goes red if node ever changes
+      rather than quietly becoming wrong.
+      Chunk-type validation is NOT addressed here. Lava's `Writable` produces the right
+      codes (`ERR_INVALID_ARG_TYPE`, `ERR_STREAM_NULL_VALUES`) but delivers them as an
+      async `'error'` where node throws synchronously — an earlier claim that it threw
+      "with no code" was wrong. Fixing it reaches every Writable in the tree; see the
+      open entry below for why the attempt inside this change was reverted.
+      Pinned by `tests/node-compat/cases/60-process-stdio.js` and
+      `61-stdio-lifecycle.js` (both byte-identical to node), by
+      `tests/stdio/stdio-lifecycle.test.mjs` for the pipe shape the oracle harness cannot
+      reach, and by six `tests/mutation-manifest.json` entries: the pipe exclusion twice
+      (once per gate, because the oracle case and the node:test cover different fd shapes),
+      the `_destroy` undo, the individual `ending` field it clears, the `autoDestroy`
+      option the undo is reached through, and the `_isStdio` marker.
+      `util.debuglog` was the concrete casualty of the absence — with `NODE_DEBUG`
+      matching, node printed and Lava threw, which is why the debuglog spin in #324 could
+      not be pinned as an oracle case. That blocker is gone.
+- [ ] **`stream.js` reports chunk-type errors asynchronously where node throws**
+      ([#327](https://github.com/x-ror/lava/issues/327)) — node
+      throws `ERR_INVALID_ARG_TYPE` / `ERR_STREAM_NULL_VALUES` synchronously from
+      `Writable#write`; Lava produces the right codes but delivers them as an async
+      `'error'` and returns false. It also rejects `DataView`/`Int16Array`, which node
+      accepts (node converts the view to a Buffer with `encoding: 'buffer'` in the same
+      step), and its message says "Buffer or Uint8Array" where node says "Buffer,
+      TypedArray, or DataView".
+      Attempted inside #326 and **reverted**, because the change reaches every Writable in
+      the tree and produced two regressions the merge gate caught: porting node's accept
+      set without its conversion left `chunk.length` undefined, so `writableLength` became
+      `NaN` and the stream never emitted `'drain'` again — permanently stalling
+      `src.pipe(process.stdout)` on a process-lifetime singleton — and the bare `throw`
+      moved the `pipe()` error from the writable onto the readable. Needs its own change
+      with a `62-stream-write-validation` oracle case (61 is taken) covering the accept
+      set, the
+      message template, and which stream the `pipe()` error lands on.
+- [ ] **`process.stdout`/`stderr` surface holes and the tty half**
+      ([#328](https://github.com/x-ror/lava/issues/328)) — `constructor.name`, `pipe`
+      (absent on every Writable, not just stdio — `stream.js` defines only
+      `Readable.prototype.pipe`), `writableCorked`, `closed`, `errored`, `_writev`; the
+      write-callback err arg (`undefined` where node passes `null`); `end(cb)` running
+      after `'finish'` instead of before; a swallowed EPIPE where node dies noisily; and
+      `columns`/`rows`/`getWindowSize`/`hasColors` on a terminal, which need TIOCGWINSZ.
+- [ ] **`process.on` does not exist**, so `process.on('exit', …)` throws — found while
+      pinning the above, which had to use a timer instead. Also still missing:
+      `process.hrtime` (`hrtime.bigint()` throws; `JSBigIntCreateWithUInt64` IS exported by
+      the JSC we link, so the in-repo "no BigInt constructor" comment is stale), and
+      `tty.js`'s `getWindowSize()` fakes 80x24 from env vars with no `TIOCGWINSZ` ioctl —
+      `linux.ioctl` and `linux.TIOCGWINSZ` both exist in `core:sys/linux`; only the
+      `winsize` struct needs declaring.
 - [x] **`esm.js` — the module loader, and the one surface where a forged match is
       code execution** — done: 101 counted sites (method 81, global 20) to 0 in all
       four classes. This outranked the rest of the tail because the file's output is

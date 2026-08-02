@@ -2,7 +2,7 @@
   "$comment": [
     "Every entry names a test and the ONE-LINE change to production source that must",
     "make it go red. `make test-mutation` applies each change, runs the named gate,",
-    "and fails if the gate still passes \u2014 because a test that survives the deletion of",
+    "and fails if the gate still passes — because a test that survives the deletion of",
     "the code it claims to pin is asserting something else.",
     "",
     "This exists because three tests landed in #321 that passed for the wrong reason,",
@@ -18,7 +18,7 @@
     "  why     one sentence: the defect this catches if the mutation survives",
     "  source  production file to patch (never a test file)",
     "  find    exact string to replace; must appear EXACTLY once (the runner checks)",
-    "  replace what to put there \u2014 usually the pre-fix code, or a deleted guard",
+    "  replace what to put there — usually the pre-fix code, or a deleted guard",
     "  gate    how to observe red; see GATE KINDS in scripts/run-mutations.mjs",
     "  expect_detail  substring the RED output must contain; '' is a visible opt-out",
     "  (`rebuild` is gone: it was derivable from the gate kind, and a run filtered to",
@@ -73,7 +73,7 @@
     },
     {
       "name": "run_until_idle_waits_out_a_stale_wakeup dies when a no-progress tick ends the drive",
-      "why": "A surplus wakeup byte ends the drive with an off-loop completion still in flight, and it returns the did_work an earlier tick latched \u2014 so it reports success.",
+      "why": "A surplus wakeup byte ends the drive with an off-loop completion still in flight, and it returns the did_work an earlier tick latched — so it reports success.",
       "source": "pkg/runtime/eventloop/loop.odin",
       "find": "\t\t\tif loop.active_io_count == 0 && loop.active_async == 0 {\n\t\t\t\treturn did_work\n\t\t\t}\n\t\t\tcontinue",
       "replace": "\t\t\treturn did_work",
@@ -109,7 +109,7 @@
     },
     {
       "name": "the poisoned http-smoke phases die when a framing validator goes back to re.test",
-      "why": "Content-Length framing. With the check on a live regex, a poisoned exec answered 200 OK for `Content-Length: abc` \u2014 parseInt gives NaN and the body framing desyncs. The charCode form has no regex to poison at all.",
+      "why": "Content-Length framing. With the check on a live regex, a poisoned exec answered 200 OK for `Content-Length: abc` — parseInt gives NaN and the body framing desyncs. The charCode form has no regex to poison at all.",
       "source": "pkg/runtime/js/internal/http.js",
       "find": "        if (!allChars(contentLengthHeader, isAsciiDigit)) return sendErrorAndClose(400);",
       "replace": "        if (!/^\\d+$/.test(contentLengthHeader)) return sendErrorAndClose(400);",
@@ -163,7 +163,7 @@
     },
     {
       "name": "54-url-pollution X1 dies when endsInANumber goes back to a live re.test",
-      "why": "Steered true, '4x' reads as numeric and parseInt gives 4, so http://1.2.3.4x/ silently becomes http://1.2.3.4/ \u2014 a host substitution.",
+      "why": "Steered true, '4x' reads as numeric and parseInt gives 4, so http://1.2.3.4x/ silently becomes http://1.2.3.4/ — a host substitution.",
       "source": "pkg/runtime/js/internal/url.js",
       "find": "    if (allChars(last, isAsciiDigit)) return true;",
       "replace": "    if (last !== '' && /^[0-9]+$/.test(last)) return true;",
@@ -190,7 +190,7 @@
     },
     {
       "name": "the Lava-only regexp pollution test dies when the header trim goes back to a global replaceAll",
-      "why": "A global replace under a forged exec does not answer wrongly \u2014 it never returns, because lastIndex only advances on an empty match. The observable effect IS the hang, so the recorded reason is the timeout verdict: before capture() bounded it this entry ate 3m16s and multi-GB in CI and degraded to WRONG REASON on a memory-capped runner.",
+      "why": "A global replace under a forged exec does not answer wrongly — it never returns, because lastIndex only advances on an empty match. The observable effect IS the hang, so the recorded reason is the timeout verdict: before capture() bounded it this entry ate 3m16s and multi-GB in CI and degraded to WRONG REASON on a memory-capped runner.",
       "source": "pkg/runtime/js/internal/fetch.js",
       "find": "    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
       "replace": "    if (/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g.test(value)) value = value.replace(/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g, '');\n    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
@@ -209,7 +209,7 @@
     },
     {
       "name": "57-format-single-arg dies when console.js drops the single-argument guard",
-      "why": "console.js has its own formatter \u2014 it is the bootstrap prelude and has no require to delegate with \u2014 so removing util.js's guard leaves console.log correct and vice versa. This entry moves the raw console.log rows, a different line range from the util entry.",
+      "why": "console.js has its own formatter — it is the bootstrap prelude and has no require to delegate with — so removing util.js's guard leaves console.log correct and vice versa. This entry moves the raw console.log rows, a different line range from the util entry.",
       "source": "pkg/runtime/js/console.js",
       "find": "    if (args.length === 1 && typeof first === 'string') return first;\n",
       "replace": "",
@@ -240,7 +240,7 @@
     },
     {
       "name": "the Lava-only test dies when toUSVString goes back to the global regex",
-      "why": "The surrogate pre-scan is not a guard against this: a VALID pair \u2014 any emoji in a remote query \u2014 sets hasSurrogate too, and the global replace then spins (or throws RangeError from runaway growth). new URLSearchParams(remoteQuery) is on the network path. Hang vs throw is runner-dependent; expect_detail lists both.",
+      "why": "The surrogate pre-scan is not a guard against this: a VALID pair — any emoji in a remote query — sets hasSurrogate too, and the global replace then spins (or throws RangeError from runaway growth). new URLSearchParams(remoteQuery) is on the network path. Hang vs throw is runner-dependent; expect_detail lists both.",
       "source": "pkg/runtime/js/internal/url.js",
       "find": "    if (!hasSurrogate) return str;\n    var out = StringPrototypeSlice(str, 0, i);",
       "replace": "    if (!hasSurrogate) return str;\n    var SPOL = /([\\uD800-\\uDBFF])([\\uDC00-\\uDFFF])?|([\\uDC00-\\uDFFF])/g;\n    return StringPrototypeReplace(str, SPOL, function (m, h, l, lone) {\n      return lone !== undefined || l === undefined ? '\\uFFFD' : m;\n    });\n    var out = StringPrototypeSlice(str, 0, i);",
@@ -280,7 +280,7 @@
     },
     {
       "name": "58-esm-pollution targeted dies when the export-default name comes back through .match",
-      "why": "String.prototype.match re-reads R.exec off the receiver, so the declared name is attacker-chosen and the transform interpolates it into the emitted module body as an identifier \u2014 code injection, not a wrong answer.",
+      "why": "String.prototype.match re-reads R.exec off the receiver, so the declared name is attacker-chosen and the transform interpolates it into the emitted module body as an identifier — code injection, not a wrong answer.",
       "source": "pkg/runtime/js/internal/esm.js",
       "find": "        var fn = RegExpPrototypeExec(RE_DEFAULT_FUNCTION, expr);",
       "replace": "        var fn = expr.match(/^(?:async\\s+)?function\\b\\s*\\*?\\s*([A-Za-z_$][\\w$]*)/);",
@@ -316,7 +316,7 @@
     },
     {
       "name": "58-esm-pollution json dies when emitted literals go back through the live JSON.stringify",
-      "why": "Every string literal in the generated CommonJS \u2014 require specifiers, export keys, __filename/__dirname/import.meta.url \u2014 is produced here, so a replaced stringify writes the emitted source directly.",
+      "why": "Every string literal in the generated CommonJS — require specifiers, export keys, __filename/__dirname/import.meta.url — is produced here, so a replaced stringify writes the emitted source directly.",
       "source": "pkg/runtime/js/internal/esm.js",
       "find": "    return JSONStringify(StringG(value));",
       "replace": "    return JSON.stringify(String(value));",
@@ -334,7 +334,7 @@
     },
     {
       "name": "58-esm-pollution join dies when the wrapper is assembled with a live Array.prototype.join",
-      "why": "The joins assemble the emitted module, so a gadget lying only for the '\\n' separator replaces the WHOLE output rather than one interpolated identifier \u2014 a strictly larger win than the export-default carrier. Mutating the capture rather than one call site keeps esm.js syntactically valid, so the gate measures the carrier and not a bootstrap parse error.",
+      "why": "The joins assemble the emitted module, so a gadget lying only for the '\\n' separator replaces the WHOLE output rather than one interpolated identifier — a strictly larger win than the export-default carrier. Mutating the capture rather than one call site keeps esm.js syntactically valid, so the gate measures the carrier and not a bootstrap parse error.",
       "source": "pkg/runtime/js/internal/esm.js",
       "find": "  var ArrayPrototypeJoin = primordials.ArrayPrototypeJoin;",
       "replace": "  var ArrayPrototypeJoin = function (a, s) {\n    return a.join(s);\n  };",
@@ -501,6 +501,101 @@
         "payload must round-trip exactly"
       ],
       "rebuild": true
+    },
+    {
+      "name": "61-stdio-lifecycle dies when pipe() stops excluding the stdio singletons",
+      "why": "Without node's `dest !== process.stdout/stderr` exclusion, `src.pipe(process.stdout)` calls end() on a process-lifetime singleton. Note what the assertion keys off: since `_destroy` undoes the teardown, the stream RECOVERS a tick later, so `writable` reads true either way and only the spurious 'finish' event proves end() was reached. Before that half existed this dropped every later write and raised 'write after end'.",
+      "source": "pkg/runtime/js/internal/stream.js",
+      "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
+      "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
+      "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
+      "expect_detail": [
+        "pipe() must not even reach end(), so no finish"
+      ]
+    },
+    {
+      "name": "stdio-lifecycle dies when pipe() stops excluding the stdio singletons (pipe shape)",
+      "why": "Same defect as the compat entry, gated on the node:test so both fd shapes are covered — node's stdout is a different class on a pipe. The script counts 'finish' events rather than comparing bytes, because the recovery makes the bytes identical with the exclusion deleted; a byte-only version of this test SURVIVED this mutation.",
+      "source": "pkg/runtime/js/internal/stream.js",
+      "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
+      "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
+      "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
+      "expect_detail": [
+        "two finished=0",
+        "lava must match node on a pipe"
+      ],
+      "rebuild": true
+    },
+    {
+      "name": "stdio-lifecycle dies when _destroy stops undoing the teardown",
+      "why": "node's stdio _destroy is a dummy that runs the callback and then calls _undestroy(). Drop the undo and a single process.stdout.end() anywhere in a dependency is permanent: the stream stays ended for the rest of the run and silently drops every later write. Gated on the node:test, not the oracle case: recovery is only observable when the harness controls the fd shape, and the compat harness always gives a case a file.",
+      "source": "pkg/runtime/js/internal/stdio.js",
+      "find": "    cb(err);\n    this._undestroy();",
+      "replace": "    cb(err);",
+      "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
+      "expect_detail": [
+        "recovers from destroy()",
+        "lava must match node byte-for-byte on a file"
+      ],
+      "rebuild": true
+    },
+    {
+      "name": "stdio-lifecycle dies when _undestroy stops clearing the ending flag",
+      "why": "The `writable` getter is `!destroyed && !ending`, so leaving `ending` set makes the stream report unwritable forever even though destroyed was cleared — the recovery looks applied and is not. Pins the individual field, not just the presence of the call.",
+      "source": "pkg/runtime/js/internal/stream.js",
+      "find": "      w.ended = false;\n      w.ending = false;\n      w.finished = false;",
+      "replace": "      w.ended = false;\n      w.finished = false;",
+      "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
+      "expect_detail": [
+        "lava must match node byte-for-byte on a file"
+      ],
+      "rebuild": true
+    },
+    {
+      "name": "stdio-lifecycle dies when the stdio stream pins autoDestroy/emitClose off",
+      "why": "The recovery is reached THROUGH autoDestroy (end() -> 'finish' -> destroy() -> _undestroy). Setting autoDestroy:false — as the first revision of this file did — leaves _destroy unreached, so end() is permanent even with the dummy in place, and 'close' never fires.",
+      "source": "pkg/runtime/js/internal/stdio.js",
+      "find": "    ReflectApply(Writable, this, [{ decodeStrings: false }]);",
+      "replace": "    ReflectApply(Writable, this, [{ decodeStrings: false, autoDestroy: false, emitClose: false }]);",
+      "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
+      "expect_detail": [
+        "keep writing after end()",
+        "lava must match node byte-for-byte on a file"
+      ],
+      "rebuild": true
+    },
+    {
+      "name": "61-stdio-lifecycle dies when the _isStdio marker is dropped",
+      "why": "node sets an own _isStdio on both singletons and its own stream/net code feature-detects on it, so ecosystem code reads it too. Absent, a library's 'is this stdio?' check silently takes the wrong branch.",
+      "source": "pkg/runtime/js/internal/stdio.js",
+      "find": "    this._isStdio = true;",
+      "replace": "    this._isStdio = undefined;",
+      "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
+      "expect_detail": [
+        "_isStdio marker"
+      ]
+    },
+    {
+      "name": "fs_write_payload dies when the buffer length is sampled before the window getters",
+      "why": "byteOffset/byteLength on a DataView may be OWN accessors, so reading them runs arbitrary JS that can resize the backing ArrayBuffer. Sampling the buffer's length first validates the window against a size that no longer exists, and the resolver hands back a slice past the allocation — 4088 bytes of out-of-bounds heap written into a caller-named file.",
+      "source": "pkg/runtime/fs.odin",
+      "find": "\t\t\t\toff_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteOffset\"), nil)\n\t\t\t\tlen_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteLength\"), nil)\n\t\t\t\t// Now that no further JS can run, sample the authoritative length and take\n\t\t\t\t// the base pointer back to back: the pointer is only valid until the next\n\t\t\t\t// JSC API call (a GC/realloc can move it), so nothing may come between them\n\t\t\t\t// but the pure-Odin validation below.\n\t\t\t\tab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))",
+      "replace": "\t\t\t\tab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))\n\t\t\t\toff_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteOffset\"), nil)\n\t\t\t\tlen_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteLength\"), nil)",
+      "gate": "odin:cmd/lava:main.fs_write_payload_rejects_a_window_resized_by_its_own_getter",
+      "expect_detail": [
+        "out-of-bounds read"
+      ]
+    },
+    {
+      "name": "stdio_fd_guard dies when the fd is converted before it is compared",
+      "why": "`this.fd` is a plain writable property, so process.stdout.fd = 1.5 reaches this native. A float->int conversion is undefined in Odin for NaN, +/-Inf and out-of-range values, and truncation lands 1.5 and 2.9 squarely on fd 1 and 2 — so converting first turns the guard into a no-op for exactly the values it exists to catch. NaN and Infinity do NOT catch this on x86 (cvttsd2si yields INT_MIN, rejected either way), which is why the fractional cases are in the list.",
+      "source": "pkg/runtime/stdio.odin",
+      "find": "\tswitch {\n\tcase fd_num == 1:\n\t\ttarget = os.stdout\n\tcase fd_num == 2:\n\t\ttarget = os.stderr",
+      "replace": "\tfd_int := int(fd_num)\n\tswitch fd_int {\n\tcase 1:\n\t\ttarget = os.stdout\n\tcase 2:\n\t\ttarget = os.stderr",
+      "gate": "odin:cmd/lava:main.stdio_write_sync_rejects_every_fd_but_1_and_2",
+      "expect_detail": [
+        "writeSync(1.5, ...) was not rejected"
+      ]
     }
   ]
 }
