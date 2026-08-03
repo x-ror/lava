@@ -1008,7 +1008,11 @@
       "find": "  if (n < spec.min) {",
       "replace": "  if (false && n < spec.min) {",
       "gate": "node-test:scripts/agent-cycle/assert-case-counts.test.mjs",
-      "expect_detail": "min floor must not be disabled"
+      "expect_detail": [
+        "if (n < spec.min)",
+        "min floor",
+        "false &&"
+      ]
     },
     {
       "name": "bench-gate dies when --gate exits 0 without a runnable lava",
@@ -1026,7 +1030,11 @@
       "find": "  if (uncapped.length > 0) {",
       "replace": "  if (false && uncapped.length > 0) {",
       "gate": "node-test:scripts/agent-cycle/bench-gate-integrity.test.mjs",
-      "expect_detail": "uncapped check must not be disabled"
+      "expect_detail": [
+        "if (uncapped.length > 0)",
+        "uncapped",
+        "false &&"
+      ]
     },
     {
       "name": "check-global-replace dies when allowKey goes back to file:line",
@@ -1035,7 +1043,12 @@
       "find": "export function allowKey(hit) {\n  const m = typeof hit.what === 'string' ? hit.what.match(/^([A-Za-z_$][\\w$]*)\\s*=/) : null;\n  if (m) return `${hit.file}:${m[1]}`;\n  return `${hit.file}:${hit.how}:${hit.what}`;\n}",
       "replace": "export function allowKey(hit) {\n  return `${hit.file}:${hit.line}`;\n}",
       "gate": "node-test:scripts/check-global-replace.test.mjs",
-      "expect_detail": "must not be keyed by line number"
+      "expect_detail": [
+        "allowKey prefers binding",
+        "must not be keyed by line number",
+        "internal/util.js:ansiRegex",
+        "Expected values to be strictly equal"
+      ]
     }
   ]
 }
