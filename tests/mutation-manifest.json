@@ -1032,8 +1032,8 @@
       "name": "trigger permission dies when an issue body can grant itself a run",
       "why": "The repository is public and an issue body is written by whoever opened it. Treating a lava-task marker as permission let a stranger enqueue an agent, and the dispatch path passes explicit issue numbers, which is the manual override that skips the label check.",
       "source": "workflows/triggers/issues.mjs",
-      "find": "  return listOpenIssues().filter(isAgentReady);",
-      "replace": "  return listOpenIssues().filter((i) => isAgentReady(i) || /lava-task/.test(i.body || \"\"));",
+      "find": "  return issues.filter(isAgentReady);",
+      "replace": "  return issues.filter((i) => isAgentReady(i) || /lava-task/.test(i.body || \"\"));",
       "gate": "node-test:commands/review-fixes.test.mjs",
       "expect_detail": [
         "an issue body granted itself a run",
@@ -1053,16 +1053,22 @@
       ]
     },
     {
-      "name": "the ledger lock dies when the critical section stops being exclusive",
-      "why": "The dispatch ledger is a read-modify-write of one whole JSON file. Two pollers interleaving load and save lose an attempt count or a completion, and the in-flight guard only helps if the claim that sets it is atomic with the check that reads it.",
+      "name": "the ledger lock dies when a held lock stops excluding a second holder",
+      "why": "Mutual exclusion. Two pollers interleaving load and save on the dispatch ledger lose an attempt count or a completion, and the in-flight guard only helps if the claim that sets it is atomic with the check that reads it. Paired with the lost-update entry on the same mutation: expect_detail arrays are any-of, so one array naming both properties is satisfied by either alone.",
       "source": "runtime/lock.mjs",
       "find": "      mkdirSync(lockPath);\n      break;",
       "replace": "      break;",
       "gate": "node-test:runtime/lock.test.mjs",
-      "expect_detail": [
-        "an increment was lost",
-        "timed out"
-      ]
+      "expect_detail": "a held lock blocks"
+    },
+    {
+      "name": "the ledger lock dies when concurrent writers stop keeping every increment",
+      "why": "Lost updates, the effect exclusion exists to prevent. Three processes each doing 25 locked read-modify-writes must total 75; without the lock a save overwrites an increment another process just made. Paired with the exclusion entry on the same mutation, because a single expect_detail array would accept either property on its own.",
+      "source": "runtime/lock.mjs",
+      "find": "      mkdirSync(lockPath);\n      break;",
+      "replace": "      break;",
+      "gate": "node-test:runtime/lock.test.mjs",
+      "expect_detail": "lose no increment"
     },
     {
       "name": "the claude retry dies when a signal-killed run is retried",
@@ -1073,6 +1079,30 @@
       "gate": "node-test:commands/review-fixes.test.mjs",
       "expect_detail": [
         "killed by a signal is NOT retried"
+      ]
+    },
+    {
+      "name": "the drain dies when an issue already being worked on can start a second run",
+      "why": "The trigger path refused a repeat dispatch; the drain path did not consult run state at all, so every `make agent-run` took the top of the queue again. One issue reached six concurrent runs, six worktrees and six agents doing the same work. A guard on one of two entry points is not a guard.",
+      "source": "runtime/runs.mjs",
+      "find": "    if (r.state && !isTerminal(r.state) && r.issue != null) out.add(r.issue);",
+      "replace": "    if (r.state && r.issue != null) out.add(r.issue);",
+      "gate": "node-test:runtime/runs.test.mjs",
+      "expect_detail": [
+        "a finished run does not",
+        "issuesInFlight"
+      ]
+    },
+    {
+      "name": "resume dies when a run whose worktree is gone is restarted instead of refused",
+      "why": "The worktree IS the work: the branch, the edits, the plan the planner already wrote. Bootstrapping a fresh one under the old run id would look like a resume while discarding all of it.",
+      "source": "runtime/runs.mjs",
+      "find": "  if (!existsSync(state.wt)) {",
+      "replace": "  if (false) {",
+      "gate": "node-test:workflows/durable.test.mjs",
+      "expect_detail": [
+        "worktree is gone",
+        "refused, not silently restarted"
       ]
     }
   ]

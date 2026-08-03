@@ -14,7 +14,7 @@ import { pollAndDispatch } from './triggers/issues.mjs';
 import { STATE_DIR } from '../runtime/paths.mjs';
 import { listOpenIssues, selectReadyIssues, isAgentReady } from '../runtime/github.mjs';
 import { buildDag, explain, UNTIERED } from '../runtime/dag.mjs';
-import { listRuns, isTerminal, findResumable, checkResumable } from './durable.mjs';
+import { listRuns, isTerminal, findResumable, checkResumable } from '../runtime/runs.mjs';
 
 function parseFlags(argv) {
   const flags = {};

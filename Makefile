@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: test-stdio help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property test-mutation check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean agent-queue agent-run agent-status
+.PHONY: test-stdio help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property test-mutation check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean agent-queue agent-run agent-resume agent-status
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -88,7 +88,8 @@ help:
 	@printf '%s\n' 'Agent system'
 	@printf '%s\n' '  make agent-queue        Derived task DAG: order, tiers, blockers (ALL=1 ignores the label gate)'
 	@printf '%s\n' '  make agent-run          Drain one ready issue end-to-end (MAX=n PROVIDER=grok|claude|codex|none|auto)'
-	@printf '%s\n' '  make agent-status       Last pipeline run and recent run ids'
+	@printf '%s\n' '  make agent-resume       Continue a run killed mid-flight (RUN=id or ISSUE=n)'
+	@printf '%s\n' '  make agent-status       In-flight runs and the last completed one'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Env knobs (oracle runners):'
 	@printf '%s\n' '  RUN_LAVA=1              Compare each case Node-vs-Lava instead of Node-only'
@@ -375,6 +376,13 @@ agent-queue:
 
 agent-run:
 	$(RUNSCRIPT) ./scripts/agent-loop.sh --max $(or $(MAX),1) --provider $(or $(PROVIDER),claude)
+
+# Continue a run that stopped before a terminal node, in the worktree it was
+# already building in. `make agent-run resume` does NOT do this — make reads
+# `resume` as a second target, so that form silently starts a fresh drain and
+# ends with "No rule to make target 'resume'". Hence a target of its own.
+agent-resume:
+	node workflows/cli.mjs resume $(if $(RUN),$(RUN),) $(if $(ISSUE),--issue $(ISSUE),)
 
 agent-status:
 	node workflows/cli.mjs status
