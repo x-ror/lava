@@ -9,7 +9,7 @@
     "actions:check": "bun run scripts/check-actions.mjs",
     "md:check": "markdownlint-cli2",
     "md:fix": "markdownlint-cli2 --fix",
-    "js:scripttests": "node --test 'scripts/**/*.test.mjs'"
+    "js:scripttests": "node --test 'scripts/**/*.test.mjs' 'runtime/**/*.test.mjs' 'commands/**/*.test.mjs' 'workflows/**/*.test.mjs' 'llm/**/*.test.mjs' 'agents/**/*.test.mjs'"
   },
   "devDependencies": {
     "acorn": "^8.18.0",

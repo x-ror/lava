@@ -21,7 +21,7 @@ export NODE_OPTIONS="${NODE_OPTIONS:-} --no-warnings"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 "$NODE_BIN" --version >/dev/null
-node "$ROOT_DIR/scripts/agent-cycle/assert-case-counts.mjs" tests/std/sqlite/cases
+node "$ROOT_DIR/runtime/gates/assert-case-counts.mjs" tests/std/sqlite/cases
 
 for case_file in "$ROOT_DIR"/tests/std/sqlite/cases/*.js; do
 	[ -f "$case_file" ] || continue

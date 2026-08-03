@@ -1,0 +1,66 @@
+{
+  "name": "feature-pipeline",
+  "description": "New task → planner → odin-feature → critic → pr-gate → (fixer loop) → Create PR. PR only after pr-gate SHIP/SHIP-AFTER. Never merge.",
+  "triggers": [
+    { "type": "issue.labeled", "labels": ["agent-ready", "lava-ready"] },
+    { "type": "issue.opened", "require_lava_task": true },
+    { "type": "schedule", "interval": "30m", "action": "drain-ready" },
+    {
+      "type": "pr.comment",
+      "commands": ["/odin-feature", "/pr-gate", "/fixer", "/critic", "/run-pipeline"]
+    },
+    { "type": "gate.failure", "action": "fixer" },
+    { "type": "manual", "entry": "commands/index.mjs run-pipeline" }
+  ],
+  "graph": {
+    "entry": "select",
+    "nodes": {
+      "select": { "type": "system", "next": "planner" },
+      "planner": {
+        "type": "command",
+        "command": "planner",
+        "next": "odin-feature",
+        "on_fail": "terminal.needs-human"
+      },
+      "odin-feature": {
+        "type": "command",
+        "command": "odin-feature",
+        "isolation": "worktree",
+        "next": "critic",
+        "on_fail": "fixer"
+      },
+      "critic": {
+        "type": "command",
+        "command": "critic",
+        "next": "pr-gate",
+        "on_fail": "pr-gate"
+      },
+      "pr-gate": {
+        "type": "command",
+        "command": "pr-gate",
+        "hard_gate": true,
+        "on_ship": "create-pr",
+        "on_ship_after": "create-pr",
+        "on_block": "fixer"
+      },
+      "fixer": {
+        "type": "command",
+        "command": "fixer",
+        "max_rounds": 3,
+        "next": "pr-gate",
+        "on_stall": "terminal.needs-human"
+      },
+      "create-pr": { "type": "system", "action": "draft_pr", "next": "terminal.done" },
+      "terminal.done": { "type": "terminal", "status": "done" },
+      "terminal.needs-human": { "type": "terminal", "status": "needs-human-decision" }
+    }
+  },
+  "policy": {
+    "max_fix_rounds": 3,
+    "stall_if_no_open_count_drop": 2,
+    "never_merge": true,
+    "never_self_waive_p1": true,
+    "worktree_outside_main": true,
+    "forbid_git_stash": true
+  }
+}

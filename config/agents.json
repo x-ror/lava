@@ -1,0 +1,101 @@
+{
+  "defaults": {
+    "max_turns": 100,
+    "max_fix_rounds": 3,
+    "isolation": "worktree",
+    "retry": { "max_attempts": 2, "on": ["provider_error", "timeout"] },
+    "allow_merge": false
+  },
+  "providers": {
+    "grok": {
+      "bin": "grok",
+      "headless_flags": ["--always-approve"],
+      "prompt_file_flag": "--prompt-file",
+      "cwd_flag": "--cwd",
+      "max_turns_flag": "--max-turns"
+    },
+    "claude": {
+      "bin": "claude",
+      "headless_flags": ["--dangerously-skip-permissions"],
+      "prompt_inline_flag": "-p",
+      "cwd_flag": "--cwd"
+    },
+    "codex": {
+      "bin": "codex",
+      "headless_flags": ["--full-auto"],
+      "prompt_inline_flag": "-p",
+      "cwd_flag": "--cd"
+    },
+    "none": { "bin": null, "dry_run": true }
+  },
+  "dual_review": {
+    "enabled": true,
+    "implement_provider": "auto",
+    "review_provider": "auto"
+  },
+  "agents": {
+    "planner": {
+      "role": "Analyze issues, decompose work, build a dependency DAG of tasks.",
+      "command": "planner",
+      "prompt": "agents/prompts/planner.md",
+      "tools": ["git", "github", "code_search", "shell_readonly"],
+      "provider": "auto",
+      "isolation": "none"
+    },
+    "odin-feature": {
+      "role": "Implement a Lava runtime feature with TDD (contract → red test → code).",
+      "command": "odin-feature",
+      "prompt": "agents/prompts/odin-feature.md",
+      "tools": ["git", "github", "code_search", "shell", "test_runner", "linter"],
+      "provider": "auto",
+      "isolation": "worktree",
+      "design_first": true
+    },
+    "critic": {
+      "role": "Adversarial critique / debate of the implementation before pr-gate.",
+      "command": "critic",
+      "prompt": "agents/prompts/critic.md",
+      "tools": ["git", "code_search", "shell_readonly"],
+      "provider": "auto",
+      "isolation": "worktree",
+      "prefer_alt_provider": true
+    },
+    "pr-gate": {
+      "role": "Hard merge gate — mechanical tests + specialist review + SHIP/SHIP-AFTER/BLOCK.",
+      "command": "pr-gate",
+      "prompt": "agents/prompts/pr-gate.md",
+      "tools": ["git", "github", "code_search", "shell", "test_runner", "linter"],
+      "provider": "auto",
+      "isolation": "worktree",
+      "hard_gate": true
+    },
+    "fixer": {
+      "role": "Fix code from pr-gate findings or red test output (max N rounds).",
+      "command": "fixer",
+      "prompt": "agents/prompts/fixer.md",
+      "tools": ["git", "code_search", "shell", "test_runner", "linter"],
+      "provider": "auto",
+      "isolation": "worktree"
+    }
+  },
+  "specialists": {
+    "regression-hunter": { "prompt": "agents/specialists/regression-hunter.md" },
+    "code-quality-auditor": { "prompt": "agents/specialists/code-quality-auditor.md" },
+    "test-coverage-auditor": { "prompt": "agents/specialists/test-coverage-auditor.md" },
+    "docs-auditor": { "prompt": "agents/specialists/docs-auditor.md" },
+    "odin-safety-auditor": { "prompt": "agents/specialists/odin-safety-auditor.md" },
+    "node-parity-auditor": { "prompt": "agents/specialists/node-parity-auditor.md" },
+    "perf-memory-auditor": { "prompt": "agents/specialists/perf-memory-auditor.md" },
+    "security-auditor": { "prompt": "agents/specialists/security-auditor.md" },
+    "odin-sdk-scout": { "prompt": "agents/specialists/odin-sdk-scout.md" },
+    "odin-implementer": { "prompt": "agents/specialists/odin-implementer.md" }
+  },
+  "commands": {
+    "odin-feature": "odin-feature",
+    "pr-gate": "pr-gate",
+    "planner": "planner",
+    "fixer": "fixer",
+    "critic": "critic",
+    "run-pipeline": "pipeline"
+  }
+}

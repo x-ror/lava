@@ -42,3 +42,6 @@ graphify-out/
 
 # Agent-cycle driver local state (issue plans, locks)
 .agent-cycle/
+.agent-state/
+.agent-prompt.txt
+.agent-prompt-*.txt

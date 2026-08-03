@@ -118,16 +118,13 @@ coupling.
       ([#329](https://github.com/x-ror/lava/issues/329)) — fixed by adding
       `js/internal/fs.js` over `make_fs_bindings`, so `node:fs` is no longer the
       native-direct outlier ARCHITECTURE.md §3.4 named. All three were pre-existing and
-      none threw — each returned plausible-looking wrong output:
-      1. **Reads returned a bare `Uint8Array`, not a `Buffer`.** `Buffer.isBuffer` was
-         false and `.toString('hex')` fell through to `Uint8Array.prototype.toString`,
-         which ignores its argument: `"116,121"` where node gives `"7479"`. `.equals`,
-         `.compare`, `.readUInt32BE`, `.toString('base64')` and `.indexOf(string)` were
-         all wrong or missing on every file read.
-      2. **The encoding argument was ignored.** Every read decoded as UTF-8, so
-         `readFileSync(p, 'hex')` returned the file's text instead of its hex.
-      3. **Undecodable bytes produced `""`.** Invalid UTF-8 yielded an empty string where
-         node substitutes U+FFFD — the shape of bug that reads as an empty file.
+      none threw — each returned plausible-looking wrong output: 1. **Reads returned a bare `Uint8Array`, not a `Buffer`.** `Buffer.isBuffer` was
+      false and `.toString('hex')` fell through to `Uint8Array.prototype.toString`,
+      which ignores its argument: `"116,121"` where node gives `"7479"`. `.equals`,
+      `.compare`, `.readUInt32BE`, `.toString('base64')` and `.indexOf(string)` were
+      all wrong or missing on every file read. 2. **The encoding argument was ignored.** Every read decoded as UTF-8, so
+      `readFileSync(p, 'hex')` returned the file's text instead of its hex. 3. **Undecodable bytes produced `""`.** Invalid UTF-8 yielded an empty string where
+      node substitutes U+FFFD — the shape of bug that reads as an empty file.
       The layer fixes all three by never asking the native for a string: it takes bytes and
       decodes through `Buffer#toString`, reusing codecs the buffer oracle cases already
       cover instead of maintaining a second implementation. The re-tag is **zero copy**

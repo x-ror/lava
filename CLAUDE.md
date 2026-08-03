@@ -6,13 +6,13 @@ runtime (FFI, event loop, I/O transports, native stdlib). Read
 
 Layering (never blur it):
 
-| Layer                       | Path                          | Holds                                            |
-| --------------------------- | ----------------------------- | ------------------------------------------------ |
-| CLI                         | `cmd/lava`                    | argv → loop → `runtime.eval/run_file`            |
-| Runtime orchestration       | `pkg/runtime`                 | globals, require, native primitives              |
-| Embedded spec surface       | `pkg/runtime/js/**.js`        | `Buffer`, `fetch`, streams, `URL`, `http`…       |
-| Engine FFI / private ABI    | `pkg/jsc`                     | JSC C API, string/view/host ABI, probes          |
-| Event loop                  | `pkg/runtime/eventloop`       | phases, timers, io_uring/epoll, threadpool       |
+| Layer                    | Path                    | Holds                                      |
+| ------------------------ | ----------------------- | ------------------------------------------ |
+| CLI                      | `cmd/lava`              | argv → loop → `runtime.eval/run_file`      |
+| Runtime orchestration    | `pkg/runtime`           | globals, require, native primitives        |
+| Embedded spec surface    | `pkg/runtime/js/**.js`  | `Buffer`, `fetch`, streams, `URL`, `http`… |
+| Engine FFI / private ABI | `pkg/jsc`               | JSC C API, string/view/host ABI, probes    |
+| Event loop               | `pkg/runtime/eventloop` | phases, timers, io_uring/epoll, threadpool |
 
 ---
 
@@ -109,7 +109,7 @@ appears in CI, read the code or shrink the CPU set; do not just re-run.
 ## 4. Odin conventions
 
 - **Allocator discipline.** A struct that outlives the call captures the owning
-  `Runtime_State.allocator` at creation and clones *and* frees through it. Do not
+  `Runtime_State.allocator` at creation and clones _and_ frees through it. Do not
   rely on the ambient `context.allocator`: a `proc "c"` callback resets `context`
   to `runtime.default_context()`, so alloc-inside-callback / free-at-teardown
   mismatches. Guarded by `module_cache_alloc_test`, `dns_alloc_test`.
@@ -120,7 +120,7 @@ appears in CI, read the code or shrink the CPU set; do not just re-run.
   Never hold an unrooted `JSValueRef` across an allocation that can GC. A cache
   keyed by a JSC handle (context, object, string) must be swept when that handle
   dies — JSC recycles addresses, so a surviving entry silently resolves to an
-  object in the *next* VM. Sweep from `destroy_runtime_state`, while the context
+  object in the _next_ VM. Sweep from `destroy_runtime_state`, while the context
   is still alive. Pinned by `cmd/lava/repeated_eval_test.odin`.
 - **Bind map/array backing explicitly.** A container that outlives the call must
   be `make`d with the owning allocator, never left to bind implicitly: Odin binds
@@ -137,8 +137,8 @@ appears in CI, read the code or shrink the CPU set; do not just re-run.
 - **Threads** touch only their own request payload — never the loop, never JSC.
   Completions come back through `post_async`; JS values are materialized only on
   the loop thread.
-- **Conditional compilation** (`when ODIN_OS`) must keep every target *compiling
-  and honest*: a stub returns a real "unsupported" error, it does not silently
+- **Conditional compilation** (`when ODIN_OS`) must keep every target _compiling
+  and honest_: a stub returns a real "unsupported" error, it does not silently
   succeed.
 - **Comments explain why**, not what. Match the density of the surrounding file —
   this codebase documents non-obvious decisions inline and expects the same.
@@ -194,7 +194,7 @@ Rules that keep this from becoming ceremony:
 - Route through `require('primordials')` — internal modules run alongside user
   code that can poison prototypes. `make check-primordials` is a **ratchet**: a
   hardened file (baseline 0) rejects any new pollutable call. `UPDATE=1` only to
-  *lower* a baseline.
+  _lower_ a baseline.
   One exception, and do not add a second: `js/internal/esm.js` is evaluated
   standalone and deliberately kept off the module table, so user code cannot reach
   the transform — which also denies it a `require`. It takes the table as a factory
@@ -221,7 +221,7 @@ Rules that keep this from becoming ceremony:
   candidates from **more than one class** the bare marker suppresses nothing —
   name it, `// primordials-ok: method` (comma-separated list allowed). An
   unrecognized class name suppresses nothing, so a typo fails loud.
-- `UPDATE=1` only *lowers* a baseline. Raising one needs
+- `UPDATE=1` only _lowers_ a baseline. Raising one needs
   `make check-primordials UPDATE=1 RAISE=--allow-raise` and a stated reason (a
   newly scanned file, or a new class). A corrupt baseline fails hard rather than
   inviting a rebaseline.
@@ -231,7 +231,7 @@ Rules that keep this from becoming ceremony:
   dynamic key takes dataflow the counter does not have, and a blanket rule would
   fire on every options object.
   A fourth is COUNTED and still wrong, which is the nastiest of the set because the
-  fix *looks* applied: `StringPrototypeReplace/Match/Search/Split` score 0 in
+  fix _looks_ applied: `StringPrototypeReplace/Match/Search/Split` score 0 in
   `method`, yet they route through the spec's RegExpExec, which re-reads `R.exec`
   off the receiver — so a poisoned `exec` steers them straight through the
   primordial. A GLOBAL one does not answer wrongly, it never returns, because
@@ -250,7 +250,7 @@ Rules that keep this from becoming ceremony:
   `Promise.resolve(x)` read it implicitly, with no member expression in the
   source. It is also a plain data property an ordinary merge gadget can set, so
   treat `await` on a caller-supplied value as a live call.
-- "Baseline 0" in a class means no *counted* site of that class is left — the
+- "Baseline 0" in a class means no _counted_ site of that class is left — the
   ratchet is a floor, not a proof, and per-class counts are what make it
   readable rather than reassuring. It earned that caveat: `encoding.js` stood at
   0 while `units.buffer` went through the live `%TypedArray%.prototype.buffer`
@@ -313,7 +313,7 @@ Two more kinds, both added because hand-picked inputs kept missing edge cases:
   `make test-scripts`, run inside `make check-js`.
 
 **Order: contract → red test → implementation.** Write the contract comment
-(§4/§5) from a real `node` probe, then the tests, and watch them fail *before*
+(§4/§5) from a real `node` probe, then the tests, and watch them fail _before_
 there is anything to pass them. A test authored after the code routinely asserts
 less than its comment claims, and nothing catches that — two tests landed that
 way in #320, both with confident comments, and mutation is what exposed them.
@@ -329,18 +329,18 @@ once by hand: `make test-mutation` re-applies it in CI and fails if the test
 survives. Doing it by hand depends on remembering to, and that is exactly how the
 three examples below got in — each passed, and each passed just as well with the
 code it claimed to pin deleted. The runner refuses to report unless the tree is
-clean, each `find` is unique, and every gate is green *before* mutating; a stale
+clean, each `find` is unique, and every gate is green _before_ mutating; a stale
 entry is a failure, not a skip. Two examples of what this catches,
 both real: an assertion that holds equally with and without the code under test
 (a failed `map_insert` stores nothing either way, so `!hit` proved nothing), and
 an assertion aimed at memory the test cannot observe (net connections are freed
 under `runtime.default_context()`, so no tracking allocator ever sees them —
-the census had to move to `/proc/self/fd`), and an assertion whose *setup* threw
+the census had to move to `/proc/self/fd`), and an assertion whose _setup_ threw
 before reaching the code under test — `obj + name` as a map key coerces
 `%TypedArray%.prototype` and calls `join` on an incompatible receiver, so the case
 printed `THREW:TypeError` on both runtimes: byte-identical, which is exactly what
 the oracle model reads as success. A third shape worth naming because it is
-invisible on inspection: a test whose *scaffolding* suppresses the condition under
+invisible on inspection: a test whose _scaffolding_ suppresses the condition under
 test — an event-loop case used a timer to avoid needing a thread, and a pending
 timer gives `platform_poll` a positive timeout, which counts as progress by itself,
 so the no-progress tick being tested never occurred.
@@ -356,16 +356,21 @@ if perf is claimed. Run `/pr-gate` before asking for review.
 
 ## 8. AI pipeline in this repo
 
-- `/odin-feature <task>` — implement: reuse scout → design → implement → gates.
-- `/pr-gate` — merge gate: mechanical gates + parallel specialist review + scorecard.
-- `/agent-cycle [status|f1–f7|min-slice|pilot]` — integrate the autonomous
-  agent loop (gate integrity → worktree safety → groom → routing → structured
-  review I/O → driver → pilot). **Do not build the driver first.** Canonical
-  plan: [docs/agent-cycle-plan.md](docs/agent-cycle-plan.md). Skill ships in
-  both [`.claude/skills/agent-cycle/`](.claude/skills/agent-cycle/) (Claude Code)
-  and [`.grok/skills/agent-cycle/`](.grok/skills/agent-cycle/) (Grok Build);
-  same procedure, one plan file.
-- Agents in [.claude/agents/](.claude/agents/) are specialists (`odin-sdk-scout`,
-  `odin-implementer`, `regression-hunter`, `odin-safety-auditor`,
-  `node-parity-auditor`, `perf-memory-auditor`, `security-auditor`,
-  `test-coverage-auditor`, `code-quality-auditor`, `docs-auditor`).
+Autonomous agent system — human slash commands and system automation share the
+same named commands (`node commands/index.mjs <cmd>`).
+
+| Command         | Role                                                             |
+| --------------- | ---------------------------------------------------------------- |
+| `/odin-feature` | Implement with TDD (reuse scout → design → red test → code)      |
+| `/pr-gate`      | Hard merge gate: tests + specialists → SHIP / SHIP-AFTER / BLOCK |
+| `/planner`      | Build task DAG from GitHub issues                                |
+| `/critic`       | Adversarial critique before pr-gate                              |
+| `/fixer`        | Fix from pr-gate findings or red gates                           |
+| `/run-pipeline` | Full autonomous DAG → draft PR (never merge)                     |
+
+- **Auto-start:** `node workflows/triggers/issues.mjs`, `schedule.mjs`, PR comments, gate-failure.
+- **Registry:** [config/agents.yaml](config/agents.yaml) · [config/agents.json](config/agents.json)
+- **Architecture:** [docs/agent-system/ARCHITECTURE.md](docs/agent-system/ARCHITECTURE.md)
+- **Usage:** [docs/agent-system/USAGE.md](docs/agent-system/USAGE.md)
+- **Specialists:** [agents/specialists/](agents/specialists/) (mirrored under `.claude/agents/` for harness discovery)
+- **PR only after successful `pr-gate`.** Merge to master is always human.

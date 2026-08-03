@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lava-agent-findings",
+  "title": "Agent specialist findings",
+  "type": "object",
+  "required": ["agent", "findings"],
+  "additionalProperties": true,
+  "properties": {
+    "agent": { "type": "string" },
+    "verdict_native": { "type": "string" },
+    "ran_commands": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "what"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string", "enum": ["P0", "P1", "P2", "nit"] },
+          "file": { "type": "string" },
+          "line": { "type": ["integer", "null"] },
+          "what": { "type": "string" },
+          "failure": { "type": "string" },
+          "evidence": { "type": "string" },
+          "fix": { "type": "string" },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "class": {
+            "type": "string",
+            "description": "parity | safety | security | gate-weakening | style | other — floors severity"
+          }
+        }
+      }
+    }
+  }
+}

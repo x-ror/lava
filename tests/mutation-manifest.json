@@ -232,10 +232,7 @@
       "find": "    var src = StringG(str);\n    var n = src.length;\n    var out = '';",
       "replace": "    return StringG(str)\n      .replaceAll('-', '+')\n      .replaceAll('_', '/')\n      .replaceAll(/[^A-Za-z0-9+/]/g, '');\n    var src = StringG(str);\n    var n = src.length;\n    var out = '';",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": [
-        "timed out",
-        "got b64=THREW:RangeError"
-      ],
+      "expect_detail": ["timed out", "got b64=THREW:RangeError"],
       "timeout_ms": 30000
     },
     {
@@ -245,10 +242,7 @@
       "find": "    if (!hasSurrogate) return str;\n    var out = StringPrototypeSlice(str, 0, i);",
       "replace": "    if (!hasSurrogate) return str;\n    var SPOL = /([\\uD800-\\uDBFF])([\\uDC00-\\uDFFF])?|([\\uDC00-\\uDFFF])/g;\n    return StringPrototypeReplace(str, SPOL, function (m, h, l, lone) {\n      return lone !== undefined || l === undefined ? '\\uFFFD' : m;\n    });\n    var out = StringPrototypeSlice(str, 0, i);",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": [
-        "timed out",
-        "got usp=THREW:RangeError"
-      ],
+      "expect_detail": ["timed out", "got usp=THREW:RangeError"],
       "timeout_ms": 30000
     },
     {
@@ -393,10 +387,7 @@
       "find": "    s = replaceCharAll(s, '+', '%20');",
       "replace": "    if (s.indexOf('+') !== -1) s = s.replace(/\\+/g, '%20');",
       "gate": "compat:tests/node-compat/cases/59-global-replace-hangs.js",
-      "expect_detail": [
-        "timed out",
-        "plus="
-      ],
+      "expect_detail": ["timed out", "plus="],
       "timeout_ms": 30000
     },
     {
@@ -406,10 +397,7 @@
       "find": "      pattern = replaceCharAll(pattern, '\\\\', '/');",
       "replace": "      pattern = pattern.replace(/\\\\/g, '/');",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": [
-        "timed out",
-        "THREW:RangeError"
-      ],
+      "expect_detail": ["timed out", "THREW:RangeError"],
       "timeout_ms": 30000
     },
     {
@@ -419,10 +407,7 @@
       "find": "        hex += StringPrototypeSlice(raw, h, h + 2);",
       "replace": "        hex += raw.replaceAll(/(.{2})/g, '$1 ').trim();",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": [
-        "timed out",
-        "THREW:RangeError"
-      ],
+      "expect_detail": ["timed out", "THREW:RangeError"],
       "timeout_ms": 30000
     },
     {
@@ -432,10 +417,7 @@
       "find": "    if (nativeEndings) str = toNativeEndings(str);",
       "replace": "    if (nativeEndings) str = str.replace(/\\r?\\n/g, nativeEol());",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": [
-        "timed out",
-        "THREW:RangeError"
-      ],
+      "expect_detail": ["timed out", "THREW:RangeError"],
       "timeout_ms": 30000
     },
     {
@@ -445,10 +427,7 @@
       "find": "    return StringPrototypeToUpperCase(out);",
       "replace": "    return env.replace(/[|\\\\{}()[\\]^$+?.]/g, '\\\\$&').replace(/\\*/g, '.*').replace(/,/g, '$|^').toUpperCase();",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": [
-        "timed out",
-        "THREW:RangeError"
-      ],
+      "expect_detail": ["timed out", "THREW:RangeError"],
       "timeout_ms": 30000
     },
     {
@@ -458,10 +437,7 @@
       "find": "  function escapeQuoted(value) {",
       "replace": "  var ESCAPE_QUOTE_OR_BACKSLASH = /[\\\\\"]/g;\n  function escapeQuoted(value) {\n    return value.replace(ESCAPE_QUOTE_OR_BACKSLASH, '\\\\$&');",
       "gate": "compat:tests/node-compat/cases/59-global-replace-hangs.js",
-      "expect_detail": [
-        "timed out",
-        "mime="
-      ],
+      "expect_detail": ["timed out", "mime="],
       "timeout_ms": 30000
     },
     {
@@ -471,10 +447,7 @@
       "find": "    domain = foldSeparators(domain);",
       "replace": "    domain = domain.replace(/[\\x2E\\u3002\\uFF0E\\uFF61]/g, '\\x2E');",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": [
-        "timed out",
-        "THREW:RangeError"
-      ],
+      "expect_detail": ["timed out", "THREW:RangeError"],
       "timeout_ms": 30000
     },
     {
@@ -484,9 +457,7 @@
       "find": "      c === 0x2e //    .",
       "replace": "      false //    .",
       "gate": "odin:cmd/lava:main.regexp_pollution_immunity",
-      "expect_detail": [
-        "want dbg-nodot=false got"
-      ],
+      "expect_detail": ["want dbg-nodot=false got"],
       "timeout_ms": 30000
     },
     {
@@ -496,10 +467,7 @@
       "find": "\t\tif !stdio_retryable(werr) do return written, werr",
       "replace": "\t\tif werr != nil do return written, werr",
       "gate": "node-test:tests/stdio/stdio-write.test.mjs",
-      "expect_detail": [
-        "expected 300001 bytes",
-        "payload must round-trip exactly"
-      ],
+      "expect_detail": ["expected 300001 bytes", "payload must round-trip exactly"],
       "rebuild": true
     },
     {
@@ -509,9 +477,7 @@
       "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
       "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
       "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
-      "expect_detail": [
-        "pipe() must not even reach end(), so no finish"
-      ]
+      "expect_detail": ["pipe() must not even reach end(), so no finish"]
     },
     {
       "name": "stdio-lifecycle dies when pipe() stops excluding the stdio singletons (pipe shape)",
@@ -520,10 +486,7 @@
       "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
       "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
       "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
-      "expect_detail": [
-        "two finished=0",
-        "lava must match node on a pipe"
-      ],
+      "expect_detail": ["two finished=0", "lava must match node on a pipe"],
       "rebuild": true
     },
     {
@@ -533,10 +496,7 @@
       "find": "    cb(err);\n    this._undestroy();",
       "replace": "    cb(err);",
       "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
-      "expect_detail": [
-        "recovers from destroy()",
-        "lava must match node byte-for-byte on a file"
-      ],
+      "expect_detail": ["recovers from destroy()", "lava must match node byte-for-byte on a file"],
       "rebuild": true
     },
     {
@@ -546,9 +506,7 @@
       "find": "      w.ended = false;\n      w.ending = false;\n      w.finished = false;",
       "replace": "      w.ended = false;\n      w.finished = false;",
       "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
-      "expect_detail": [
-        "lava must match node byte-for-byte on a file"
-      ],
+      "expect_detail": ["lava must match node byte-for-byte on a file"],
       "rebuild": true
     },
     {
@@ -558,10 +516,7 @@
       "find": "    ReflectApply(Writable, this, [{ decodeStrings: false }]);",
       "replace": "    ReflectApply(Writable, this, [{ decodeStrings: false, autoDestroy: false, emitClose: false }]);",
       "gate": "node-test:tests/stdio/stdio-lifecycle.test.mjs",
-      "expect_detail": [
-        "keep writing after end()",
-        "lava must match node byte-for-byte on a file"
-      ],
+      "expect_detail": ["keep writing after end()", "lava must match node byte-for-byte on a file"],
       "rebuild": true
     },
     {
@@ -571,9 +526,7 @@
       "find": "    this._isStdio = true;",
       "replace": "    this._isStdio = undefined;",
       "gate": "compat:tests/node-compat/cases/61-stdio-lifecycle.js",
-      "expect_detail": [
-        "_isStdio marker"
-      ]
+      "expect_detail": ["_isStdio marker"]
     },
     {
       "name": "fs_write_payload dies when the buffer length is sampled before the window getters",
@@ -582,9 +535,7 @@
       "find": "\t\t\t\toff_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteOffset\"), nil)\n\t\t\t\tlen_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteLength\"), nil)\n\t\t\t\t// Now that no further JS can run, sample the authoritative length and take\n\t\t\t\t// the base pointer back to back: the pointer is only valid until the next\n\t\t\t\t// JSC API call (a GC/realloc can move it), so nothing may come between them\n\t\t\t\t// but the pure-Odin validation below.\n\t\t\t\tab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))",
       "replace": "\t\t\t\tab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))\n\t\t\t\toff_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteOffset\"), nil)\n\t\t\t\tlen_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteLength\"), nil)",
       "gate": "odin:cmd/lava:main.fs_write_payload_rejects_a_window_resized_by_its_own_getter",
-      "expect_detail": [
-        "out-of-bounds read"
-      ]
+      "expect_detail": ["out-of-bounds read"]
     },
     {
       "name": "stdio_fd_guard dies when the fd is converted before it is compared",
@@ -593,9 +544,7 @@
       "find": "\tswitch {\n\tcase fd_num == 1:\n\t\ttarget = os.stdout\n\tcase fd_num == 2:\n\t\ttarget = os.stderr",
       "replace": "\tfd_int := int(fd_num)\n\tswitch fd_int {\n\tcase 1:\n\t\ttarget = os.stdout\n\tcase 2:\n\t\ttarget = os.stderr",
       "gate": "odin:cmd/lava:main.stdio_write_sync_rejects_every_fd_but_1_and_2",
-      "expect_detail": [
-        "writeSync(1.5, ...) was not rejected"
-      ]
+      "expect_detail": ["writeSync(1.5, ...) was not rejected"]
     },
     {
       "name": "62-fs-read-buffer dies when the read result is not re-tagged as a Buffer",
@@ -604,9 +553,7 @@
       "find": "    return BufferFrom(\n      TypedArrayPrototypeGetBuffer(value),\n      TypedArrayPrototypeGetByteOffset(value),\n      TypedArrayPrototypeGetByteLength(value),\n    );",
       "replace": "    return value;",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "readFileSync must return a Buffer"
-      ]
+      "expect_detail": ["readFileSync must return a Buffer"]
     },
     {
       "name": "62-fs-read-buffer dies when the encoding is dropped instead of decoded in JS",
@@ -615,9 +562,7 @@
       "find": "    return encoding === null ? buf : BufferPrototypeToString(buf, encoding);",
       "replace": "    return buf;",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "an encoding must be decoded, not returned as a Buffer"
-      ]
+      "expect_detail": ["an encoding must be decoded, not returned as a Buffer"]
     },
     {
       "name": "62-fs-read-buffer dies when an unknown encoding is not rejected",
@@ -626,9 +571,7 @@
       "find": "    if (encoding !== 'buffer' && !BufferIsEncoding(encoding)) {",
       "replace": "    if (false) {",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "Unknown encoding: bogus"
-      ]
+      "expect_detail": ["Unknown encoding: bogus"]
     },
     {
       "name": "57-format-single-arg dies when util.inspect stops quoting a top-level string",
@@ -637,9 +580,7 @@
       "find": "    if (t === 'string') return quote(v);",
       "replace": "    if (t === 'string') return depth === 0 ? v : quote(v);",
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
-      "expect_detail": [
-        "'x'"
-      ]
+      "expect_detail": ["'x'"]
     },
     {
       "name": "57-format-single-arg dies when inspect stops choosing the quote character",
@@ -648,9 +589,7 @@
       "find": "    if (StringPrototypeIndexOf(s, \"'\") !== -1) {\n      if (StringPrototypeIndexOf(s, '\"') === -1) q = '\"';\n      else if (StringPrototypeIndexOf(s, '`') === -1 && StringPrototypeIndexOf(s, '${') === -1)\n        q = '`';\n    }\n",
       "replace": "",
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
-      "expect_detail": [
-        "it\\'s"
-      ]
+      "expect_detail": ["it\\'s"]
     },
     {
       "name": "62-fs-read-buffer dies when the pristine Buffer capture moves back into fs.js",
@@ -659,10 +598,7 @@
       "find": "  var PristineBuffer = require.pristineBuffer;",
       "replace": "  var PristineBuffer = require('buffer').Buffer;",
       "gate": "compat:tests/node-compat/cases/63-fs-buffer-capture.js",
-      "expect_detail": [
-        "must not steer the read",
-        "must not observe the file contents"
-      ]
+      "expect_detail": ["must not steer the read", "must not observe the file contents"]
     },
     {
       "name": "62-fs-read-buffer dies when falsy encodings stop meaning binary",
@@ -671,9 +607,7 @@
       "find": "    if (!encoding) return null;",
       "replace": "    if (encoding === null || encoding === undefined) return null;",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "invalid encoding. Received ''"
-      ]
+      "expect_detail": ["invalid encoding. Received ''"]
     },
     {
       "name": "62-fs-read-buffer dies when 'buffer' is validated like an ordinary encoding",
@@ -682,9 +616,7 @@
       "find": "    if (encoding !== 'buffer' && !BufferIsEncoding(encoding)) {",
       "replace": "    if (!BufferIsEncoding(encoding)) {",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "invalid encoding. Received 'buffer'"
-      ]
+      "expect_detail": ["invalid encoding. Received 'buffer'"]
     },
     {
       "name": "62-fs-read-buffer dies when ERR_INVALID_ARG_TYPE loses node's object branch",
@@ -693,9 +625,7 @@
       "find": "      if (typeof ctor === 'function' && ctor.name) return 'an instance of ' + ctor.name;",
       "replace": "",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "Received {}"
-      ]
+      "expect_detail": ["Received {}"]
     },
     {
       "name": "62-fs-read-buffer dies when the Received string stops being truncated",
@@ -704,9 +634,7 @@
       "find": "    if (typeof shown === 'string' && shown.length > RECEIVED_STR_MAX + 3) {\n      shown = StringPrototypeSlice(shown, 0, RECEIVED_STR_MAX) + '...';\n    }",
       "replace": "",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
-      ]
+      "expect_detail": ["yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"]
     },
     {
       "name": "62-fs-read-buffer dies when the read result is copied instead of shared",
@@ -715,10 +643,7 @@
       "find": "    return BufferFrom(\n      TypedArrayPrototypeGetBuffer(value),\n      TypedArrayPrototypeGetByteOffset(value),\n      TypedArrayPrototypeGetByteLength(value),\n    );",
       "replace": "    return BufferFrom(value);",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "shared not copied",
-        "must not be an offset into a pool"
-      ]
+      "expect_detail": ["shared not copied", "must not be an offset into a pool"]
     },
     {
       "name": "62-fs-read-buffer dies when path type validation is dropped",
@@ -727,9 +652,7 @@
       "find": "    validatePath(path);\n    var encoding = readEncoding(options);",
       "replace": "    var encoding = readEncoding(options);",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "ENOENT: no such file or directory, open 'null'"
-      ]
+      "expect_detail": ["ENOENT: no such file or directory, open 'null'"]
     },
     {
       "name": "62-fs-read-buffer dies when the error callback regains its second argument",
@@ -738,9 +661,7 @@
       "find": "      if (err) {\n        cb(err);\n        return;\n      }",
       "replace": "      if (err) {\n        cb(err, data);\n        return;\n      }",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "the error callback takes one argument on node"
-      ]
+      "expect_detail": ["the error callback takes one argument on node"]
     },
     {
       "name": "62-fs-read-buffer dies when cb validation moves after options validation",
@@ -749,9 +670,7 @@
       "find": "    var cb = callback || options;\n    if (typeof cb !== 'function') {",
       "replace": "    var cb = callback || options;\n    readEncoding(typeof options === 'function' ? null : options);\n    if (typeof cb !== 'function') {",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "invalid encoding. Received 'bogus'"
-      ]
+      "expect_detail": ["invalid encoding. Received 'bogus'"]
     },
     {
       "name": "62-fs-read-buffer dies when a function in the options slot is rejected",
@@ -760,9 +679,7 @@
       "find": "    if (options === null || options === undefined || typeof options === 'function') {",
       "replace": "    if (options === null || options === undefined) {",
       "gate": "compat:tests/node-compat/cases/62-fs-read-buffer.js",
-      "expect_detail": [
-        "Received type function"
-      ]
+      "expect_detail": ["Received type function"]
     },
     {
       "name": "57-format-single-arg dies when inspect drops node's ${ guard",
@@ -771,9 +688,7 @@
       "find": "      else if (StringPrototypeIndexOf(s, '`') === -1 && StringPrototypeIndexOf(s, '${') === -1)\n        q = '`';",
       "replace": "      else if (StringPrototypeIndexOf(s, '`') === -1) q = '`';",
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
-      "expect_detail": [
-        "${d}"
-      ]
+      "expect_detail": ["${d}"]
     },
     {
       "name": "57-format-single-arg dies when the backtick branch is removed",
@@ -782,9 +697,7 @@
       "find": "      else if (StringPrototypeIndexOf(s, '`') === -1 && StringPrototypeIndexOf(s, '${') === -1)\n        q = '`';\n",
       "replace": "",
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
-      "expect_detail": [
-        "both ' and \""
-      ]
+      "expect_detail": ["both ' and \""]
     },
     {
       "name": "57-format-single-arg dies when inspect stops escaping control characters",
@@ -793,9 +706,7 @@
       "find": "      else if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) esc = escByte(c);",
       "replace": "",
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
-      "expect_detail": [
-        "\\\\x1B"
-      ]
+      "expect_detail": ["\\\\x1B"]
     },
     {
       "name": "57-format-single-arg dies when a lone surrogate is not escaped",
@@ -804,9 +715,7 @@
       "find": "        if (next >= 0xdc00 && next <= 0xdfff)\n          i++; // consume the pair\n        else esc = escUnit(c);",
       "replace": "        if (next >= 0xdc00 && next <= 0xdfff) i++;",
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
-      "expect_detail": [
-        "\\\\ud800"
-      ]
+      "expect_detail": ["\\\\ud800"]
     },
     {
       "name": "57-format-single-arg dies when Symbol.for is read off the captured Symbol object",
@@ -815,9 +724,7 @@
       "find": "    SymbolFor: Symbol.for,",
       "replace": "    SymbolFor: undefined,",
       "gate": "compat:tests/node-compat/cases/57-format-single-arg.js",
-      "expect_detail": [
-        "<Buffer 61 62>"
-      ]
+      "expect_detail": ["<Buffer 61 62>"]
     },
     {
       "name": "64-stream-write dies when write() reports errors async instead of throwing",
@@ -826,9 +733,7 @@
       "find": "    if (chunk === null) throw errNullValues();",
       "replace": "    if (chunk === null) { writeErrorNextTick(this, errNullValues(), cb); return false; }",
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
-      "expect_detail": [
-        "write(null) must throw SYNCHRONOUSLY"
-      ]
+      "expect_detail": ["write(null) must throw SYNCHRONOUSLY"]
     },
     {
       "name": "64-stream-write dies when the accept set goes back to instanceof Uint8Array",
@@ -837,10 +742,7 @@
       "find": "  function isBytesChunk(chunk) {\n    return ArrayBufferIsView(chunk);\n  }",
       "replace": "  function isBytesChunk(chunk) {\n    return chunk instanceof Uint8Array;\n  }",
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
-      "expect_detail": [
-        "Receiver should be a typed array view",
-        "must be of type string"
-      ]
+      "expect_detail": ["Receiver should be a typed array view", "must be of type string"]
     },
     {
       "name": "64-stream-write dies when a view is not normalized to a Buffer",
@@ -849,9 +751,7 @@
       "find": "        chunk = bytesToBuffer(chunk);\n        encoding = 'buffer';\n      } else {\n        throw errInvalidArg('chunk', CHUNK_EXPECTED, chunk);",
       "replace": "        encoding = 'buffer';\n      } else {\n        throw errInvalidArg('chunk', CHUNK_EXPECTED, chunk);",
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
-      "expect_detail": [
-        "false, undefined"
-      ]
+      "expect_detail": ["false, undefined"]
     },
     {
       "name": "64-stream-write dies when Readable.push does not accept what write does",
@@ -860,9 +760,7 @@
       "find": "      } else if (isBytesChunk(chunk)) {\n        // The readable half must accept exactly what the writable half does, or a\n        // PassThrough takes a view on one side and errors on the other \u2014 which is how the\n        // first attempt at this shipped.\n        chunk = bytesToBuffer(chunk);",
       "replace": "      } else if (chunk instanceof Uint8Array) {\n        chunk = bytesToBuffer(chunk);",
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
-      "expect_detail": [
-        "async:ERR_INVALID_ARG_TYPE"
-      ]
+      "expect_detail": ["async:ERR_INVALID_ARG_TYPE"]
     },
     {
       "name": "64-stream-write dies when the encoding is not validated before the chunk type",
@@ -871,9 +769,7 @@
       "find": "    if (encoding) validateEncoding(encoding);\n",
       "replace": "",
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
-      "expect_detail": [
-        "must be of type string or an instance of Buffer"
-      ]
+      "expect_detail": ["must be of type string or an instance of Buffer"]
     },
     {
       "name": "64-stream-write dies when setDefaultEncoding accepts an unknown name",
@@ -882,9 +778,7 @@
       "find": "    validateEncoding(encoding);\n    this._writableState.defaultEncoding = encoding;",
       "replace": "    this._writableState.defaultEncoding = encoding;",
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
-      "expect_detail": [
-        "setDefaultEncoding must validate"
-      ]
+      "expect_detail": ["setDefaultEncoding must validate"]
     },
     {
       "name": "65-lazy-buffer-capture dies when a module resolves Buffer itself instead of taking the loader's",
@@ -893,9 +787,7 @@
       "find": "  var PristineBuffer = require.pristineBuffer;",
       "replace": "  var PristineBuffer = { Buffer: require('buffer').Buffer, from: require('buffer').Buffer.from, alloc: require('buffer').Buffer.alloc, concat: require('buffer').Buffer.concat, isBuffer: require('buffer').Buffer.isBuffer };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
-      "expect_detail": [
-        "net must not resolve Buffer through the shim"
-      ]
+      "expect_detail": ["net must not resolve Buffer through the shim"]
     },
     {
       "name": "65-lazy-buffer-capture dies when Buffer.from is read off the constructor at call time",
@@ -904,9 +796,7 @@
       "find": "  var BufferFrom = PristineBuffer.from;",
       "replace": "  var BufferFrom = function (v, a, b) { return PristineBuffer.Buffer.from(v, a, b); };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
-      "expect_detail": [
-        "a replaced Buffer.from must not steer net either"
-      ]
+      "expect_detail": ["a replaced Buffer.from must not steer net either"]
     },
     {
       "name": "65-lazy-buffer-capture dies when os.userInfo reads Buffer.from at call time",
@@ -915,9 +805,7 @@
       "find": "  var BufferFrom = PristineBuffer.from;",
       "replace": "  var BufferFrom = function (v, a, b) { return PristineBuffer.Buffer.from(v, a, b); };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
-      "expect_detail": [
-        "os must not read Buffer.from at call time"
-      ]
+      "expect_detail": ["os must not read Buffer.from at call time"]
     },
     {
       "name": "65-lazy-buffer-capture dies when http.js resolves Buffer itself",
@@ -926,9 +814,7 @@
       "find": "  var PristineBuffer = require.pristineBuffer;",
       "replace": "  var PristineBuffer = { Buffer: require('buffer').Buffer, from: require('buffer').Buffer.from, alloc: require('buffer').Buffer.alloc, concat: require('buffer').Buffer.concat, isBuffer: require('buffer').Buffer.isBuffer, bufferToString: function (b, e, a, c) { return b.toString(e, a, c); }, bufferIndexOf: function (b, n) { return b.indexOf(n); }, bufferSlice: function (b, a, c) { return b.slice(a, c); } };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
-      "expect_detail": [
-        "http response body must not be steered"
-      ]
+      "expect_detail": ["http response body must not be steered"]
     },
     {
       "name": "65-lazy-buffer-capture dies when the chunked reassembly reads Buffer.concat live",
@@ -937,9 +823,7 @@
       "find": "  var BufferConcat = PristineBuffer.concat;",
       "replace": "  var BufferConcat = function (l, t) { return require('buffer').Buffer.concat(l, t); };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
-      "expect_detail": [
-        "http chunked framing must not be steered"
-      ]
+      "expect_detail": ["http chunked framing must not be steered"]
     },
     {
       "name": "65-lazy-buffer-capture dies when the chunk size is read through a live toString",
@@ -948,9 +832,7 @@
       "find": "  var BufferPrototypeToString = PristineBuffer.bufferToString;",
       "replace": "  var BufferPrototypeToString = function (b, e, a, c) { return b.toString(e, a, c); };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
-      "expect_detail": [
-        "http chunked framing must not be steered"
-      ]
+      "expect_detail": ["http chunked framing must not be steered"]
     },
     {
       "name": "65-lazy-buffer-capture dies when the framing cursor advances through a live slice",
@@ -959,9 +841,7 @@
       "find": "  var BufferPrototypeSlice = PristineBuffer.bufferSlice;",
       "replace": "  var BufferPrototypeSlice = function (b, a, c) { return b.slice(a, c); };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
-      "expect_detail": [
-        "http chunked framing must not be steered"
-      ]
+      "expect_detail": ["http chunked framing must not be steered"]
     },
     {
       "name": "65-lazy-buffer-capture dies when net's INBOUND wrap reads Buffer live",
@@ -970,26 +850,24 @@
       "find": "  var BufferFrom = PristineBuffer.from;",
       "replace": "  var BufferFrom = function (v, a, b) { return require('buffer').Buffer.from(v, a, b); };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
-      "expect_detail": [
-        "net must not resolve Buffer through the shim"
-      ]
+      "expect_detail": ["net must not resolve Buffer through the shim"]
     },
     {
       "name": "gate-integrity dies when the NODE_BIN rule is removed",
       "why": "Without this rule agents set NODE_BIN=./bin/lava and every oracle becomes lava-vs-lava green.",
-      "source": "scripts/agent-cycle/gate-integrity.mjs",
+      "source": "runtime/gates/integrity.mjs",
       "find": "    id: 'node-bin-override',\n    reason: 'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',\n    re: /\\bNODE_BIN\\s*=/,\n  },",
       "replace": "    id: 'node-bin-override',\n    reason: 'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',\n    re: /(?!)/,\n  },",
-      "gate": "node-test:scripts/agent-cycle/gate-integrity.test.mjs",
+      "gate": "node-test:runtime/gates/integrity.test.mjs",
       "expect_detail": "blocks: node-bin-override"
     },
     {
       "name": "gate-integrity dies when settings.json self-protect is dropped from PROTECTED_WRITE_PATHS",
       "why": "An agent that can Edit settings.json deletes the deny list; that path must stay hard-blocked.",
-      "source": "scripts/agent-cycle/gate-integrity.mjs",
+      "source": "runtime/gates/integrity.mjs",
       "find": "  '.claude/settings.json',\n  '.claude/settings.local.json',",
       "replace": "  '.claude/settings.local.json',",
-      "gate": "node-test:scripts/agent-cycle/gate-integrity.test.mjs",
+      "gate": "node-test:runtime/gates/integrity.test.mjs",
       "expect_detail": "self-protect: blocks Edit of settings.json"
     },
     {
@@ -998,21 +876,17 @@
       "source": "scripts/lib/compare.sh",
       "find": "\tlava | lava.exe)\n\t\tprintf '%s\\n' \"GATE INTEGRITY: NODE_BIN must be the Node oracle, not Lava (got $NODE_BIN)\" >&2\n\t\treturn 2\n\t\t;;",
       "replace": "\tlava | lava.exe)\n\t\treturn 0\n\t\t;;",
-      "gate": "node-test:scripts/agent-cycle/compare-integrity.test.mjs",
+      "gate": "node-test:runtime/gates/compare-integrity.test.mjs",
       "expect_detail": "GATE INTEGRITY"
     },
     {
       "name": "assert-case-counts dies when the min floor branch is disabled",
       "why": "Silent case deletion must fail the count; if (false) makes every suite green at any size.",
-      "source": "scripts/agent-cycle/assert-case-counts.mjs",
+      "source": "runtime/gates/assert-case-counts.mjs",
       "find": "  if (n < spec.min) {",
       "replace": "  if (false && n < spec.min) {",
-      "gate": "node-test:scripts/agent-cycle/assert-case-counts.test.mjs",
-      "expect_detail": [
-        "if (n < spec.min)",
-        "min floor",
-        "false &&"
-      ]
+      "gate": "node-test:runtime/gates/assert-case-counts.test.mjs",
+      "expect_detail": ["if (n < spec.min)", "min floor", "false &&"]
     },
     {
       "name": "bench-gate dies when --gate exits 0 without a runnable lava",
@@ -1020,7 +894,7 @@
       "source": "bench/run.mjs",
       "find": "  if (GATE) {\n    console.error('benchmark gate FAILED \u2014 lava not runnable (LAVA_BIN must work under --gate)');\n    process.exit(1);\n  }\n  process.exit(0);",
       "replace": "  if (GATE) {\n    // mutated: silent green\n  }\n  process.exit(0);",
-      "gate": "node-test:scripts/agent-cycle/bench-gate-integrity.test.mjs",
+      "gate": "node-test:runtime/gates/bench-gate-integrity.test.mjs",
       "expect_detail": "lava not runnable"
     },
     {
@@ -1029,12 +903,8 @@
       "source": "bench/run.mjs",
       "find": "  if (uncapped.length > 0) {",
       "replace": "  if (false && uncapped.length > 0) {",
-      "gate": "node-test:scripts/agent-cycle/bench-gate-integrity.test.mjs",
-      "expect_detail": [
-        "if (uncapped.length > 0)",
-        "uncapped",
-        "false &&"
-      ]
+      "gate": "node-test:runtime/gates/bench-gate-integrity.test.mjs",
+      "expect_detail": ["if (uncapped.length > 0)", "uncapped", "false &&"]
     },
     {
       "name": "check-global-replace dies when allowKey goes back to file:line",

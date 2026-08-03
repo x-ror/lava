@@ -406,12 +406,12 @@ siblings, each with a `node:test` file) and counts **four classes** of
 pollutable site, each baselined separately in
 `tests/node-compat/pollution-baseline.json`:
 
-| class | example | resolved through |
-| ----- | ------- | ---------------- |
-| `method` | `arr.push(x)` | a pollutable prototype method |
-| `invoke` | `fn.call(t, a)` | `Function.prototype` |
-| `accessor` | `view.buffer` | a configurable prototype getter |
-| `global` | `String(x)` | a replaceable global, read live |
+| class      | example         | resolved through                |
+| ---------- | --------------- | ------------------------------- |
+| `method`   | `arr.push(x)`   | a pollutable prototype method   |
+| `invoke`   | `fn.call(t, a)` | `Function.prototype`            |
+| `accessor` | `view.buffer`   | a configurable prototype getter |
+| `global`   | `String(x)`     | a replaceable global, read live |
 
 `make check-primordials` (part of `make check-js`) fails on any per-class
 increase, and `--update` refuses to raise a floor without `--allow-raise`. The
