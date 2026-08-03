@@ -15,8 +15,9 @@
 //   lava (pre) app sees: "TAMPERED"     dep captured: ["top secret"]
 //
 // loader.js snapshots Buffer.from / isEncoding / prototype.toString immediately after it
-// eager-instantiates buffer, and hands them to fs through its natives argument, so the
-// capture provably precedes user code.
+// eager-instantiates buffer, and hands them to every migrated internal module as
+// `require.pristineBuffer`, so the capture provably precedes user code. (fs took them
+// through its `natives` argument until #333 unified the two channels.)
 //
 // This is an ORACLE case rather than a Lava-only one because the fix makes Lava agree with
 // node: node's fs builds its result from an internal binding, so the shim never sees it.

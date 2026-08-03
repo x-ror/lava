@@ -53,26 +53,58 @@
   req('primordials');
   req('buffer');
 
-  // Hand `fs` a PRISTINE Buffer, captured here rather than inside fs.js.
+  // Hand the LAZY internal modules a PRISTINE Buffer.
   //
-  // fs.js is a lazy module: its factory does not run until user code calls require('fs'),
-  // which is arbitrarily late. A `require('buffer').Buffer` capture at ITS module-eval
-  // therefore reads whatever the exports object holds by then, and that object is the one
-  // user code holds too — so a dependency's top-level `require('buffer').Buffer = shim`
-  // makes every later fs read return, and disclose, whatever the shim wants. Node's fs
-  // builds its result from an internal binding user code cannot reach.
+  // §5's "capture at module-eval" rule is sound only for modules the LOADER instantiates
+  // before user code. A lazy module's factory does not run until user code calls require()
+  // for it, so its own `require('buffer').Buffer` reads whatever the exports object holds
+  // by then — the object user code holds.
   //
-  // §5's "capture at module-eval" rule is only sound because the LOADER runs before user
-  // code, and that is true of the eager list above, not of a lazy module. So the capture
-  // belongs here, one line after buffer is instantiated, where the ordering is provable.
-  // fs receives it through its natives argument like any other binding.
-  var pristineBuffer = req('buffer').Buffer;
-  if (natives.fs) {
-    natives.fs.Buffer = pristineBuffer;
-    natives.fs.bufferFrom = pristineBuffer.from;
-    natives.fs.bufferIsEncoding = pristineBuffer.isEncoding;
-    natives.fs.bufferToString = pristineBuffer.prototype.toString;
-  }
+  // WHAT NODE ACTUALLY DOES, because an earlier version of this comment got it backwards.
+  // Node does NOT route payload bytes through the public `Buffer.from`, so replacing that
+  // member cannot corrupt node's output — measured, `sock.write('PAYLOAD')` delivers
+  // "PAYLOAD" on node and delivered "TAMPERED" here. That specific divergence is what this
+  // table closes. Node IS steerable through the same export for other members: with
+  // `Buffer.byteLength` returning real+3, node answered `Content-Length: 10` for a 7-byte
+  // body. So "node uses the buffer binding and is immune" is false and must not be
+  // repeated — Lava is deliberately STRICTER than node here, which §1 counts as a
+  // deviation and `65-lazy-buffer-capture.js` pins on the vectors it can express.
+  //
+  // Three categories, and only the third needs this table:
+  //   eager (the list above)         — their own capture is pristine
+  //   bootstrap (stream, stdio)      — instantiated by installStdio before user code
+  //   lazy (fs, http, https, net, os) — capture at the user's first require(): TOO LATE
+  //
+  // The OPERATIONS, not just the constructor: `.from` is read off the constructor at CALL
+  // time, so `Buffer.from = evil` steers a module holding a pristine `Buffer`. Same lesson
+  // as `Symbol.for` in util.js — the object is not the method.
+  //
+  // Attached to the internal `req`, so a module reads `require.pristineBuffer` with no new
+  // factory argument. The shape mirrors `publicReq.primordials` below, though that one
+  // hangs off the PUBLIC resolver and is read by Odin for esm.js, not by a factory — this
+  // is the first use of the internal-req channel, not a reuse of an existing one.
+  var PristineBufferCtor = req('buffer').Buffer;
+  req.pristineBuffer = {
+    __proto__: null,
+    Buffer: PristineBufferCtor,
+    from: PristineBufferCtor.from,
+    alloc: PristineBufferCtor.alloc,
+    concat: PristineBufferCtor.concat,
+    isBuffer: PristineBufferCtor.isBuffer,
+    isEncoding: PristineBufferCtor.isEncoding,
+    // Already UNCURRIED, so a consumer calls `bufferToString(buf, 'utf8')` directly. The
+    // primordials table sets this convention (`ArrayPrototypeSlice: caller2(...)`) — a raw
+    // unbound method invites each consumer to re-derive it, and two consumers deriving it
+    // differently is how the six copies of describeType happened.
+    bufferToString: req('primordials').uncurryThis(PristineBufferCtor.prototype.toString),
+    // The rest of the framing path in http.js's chunked decoder: it reads the chunk-size
+    // line, finds the CRLF boundary and advances the cursor through these three. Every one
+    // was a live `Buffer.prototype` read, i.e. a request-smuggling gadget — a replaced
+    // `toString` that INFLATES the size is the sharp version. Node frames HTTP in C
+    // (llhttp) and is not steerable here at all.
+    bufferIndexOf: req('primordials').uncurryThis(PristineBufferCtor.prototype.indexOf),
+    bufferSlice: req('primordials').uncurryThis(PristineBufferCtor.prototype.slice),
+  };
 
   req('stream/web');
   req('fetch');
