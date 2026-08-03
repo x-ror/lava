@@ -206,3 +206,99 @@ test('a cycle without a terminal is capped by maxSteps', async () => {
   });
   assert.equal(final.status, 'max-steps');
 });
+
+// ── a plan that says the work already exists ────────────────────────────────
+
+/** The shipped graph's shape around planner, trimmed to what routing needs. */
+const PLAN_GRAPH = {
+  entry: 'planner',
+  nodes: {
+    planner: { type: 'command', command: 'planner', next: 'odin-feature' },
+    'odin-feature': { type: 'command', command: 'odin-feature', next: 'terminal.done' },
+    'terminal.done': { type: 'terminal', status: 'done' },
+    'terminal.needs-human': { type: 'terminal', status: 'needs-human-decision' },
+  },
+};
+
+async function runPlan(plan, graph = PLAN_GRAPH) {
+  const calls = [];
+  const final = await runGraph({
+    graph,
+    state: { issue: { number: 91 }, wt: '/tmp/wt' },
+    maxSteps: 10,
+    invoke: async (command) => {
+      calls.push(command);
+      return command === 'planner' ? { ok: true, status: 0, plan } : { ok: true, status: 0 };
+    },
+  });
+  return { final, calls };
+}
+
+test('a plan reporting the work is already done stops the run', async () => {
+  // #91: planner returned terminal "already-done" with zero tasks, and the
+  // pipeline spent four more agent sessions before pr-gate blocked it.
+  const { final, calls } = await runPlan({ terminal: 'already-done', tasks: [] });
+  assert.deepEqual(calls, ['planner'], 'work continued after the plan said not to');
+  assert.equal(final.status, 'needs-human-decision');
+  assert.match(final.terminalReason, /already-done/);
+});
+
+test('it stops at needs-human, never at done', async () => {
+  // The planner can be wrong — it was, for #91. Closing the run as `done` would
+  // bury an issue on one bad conclusion; stopping to ask costs a human a minute.
+  const { final } = await runPlan({ terminal: 'already-done', tasks: [] });
+  assert.notEqual(final.status, 'done');
+});
+
+test('any terminal value stops it, not just already-done', async () => {
+  const { final, calls } = await runPlan({ terminal: 'superseded-by-#400', tasks: [] });
+  assert.deepEqual(calls, ['planner']);
+  assert.match(final.terminalReason, /superseded-by-#400/);
+});
+
+test('a normal plan does not stop anything', async () => {
+  const { final, calls } = await runPlan({ terminal: null, tasks: [{ id: 't1', title: 'x' }] });
+  assert.deepEqual(calls, ['planner', 'odin-feature']);
+  assert.equal(final.status, 'done');
+  assert.equal(final.terminalReason, undefined);
+});
+
+test('a node can name its own terminal target', async () => {
+  const graph = structuredClone(PLAN_GRAPH);
+  graph.nodes.planner.on_terminal = 'terminal.done';
+  const { final } = await runPlan({ terminal: 'already-done' }, graph);
+  assert.equal(final.status, 'done');
+});
+
+test('a hard gate verdict outranks a plan opinion', async () => {
+  // BLOCK is evidence; a plan is an opinion. If both arrive, the gate wins.
+  const graph = {
+    entry: 'pr-gate',
+    nodes: {
+      'pr-gate': {
+        type: 'command',
+        command: 'pr-gate',
+        hard_gate: true,
+        on_ship: 'create-pr',
+        on_block: 'fixer',
+      },
+      fixer: { type: 'command', command: 'fixer', next: 'terminal.done' },
+      'create-pr': { type: 'system', next: 'terminal.done' },
+      'terminal.done': { type: 'terminal', status: 'done' },
+      'terminal.needs-human': { type: 'terminal', status: 'needs-human-decision' },
+    },
+  };
+  const calls = [];
+  await runGraph({
+    graph,
+    state: { issue: { number: 91 }, wt: '/tmp/wt' },
+    maxSteps: 6,
+    invoke: async (command) => {
+      calls.push(command);
+      return command === 'pr-gate'
+        ? { ok: true, status: 0, verdict: { verdict: 'BLOCK' }, plan: { terminal: 'already-done' } }
+        : { ok: true, status: 0 };
+    },
+  });
+  assert.ok(calls.includes('fixer'), 'a plan opinion diverted a BLOCK');
+});

@@ -97,6 +97,13 @@ export async function invokeCommand(commandName, opts = {}) {
     }
   }
 
+  // ONE path, used by the prompt, the pre-run cleanup and the read-back. They
+  // were derived separately: the prompt honoured opts.findingsPath while the
+  // other two used the default, so a caller passing a path would have had the
+  // gate write to one file and the aggregator read another — reported as "no
+  // verdict", or worse, silently answered by a stale file at the default.
+  const findingsPath = opts.findingsPath ?? join(wt, FINDINGS_FILE);
+
   const prompt = buildAgentPrompt(agent, {
     issue,
     wt,
@@ -105,8 +112,13 @@ export async function invokeCommand(commandName, opts = {}) {
     plan,
     planPath,
     extra: opts.extra,
-    findingsPath: opts.findingsPath,
     gateLog: opts.gateLog,
+    // A hard gate reports its verdict through a file. Telling it the absolute
+    // path here, rather than trusting the playbook to mention one, is what makes
+    // the contract survive a playbook edit — pr-gate shipped for a week writing
+    // only a text report, so every run ended "produced no verdict" and the
+    // pipeline could never reach a PR.
+    findingsPath: agent.hard_gate ? findingsPath : undefined,
     args: opts.args,
     flags: opts.flags,
   });
@@ -132,7 +144,6 @@ export async function invokeCommand(commandName, opts = {}) {
   // A hard gate reads its verdict from a file the agent writes. A file left by
   // the previous fixer round would be read as THIS round's verdict, so the loop
   // could exit on a stale SHIP. Delete before, and only trust what reappears.
-  const findingsPath = join(wt, FINDINGS_FILE);
   if (agent.hard_gate) rmSync(findingsPath, { force: true });
 
   const result = runLlm(prompt, {
@@ -179,6 +190,7 @@ export async function invokeCommand(commandName, opts = {}) {
     provider: result.provider,
     verdict,
     verdictError,
+    findingsPath,
     plan: planOut,
     planPath,
     wt,
