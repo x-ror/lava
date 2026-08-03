@@ -247,11 +247,15 @@ switch (cmd) {
   case 'drain':
   case 'loop': {
     // Full automation: select → worktree → agent → gates → PR → next
-    const r = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'run-loop.mjs'), ...rest], {
-      cwd: ROOT,
-      stdio: 'inherit',
-      env: process.env,
-    });
+    const r = spawnSync(
+      process.execPath,
+      [join(dirname(fileURLToPath(import.meta.url)), 'run-loop.mjs'), ...rest],
+      {
+        cwd: ROOT,
+        stdio: 'inherit',
+        env: process.env,
+      },
+    );
     process.exit(r.status ?? 1);
     break;
   }
