@@ -1,0 +1,140 @@
+name: Agent system
+
+# Self-start for the autonomous pipeline. This is the executable copy of the
+# `triggers` block in config/pipeline.json — before this file existed, that block
+# was documentation and nothing ever fired it.
+#
+# INERT BY DEFAULT. Every job is gated on the repository variable
+# AGENT_AUTOSTART == 'true' (Settings → Secrets and variables → Actions →
+# Variables). Until you set it, this workflow costs nothing and does nothing.
+# It also needs ANTHROPIC_API_KEY as a repository secret; without it the CLI has
+# no credentials and the run fails fast rather than opening an empty PR.
+#
+# Cost warning: a single drain runs planner + odin-feature + critic + pr-gate
+# (+ up to 3 fixer rounds) per issue, each a full agent session. Start with
+# --max 1 and workflow_dispatch before enabling the schedule.
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created]
+  schedule:
+    # Every 30 minutes, matching the `schedule` entry in config/pipeline.json.
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      issues:
+        description: 'Comma-separated issue numbers (blank = drain ready queue)'
+        required: false
+        type: string
+      max:
+        description: 'Maximum issues to process'
+        required: false
+        default: '1'
+        type: string
+
+# One agent run at a time: two drains would race on the same ready issues and
+# on the bench lock.
+concurrency:
+  group: agent-system
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: write
+
+jobs:
+  dispatch:
+    name: Run agent pipeline
+    runs-on: ubuntu-latest
+    # `github.event.issue.pull_request` is set only on PR comments; a comment on
+    # a plain issue is not a PR command. The comment body check keeps the job
+    # from booting a full toolchain for every "thanks".
+    if: |
+      vars.AGENT_AUTOSTART == 'true' &&
+      (github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/'))
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install JavaScriptCoreGTK (6.0), SQLite and OpenSSL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjavascriptcoregtk-6.0-dev libsqlite3-dev libssl-dev pkg-config
+
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '24'
+          cache: true
+          run-install: true
+
+      - name: Setup Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          llvm-version: '18'
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Fail fast without credentials
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::AGENT_AUTOSTART is on but ANTHROPIC_API_KEY is unset."
+            echo "The pipeline would run under provider 'none', which is a no-op."
+            exit 1
+          fi
+
+      - name: Configure git identity for agent commits
+        run: |
+          git config --global user.name 'lava-agent[bot]'
+          git config --global user.email 'lava-agent@users.noreply.github.com'
+
+      - name: Dispatch
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_PROVIDER: claude
+          EVENT: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ISSUE: ${{ github.event.issue.number }}
+          INPUT_ISSUES: ${{ inputs.issues }}
+          INPUT_MAX: ${{ inputs.max }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            issues)
+              node workflows/triggers/issues.mjs --once
+              ;;
+            issue_comment)
+              node workflows/triggers/pr-comments.mjs \
+                --comment-body "$COMMENT_BODY" --issue "$COMMENT_ISSUE"
+              ;;
+            schedule)
+              node workflows/triggers/schedule.mjs --max 1 --provider claude
+              ;;
+            workflow_dispatch)
+              if [ -n "${INPUT_ISSUES:-}" ]; then
+                node commands/index.mjs run-pipeline \
+                  --issues "$INPUT_ISSUES" --provider claude --source trigger
+              else
+                node commands/index.mjs run-pipeline \
+                  --max "${INPUT_MAX:-1}" --provider claude --source trigger
+              fi
+              ;;
+          esac
+
+      - name: Upload run state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-state-${{ github.run_id }}
+          path: .agent-state/
+          if-no-files-found: ignore
+          retention-days: 14

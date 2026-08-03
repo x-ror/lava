@@ -1,6 +1,6 @@
 {
   "name": "feature-pipeline",
-  "description": "New task → planner → odin-feature → critic → pr-gate → (fixer loop) → Create PR. PR only after pr-gate SHIP/SHIP-AFTER. Never merge.",
+  "description": "New task → planner → odin-feature → critic → gates → pr-gate → (fixer loop) → Create PR. PR only after pr-gate SHIP/SHIP-AFTER. Never merge.",
   "triggers": [
     { "type": "issue.labeled", "labels": ["agent-ready", "lava-ready"] },
     { "type": "issue.opened", "require_lava_task": true },
@@ -12,6 +12,7 @@
     { "type": "gate.failure", "action": "fixer" },
     { "type": "manual", "entry": "commands/index.mjs run-pipeline" }
   ],
+  "//triggers": "Documentation of what .github/workflows/agent-system.yml is wired to fire. Nothing reads this block at runtime — the workflow file is the executable copy, and workflows/triggers/*.mjs are the handlers.",
   "graph": {
     "entry": "select",
     "nodes": {
@@ -32,8 +33,14 @@
       "critic": {
         "type": "command",
         "command": "critic",
+        "next": "gates",
+        "on_fail": "gates"
+      },
+      "gates": {
+        "type": "system",
+        "action": "gates",
         "next": "pr-gate",
-        "on_fail": "pr-gate"
+        "//": "The pipeline runs the routed mechanical gates itself. pr-gate runs them too, but that run is self-reported by the agent; this one is the trust boundary and is what sets gateRed for the verdict aggregator. Red routes to fixer via forceNext."
       },
       "pr-gate": {
         "type": "command",
@@ -41,13 +48,14 @@
         "hard_gate": true,
         "on_ship": "create-pr",
         "on_ship_after": "create-pr",
-        "on_block": "fixer"
+        "on_block": "fixer",
+        "//": "Fail-closed: anything that is not a machine-readable SHIP / SHIP-AFTER takes on_block, including a crash, a turn-limit exit, or a run under provider `none`. See workflows/engine.test.mjs."
       },
       "fixer": {
         "type": "command",
         "command": "fixer",
         "max_rounds": 3,
-        "next": "pr-gate",
+        "next": "gates",
         "on_stall": "terminal.needs-human"
       },
       "create-pr": { "type": "system", "action": "draft_pr", "next": "terminal.done" },

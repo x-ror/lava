@@ -1,23 +1,117 @@
 /**
  * Feature pipeline — default autonomous DAG:
- *   select → planner → odin-feature → critic → pr-gate → (fixer)* → draft PR
+ *   select → planner → odin-feature → critic → gates → pr-gate → (fixer)* → draft PR
  *
  * Every agent step goes through invokeCommand() — the same function slash
  * commands use. The system does not bypass the command layer.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { runGraph } from './engine.mjs';
 import { saveState, loadState, newRunId, appendEvent } from './durable.mjs';
 import { selectReadyIssues, createDraftPr, isHumanOnly } from '../runtime/github.mjs';
 import { bootstrapWorktree } from '../runtime/worktree.mjs';
 import { runGates } from '../runtime/gates/run-gates.mjs';
-import { ROOT, STATE_DIR, CONFIG_PIPELINE } from '../runtime/paths.mjs';
+import { ROOT, STATE_DIR } from '../runtime/paths.mjs';
 import { invokeCommand } from '../commands/invoke.mjs';
 
 function loadPipelineConfig() {
   const p = join(ROOT, 'config/pipeline.json');
   return JSON.parse(readFileSync(p, 'utf8'));
+}
+
+/**
+ * System-node handlers for one issue.
+ *
+ * `deps` exists so the two decisions that can push code off this machine — is
+ * the gate green, and may a PR be opened — are testable without a worktree, a
+ * toolchain, or a network. They were untestable and therefore untested.
+ *
+ * @param {object} issue
+ * @param {{ runGates?: Function, createDraftPr?: Function }} [deps]
+ */
+export function makeHandlers(issue, deps = {}) {
+  const gates = deps.runGates || runGates;
+  const openPr = deps.createDraftPr || createDraftPr;
+
+  return {
+    select: async () => ({}),
+
+    // The trust boundary. pr-gate runs the mechanical gates too, but that run is
+    // self-reported by the agent; this one is the pipeline's own, and it is what
+    // sets gateRed — which the aggregator turns into BLOCK regardless of what
+    // the findings file claims.
+    gates: async (s) => {
+      if (s.dryRun) {
+        return { gateRed: false, gateUnrun: true, gateLog: '(dry run: gates not executed)' };
+      }
+      const g = gates(s.wt, s.env || {});
+      if (!g.ok) {
+        console.log(`[pipeline #${issue.number}] gates RED at ${g.failed}`);
+        return {
+          forceNext: 'fixer',
+          gateRed: true,
+          gateUnrun: false,
+          gateLog: g.log,
+          gateFailed: g.failed,
+        };
+      }
+      return { gateRed: false, gateUnrun: false, gateLog: null, gateTargets: g.targets };
+    },
+
+    draft_pr: async (s) => {
+      if (!s.createPr || s.dryRun) {
+        return { pr: null, prSkipped: true };
+      }
+      // Defense in depth: the graph only routes here on SHIP / SHIP-AFTER, but
+      // this is the single place a PR can be created, so it re-checks rather
+      // than trusting the edge it arrived on.
+      const v = s.verdict?.verdict;
+      if (v !== 'SHIP' && v !== 'SHIP-AFTER') {
+        return {
+          pr: null,
+          prBlocked: `verdict ${v || 'none'} — a PR requires SHIP or SHIP-AFTER`,
+          forceNext: 'terminal.needs-human',
+        };
+      }
+
+      // Final gate before anything leaves the machine, mutations included. The
+      // fix→verify loop skips `make test-mutation` because it re-applies the
+      // whole manifest; skipping it everywhere would be gate-weakening
+      // (CLAUDE.md §6), so it runs exactly once, here.
+      const final = gates(s.wt, s.env || {}, { runMutation: true });
+      if (!final.ok) {
+        return {
+          forceNext: 'fixer',
+          gateRed: true,
+          gateLog: final.log,
+          prBlocked: `final gate red at ${final.failed}`,
+        };
+      }
+
+      const title = `fix: ${s.issue.title}`.slice(0, 72);
+      const body = `Closes #${s.issue.number}
+
+## Summary
+Autonomous agent pipeline for #${s.issue.number}.
+
+## pr-gate
+Verdict: ${s.verdict?.verdict || 'unknown'}
+Reason: ${s.verdict?.reason || '(none)'}
+
+## Gates
+Ran: ${(final.targets || []).join(', ') || 'make check'}
+
+## Test plan
+- [ ] Routed mechanical gates (above) re-checked by a human
+- [ ] Human review before merge
+
+Merge is human-only. Never auto-merged.
+`;
+      const pr = openPr({ title, body, branch: s.branch, cwd: s.wt });
+      return { pr: pr.url || null, prOk: pr.ok, prError: pr.error };
+    },
+  };
 }
 
 /**
@@ -34,10 +128,13 @@ export async function runIssuePipeline(issue, opts = {}) {
 
   if (!state) {
     // Bootstrap isolation up front so every command shares one worktree.
-    const boot =
-      opts.dryRun && opts.skipBootstrap
-        ? { wt: process.cwd(), branch: `agent/${issue.number}`, env: {} }
-        : bootstrapWorktree(issue.number);
+    // `--no-worktree` runs the graph in place — a development path for
+    // exercising the DAG without a bun install. It must never push, so it forces
+    // --no-pr rather than opening a PR from the main tree.
+    const inPlace = opts.worktree === false;
+    const boot = inPlace
+      ? { wt: opts.cwd || process.cwd(), branch: null, env: {} }
+      : bootstrapWorktree(issue.number);
     state = {
       runId,
       issue,
@@ -50,90 +147,32 @@ export async function runIssuePipeline(issue, opts = {}) {
       maxTurns: opts.maxTurns,
       maxFixRounds: cfg.policy?.max_fix_rounds || 3,
       fixRound: 0,
-      createPr: opts.createPr !== false,
+      createPr: opts.createPr !== false && !inPlace,
+      source: opts.source || 'workflow',
       history: [],
     };
     saveState(runId, state);
   }
 
-  const handlers = {
-    select: async (s) => {
-      // already selected; advance
-      return {};
-    },
-    draft_pr: async (s) => {
-      if (!s.createPr || s.dryRun) {
-        return { pr: null, prSkipped: true };
-      }
-      // Hard rule: only after pr-gate SHIP / SHIP-AFTER
-      const v = s.verdict?.verdict;
-      if (v !== 'SHIP' && v !== 'SHIP-AFTER') {
-        // If agent did not write findings, run mechanical gates as stand-in.
-        const gates = runGates(s.wt, s.env || {});
-        if (!gates.ok) {
-          return {
-            forceNext: 'fixer',
-            gateLog: gates.log,
-            prBlocked: 'gates red before PR',
-          };
-        }
-        // No structured verdict but gates green → allow draft with SHIP-AFTER note
-        s.verdict = { verdict: 'SHIP-AFTER', reason: 'mechanical gates green; no findings file' };
-      }
-      const title = `fix: ${s.issue.title}`.slice(0, 72);
-      const body = `Closes #${s.issue.number}
-
-## Summary
-Autonomous agent pipeline for #${s.issue.number}.
-
-## pr-gate
-Verdict: ${s.verdict?.verdict || 'unknown'}
-Reason: ${s.verdict?.reason || '(none)'}
-
-## Test plan
-- [ ] Routed mechanical gates
-- [ ] Human review before merge
-
-Merge is human-only. Never auto-merged.
-`;
-      const pr = createDraftPr({
-        title,
-        body,
-        branch: s.branch,
-        cwd: s.wt,
-      });
-      return { pr: pr.url || null, prOk: pr.ok, prError: pr.error };
-    },
-  };
-
   const finalState = await runGraph({
     graph: cfg.graph,
     state,
-    handlers,
+    handlers: makeHandlers(issue),
     maxSteps: 40,
     onStep: (step) => {
       appendEvent(runId, {
         node: step.node,
         next: step.next,
         ok: step.result?.ok,
-        verdict: step.result?.verdict?.verdict,
+        verdict: step.state?.verdict?.verdict,
       });
       saveState(runId, step.state);
       console.log(
         `[pipeline #${issue.number}] ${step.node} → ${step.next || '∅'}` +
-          (step.result?.verdict ? ` [${step.result.verdict.verdict}]` : ''),
+          (step.state?.verdict ? ` [${step.state.verdict.verdict}]` : ''),
       );
     },
   });
-
-  // If graph used command nodes without hard verdict, ensure PR only after gates.
-  if (
-    finalState.node === 'create-pr' ||
-    finalState.status === 'done' ||
-    finalState.history?.some((h) => h.node === 'create-pr')
-  ) {
-    /* handled */
-  }
 
   saveState(runId, finalState);
   mkdirSync(STATE_DIR, { recursive: true });
@@ -145,6 +184,8 @@ Merge is human-only. Never auto-merged.
         issue: issue.number,
         status: finalState.status,
         pr: finalState.pr,
+        prBlocked: finalState.prBlocked,
+        verdict: finalState.verdict,
         history: finalState.history,
       },
       null,
@@ -153,13 +194,14 @@ Merge is human-only. Never auto-merged.
   );
 
   return {
-    ok: finalState.status === 'done',
+    ok: finalState.status === 'done' && !finalState.prBlocked,
     status: finalState.status || finalState.node,
     runId,
     issue: issue.number,
     wt: finalState.wt,
     branch: finalState.branch,
     pr: finalState.pr,
+    prBlocked: finalState.prBlocked,
     verdict: finalState.verdict,
     history: finalState.history,
   };
@@ -180,6 +222,10 @@ export async function runPipeline(opts = {}) {
     return { ok: true, results: [], queue: [] };
   }
 
+  if (opts.worktree === false && opts.createPr !== false) {
+    console.warn('[pipeline] --no-worktree implies --no-pr (refusing to push the main tree)');
+  }
+
   console.log(`[pipeline] queue: ${queue.map((i) => '#' + i.number).join(', ')}`);
   const results = [];
   let n = 0;
@@ -187,10 +233,13 @@ export async function runPipeline(opts = {}) {
     if (n >= max) break;
     n++;
     try {
-      // For dry-run with provider none, still useful to invoke planner only etc.
+      // Prompt-only sweep: bootstrap once, write every agent's prompt, run no
+      // LLM. Useful for reading what the system would send before paying for it.
       if (opts.dryRun && opts.provider === 'none') {
-        // Lightweight path: bootstrap + write prompts for each command without LLM
-        const boot = bootstrapWorktree(issue.number);
+        const boot =
+          opts.worktree === false
+            ? { wt: opts.cwd || process.cwd(), branch: null, env: {} }
+            : bootstrapWorktree(issue.number);
         for (const cmd of ['planner', 'odin-feature', 'critic', 'pr-gate']) {
           await invokeCommand(cmd, {
             issue,
@@ -200,7 +249,7 @@ export async function runPipeline(opts = {}) {
             env: boot.env,
             worktree: false,
             dryRun: true,
-            source: 'workflow',
+            source: opts.source || 'workflow',
           });
         }
         results.push({

@@ -892,8 +892,8 @@
       "name": "gate-integrity dies when the NODE_BIN rule is removed",
       "why": "Without this rule agents set NODE_BIN=./bin/lava and every oracle becomes lava-vs-lava green.",
       "source": "runtime/gates/integrity.mjs",
-      "find": "    id: 'node-bin-override',\n    reason: 'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',\n    re: /\\bNODE_BIN\\s*=/,\n  },",
-      "replace": "    id: 'node-bin-override',\n    reason: 'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',\n    re: /(?!)/,\n  },",
+      "find": "    id: 'node-bin-override',\n    reason:\n      'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',\n    re: /\\bNODE_BIN\\s*=/,\n  },",
+      "replace": "    id: 'node-bin-override',\n    reason:\n      'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',\n    re: /(?!)/,\n  },",
       "gate": "node-test:runtime/gates/integrity.test.mjs",
       "expect_detail": "blocks: node-bin-override"
     },
@@ -954,6 +954,66 @@
         "must not be keyed by line number",
         "internal/util.js:ansiRegex",
         "Expected values to be strictly equal"
+      ]
+    },
+    {
+      "name": "worktree isolation dies when the bootstrap path loses its pid suffix",
+      "why": "A dropped $ collapses every bootstrap of one task onto a single path, so the second attempt hits the existence guard and the pipeline for that issue can never retry. This shipped once, in the rename out of scripts/agent-cycle/.",
+      "source": "runtime/worktree-bootstrap.sh",
+      "find": "WT_BASE=\"$PARENT/lava-wt-$SAFE_BRANCH-$$\"",
+      "replace": "WT_BASE=\"$PARENT/lava-wt-$SAFE_BRANCH-$\"",
+      "gate": "node-test:runtime/worktree.test.mjs",
+      "expect_detail": [
+        "distinct worktree paths",
+        "notEqual"
+      ]
+    },
+    {
+      "name": "engine verdict routing dies when a missing pr-gate verdict is treated as shippable",
+      "why": "Fail-open hard gate: a pr-gate that crashed, timed out, or ran under provider none returns ok with no findings file, and reading that as SHIP-AFTER opens a draft PR with zero mechanical gates run.",
+      "source": "workflows/engine.mjs",
+      "find": "        else next = node.on_block || node.on_fail || node.next;",
+      "replace": "        else next = node.on_ship_after || node.on_ship || node.next;",
+      "gate": "node-test:workflows/engine.test.mjs",
+      "expect_detail": [
+        "a missing verdict is BLOCK",
+        "a PR was opened without a verdict"
+      ]
+    },
+    {
+      "name": "draft-pr guard dies when a non-SHIP verdict can still open a PR",
+      "why": "ARCHITECTURE rule 3 and CLAUDE.md section 7: a draft PR may exist only after pr-gate returned SHIP or SHIP-AFTER. Without the re-check, one edited graph edge is enough to auto-open PRs off BLOCK.",
+      "source": "workflows/pipeline.mjs",
+      "find": "      if (v !== 'SHIP' && v !== 'SHIP-AFTER') {",
+      "replace": "      if (false && v !== 'SHIP' && v !== 'SHIP-AFTER') {",
+      "gate": "node-test:workflows/pipeline.test.mjs",
+      "expect_detail": [
+        "never opens a PR",
+        "prBlocked"
+      ]
+    },
+    {
+      "name": "the derived DAG dies when a closed prerequisite stops counting as satisfied",
+      "why": "The graph shrinks as work lands because an edge pointing outside the open set is a landed dependency. Break that and every epic stays blocked by issues that already shipped, and the queue drains to nothing with work still available.",
+      "source": "runtime/dag.mjs",
+      "find": "    if (!byNumber.has(prerequisite)) return; // closed: already satisfied",
+      "replace": "    if (false) return; // closed: already satisfied",
+      "gate": "node-test:runtime/dag.test.mjs",
+      "expect_detail": [
+        "does not block either",
+        "blocked-by naming a closed issue"
+      ]
+    },
+    {
+      "name": "the derived DAG dies when a checklist above the first tier joins the queue",
+      "why": "The master queue issue opens with trackers and house rules before the ordered section. A checkbox up there is someone notes; counted as a queue item it can mark real work done and drop it from the drain.",
+      "source": "runtime/dag.mjs",
+      "find": "    if (m && tier !== null) tiers.set(Number(m[2]), { tier, done: m[1] !== ' ' });",
+      "replace": "    if (m) tiers.set(Number(m[2]), { tier, done: m[1] !== ' ' });",
+      "gate": "node-test:runtime/dag.test.mjs",
+      "expect_detail": [
+        "above the first tier heading",
+        "pre-tier item leaked"
       ]
     }
   ]

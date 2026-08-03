@@ -60,7 +60,7 @@ Options:
   --provider NAME    grok | claude | codex | none | auto
   --cwd PATH         Working directory / existing worktree
   --worktree         Force isolated worktree (default for system invokes)
-  --no-worktree      Stay in cwd
+  --no-worktree      Stay in cwd; for run-pipeline this also forces --no-pr
   --dry-run          Write prompt only
   --max-turns N      Headless turn budget
   --once / --max N   Pipeline drain limits
@@ -119,7 +119,6 @@ async function main() {
           .map((s) => Number(s.trim()))
       : undefined,
     createPr: flags['no-pr'] ? false : true,
-    skipReview: !!flags['skip-review'],
   };
 
   const result = await invokeCommand(cmd, opts);
