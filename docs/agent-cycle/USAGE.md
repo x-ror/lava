@@ -67,7 +67,7 @@ node scripts/agent-cycle/run-loop.mjs --agent auto
 ## Flags
 
 | Flag | Meaning |
-|------|---------|
+| ------ | --------- |
 | `--once` | One issue, then exit |
 | `--max N` | Cap issues this run (default 20) |
 | `--issues a,b,c` | Explicit queue (numbers) |
@@ -97,6 +97,7 @@ git -C /home/tymch/lava-wt-agent-cycle-*-* status -sb
 
 Current run-loop streams agent stdout/stderr live (`stdio: inherit`) and uses
 `--prompt-file` so you see progress.
+
 ---
 
 ## What happens per issue
@@ -161,7 +162,7 @@ Implement #335 per docs/agent-cycle-plan.md …
 ## Stop conditions
 
 | Condition | Behavior |
-|-----------|----------|
+| ----------- | ---------- |
 | Queue empty | exit 0 |
 | `--max` reached | stop |
 | Gates red after 3 fixes | mark needs-human, continue next |

@@ -97,6 +97,7 @@ area: util
 ```
 
 **Acceptance (residual only):**
+
 - [ ] `util.inspect` honors `maxArrayLength` / `maxStringLength` (Node defaults) — contract comment + node probe
 - [ ] oracle case: long array/string truncated like node; control-char path remains green
 - [ ] routed L0/L1 green (`util.js` paths)
@@ -108,12 +109,14 @@ Implementation exists (`path.js` matchesGlob). Residual = fidelity gaps in issue
 ### #104 — util/console residual
 
 Shipped since filing: `promisify` / `callbackify` / `inherits` / `types`. Residual candidates:
+
 - `console.Console` constructor (comment in `console.js`: not yet provided)
 - any remaining inspect/format/%d/%i / getter-invocation gaps — **must re-probe** before coding
 
 ### #105 — events.once({signal})
 
 `once(emitter, name)` is 2-arg only (`events.js`); `on(..., {signal})` exists. Residual:
+
 - [ ] `events.once(emitter, name, { signal })` aborts like Node
 - [ ] confirm `defaultMaxListeners` is live (setter path present — may already be OK)
 
@@ -131,6 +134,7 @@ area: fetch
 ```
 
 **Acceptance:**
+
 - [ ] Address-list connect fallback already on master — document in issue, do not reimplement
 - [ ] Happy Eyeballs (RFC 8305 stagger IPv6/IPv4) **or** explicit “wontfix / later epic” decision
 - [ ] design-only first (`odin-feature --design-only`) before implement
@@ -142,6 +146,7 @@ Rewrite title/body to current ratios (remeasure `make bench` buffer-to-hex/base6
 ### #35 — CI toolchain residual
 
 Partially done: `actions/checkout@v7`, Node 24 via `setup-vp`, `setup-odin@v2`. Residual:
+
 - pin **specific** Odin release (not floating default) if still floating
 - macOS/Windows CI still intentionally disabled — document or drop from Acceptance
 - document toolchain in repo if not already
@@ -203,6 +208,7 @@ area: loader,process,console
 ```
 
 **Acceptance:**
+
 - [ ] Contract: `require('node:process')` / `require('node:console')` always return the init-time intrinsic (node probe after `globalThis.process = {}` before require)
 - [ ] Red oracle case under `tests/node-compat/cases/` — fails before fix, green after under node-vs-lava
 - [ ] Capture via eager load and/or `natives` 4th factory arg — not a live global read in a lazy factory (`CLAUDE.md` §5 / #333 class)
@@ -222,6 +228,7 @@ area: errors
 ```
 
 **Acceptance:**
+
 - [ ] Node probe: coded TypeError `toString()` / first stack line includes `[ERR_*]` while `name === 'TypeError'`
 - [ ] Shared construction path (JS and/or `errors.odin`) — not six hand-rolled formatters
 - [ ] Oracle case covering JS-layer + native-thrown coded error
@@ -241,6 +248,7 @@ area: timers,eventloop
 ```
 
 **Acceptance:**
+
 - [ ] `setTimeout`/`setInterval`/`setImmediate` return handle with `.ref()`/`.unref()` (node probe)
 - [ ] Unreffed-only interval does not keep process alive; ref'd does
 - [ ] `clearTimeout`/`clearInterval` accept handle and numeric id
@@ -261,6 +269,7 @@ area: globals,process
 ```
 
 **Acceptance:**
+
 - [ ] Globals `btoa`/`atob` present; round-trip oracle (reuse Buffer base64)
 - [ ] `process.hrtime()` → `[s, ns]`; `process.hrtime.bigint()` monotonic BigInt
 - [ ] Back hrtime with existing monotonic clock (`performance.now` path)
@@ -280,6 +289,7 @@ area: loader,require
 ```
 
 **Acceptance:**
+
 - [ ] `require.resolve(spec)` absolute path (reuse `resolve_module_path`)
 - [ ] `require.main` entry module; `require.cache` registry (may stage resolve first)
 - [ ] Oracle: resolve idempotent + main/cache shape vs node
@@ -299,6 +309,7 @@ area: loader,esm
 ```
 
 **Acceptance:**
+
 - [ ] `await import('./x.mjs')` resolves via Lava loader (not bare JSC)
 - [ ] Named + default export readable; relative path works
 - [ ] Oracle case; design-only first (`esm.js` / native bridge)
@@ -318,6 +329,7 @@ area: util
 ```
 
 **Acceptance:**
+
 - [ ] `allowNegative: true` → `--no-foo` boolean negation (node probe)
 - [ ] default-args under eval-mode argv per issue body
 - [ ] Oracle + L0+L1 (`parse_args.js`)
@@ -336,6 +348,7 @@ area: util
 ```
 
 **Acceptance:** (from issue checklist — each independently oracled)
+
 - [ ] promisify custom idempotency (`promisify(promisify(custom))`)
 - [ ] callbackify `length === original.length + 1`; falsy rejection `ERR_FALSY_VALUE_REJECTION`
 - [ ] deprecate checks `noDeprecation` at call time; preserves prototype for constructors
