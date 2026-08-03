@@ -114,9 +114,14 @@ export function shouldDispatch(issue, record, now = Date.now()) {
  *
  * The marker still carries data (`blocked-by`), which runtime/dag.mjs reads.
  * Data from an untrusted body is fine; permission from it is not.
+ *
+ * @param {object[]} [issues] injectable so the rule can be tested without `gh`.
+ *   The first test of this asserted on isAgentReady instead — a function the
+ *   mutation does not touch — so the manifest entry named a gate that passed
+ *   with the filter fully broken.
  */
-export function discoverTriggeredIssues() {
-  return listOpenIssues().filter(isAgentReady);
+export function discoverTriggeredIssues(issues = listOpenIssues()) {
+  return issues.filter(isAgentReady);
 }
 
 /**

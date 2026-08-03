@@ -1032,8 +1032,8 @@
       "name": "trigger permission dies when an issue body can grant itself a run",
       "why": "The repository is public and an issue body is written by whoever opened it. Treating a lava-task marker as permission let a stranger enqueue an agent, and the dispatch path passes explicit issue numbers, which is the manual override that skips the label check.",
       "source": "workflows/triggers/issues.mjs",
-      "find": "  return listOpenIssues().filter(isAgentReady);",
-      "replace": "  return listOpenIssues().filter((i) => isAgentReady(i) || /lava-task/.test(i.body || \"\"));",
+      "find": "  return issues.filter(isAgentReady);",
+      "replace": "  return issues.filter((i) => isAgentReady(i) || /lava-task/.test(i.body || \"\"));",
       "gate": "node-test:commands/review-fixes.test.mjs",
       "expect_detail": [
         "an issue body granted itself a run",
@@ -1060,8 +1060,8 @@
       "replace": "      break;",
       "gate": "node-test:runtime/lock.test.mjs",
       "expect_detail": [
-        "an increment was lost",
-        "timed out"
+        "a held lock blocks",
+        "lose no increment"
       ]
     },
     {
