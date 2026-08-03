@@ -54,8 +54,11 @@ node commands/index.mjs run-pipeline --issues 91 --provider claude
 # Poll ready issues (label agent-ready / lava-ready / lava-task block)
 node workflows/triggers/issues.mjs --once
 
-# Scheduled drain (wire to cron every 30m)
-node workflows/triggers/schedule.mjs --max 3 --provider grok
+# Scheduled drain. Use the wrapper from cron, not this line directly: cron runs
+# with a near-empty environment and PATH ~= /usr/bin:/bin, and node/claude live
+# under $HOME. The wrapper also takes a lock, so a 30-minute tick cannot stack
+# drains on top of a run that takes hours.
+./scripts/agent-loop.sh --max 1 --provider claude
 
 # PR comment contains /pr-gate
 node workflows/triggers/pr-comments.mjs --comment-body '/pr-gate' --pr 42
