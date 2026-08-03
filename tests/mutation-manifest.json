@@ -1053,16 +1053,22 @@
       ]
     },
     {
-      "name": "the ledger lock dies when the critical section stops being exclusive",
-      "why": "The dispatch ledger is a read-modify-write of one whole JSON file. Two pollers interleaving load and save lose an attempt count or a completion, and the in-flight guard only helps if the claim that sets it is atomic with the check that reads it.",
+      "name": "the ledger lock dies when a held lock stops excluding a second holder",
+      "why": "Mutual exclusion. Two pollers interleaving load and save on the dispatch ledger lose an attempt count or a completion, and the in-flight guard only helps if the claim that sets it is atomic with the check that reads it. Paired with the lost-update entry on the same mutation: expect_detail arrays are any-of, so one array naming both properties is satisfied by either alone.",
       "source": "runtime/lock.mjs",
       "find": "      mkdirSync(lockPath);\n      break;",
       "replace": "      break;",
       "gate": "node-test:runtime/lock.test.mjs",
-      "expect_detail": [
-        "a held lock blocks",
-        "lose no increment"
-      ]
+      "expect_detail": "a held lock blocks"
+    },
+    {
+      "name": "the ledger lock dies when concurrent writers stop keeping every increment",
+      "why": "Lost updates, the effect exclusion exists to prevent. Three processes each doing 25 locked read-modify-writes must total 75; without the lock a save overwrites an increment another process just made. Paired with the exclusion entry on the same mutation, because a single expect_detail array would accept either property on its own.",
+      "source": "runtime/lock.mjs",
+      "find": "      mkdirSync(lockPath);\n      break;",
+      "replace": "      break;",
+      "gate": "node-test:runtime/lock.test.mjs",
+      "expect_detail": "lose no increment"
     },
     {
       "name": "the claude retry dies when a signal-killed run is retried",
