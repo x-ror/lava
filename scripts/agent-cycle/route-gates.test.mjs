@@ -16,7 +16,9 @@ test('loader.js routes strict + smokes (not silent drop of **.js)', () => {
 
 test('buffer path routes bun-buffer + api-surface (non-CI)', () => {
   const r = routePaths(['pkg/runtime/buffer.odin']);
-  assert.ok(r.nonCi.includes('make bun-buffer-tests') || r.targets.includes('make bun-buffer-tests'));
+  assert.ok(
+    r.nonCi.includes('make bun-buffer-tests') || r.targets.includes('make bun-buffer-tests'),
+  );
   assert.ok(r.targets.includes('make api-surface'));
 });
 

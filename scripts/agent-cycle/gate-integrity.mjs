@@ -26,7 +26,8 @@ export const RULES = [
   },
   {
     id: 'node-bin-override',
-    reason: 'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',
+    reason:
+      'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',
     re: /\bNODE_BIN\s*=/,
   },
   {
@@ -41,7 +42,8 @@ export const RULES = [
   },
   {
     id: 'skip-known-gaps',
-    reason: 'SKIP_KNOWN_LAVA_GAPS= on the command line weakens oracle coverage; make recipes set it internally',
+    reason:
+      'SKIP_KNOWN_LAVA_GAPS= on the command line weakens oracle coverage; make recipes set it internally',
     re: /\bSKIP_KNOWN_LAVA_GAPS\s*=/,
   },
   {
@@ -61,7 +63,8 @@ export const RULES = [
   },
   {
     id: 'baseline-shell-write',
-    reason: 'shell rewrite/delete of a baseline, gaps, settings, or gate-integrity file is human-only',
+    reason:
+      'shell rewrite/delete of a baseline, gaps, settings, or gate-integrity file is human-only',
     re: /(?:\b(?:rm|mv|cp|tee|truncate)\b|\b(?:sed|perl|awk)\b[^\n]*\s-(?:i|i\w)|(?:^|[\s;|&])(?:cat|printf)\b[^\n]*>)[^\n]*(?:pollution-baseline\.json|known-lava-gaps\.txt|primordials\.baseline|mutation-manifest\.json|thresholds\.json|case-counts\.json|settings\.json|gate-integrity\.(?:mjs|sh|json)|compare\.sh)/i,
   },
   {
@@ -71,7 +74,8 @@ export const RULES = [
   },
   {
     id: 'delete-oracle-or-bench',
-    reason: 'deleting oracle cases / benches / bin/lava hides coverage without failing a counter until the next run',
+    reason:
+      'deleting oracle cases / benches / bin/lava hides coverage without failing a counter until the next run',
     re: /\b(?:rm|mv)\b[^\n]*(?:tests\/(?:node-compat|runtime|std|property|stdio)\/|bench\/(?:micro|macro)\/|bin\/lava\b)|\bgit\s+rm\b[^\n]*(?:tests\/(?:node-compat|runtime|std|property|stdio)\/|bench\/(?:micro|macro)\/)/i,
   },
   {
@@ -81,7 +85,8 @@ export const RULES = [
   },
   {
     id: 'git-stash-cycle',
-    reason: 'git stash push/pop/apply is forbidden in the agent cycle (shared refs/stash across worktrees); list is ok',
+    reason:
+      'git stash push/pop/apply is forbidden in the agent cycle (shared refs/stash across worktrees); list is ok',
     re: /\bgit\s+stash\s+(?:push|pop|apply|drop|save|clear|create|store)\b|\bgit\s+stash\s*$|\bgit\s+stash\s+-/,
   },
   {
@@ -127,21 +132,14 @@ export const PROTECTED_WRITE_PATHS = [
 ];
 
 /** Prefixes: any path under these is hard-blocked for Edit/Write. */
-export const PROTECTED_WRITE_PREFIXES = [
-  '.github/workflows/',
-  '.claude/hooks/',
-  '.grok/hooks/',
-];
+export const PROTECTED_WRITE_PREFIXES = ['.github/workflows/', '.claude/hooks/', '.grok/hooks/'];
 
 /**
  * Policy-only note for docs. Hard-blocked paths above supersede this list —
  * human work on them requires disabling hooks / editing outside the agent.
  * Kept so `human-required-paths.md` and the skill stay aligned.
  */
-export const HUMAN_REQUIRED_PATHS = [
-  ...PROTECTED_WRITE_PATHS,
-  ...PROTECTED_WRITE_PREFIXES,
-];
+export const HUMAN_REQUIRED_PATHS = [...PROTECTED_WRITE_PATHS, ...PROTECTED_WRITE_PREFIXES];
 
 /**
  * @param {string} command
@@ -166,7 +164,9 @@ export function checkWritePath(filePath) {
   if (!filePath) return { blocked: false };
   const norm = filePath.replace(/\\/g, '/');
   const rootNorm = ROOT.replace(/\\/g, '/');
-  let rel = norm.startsWith(rootNorm) ? norm.slice(rootNorm.length).replace(/^\//, '') : norm.replace(/^\.\//, '');
+  let rel = norm.startsWith(rootNorm)
+    ? norm.slice(rootNorm.length).replace(/^\//, '')
+    : norm.replace(/^\.\//, '');
   // Absolute paths outside the repo: still match by suffix on protected basenames.
   for (const p of PROTECTED_WRITE_PATHS) {
     if (rel === p || rel.endsWith('/' + p) || rel.endsWith(p)) {
@@ -225,17 +225,13 @@ export function extractCommandFromHookInput(input) {
   if (typeof ti.cmd === 'string') return { kind: 'bash', command: ti.cmd };
   // Edit / Write / search_replace
   const path =
-    ti.file_path ||
-    ti.filePath ||
-    ti.path ||
-    ti.target_file ||
-    ti.targetFile ||
-    ti.file ||
-    '';
+    ti.file_path || ti.filePath || ti.path || ti.target_file || ti.targetFile || ti.file || '';
   const tool = String(input.tool_name || input.toolName || input.tool || '');
   if (
     /edit|write|search_replace|str_replace/i.test(tool) ||
-    (path && !/read/i.test(tool) && (ti.old_string != null || ti.new_string != null || ti.content != null))
+    (path &&
+      !/read/i.test(tool) &&
+      (ti.old_string != null || ti.new_string != null || ti.content != null))
   ) {
     return { kind: 'write', path: String(path) };
   }
@@ -324,8 +320,6 @@ function main() {
   process.exit(0);
 }
 
-const isMain =
-  process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMain) main();

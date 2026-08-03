@@ -25,7 +25,11 @@ const FLOOR_CLASSES = new Set(['parity', 'safety', 'security', 'gate-weakening',
  */
 export function normalizeFinding(f) {
   const out = { ...f };
-  if (out.class && FLOOR_CLASSES.has(out.class) && (out.severity === 'P2' || out.severity === 'nit')) {
+  if (
+    out.class &&
+    FLOOR_CLASSES.has(out.class) &&
+    (out.severity === 'P2' || out.severity === 'nit')
+  ) {
     out.severity = 'P1';
     out.severity_note = `raised from ${f.severity}: class ${out.class} cannot be P2`;
   }

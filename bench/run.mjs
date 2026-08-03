@@ -170,9 +170,7 @@ const reportOnly = new Set(thresholdsFile.report_only || []);
   // micro: buffer, encoding, json, require, url (+ noop excluded) + macro: fs = 6
   const minFiles = 0;
   if (benchFileCount < minFiles) {
-    console.error(
-      `gate-integrity: found ${benchFileCount} bench files, expected >= ${minFiles}`,
-    );
+    console.error(`gate-integrity: found ${benchFileCount} bench files, expected >= ${minFiles}`);
     process.exit(1);
   }
 }

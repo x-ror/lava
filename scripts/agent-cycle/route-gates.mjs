@@ -43,7 +43,13 @@ export const TIERS = {
 };
 
 /** Always-run mechanical set for any non-empty diff. */
-export const ALWAYS = ['make check', 'make build', 'make test', 'make test-lava', 'make test-odin-serial'];
+export const ALWAYS = [
+  'make check',
+  'make build',
+  'make test',
+  'make test-lava',
+  'make test-odin-serial',
+];
 
 /**
  * Route rules: each entry is { match: (relPath) => bool, targets: string[], tier: 'L0'|'L1'|'L2' }
@@ -94,7 +100,13 @@ const ROUTES = [
   },
   {
     re: globToRe('pkg/jsc/**'),
-    targets: ['make test-odin', 'make bun-buffer-tests', 'make api-surface', 'make bench-gate', 'make test-lava-nohostfn'],
+    targets: [
+      'make test-odin',
+      'make bun-buffer-tests',
+      'make api-surface',
+      'make bench-gate',
+      'make test-lava-nohostfn',
+    ],
   },
   {
     re: globToRe('pkg/runtime/http.odin'),
@@ -345,6 +357,5 @@ function main() {
   console.log(JSON.stringify({ paths, ...result }, null, 2));
 }
 
-const isMain =
-  process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) main();

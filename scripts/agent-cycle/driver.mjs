@@ -126,7 +126,13 @@ function cmdSelect() {
     for (const n of fallback) {
       const hit = issues.find((i) => i.number === n);
       if (hit && !isHumanOnlyIssue(hit)) {
-        console.log(JSON.stringify({ number: hit.number, title: hit.title, source: 'bucket-a-fallback' }, null, 2));
+        console.log(
+          JSON.stringify(
+            { number: hit.number, title: hit.title, source: 'bucket-a-fallback' },
+            null,
+            2,
+          ),
+        );
         return;
       }
     }
@@ -153,11 +159,15 @@ function cmdPlan(num) {
   const issue = JSON.parse(raw);
   if (isHumanOnlyIssue(issue)) {
     console.log(
-      JSON.stringify({
-        number: issue.number,
-        terminal: 'needs-human-decision',
-        reason: 'human-only heuristic or label',
-      }, null, 2),
+      JSON.stringify(
+        {
+          number: issue.number,
+          terminal: 'needs-human-decision',
+          reason: 'human-only heuristic or label',
+        },
+        null,
+        2,
+      ),
     );
     return;
   }
@@ -231,6 +241,8 @@ switch (cmd) {
     cmdAggregate(rest);
     break;
   default:
-    console.error('usage: driver.mjs status|select|plan <n>|route [--from-git|paths...]|aggregate <files>');
+    console.error(
+      'usage: driver.mjs status|select|plan <n>|route [--from-git|paths...]|aggregate <files>',
+    );
     process.exit(2);
 }
