@@ -29,7 +29,17 @@
           "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
           "class": {
             "type": "string",
-            "description": "parity | safety | security | gate-weakening | style | other — floors severity"
+            "enum": [
+              "parity",
+              "safety",
+              "security",
+              "gate-weakening",
+              "memory-safety",
+              "perf",
+              "style",
+              "other"
+            ],
+            "description": "Drives the severity floor. parity, safety, security, gate-weakening and memory-safety can never be P2 — aggregate-verdict.mjs raises them to P1. The rest are informational. Unconstrained before, and the vocabulary had already drifted: memory-safety was floored by the aggregator and named nowhere here, so an auditor reading this file did not know the class existed."
           }
         }
       }

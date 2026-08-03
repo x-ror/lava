@@ -17,8 +17,21 @@ const MAX_P0 = Number(process.env.MAX_P0 || 2);
 const GATE_RED = process.env.GATE_RED === '1';
 const GATE_UNRUN = process.env.GATE_UNRUN === '1' || process.env.GATE_PENDING === '1';
 
-/** Classes that must never be demoted to P2 (CLAUDE.md §1 / plan F3). */
-const FLOOR_CLASSES = new Set(['parity', 'safety', 'security', 'gate-weakening', 'memory-safety']);
+/**
+ * Classes that must never be demoted to P2 (CLAUDE.md §1 / plan F3).
+ *
+ * Exported so `findings-schema.json` can be held to it: the schema left `class`
+ * unconstrained and its description listed five of these, omitting
+ * `memory-safety` — a class this set floors and no auditor reading the schema
+ * would have known to use.
+ */
+export const FLOOR_CLASSES = new Set([
+  'parity',
+  'safety',
+  'security',
+  'gate-weakening',
+  'memory-safety',
+]);
 
 /**
  * @param {object} f

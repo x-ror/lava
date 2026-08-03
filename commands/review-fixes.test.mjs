@@ -293,3 +293,52 @@ test('the verdict example in the playbook is not fiction', async () => {
   assert.equal(aggregate([doc]).verdict, 'SHIP-AFTER');
   assert.equal(aggregate([{ agent: 'pr-gate', findings: [] }]).verdict, 'SHIP');
 });
+
+test('one findings path is used for the prompt, the cleanup and the read', async () => {
+  // The prompt honoured opts.findingsPath while cleanup and read-back still used
+  // the default, so a caller passing a path would have the gate write to one
+  // file and the aggregator read another — "no verdict", or worse, a stale one.
+  const dir = mkdtempSync(join(tmpdir(), 'lava-fp2-'));
+  try {
+    const custom = join(dir, 'custom-findings.json');
+    // A stale file at the custom path must be cleared, exactly like the default.
+    writeFileSync(custom, JSON.stringify({ agent: 'stale', findings: [] }));
+    const r = await invokeCommand('pr-gate', {
+      issue: { number: 1, title: 't', body: '' },
+      cwd: dir,
+      findingsPath: custom,
+      provider: 'none',
+      worktree: false,
+      source: 'human',
+    });
+    const prompt = readFileSync(join(dir, '.agent-prompt.txt'), 'utf8');
+    assert.match(prompt, new RegExp(`Verdict file \\(REQUIRED\\): ${custom}`));
+    assert.equal(r.findingsPath, custom, 'the result reported a different path');
+    assert.equal(r.verdict, null, 'a stale file at the custom path was read as this run');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('every class the aggregator floors is a class the schema documents', async () => {
+  // `class` decides the P1 floor and the schema left it unconstrained, so the
+  // vocabulary lived in two places. It had already drifted: the aggregator
+  // floors `memory-safety`, which the schema description never listed.
+  const { ROOT } = await import('../runtime/paths.mjs');
+  const { FLOOR_CLASSES } = await import('../runtime/gates/aggregate-verdict.mjs');
+  const schema = JSON.parse(readFileSync(join(ROOT, 'runtime/gates/findings-schema.json'), 'utf8'));
+  const documented = schema.properties.findings.items.properties.class.enum;
+  assert.ok(Array.isArray(documented), 'class has no enum — any string passes');
+  for (const c of FLOOR_CLASSES) {
+    assert.ok(documented.includes(c), `aggregator floors "${c}" but the schema omits it`);
+  }
+});
+
+test('the documented example uses a class the schema allows', async () => {
+  const { ROOT } = await import('../runtime/paths.mjs');
+  const md = readFileSync(join(ROOT, 'agents/prompts/pr-gate.md'), 'utf8');
+  const doc = JSON.parse(md.match(/## Step 5b[\s\S]*?```json\n([\s\S]*?)```/)[1]);
+  const schema = JSON.parse(readFileSync(join(ROOT, 'runtime/gates/findings-schema.json'), 'utf8'));
+  const allowed = schema.properties.findings.items.properties.class.enum;
+  for (const f of doc.findings) assert.ok(allowed.includes(f.class), `bad class ${f.class}`);
+});
