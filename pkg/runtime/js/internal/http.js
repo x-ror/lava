@@ -18,7 +18,19 @@
   }
 
   var EventEmitter = require('events');
-  var Buffer = require('buffer').Buffer;
+  // Pristine, from the loader: this module is LAZY, so its own capture would run after
+  // user code and be steerable (#333).
+  var PristineBuffer = require.pristineBuffer;
+  var BufferFrom = PristineBuffer.from;
+  var BufferAlloc = PristineBuffer.alloc;
+  var BufferConcat = PristineBuffer.concat;
+  // The chunked decoder frames NETWORK-CONTROLLED bytes; every read below was live off
+  // `Buffer.prototype`. Measured before this: replacing `toString` so a size line "5" reads
+  // as "1" turned a valid chunked POST into 400 here, while node (llhttp, in C) delivered
+  // the body unchanged.
+  var BufferPrototypeToString = PristineBuffer.bufferToString;
+  var BufferPrototypeIndexOf = PristineBuffer.bufferIndexOf;
+  var BufferPrototypeSlice = PristineBuffer.bufferSlice;
   var net = require('net');
   /** Pristine intrinsics — response head must not use overridable Buffer methods. */
   var primordials = require('primordials');
@@ -197,8 +209,8 @@
     return code;
   }
 
-  var CRLF = Buffer.from('\r\n', 'latin1');
-  var LAST_CHUNK = Buffer.from('0\r\n\r\n', 'latin1');
+  var CRLF = BufferFrom('\r\n', 'latin1');
+  var LAST_CHUNK = BufferFrom('0\r\n\r\n', 'latin1');
   /** Max combined head+body size for single-write coalesce. */
   var HEAD_BODY_COALESCE_MAX = 64 * 1024;
 
@@ -234,8 +246,8 @@
    * @returns {Buffer}
    */
   function frameChunkedBody(bodyChunk) {
-    return Buffer.concat([
-      Buffer.from(bodyChunk.length.toString(16) + '\r\n', 'latin1'),
+    return BufferConcat([
+      BufferFrom(bodyChunk.length.toString(16) + '\r\n', 'latin1'),
       bodyChunk,
       CRLF,
     ]);
@@ -253,7 +265,7 @@
    * @returns {function(Buffer|undefined): void} feed
    */
   function createChunkedDecoder(request, onError, onComplete) {
-    var buffer = Buffer.alloc(0);
+    var buffer = BufferAlloc(0);
     var state = 'size';
     var bytesRemaining = 0;
     var finished = false;
@@ -266,17 +278,17 @@
     return function feed(incoming) {
       if (finished) return;
       if (incoming && incoming.length) {
-        buffer = buffer.length ? Buffer.concat([buffer, incoming]) : incoming;
+        buffer = buffer.length ? BufferConcat([buffer, incoming]) : incoming;
       }
       for (;;) {
         if (state === 'size') {
-          var lineEnd = buffer.indexOf('\r\n');
+          var lineEnd = BufferPrototypeIndexOf(buffer, '\r\n');
           if (lineEnd < 0) {
             if (buffer.length > MAX_CHUNK_LINE_BYTES) fail();
             return;
           }
           if (lineEnd > MAX_CHUNK_LINE_BYTES) return fail();
-          var sizeLine = buffer.toString('latin1', 0, lineEnd);
+          var sizeLine = BufferPrototypeToString(buffer, 'latin1', 0, lineEnd);
           var extensionSep = sizeLine.indexOf(';');
           var sizeToken = extensionSep >= 0 ? sizeLine.slice(0, extensionSep) : sizeLine;
           if (!allChars(sizeToken, isAsciiHexDigit)) return fail();
@@ -284,7 +296,7 @@
             return fail();
           var chunkSize = parseIntG(sizeToken, 16);
           if (!NumberIsSafeInteger(chunkSize) || chunkSize < 0) return fail();
-          buffer = buffer.slice(lineEnd + 2);
+          buffer = BufferPrototypeSlice(buffer, lineEnd + 2);
           if (chunkSize === 0) state = 'trailer';
           else {
             bytesRemaining = chunkSize;
@@ -293,32 +305,32 @@
         } else if (state === 'data') {
           if (buffer.length === 0) return;
           var take = buffer.length < bytesRemaining ? buffer.length : bytesRemaining;
-          request.emit('data', buffer.slice(0, take));
-          buffer = buffer.slice(take);
+          request.emit('data', BufferPrototypeSlice(buffer, 0, take));
+          buffer = BufferPrototypeSlice(buffer, take);
           bytesRemaining -= take;
           if (bytesRemaining === 0) state = 'dataCRLF';
         } else if (state === 'dataCRLF') {
           if (buffer.length < 2) return;
           if (buffer[0] !== 13 || buffer[1] !== 10) return fail();
-          buffer = buffer.slice(2);
+          buffer = BufferPrototypeSlice(buffer, 2);
           state = 'size';
         } else {
           if (buffer.length < 2) return;
           if (buffer[0] === 13 && buffer[1] === 10) {
-            buffer = buffer.slice(2);
+            buffer = BufferPrototypeSlice(buffer, 2);
             finished = true;
             return onComplete(buffer);
           }
-          var trailerEnd = buffer.indexOf('\r\n');
+          var trailerEnd = BufferPrototypeIndexOf(buffer, '\r\n');
           if (trailerEnd < 0) {
             if (buffer.length > MAX_CHUNK_LINE_BYTES) fail();
             return;
           }
           if (trailerEnd > MAX_CHUNK_LINE_BYTES) return fail();
-          var trailerLine = buffer.toString('latin1', 0, trailerEnd);
+          var trailerLine = BufferPrototypeToString(buffer, 'latin1', 0, trailerEnd);
           var colon = trailerLine.indexOf(':');
           if (colon <= 0 || !isHttpToken(trailerLine.slice(0, colon))) return fail();
-          buffer = buffer.slice(trailerEnd + 2);
+          buffer = BufferPrototypeSlice(buffer, trailerEnd + 2);
         }
       }
     };
@@ -559,7 +571,7 @@
     }
     var ok = true;
     if (!omitBody && chunk && chunk.length) {
-      var bytes = typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk;
+      var bytes = typeof chunk === 'string' ? BufferFrom(chunk, encoding || 'utf8') : chunk;
       // The socket's return value IS the backpressure signal: false means the
       // native write buffer crossed its high-water mark and a 'drain' is owed
       // (forwarded to this response by _drainForwarder). Swallowing it here
@@ -588,7 +600,7 @@
 
     var body = null;
     if (chunk !== undefined && chunk !== null) {
-      body = typeof chunk === 'string' ? Buffer.from(chunk, encoding || 'utf8') : chunk;
+      body = typeof chunk === 'string' ? BufferFrom(chunk, encoding || 'utf8') : chunk;
     }
     var omitBody = this._isHead || statusHasNoBody(this.statusCode);
     if (!this.headersSent) {
@@ -647,7 +659,7 @@
     return reTest(CONNECTION_KEEPALIVE_RE, connection);
   }
 
-  var EMPTY_BUFFER = Buffer.alloc(0);
+  var EMPTY_BUFFER = BufferAlloc(0);
   var DEADLINE_SWEEP_MS = 100;
 
   /**
@@ -838,7 +850,7 @@
       clearAllDeadlines();
       var reason = STATUS_CODES[statusCode] || 'Error';
       socket.write(
-        Buffer.from(
+        BufferFrom(
           'HTTP/1.1 ' +
             statusCode +
             ' ' +
@@ -1016,10 +1028,10 @@
       deadlines.idleUntil = 0;
       if (!receivingRequest) beginReceiveDeadlines();
       if (parsingHead) {
-        pendingBytes = pendingBytes.length ? Buffer.concat([pendingBytes, chunk]) : chunk;
+        pendingBytes = pendingBytes.length ? BufferConcat([pendingBytes, chunk]) : chunk;
         processRequestHead();
       } else if (requestBodyComplete) {
-        pendingBytes = pendingBytes.length ? Buffer.concat([pendingBytes, chunk]) : chunk;
+        pendingBytes = pendingBytes.length ? BufferConcat([pendingBytes, chunk]) : chunk;
       } else if (chunkedDecoder) {
         chunkedDecoder(chunk);
       } else {

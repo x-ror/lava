@@ -208,7 +208,14 @@ Rules that keep this from becoming ceremony:
   `.byteOffset`, `.byteLength`, `.constructor`, `__proto__` — use a captured
   getter such as `TypedArrayPrototypeGetBuffer`), and `global` (a replaceable
   global read live instead of captured at module-eval, which the loader runs
-  before user code). Computed and destructured forms count the same as the dot
+  before user code).
+  **Module-eval capture is pristine only in a module the loader instantiates BEFORE user
+  code** — the eager list in `loader.js`, plus `stream`/`stdio` via `installStdio`. A LAZY
+  module's factory runs on the user's first `require()`, so a capture there is a live read
+  in disguise: `var StringG = String` at the top of `net.js` scores 0 and is still
+  steerable. Take the handle from the loader instead (`require('primordials')`,
+  `require.pristineBuffer`). The ratchet cannot see this — it exempts every module-eval
+  capture, which is why #333 shipped. Computed and destructured forms count the same as the dot
   form, so `view['buffer']` is not a way to lower a number.
 - A false positive takes `// primordials-ok` on the line. On a line carrying
   candidates from **more than one class** the bare marker suppresses nothing —

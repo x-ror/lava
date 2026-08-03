@@ -84,16 +84,16 @@
     "global": 0
   },
   "internal/http.js": {
-    "method": 35,
+    "method": 21,
     "invoke": 5,
     "accessor": 0,
-    "global": 30
+    "global": 21
   },
   "internal/https.js": {
-    "method": 2,
+    "method": 0,
     "invoke": 0,
     "accessor": 0,
-    "global": 10
+    "global": 8
   },
   "internal/loader.js": {
     "method": 2,
@@ -117,13 +117,13 @@
     "method": 2,
     "invoke": 2,
     "accessor": 3,
-    "global": 11
+    "global": 9
   },
   "internal/os.js": {
     "method": 12,
     "invoke": 0,
     "accessor": 1,
-    "global": 10
+    "global": 7
   },
   "internal/parse_args.js": {
     "method": 0,

@@ -656,8 +656,8 @@
       "name": "62-fs-read-buffer dies when the pristine Buffer capture moves back into fs.js",
       "why": "fs.js is a LAZY module, so a `require('buffer').Buffer` capture at its module-eval reads whatever user code left there — a dependency's top-level `require('buffer').Buffer = shim` then steers and discloses every fs read. loader.js snapshots it right after buffer is instantiated, where the ordering is provable.",
       "source": "pkg/runtime/js/internal/fs.js",
-      "find": "  var BufferFrom = native.bufferFrom;",
-      "replace": "  var BufferFrom = require('buffer').Buffer.from;",
+      "find": "  var PristineBuffer = require.pristineBuffer;",
+      "replace": "  var PristineBuffer = require('buffer').Buffer;",
       "gate": "compat:tests/node-compat/cases/63-fs-buffer-capture.js",
       "expect_detail": [
         "must not steer the read",
@@ -884,6 +884,94 @@
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
       "expect_detail": [
         "setDefaultEncoding must validate"
+      ]
+    },
+    {
+      "name": "65-lazy-buffer-capture dies when a module resolves Buffer itself instead of taking the loader's",
+      "why": "net.js is a LAZY module, so its own require('buffer') runs on the user's first require of net — after user code. Node is not steerable this way; measured, sock.write('PAYLOAD') delivered \"PAYLOAD\" on node and \"TAMPERED\" here.",
+      "source": "pkg/runtime/js/internal/net.js",
+      "find": "  var PristineBuffer = require.pristineBuffer;",
+      "replace": "  var PristineBuffer = { Buffer: require('buffer').Buffer, from: require('buffer').Buffer.from, alloc: require('buffer').Buffer.alloc, concat: require('buffer').Buffer.concat, isBuffer: require('buffer').Buffer.isBuffer };",
+      "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
+      "expect_detail": [
+        "net must not resolve Buffer through the shim"
+      ]
+    },
+    {
+      "name": "65-lazy-buffer-capture dies when Buffer.from is read off the constructor at call time",
+      "why": "Capturing the CONSTRUCTOR is not enough: `.from` is a writable member read off it at call time, so `Buffer.from = evil` steers a module holding a pristine constructor. This is the half the first version of the fix missed — the object is not the method, the same lesson as Symbol.for in util.js.",
+      "source": "pkg/runtime/js/internal/net.js",
+      "find": "  var BufferFrom = PristineBuffer.from;",
+      "replace": "  var BufferFrom = function (v, a, b) { return PristineBuffer.Buffer.from(v, a, b); };",
+      "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
+      "expect_detail": [
+        "a replaced Buffer.from must not steer net either"
+      ]
+    },
+    {
+      "name": "65-lazy-buffer-capture dies when os.userInfo reads Buffer.from at call time",
+      "why": "os.userInfo originally re-read the live export on EVERY call, so it was steerable at any time — a case that only swaps things before the first require cannot see it. This mutation restores a call-time read while leaving the module-eval capture intact, so it pins the call-time half alone.",
+      "source": "pkg/runtime/js/internal/os.js",
+      "find": "  var BufferFrom = PristineBuffer.from;",
+      "replace": "  var BufferFrom = function (v, a, b) { return PristineBuffer.Buffer.from(v, a, b); };",
+      "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
+      "expect_detail": [
+        "os must not read Buffer.from at call time"
+      ]
+    },
+    {
+      "name": "65-lazy-buffer-capture dies when http.js resolves Buffer itself",
+      "why": "http.js was migrated with NO test behind it: reverting this one line left every gate green while the measured divergence returned. Two of five migrated modules were unpinned until this entry.",
+      "source": "pkg/runtime/js/internal/http.js",
+      "find": "  var PristineBuffer = require.pristineBuffer;",
+      "replace": "  var PristineBuffer = { Buffer: require('buffer').Buffer, from: require('buffer').Buffer.from, alloc: require('buffer').Buffer.alloc, concat: require('buffer').Buffer.concat, isBuffer: require('buffer').Buffer.isBuffer, bufferToString: function (b, e, a, c) { return b.toString(e, a, c); }, bufferIndexOf: function (b, n) { return b.indexOf(n); }, bufferSlice: function (b, a, c) { return b.slice(a, c); } };",
+      "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
+      "expect_detail": [
+        "http response body must not be steered"
+      ]
+    },
+    {
+      "name": "65-lazy-buffer-capture dies when the chunked reassembly reads Buffer.concat live",
+      "why": "http.js's chunked decoder reassembles across TCP segments with concat; a poisoned concat that reorders the parts desynchronises the size line from its body. This is framing over network-controlled bytes, not a cosmetic read.",
+      "source": "pkg/runtime/js/internal/http.js",
+      "find": "  var BufferConcat = PristineBuffer.concat;",
+      "replace": "  var BufferConcat = function (l, t) { return require('buffer').Buffer.concat(l, t); };",
+      "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
+      "expect_detail": [
+        "http chunked framing must not be steered"
+      ]
+    },
+    {
+      "name": "65-lazy-buffer-capture dies when the chunk size is read through a live toString",
+      "why": "The size line is read with buffer.toString('latin1', 0, lineEnd). A replacement that INFLATES the size is a request-smuggling primitive; node frames HTTP in C (llhttp) and is not steerable at all.",
+      "source": "pkg/runtime/js/internal/http.js",
+      "find": "  var BufferPrototypeToString = PristineBuffer.bufferToString;",
+      "replace": "  var BufferPrototypeToString = function (b, e, a, c) { return b.toString(e, a, c); };",
+      "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
+      "expect_detail": [
+        "http chunked framing must not be steered"
+      ]
+    },
+    {
+      "name": "65-lazy-buffer-capture dies when the framing cursor advances through a live slice",
+      "why": "The decoder advances past each size line and body with slice; a corrupted cursor leaves a stray byte and desynchronises every later chunk.",
+      "source": "pkg/runtime/js/internal/http.js",
+      "find": "  var BufferPrototypeSlice = PristineBuffer.bufferSlice;",
+      "replace": "  var BufferPrototypeSlice = function (b, a, c) { return b.slice(a, c); };",
+      "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
+      "expect_detail": [
+        "http chunked framing must not be steered"
+      ]
+    },
+    {
+      "name": "65-lazy-buffer-capture dies when net's INBOUND wrap reads Buffer live",
+      "why": "net's asBuffer wraps every 'data' chunk — the DISCLOSURE direction. The write-side assertion alone leaves it green while a shim reads every inbound byte.",
+      "source": "pkg/runtime/js/internal/net.js",
+      "find": "  var BufferFrom = PristineBuffer.from;",
+      "replace": "  var BufferFrom = function (v, a, b) { return require('buffer').Buffer.from(v, a, b); };",
+      "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
+      "expect_detail": [
+        "net must not resolve Buffer through the shim"
       ]
     }
   ]

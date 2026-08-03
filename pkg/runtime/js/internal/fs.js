@@ -42,11 +42,14 @@
   // later fs read. An earlier revision did exactly that and justified it with "buffer.js
   // is eager-loaded" — true of the MODULE, not of this capture.
   //
-  // loader.js snapshots the pristine functions right after it instantiates buffer, where
-  // the ordering is provable, and passes them through `native`.
-  var BufferFrom = native.bufferFrom;
-  var BufferIsEncoding = native.bufferIsEncoding;
-  var BufferPrototypeToString = P.uncurryThis(native.bufferToString);
+  // loader.js snapshots Buffer right after it instantiates the module, where the ordering
+  // is provable, and hands it to every internal module as `require.pristineBuffer`. This
+  // used to arrive through fs's own `natives` object; unified so there is ONE mechanism —
+  // http.js, net.js, https.js and os.js all needed the same thing (#333).
+  var PristineBuffer = require.pristineBuffer;
+  var BufferFrom = PristineBuffer.from;
+  var BufferIsEncoding = PristineBuffer.isEncoding;
+  var BufferPrototypeToString = PristineBuffer.bufferToString;
 
   // Node renders the offending value with util.inspect in BOTH templates, so a string
   // comes out quoted and everything else bare. Verified against node 24.18.1:

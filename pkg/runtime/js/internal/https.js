@@ -16,7 +16,12 @@
   }
 
   var http = require('http');
-  var { Buffer } = require('buffer');
+  // Pristine, from the loader — see #333; a capture here runs after user code.
+  var PristineBuffer = require.pristineBuffer;
+  var Buffer = PristineBuffer.Buffer;
+  var BufferFrom = PristineBuffer.from;
+  var BufferPrototypeToString = PristineBuffer.bufferToString;
+  var BufferIsBuffer = PristineBuffer.isBuffer;
 
   function unsupported(name) {
     var e = new Error(
@@ -63,8 +68,13 @@
       throw e;
     }
     if (typeof value === 'string') return value;
-    if (Buffer.isBuffer(value)) return value.toString('utf8');
-    if (value instanceof Uint8Array) return Buffer.from(value).toString('utf8');
+    // `value.toString('utf8')` would read the method off the INSTANCE, i.e. through the
+    // mutable `Buffer.prototype`. This is the TLS key/cert ingestion path: a replacement
+    // returning a valid PEM makes the server present a certificate of the attacker's
+    // choosing. Node is not steerable here (measured: `outcome=created steeredPEMReads=0`
+    // with `Buffer.prototype.toString` replaced; Lava read it twice and threw).
+    if (BufferIsBuffer(value)) return BufferPrototypeToString(value, 'utf8');
+    if (value instanceof Uint8Array) return BufferPrototypeToString(BufferFrom(value), 'utf8');
     if (Array.isArray(value)) {
       var ae = new Error(
         "node:https (M1) supports a single '" +

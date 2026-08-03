@@ -13,16 +13,19 @@
   }
 
   var EventEmitter = require('events');
-  var { Buffer } = require('buffer');
+  // Pristine, from the loader — see #333; a capture here runs after user code.
+  var PristineBuffer = require.pristineBuffer;
+  var Buffer = PristineBuffer.Buffer;
+  var BufferFrom = PristineBuffer.from;
 
   // Wrap native bytes (a Uint8Array) as a Buffer view over the same memory (no copy),
   // so 'data' yields a Buffer like Node.
   function asBuffer(u8) {
-    return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
+    return BufferFrom(u8.buffer, u8.byteOffset, u8.byteLength);
   }
 
   function toBytes(data, encoding) {
-    if (typeof data === 'string') return Buffer.from(data, encoding || 'utf8');
+    if (typeof data === 'string') return BufferFrom(data, encoding || 'utf8');
     return data; // Buffer / Uint8Array — native reads it directly
   }
 

@@ -12,6 +12,18 @@
 (function (require, module, exports, native) {
   'use strict';
 
+  // Pristine, from the loader. This was read LIVE inside userInfo() — re-resolved on
+  // every call, so `require('buffer').Buffer = shim` steered it at any time, not merely
+  // before the first require of this module (#333).
+  // Through primordials, not captured here: this module is lazy (#333).
+  var OsPrimordials = require('primordials');
+  var StringG = OsPrimordials.String;
+  var StringPrototypeToLowerCase = OsPrimordials.StringPrototypeToLowerCase;
+  var PristineBuffer = require.pristineBuffer;
+  var BufferFrom = PristineBuffer.from;
+  var BufferPrototypeToString = PristineBuffer.bufferToString;
+  var BufferIsEncoding = PristineBuffer.isEncoding;
+
   if (!native) {
     throw new Error('node:os is unavailable: native bindings missing');
   }
@@ -552,20 +564,53 @@
   // encoding (utf8, latin1, an unknown name, a non-object options arg) yields the
   // decoded strings — Node treats 'buffer' as the sole Buffer trigger. uid/gid are
   // -1 on Windows.
+  /**
+   * @param {{encoding?: string}} [options]
+   * @returns {{uid:number, gid:number, username:*, homedir:*, shell:*}} A NULL-PROTOTYPE
+   *          object, as node returns.
+   * @node Verified on node 24.18.1, and three things here are easy to get wrong:
+   *       - the result has a null prototype (`typeof info.hasOwnProperty === 'undefined'`);
+   *       - the encoding goes through node's ParseEncoding, so it is CASE-INSENSITIVE:
+   *         'buffer', 'BUFFER' and 'bUfFeR' all yield Buffers;
+   *       - any other known encoding TRANSCODES the strings rather than being ignored —
+   *         'hex' gives "74796d6368", 'base64' "dHltY2g=", 'ucs2' the utf16 reading.
+   *       An earlier comment here claimed 'buffer' was the sole trigger; it is not.
+   * @deviates none
+   */
   function userInfo(options) {
     var info = native.userInfo();
     var encoding = options && options.encoding;
-    if (encoding === 'buffer') {
-      var Buffer = require('buffer').Buffer;
-      return {
-        uid: info.uid,
-        gid: info.gid,
-        username: Buffer.from(info.username, 'utf8'),
-        homedir: Buffer.from(info.homedir, 'utf8'),
-        shell: info.shell === null ? null : Buffer.from(info.shell, 'utf8'),
-      };
+    // Null-prototype, matching node: this object is handed to user code and a `toString`
+    // or `hasOwnProperty` inherited from Object.prototype is an observable difference.
+    var out = { __proto__: null, uid: info.uid, gid: info.gid };
+    if (encoding === undefined || encoding === null) {
+      out.username = info.username;
+      out.homedir = info.homedir;
+      out.shell = info.shell;
+      return out;
     }
-    return info;
+    var enc = typeof encoding === 'string' ? StringPrototypeToLowerCase(encoding) : '';
+    if (enc === 'buffer') {
+      out.username = BufferFrom(info.username, 'utf8');
+      out.homedir = BufferFrom(info.homedir, 'utf8');
+      out.shell = info.shell === null ? null : BufferFrom(info.shell, 'utf8');
+      return out;
+    }
+    // An UNRECOGNIZED encoding is not an error on node — ParseEncoding answers UNKNOWN and
+    // the plain string is returned. Measured: 'not-an-encoding', '', false, 0, 123 and {}
+    // all give "tymch", none throws. An earlier revision here routed the unknown name into
+    // Buffer#toString, which threw ERR_UNKNOWN_ENCODING and broke case 35-os.
+    if (!BufferIsEncoding(enc)) {
+      out.username = info.username;
+      out.homedir = info.homedir;
+      out.shell = info.shell;
+      return out;
+    }
+    out.username = BufferPrototypeToString(BufferFrom(info.username, 'utf8'), enc);
+    out.homedir = BufferPrototypeToString(BufferFrom(info.homedir, 'utf8'), enc);
+    out.shell =
+      info.shell === null ? null : BufferPrototypeToString(BufferFrom(info.shell, 'utf8'), enc);
+    return out;
   }
 
   // ---- arg validation: Node's validateInt32, reproducing the ERR_* code/message

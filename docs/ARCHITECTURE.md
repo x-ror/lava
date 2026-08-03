@@ -146,6 +146,17 @@ fetch, sqlite, dns, fs, net, http(s), os, tty, stdio — twelve today, see
 the spec surface is readable JS, the sharp edges are native, and the seam is one
 well-defined argument.
 
+A second, JS-side channel hangs off the loader's **internal** resolver. `loader.js`
+snapshots the pristine `Buffer` operations right after it eager-instantiates `buffer` and
+attaches them to the `req` it passes each factory, so an internal module reads them as
+`require.pristineBuffer`. This is NOT public API: the property lives on `req`, never on the
+`publicReq` that `native_require_cb` consults, so user code's `require.pristineBuffer` is
+`undefined` (verified) and cannot read or overwrite the table.
+It exists because a LAZY module's own `require('buffer').Buffer` runs on the user's first
+require of that module — after user code, and therefore steerable (#333). `fs`, `http`,
+`https`, `net` and `os` take it; `stream` and `stdio` do not need it because `installStdio`
+instantiates them during bootstrap.
+
 The JS layer is substantial and high quality: `url.js` (2071 LOC, WHATWG URL),
 `streams.js` (2027, Web Streams), `buffer.js` (1646), `fetch.js` (1054),
 `crypto.js` (917). Errors use Node-shaped coded errors (`ERR_INVALID_ARG_TYPE`,

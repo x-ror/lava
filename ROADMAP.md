@@ -196,259 +196,40 @@ coupling.
       in-tree Odin codecs; correctness is already pinned by case 62, so that case going
       byte-identical is the acceptance test. Gated now by `fs-read-utf8-1k` /
       `fs-read-utf8-64k` / `fs-read-bin-1k`, which did not exist before.
-- [ ] **Lazy internal modules capture mutable module exports**
-      ([#333](https://github.com/x-ror/lava/issues/333)) — §5's "capture at module-eval"
-      rule holds only for the modules `loader.js` instantiates eagerly. `http.js`,
-      `net.js`, `stream.js`, `https.js` and `os.js` each capture `require('buffer').Buffer`
-      at their own lazy eval, so user code that runs first can steer them. `fs.js` had the
-      same defect and is fixed; the ratchet cannot see this class.
-- [ ] **`util.inspect` does not escape control characters**
-      ([#331](https://github.com/x-ror/lava/issues/331)) — `\t`, `\r`, `\f`, `\b`, `\v`,
-      `\x00`, `\x1B`, `\x7F` and lone surrogates are emitted raw where node escapes them
-      (uppercase hex, `\x0B` not `\v`). An unescaped `\x1B` makes any `util.inspect` log
-      line an ANSI-injection vector, and a lone surrogate is replaced with U+FFFD rather
-      than escaped, so the value is lossy. Also missing node's `maxArrayLength` (100) and
-      `maxStringLength` (10000) caps: inspecting a 300 000-element array yields 900 KB
-      where node yields 345 bytes, which an fs error message can carry.
-- [x] **The primordials ratchet cannot see accessor reads, and reports 0
-      anyway** — fixed: it parses with acorn and counts four classes, each
-      baselined separately — `method`, `invoke` (`.call`/`.apply`), `accessor`
-      (reads through a configurable prototype getter) and `global` (a
-      replaceable global read live instead of captured). Verified against the
-      defect that motivated it: at `07676d8^` — the commit inside #320 that
-      actually carried the vector — `encoding.js` scores 10 accessor sites
-      including `units.buffer` at line 360, against a then-recorded baseline of
-      0, so the tool exits 1 and names the line a reviewer had to find by eye.
-      (An earlier version of this entry cited `401ea40`; that revision predates
-      the vector and scores 8 accessor sites on the neighbouring `bytes.buffer`
-      read.) The detector self-tests on every run against known-positive and
-      known-negative fixtures with exact per-class counts, and refuses to report
-      on the tree _or to rebaseline_ if one regresses — a blind control is worse
-      than none. `--update` also refuses to raise a floor without
-      `--allow-raise`.
-      Do not copy the tree totals into prose; `pollution-baseline.json` is the
-      source and `make check-primordials` prints the live number. Scope is now
-      all of `pkg/runtime/js`, not just `internal/` — the real 371-line
-      `console.js` was outside the scan while the baseline described the 7-line
-      re-export, so the report read as "console is hardened".
-      One vector remains on the author (an object literal indexed by a
-      caller-supplied key needs `__proto__: null`), and two more are uncounted for
-      two different reasons: `for…of`/spread/`Symbol.toPrimitive` read a well-known
-      SYMBOL, so there is no named property to count, whereas `Object.prototype.then`
-      is an ordinary named property the detector DOES count when written
-      (`p.then(cb)` scores 1 `method`) and misses only when `await`/`Promise.resolve`
-      read it implicitly. That last one is also a plain data property settable by an
-      ordinary merge gadget — the sharpest uncounted vector, and its own item below.
-- [x] **Route the network-facing regex validators through a captured `exec`** —
-      done for `http.js` (9 sites), `url.js` (6) and `fetch.js` (1). Proven before
-      being fixed, over a real socket against the actual server: with
-      `RegExp.prototype.exec` replaced — an ordinary assignment, it is a writable
-      data property — `Content-Length: abc` answered **200 OK** instead of 400 and
-      `Transfer-Encoding: gzip` was accepted as chunked, while the other 18
-      malformed-input checks kept passing. That is request smuggling.
-      `RegExpPrototypeTest` was **removed** rather than fixed: the spec's RegExpExec
-      re-reads `R.exec` off the receiver, so it steers a `test` captured pristine at
-      module-eval and invoked through `Reflect.apply` — identical on node 24 and
-      `bin/lava`. An export that looks safe and is not is worse than no export, so
-      `RegExpPrototypeExec(re, s) !== null` is now the only spelling available.
-      Pinned by two new `run-http-smoke.sh` phases that replay the whole
-      malformed-input suite against a poisoned server, by vectors X1-X5 in
-      `54-url-pollution.js` (node's URL is native and immune, so those are real
-      differentials), by `cmd/lava/regexp_pollution_test.odin` for the header half —
-      Lava-only because under the same poison node 24 **accepts**
-      `Headers.set('X-Evil: 1\r\nInjected', 'v')`, undici's validator being
-      JavaScript — and by six entries in `tests/mutation-manifest.json`.
-      Four of the validators went further and dropped the regex entirely: a
-      character-class check needs a code-unit loop over the **captured**
-      `StringPrototypeCharCodeAt`, not a pattern, and with no RegExp in the
-      expression `exec`/`test`/`Symbol.match`/`Symbol.replace`/`lastIndex` all drop
-      out at once instead of one of them. A live `.charCodeAt` is its own carrier —
-      do not treat the loop as enough. Capture `parseInt`/`Number` used for
-      Content-Length / chunk-size conversion too. It is also faster: **elapsed-time
-      ratio** of `new URL(s)` over a fixed string pool (special / IPv4 / relative /
-      short absolute hosts, same inputs as the later `bench/micro/url.js` cases),
-      **char-loop + captured `StringPrototypeCharCodeAt`** vs the prior **captured
-      `RegExpMatches` / `re.test` form**, min of 7 interleaved pinned launches per
-      arm on Linux JSC — 0.82x–0.90x (lower is faster) — which reversed the +6% to
-      +20% regression the exec migration had introduced and that no benchmark
-      covered.
-- [ ] **The rest of the regex surface, and `.test` was not the whole of
-      it** — a poisoned `exec` steers **six** methods, not two: `re.test`, `re.exec`,
-      and `String.prototype.replace`/`match`/`search`/`split` whenever the argument
-      is a regex, because all of them route through RegExpExec. Verified identically
-      on node 24 and `bin/lava`. `matchAll` and a global `replace` are worse still —
-      a forged result never advances `lastIndex`, so they spin: a 1.4 GB OOM in the
-      probe that found this, i.e. a denial of service, not just a wrong answer.
-      This also means **the ratchet's `method` column gives false comfort here**: a
-      file can read `method 0` while calling `StringPrototypeReplace(s, /re/, x)`,
-      because capturing `String.prototype.replace` does nothing about the `exec`
-      re-read inside it. Another instance of "floor, not proof", and a sharper one
-      than the accessor case, because the fix _looks_ applied.
-      **No count in this prose, deliberately.** The previous version said "53 sites"
-      with a per-module list that summed to 43, credited `sqlite.js` with a site it
-      does not have (a bare grep scored `native.exec(...)`), and omitted `url.js`,
-      `fetch.js`, `buffer.js` and `console.js` — two of which the commit above had
-      just hardened. That is the third time a copied total went stale in this file,
-      under the rule six entries up that forbids exactly this. Derive it instead:
-      an acorn pass over `pkg/runtime/js` counting `re.test`/`re.exec` on a
-      regex-shaped receiver plus `String.prototype.{replace,replaceAll,match,
-      matchAll,search,split}` with a regex argument in EITHER position — `s.replace(re, …)`
-      and the primordial `StringPrototypeReplace(s, re, …)`, where the regex is the
-      SECOND argument. Written for the first position only, this recipe scored zero on
-      `url.js`'s own residue sites, which the paragraph above names.
-      **`esm.js` is done** — 26 of the 60 sites the recipe scored before it, next
-      largest `mime.js` at 10, and it was the sharpest of them because it emits source;
-      see the entry below. Do NOT copy a remainder list from here: re-derive it with
-      the recipe above, which is the rule this entry has already broken three times.
-      As of the esm.js commit it returns 34 sites across 11 files, and one fact about
-      that tail is worth keeping because it contradicts the obvious assumption:
-      `net.js` still carries one (`/^connect ([A-Z]+)/`), so the tail is **not** off the
-      network path.
-      _(That sentence used to also claim `buffer.js`, `querystring.js` and `punycode.js`
-      "still carry global-flag replaces". It was RIGHT about all three; its only defect
-      was omitting `path.js` and `util.js`, which carried six more between them. The
-      "correction" that replaced it — "`punycode.js` has none" — was itself false, and
-      became the FIFTH stale claim in this entry, written in the same commit that added
-      the "do not copy, re-derive" rule above. The recipe behind it was blinder than the
-      prose: it matched a regex literal written at the call site and missed every regex
-      held in a variable. There is now a gate instead of a sentence — `make check-js`
-      runs `scripts/check-global-replace.mjs`, whose own fixtures pin the three shapes
-      the hand-rolled passes missed.)_
-      The claim that none of the remainder was on the network path was **false**, and
-      the sites that were are now fixed rather than merely re-described:
-      `fetch.js`'s header-value trim (which ran BEFORE the name validator on every
-      `append`/`set`), and `url.js`'s tab/newline strip, IDNA separator fold and
-      `hostFromDomainArg`. Each was a global replace, so under a forged `exec` they
-      did not answer wrongly — they never returned. `new Headers().set('X-Ok','v')`
-      and `new URL('http://EXAMPLE.com/')` both hung, and a remote server's
-      `Location:` header reaching `new URL(location, req.url)` hung the client: a
-      remote-triggerable DoS. The Lava-only test that pins them ran in 3m07s while
-      they spun and runs in 34ms now.
-      A second pass closed the **adjacent carriers** the regex hardening left open:
-      live `String.prototype.charCodeAt` on header value/name scans (response
-      splitting under `HTTP_POISON_REGEXP=charcodeat`), live `parseInt` beside
-      Content-Length / chunk framing (desync under `HTTP_POISON_REGEXP=parseint`;
-      capture is on `primordials` at bootstrap because `http.js` is lazy), and two
-      more global-replace hangs on the network path — `buffer.js` `normalizeBase64`
-      (Basic-auth / JWT) and `url.js` `toUSVString` (emoji in a remote query). Each
-      has a Lava-only pin, an http-smoke phase where relevant, and a mutation-manifest
-      entry.
-- [x] **The global-flag replaces — the spin-forever class, down to one declared
-      exception** — `scripts/check-global-replace.mjs` reports **1 site, allowlisted with
-      a reason**, from **11 across 6 files**: `buffer.js` 2, `path.js` 2, `querystring.js`
-      1, `util.js` 4, `mime.js` 1, `punycode.js` 1.
-      The first version of this entry claimed **0 from 8**, and both numbers came from a
-      pass that only saw a regex literal written at the call site. Three sites held their
-      `/g` regex in a variable and were invisible to it — `mime.js:143`, `punycode.js:50`
-      and `util.js:572` — and the merge gate caught all three, each verified to hang.
-      `mime.js` was the sharp one: **node answers and Lava hung**, on `MIMEType#toString`
-      reachable from a remote `Content-Type`, i.e. the same Lava-only tier as the
-      querystring bug this entry was written about. That is why the recipe is now a
-      script with its own fixtures rather than a sentence.
-      The sharpest was remote-reachable and had been sitting in a public API the whole
-      time: `querystring.parse` rewrites `+` to `%20` with a global replace, so a single
-      `+` in a query string wedged any server doing
-      `parse(req.url.split('?')[1])` once a dependency had assigned
-      `RegExp.prototype.exec`. Measured: node returns `{'a b':'1'}`, Lava did not return.
-      The fix is the one this class always wants — no regex in the expression at all, so
-      `exec`/`test`/`@@replace`/`lastIndex` drop out together. `replaceCharAll(s, code,
-      repl)` on `primordials` covers the three single-character sites (it returns `s`
-      unchanged when the unit is absent, so the callers' own `indexOf` guards went away);
-      the hex grouping, the CRLF fold and the NODE_DEBUG pattern get purpose-built
-      code-unit loops.
-      **node is the oracle for exactly one of the five surfaces.** Verified by running
-      it: node answers correctly for `querystring`, and **hangs itself** on
-      `path.matchesGlob`, `util.inspect` of a Buffer and `new Blob([…],
-      {endings:'native'})` — its own implementations run the same shape. So hardening
-      those three is a deviation in Lava's favour and is pinned Lava-only, per §1;
-      `util.debuglog` is Lava-only for an unrelated reason (see the gap below). Pinned by
-      `tests/node-compat/cases/59-global-replace-hangs.js` (the oracle half), four new
-      assertions in `cmd/lava/regexp_pollution_test.odin`, and five
-      `tests/mutation-manifest.json` entries. That Odin test ran **2m49s** while the
-      sites spun — failing with `RangeError` from runaway string growth rather than a
-      clean hang — and runs in **23.7ms** now.
-- [x] **`process.stdout` / `process.stderr` do not exist** — implemented. Both are now
-      lazy, configurable getters on `process` (node's own shape; a plain
-      `JSObjectSetProperty` cannot express a getter, so the loader hands `globals.odin` a
-      closure it calls after `process` and `process.nextTick` exist). Each is a real
-      `stream.Writable`, not a lookalike: node's is a Writable in all three of its fd
-      shapes and libraries feature-detect with `instanceof`, so a hand-rolled object would
-      answer false and take the wrong branch in a logger.
-      `isTTY` answers **undefined** off a terminal, which is what node reports — not
-      `false`. `columns`/`rows` are **not implemented**: they read undefined everywhere,
-      which is right off a terminal and wrong on one, and they are deliberately not faked
-      to 80x24 because that is the `tty.js` bug in the follow-up below. Both need the
-      TIOCGWINSZ ioctl that entry describes.
-      Writes go through `process_write`, so `console.log` and `process.stdout.write` share
-      one mutex and cannot interleave mid-line, and both inherit the retry loop from #325.
-      Both singletons are **unkillable**, which node goes to two separate lengths to
-      guarantee and which the first revision of this change got wrong in both places.
-      `pipe()` excludes them from its automatic `dest.end()` (node compares identity with
-      `process.stdout`/`stderr`), and `_destroy` is a dummy that runs the callback and then
-      calls `_undestroy()` — so `end()` still emits `'finish'`/`'close'` and still runs its
-      callback, but the stream is writable again on the next tick. Without the first,
-      `src.pipe(process.stdout)` — the most common pipe in Node — ended stdout for the rest
-      of the process: every later write dropped, `write after end` raised, exit code 0 to 1.
-      Without the second, one `process.stdout.end()` in any dependency was permanent.
-      `_undestroy` is node API (present on its `Writable`, `Readable` and `process.stdout`),
-      so adding it raised parity rather than inventing a surface.
-      _Deviations, both confined to node's PIPE shape_ — this stream is one shape for every
-      fd where node has three, so neither is visible on a file or a terminal:
-      (1) no backpressure. Measured against node on a pipe, all five facts, where an
-      earlier revision of this entry declared only the first: `write(300KB)`/`write(1MB)`
-      `false`/`false` vs `true`/`true`, `writableLength` `1348576` vs `0`,
-      `writableNeedDrain` `true` vs `false`, `'drain'` emitted vs never. Nothing is
-      buffered here — the byte is on the fd before `write()` returns — so there is no drain
-      to wait for, and `if (!s.write(x)) await once(s,'drain')` skips the await rather than
-      hanging on it. (2) The lifecycle is forgiving where node's pipe shape is fatal: on a
-      pipe node's stdout is a `net.Socket`, so `end()` half-closes it and the next write is
-      an unhandled `EPIPE` and exit 1 (`node x.js | cat` prints A, B and dies where
-      `node x.js > f` prints A, B, C, D). Lava recovers in both shapes — it holds no socket,
-      and the alternative is closing fd 1 and losing every later byte to reproduce a crash.
-      Both are pinned by `tests/stdio/stdio-lifecycle.test.mjs`, which drives both shapes as
-      subprocesses and asserts **node's** side too, so the pin goes red if node ever changes
-      rather than quietly becoming wrong.
-      Chunk-type validation is NOT addressed here. Lava's `Writable` produces the right
-      codes (`ERR_INVALID_ARG_TYPE`, `ERR_STREAM_NULL_VALUES`) but delivers them as an
-      async `'error'` where node throws synchronously — an earlier claim that it threw
-      "with no code" was wrong. Fixing it reaches every Writable in the tree; see the
-      open entry below for why the attempt inside this change was reverted.
-      Pinned by `tests/node-compat/cases/60-process-stdio.js` and
-      `61-stdio-lifecycle.js` (both byte-identical to node), by
-      `tests/stdio/stdio-lifecycle.test.mjs` for the pipe shape the oracle harness cannot
-      reach, and by six `tests/mutation-manifest.json` entries: the pipe exclusion twice
-      (once per gate, because the oracle case and the node:test cover different fd shapes),
-      the `_destroy` undo, the individual `ending` field it clears, the `autoDestroy`
-      option the undo is reached through, and the `_isStdio` marker.
-      `util.debuglog` was the concrete casualty of the absence — with `NODE_DEBUG`
-      matching, node printed and Lava threw, which is why the debuglog spin in #324 could
-      not be pinned as an oracle case. That blocker is gone.
-- [x] **`stream.js` reported chunk-type errors asynchronously and refused views node
-      accepts** ([#327](https://github.com/x-ror/lava/issues/327)) — relanded after the
-      #326 revert, with the two things that attempt was missing.
-      `Writable#write` now throws `ERR_STREAM_NULL_VALUES` / `ERR_INVALID_ARG_TYPE`
-      **synchronously** as node does (routing them a tick later delivered the right code on
-      the wrong turn), validates an explicit encoding BEFORE the chunk type (so
-      `write(5, 'bogus')` reports the encoding, which is node's order), and accepts any
-      ArrayBuffer view. `ArrayBuffer.isView` replaced `instanceof Uint8Array`, which was
-      wrong in both directions: it rejected `DataView`/`Int16Array` that node takes, and
-      accepted `Object.create(Uint8Array.prototype)` that node refuses.
-      Every view is **normalized to a Buffer with encoding `'buffer'`** before `_write`
-      sees it. That step is why the first attempt was reverted: without it `chunk.length`
-      is undefined for a `DataView`, `writableLength` went NaN, `'drain'` could never fire
-      again (`NaN === 0` is false) and `pipe()` stalled forever. `Readable#push` was widened
-      to match, or a `PassThrough` accepts a view on one side and errors on the other — and
-      its refusal stays an ASYNC `'error'`, which is node's asymmetry with `write`, not an
-      oversight. `setDefaultEncoding` validates too.
-      The DataView and `%TypedArray%` window getters are NOT interchangeable — a
-      `%TypedArray%` getter throws on a DataView receiver, which is what the in-flight fix
-      hit last time — so a prototype-chain brand check picks the family.
-      `describeType` is now shared from `buffer.js` through a NON-ENUMERABLE export rather
-      than becoming a seventh near-copy of node's "Received …" clause;
-      `Object.keys(require('buffer'))` is unchanged.
-      Pinned by `tests/node-compat/cases/64-stream-write-validation.js` (byte-identical to
-      node) and six mutation entries. Converting the coded-error constructors to captured
-      globals LOWERED the ratchet 1595 -> 1590.
+- [x] **Lazy internal modules captured mutable module exports**
+      ([#333](https://github.com/x-ror/lava/issues/333)) — fixed for the five LAZY modules.
+      §5's "capture at module-eval" rule holds only for modules `loader.js` instantiates
+      before user code; a lazy module's factory runs on the user's first `require()` of it,
+      so its own `require('buffer').Buffer` reads whatever the exports object holds then —
+      the object user code holds.
+      _What node actually does, because the first version of this entry got it backwards:_
+      node does **not** route payload bytes through the public `Buffer.from`, so replacing
+      that member cannot corrupt node's output — `sock.write('PAYLOAD')` gives `"PAYLOAD"`
+      on node and gave `"TAMPERED"` here. That divergence is what this closes. But node
+      **is** steerable through the same export for other members: with `Buffer.byteLength`
+      returning real+3, node answered `Content-Length: 10` for a 7-byte body. So Lava is
+      deliberately STRICTER than node here — a §1 deviation, pinned on the vectors an
+      oracle case can express.
+      Three categories, and only the third needed the change: **eager** (the loader's list)
+      capture pristinely; **bootstrap** (`stream`, `stdio`, via `installStdio`) likewise, so
+      they keep their own capture; **lazy** (`fs`, `http`, `https`, `net`, `os`) capture too
+      late. Capturing the CONSTRUCTOR is not enough either — `.from` is read off it at call
+      time, so `Buffer.from = evil` steers a module holding a pristine `Buffer`; the loader
+      snapshots the OPERATIONS.
+      Two live `Buffer.prototype` reads found in the same pass and closed with it: `https`
+      read the TLS key/cert PEM through `value.toString('utf8')` (a replacement returning a
+      valid PEM makes the server present a chosen certificate), and `http`'s chunked decoder
+      read the chunk size, the CRLF boundary and the cursor through live `toString`/
+      `indexOf`/`slice` — request-smuggling gadgets over network-controlled bytes. Node
+      frames HTTP in C and is not steerable in either.
+      `os.userInfo` was rewritten to node's real contract while there: a **null-prototype**
+      result, a case-insensitive encoding via `ParseEncoding` (`'BUFFER'` works), other
+      known encodings **transcode** (`hex` → `"74796d6368"`), and an unrecognized one falls
+      back to the plain string rather than throwing.
+      Pinned by `tests/node-compat/cases/65-lazy-buffer-capture.js` — `net` in both
+      directions, `os` at module-eval and call time, `http` response body and chunked
+      framing — and eight mutation entries. Migrating to captured operations LOWERED the
+      ratchet from 1590 to 1558.
 - [ ] **`process.stdout`/`stderr` surface holes and the tty half**
       ([#328](https://github.com/x-ror/lava/issues/328)) — `constructor.name`, `pipe`
       (absent on every Writable, not just stdio — `stream.js` defines only
