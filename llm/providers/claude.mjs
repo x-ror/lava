@@ -46,7 +46,7 @@ export function run(prompt, ctx) {
 
   const r = spawnSync('claude', args, {
     cwd: ctx.cwd,
-    env: { ...process.env, ...(ctx.env || {}) },
+    env: { ...process.env, ...ctx.env },
     timeout: 0,
     stdio: useInline ? 'inherit' : ['pipe', 'inherit', 'inherit'],
     input: useInline ? undefined : prompt,
@@ -60,7 +60,7 @@ export function run(prompt, ctx) {
     const body = readFileSync(promptPath, 'utf8');
     const r2 = spawnSync('claude', ['--dangerously-skip-permissions', '-p', body], {
       cwd: ctx.cwd,
-      env: { ...process.env, ...(ctx.env || {}) },
+      env: { ...process.env, ...ctx.env },
       timeout: 0,
       stdio: 'inherit',
     });
