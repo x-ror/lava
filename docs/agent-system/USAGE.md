@@ -110,6 +110,30 @@ Anything other than SHIP / SHIP-AFTER is BLOCK, including a pr-gate that
 produced no verdict at all. See "The gate fails closed" in
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Resuming a killed run
+
+A pipeline runs for hours; machines reboot and people press Ctrl-C. State is
+written after every node, so a stopped run can be continued in the worktree it
+was already building in — same branch, same edits, same plan the planner had
+written.
+
+```bash
+node workflows/cli.mjs status        # what is in flight, at which node, for how long
+node workflows/cli.mjs resume        # continue the newest unfinished run
+node workflows/cli.mjs resume 91-1785788737917
+node workflows/cli.mjs resume --issue 91
+```
+
+The node it stopped in is **re-run**, not skipped: a killed agent may have
+half-applied its turn, and every agent reads the tree before acting, so
+repeating a step is recoverable where skipping one is not.
+
+Resume refuses rather than guessing when it cannot continue honestly — an
+unknown run id, a run that already reached a terminal node, or a worktree that
+has since been removed. In that last case starting fresh is the only option, and
+it is `make agent-run`, not a resume: bootstrapping a new worktree under the old
+run id would look like a resume while discarding every edit.
+
 ## Retries
 
 A trigger run records each issue in `.agent-state/trigger-issues-seen.json` with

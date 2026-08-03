@@ -9,11 +9,12 @@
  */
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { runPipeline } from './pipeline.mjs';
+import { runPipeline, runIssuePipeline } from './pipeline.mjs';
 import { pollAndDispatch } from './triggers/issues.mjs';
 import { STATE_DIR } from '../runtime/paths.mjs';
 import { listOpenIssues, selectReadyIssues, isAgentReady } from '../runtime/github.mjs';
 import { buildDag, explain, UNTIERED } from '../runtime/dag.mjs';
+import { listRuns, isTerminal, findResumable, checkResumable } from './durable.mjs';
 
 function parseFlags(argv) {
   const flags = {};
@@ -37,11 +38,15 @@ async function main() {
   const { flags, rest } = parseFlags(argv);
 
   if (!cmd || cmd === 'help') {
-    console.log(`usage: workflows/cli.mjs run|trigger|status|queue
+    console.log(`usage: workflows/cli.mjs run|trigger|status|queue|resume
 
   queue [--all]   show the derived task DAG: order, tiers, what blocks what.
                   Without --all, only issues labelled agent-ready (what would
-                  actually run). With --all, the full derived order.`);
+                  actually run). With --all, the full derived order.
+  status          In-flight runs (node, age, worktree) and the last completed one.
+  resume [runId]  Continue a run that stopped before a terminal node, in the
+                  worktree it was already building in. Newest one by default;
+                  --issue N picks that issue's.`);
     process.exit(0);
   }
 
@@ -121,18 +126,64 @@ async function main() {
   }
 
   if (cmd === 'status') {
+    // `last-run.json` is written when a run FINISHES. Reporting only that made
+    // the command answer "no runs yet" while a pipeline was in flight — exactly
+    // when the status is worth asking for. The durable state knows better.
+    const runs = listRuns();
+    const live = runs.filter((r) => r.state && !isTerminal(r.state));
+    if (live.length) {
+      console.log(`in flight (${live.length}):`);
+      for (const r of live) {
+        const age = Math.round((Date.now() - r.startedAt) / 60000);
+        console.log(
+          `  ${r.runId}  #${r.issue ?? '?'}  at ${r.node ?? '?'}  ${age}m  ${r.state.wt || ''}`,
+        );
+      }
+      console.log('  resume with: node workflows/cli.mjs resume');
+    }
+
     const last = join(STATE_DIR, 'last-run.json');
     if (existsSync(last)) {
+      console.log('last completed run:');
       console.log(readFileSync(last, 'utf8'));
-    } else {
+    } else if (!live.length) {
       console.log(JSON.stringify({ status: 'no runs yet' }));
     }
-    const runsDir = join(STATE_DIR, 'runs');
-    if (existsSync(runsDir)) {
-      const runs = readdirSync(runsDir);
-      console.log(JSON.stringify({ runs: runs.slice(-10) }, null, 2));
+
+    if (runs.length) {
+      console.log(JSON.stringify({ runs: runs.slice(0, 10).map((r) => r.runId) }, null, 2));
     }
     return;
+  }
+
+  if (cmd === 'resume') {
+    const target = rest[0]
+      ? { runId: rest[0] }
+      : findResumable(flags.issue ? { issue: Number(flags.issue) } : {});
+    if (!target) {
+      console.log('nothing to resume — no run stopped before a terminal node');
+      return;
+    }
+    const check = checkResumable(target.runId);
+    if (!check.ok) {
+      console.error(`cannot resume ${target.runId}: ${check.reason}`);
+      process.exit(1);
+    }
+    const { state } = check;
+    console.log(
+      `resuming ${target.runId} — issue #${state.issue?.number}, node ${state.node}, worktree ${state.wt}`,
+    );
+    // The node it stopped in is re-run rather than skipped: a killed agent may
+    // have half-applied its turn, and every agent reads the tree before acting,
+    // so repeating a step is recoverable where skipping one is not.
+    const r = await runIssuePipeline(state.issue, {
+      resume: true,
+      runId: target.runId,
+      provider: flags.provider || state.provider,
+      createPr: flags['no-pr'] ? false : state.createPr !== false,
+    });
+    console.log(JSON.stringify(r, null, 2));
+    process.exit(r.ok ? 0 : 1);
   }
 
   console.error('unknown command', cmd);
