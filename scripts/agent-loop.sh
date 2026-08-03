@@ -58,16 +58,42 @@ done
 mkdir -p "$ROOT_DIR/.agent-state"
 LOG="$ROOT_DIR/.agent-state/agent-loop.log"
 
+# Bookkeeping lines go to the log always, and to the terminal when there is one,
+# so an interactive run is self-explanatory instead of silent.
+say() {
+	printf '%s %s\n' "$(date -Is)" "$1" >>"$LOG"
+	[ -t 1 ] && printf '[agent-loop] %s\n' "$1"
+	return 0
+}
+
 # -n: a tick that finds the previous one still running gives up. Waiting would
 # just build a backlog of drains that all want the same issues.
 exec 9>"$ROOT_DIR/.agent-state/agent-loop.lock"
 if ! flock -n 9; then
-	echo "$(date -Is) skipped: a drain is already running" >>"$LOG"
+	say "skipped: a drain is already running"
 	exit 0
 fi
 
-echo "$(date -Is) start max=$MAX provider=$PROVIDER" >>"$LOG"
-node workflows/triggers/schedule.mjs --max "$MAX" --provider "$PROVIDER" >>"$LOG" 2>&1
-status=$?
-echo "$(date -Is) done exit=$status" >>"$LOG"
+say "start max=$MAX provider=$PROVIDER"
+
+# On a terminal, show the agent's output live AND keep the log; under cron there
+# is no terminal, so log only. The first version logged unconditionally, which
+# meant `make agent-run` printed nothing at all — a drain that found an empty
+# queue and one that spent an hour on an issue looked exactly the same from the
+# prompt, and the answer was buried in a file nobody had been told about.
+#
+# `|| status=$?` rather than a bare `$?`: `set -e` aborts on a non-zero exit, so
+# the earlier form never reached its own "done" line and a failed drain left the
+# log claiming it had started and nothing more.
+status=0
+if [ -t 1 ]; then
+	set -o pipefail
+	node workflows/triggers/schedule.mjs --max "$MAX" --provider "$PROVIDER" 2>&1 |
+		tee -a "$LOG" || status=$?
+else
+	node workflows/triggers/schedule.mjs --max "$MAX" --provider "$PROVIDER" >>"$LOG" 2>&1 ||
+		status=$?
+fi
+
+say "done exit=$status"
 exit "$status"
