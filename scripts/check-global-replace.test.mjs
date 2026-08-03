@@ -38,9 +38,24 @@ test('a non-global regex is not a spin risk and is not counted', () => {
   assert.equal(scanSource(`var R = /x/;\ns.replace(R, 'y');`, 'x').length, 0);
 });
 
-test('every allowlisted site carries a reason', () => {
+test('every allowlisted site carries a reason and a stable key (not file:line)', () => {
   for (const [site, reason] of ALLOWED) {
-    assert.match(site, /^[\w./-]+:\d+$/, `${site} should be file:line`);
+    // #337: keys are file:binding (or file:how:what), never file:line — line numbers
+    // move whenever anything is inserted above the site and teach false hang alarms.
+    assert.match(site, /^[\w./-]+:[A-Za-z_$][\w$]*(?::.+)?$/, `${site} should be file:binding`);
+    assert.doesNotMatch(site, /:\d+$/, `${site} must not be keyed by line number (#337)`);
     assert.ok(reason.length > 40, `${site} needs a real reason, got: ${reason}`);
   }
+});
+
+test('allowKey prefers binding name over line (#337)', async () => {
+  const { allowKey } = await import('./lib/global-replace-detect.mjs');
+  const key = allowKey({
+    file: 'internal/util.js',
+    line: 9999,
+    how: '.replace()',
+    what: 'ansiRegex = /x/g',
+    via: 'binding',
+  });
+  assert.equal(key, 'internal/util.js:ansiRegex');
 });

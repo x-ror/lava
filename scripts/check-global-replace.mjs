@@ -8,7 +8,7 @@
 // Usage:
 //   node scripts/check-global-replace.mjs          # fail on any site not in ALLOWED
 //   node scripts/check-global-replace.mjs --list   # report every site, exit 0
-import { scanTree, ALLOWED } from './lib/global-replace-detect.mjs';
+import { scanTree, ALLOWED, allowKey } from './lib/global-replace-detect.mjs';
 import { selfTest } from './lib/global-replace-fixtures.mjs';
 
 // The detector checks itself before it reports on the tree. A blind detector printing a
@@ -31,17 +31,18 @@ const listOnly = process.argv.includes('--list');
 
 if (listOnly) {
   for (const h of hits) {
-    const key = `${h.file}:${h.line}`;
+    const key = allowKey(h);
     console.log(
-      `${key.padEnd(34)} ${h.how.padEnd(14)} ${h.what}  [${h.via}]${ALLOWED.has(key) ? '  ALLOWED' : ''}`,
+      `${key.padEnd(40)} L${String(h.line).padStart(4)} ${h.how.padEnd(14)} ${h.what}  [${h.via}]${ALLOWED.has(key) ? '  ALLOWED' : ''}`,
     );
   }
   console.log(`\n${hits.length} site(s); ${ALLOWED.size} allowed.`);
   process.exit(0);
 }
 
-const unexpected = hits.filter((h) => !ALLOWED.has(`${h.file}:${h.line}`));
-const stale = [...ALLOWED.keys()].filter((key) => !hits.some((h) => `${h.file}:${h.line}` === key));
+// Stable keys (file:binding), not file:line — see #337 / allowKey in the detector.
+const unexpected = hits.filter((h) => !ALLOWED.has(allowKey(h)));
+const stale = [...ALLOWED.keys()].filter((key) => !hits.some((h) => allowKey(h) === key));
 
 if (unexpected.length > 0) {
   console.error('Global-flag regex reaching a RegExpExec loop — this hangs under a forged exec:\n');

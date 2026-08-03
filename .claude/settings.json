@@ -22,8 +22,6 @@
       "Bash(make bench-gate)",
       "Bash(make api-surface)",
       "Bash(make bun-buffer-tests)",
-      "Bash(make bun-buffer-report)",
-      "Bash(make vendor-bun-report)",
       "Bash(make help)",
       "Bash(odin check:*)",
       "Bash(odin test:*)",
@@ -35,6 +33,7 @@
       "Bash(vp run:*)",
       "Bash(./bin/lava:*)",
       "Bash(./scripts/run-:*)",
+      "Bash(./scripts/agent-cycle/:*)",
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",
@@ -58,7 +57,66 @@
       "Bash(git push -f:*)",
       "Bash(git reset --hard:*)",
       "Bash(gh pr merge:*)",
-      "Bash(gh pr review:*)"
+      "Bash(gh pr review:*)",
+      "Bash(git stash)",
+      "Bash(git stash:*)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Edit(.claude/settings.json)",
+      "Edit(.claude/settings.local.json)",
+      "Edit(.claude/hooks/**)",
+      "Edit(.grok/hooks/**)",
+      "Edit(scripts/agent-cycle/gate-integrity.mjs)",
+      "Edit(scripts/agent-cycle/case-counts.json)",
+      "Edit(scripts/agent-cycle/assert-case-counts.mjs)",
+      "Edit(scripts/lib/compare.sh)",
+      "Edit(scripts/lib/primordials-baseline.mjs)",
+      "Edit(scripts/lib/primordials-detect.mjs)",
+      "Edit(scripts/lib/primordials-fixtures.mjs)",
+      "Edit(scripts/check-primordials.mjs)",
+      "Edit(scripts/run-mutations.mjs)",
+      "Edit(scripts/run-node-compat-all.sh)",
+      "Edit(scripts/run-eventloop-oracle.sh)",
+      "Edit(scripts/run-fs-oracle.sh)",
+      "Edit(scripts/run-sqlite-oracle.sh)",
+      "Edit(bench/run.mjs)",
+      "Edit(bench/thresholds.json)",
+      "Edit(tests/mutation-manifest.json)",
+      "Edit(tests/node-compat/pollution-baseline.json)",
+      "Edit(tests/node-compat/known-lava-gaps.txt)",
+      "Edit(tests/runtime/eventloop/known-lava-gaps.txt)",
+      "Edit(Makefile)",
+      "Edit(package.json)",
+      "Write(.claude/settings.json)",
+      "Write(.claude/settings.local.json)",
+      "Write(.claude/hooks/**)",
+      "Write(.grok/hooks/**)",
+      "Write(scripts/agent-cycle/gate-integrity.mjs)",
+      "Write(scripts/agent-cycle/case-counts.json)",
+      "Write(scripts/lib/compare.sh)",
+      "Write(scripts/run-mutations.mjs)",
+      "Write(bench/run.mjs)",
+      "Write(bench/thresholds.json)",
+      "Write(tests/mutation-manifest.json)",
+      "Write(tests/node-compat/pollution-baseline.json)",
+      "Write(tests/node-compat/known-lava-gaps.txt)",
+      "Write(Makefile)",
+      "Write(.env)",
+      "Write(.env.*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|Read|search_replace|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/gate-integrity.sh",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }

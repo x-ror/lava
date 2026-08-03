@@ -12,6 +12,37 @@
 #   SKIP_KNOWN_LAVA_GAPS  "1" to skip paths listed in KNOWN_GAPS_FILE (default 0)
 #   KNOWN_GAPS_FILE       path to a gaps list (one relative path/line, # comments)
 
+# Gate integrity (agent-cycle F1): a lava-vs-lava "oracle" is byte-identical by
+# construction and must never count as a pass. Refuse when NODE_BIN is lava or
+# identical to LAVA_BIN under a comparative run.
+_lava_gate_integrity_check() {
+	if [ "${RUN_LAVA:-0}" != "1" ]; then
+		return 0
+	fi
+	_node_base=$(basename -- "$NODE_BIN" 2>/dev/null || basename "$NODE_BIN")
+	case "$_node_base" in
+	lava | lava.exe)
+		printf '%s\n' "GATE INTEGRITY: NODE_BIN must be the Node oracle, not Lava (got $NODE_BIN)" >&2
+		return 2
+		;;
+	esac
+	if [ -n "${LAVA_BIN:-}" ] && [ "$NODE_BIN" = "$LAVA_BIN" ]; then
+		printf '%s\n' "GATE INTEGRITY: NODE_BIN and LAVA_BIN are the same path ($NODE_BIN) — refuse lava-vs-lava" >&2
+		return 2
+	fi
+	# Resolve both if they exist; catch NODE_BIN=./bin/lava via realpath.
+	if command -v realpath >/dev/null 2>&1; then
+		_nr=$(realpath "$NODE_BIN" 2>/dev/null || true)
+		_lr=$(realpath "$LAVA_BIN" 2>/dev/null || true)
+		if [ -n "$_nr" ] && [ -n "$_lr" ] && [ "$_nr" = "$_lr" ]; then
+			printf '%s\n' "GATE INTEGRITY: NODE_BIN and LAVA_BIN resolve to the same file ($_nr)" >&2
+			return 2
+		fi
+	fi
+	return 0
+}
+_lava_gate_integrity_check || exit $?
+
 run_node_case() {
 	case_file=$1
 	printf 'node %s\n' "${case_file#$ROOT_DIR/}"

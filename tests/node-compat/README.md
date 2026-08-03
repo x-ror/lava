@@ -25,8 +25,8 @@ The cases intentionally cover APIs users expect from a Bun/Node-like runtime:
 Active compatibility tests live in two places:
 
 - `cases/` contains Lava's core Node compatibility cases.
-- `*/ported/` contains focused ports adapted from vendored upstream suites
-  (for example Bun's buffer tests).
+- `*/ported/` contains focused ports and clean-room cases (for example Buffer
+  coverage under `bun-buffer/ported/`).
 
 Run all active compatibility tests with:
 
@@ -37,9 +37,6 @@ make test-compat-lava  # compare Node vs Lava, skipping known-lava-gaps.txt
 
 `make test-compat-lava` skips documented entries in `known-lava-gaps.txt`.
 Use `make test-compat-lava-strict` to run the same suite without skips.
-
-Vendored upstream tests under `tests/vendor/` are source material only. They are
-not executed directly by the active compatibility runner.
 
 For API surface coverage, run:
 

@@ -1,6 +1,10 @@
 {
   "//": "Per-benchmark gate caps for `make bench-gate` (scripts/run-bench.sh --gate).",
-  "//notes": "Each value is the MAX acceptable lava/node wall-time ratio (lava is allowed to be up to Nx Node's time). A benchmark with no entry here is report-only (never fails the gate). Calibrated 2026-07-11 against the perf/buffer tip (observed ratio x ~1.5-2 headroom for CI noise); re-run `make bench` and tighten further as the ratios improve.",
+  "//notes": "Each value is the MAX acceptable lava/node wall-time ratio (lava is allowed to be up to Nx Node's time). A benchmark with no entry in caps and no entry in report_only fails `make bench-gate` (agent-cycle F1.2 — silent discovery shrinkage). Calibrated 2026-07-11 against the perf/buffer tip (observed ratio x ~1.5-2 headroom for CI noise); re-run `make bench` and tighten further as the ratios improve.",
+  "report_only": [
+    "decode-win1252",
+    "decode-win1252-tiny"
+  ],
   "caps": {
     "startup": 3.0,
     "json-parse": 2.0,

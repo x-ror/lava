@@ -1,7 +1,16 @@
 # Dependencies and local caches
-node_modules/
+# No trailing slash: a worktree may use a node_modules symlink (agent-cycle F2)
+# and `.gitignore` with a trailing slash matches only directories.
+node_modules
 .deps/
 tests/vendor/
+
+# Ephemeral fixtures written by node-compat cases (pid-suffixed); never commit
+tests/node-compat/fixtures/*.tmp
+tests/node-compat/fixtures/*-tmp/
+tests/node-compat/fixtures/wrapper-escape-tmp*/
+tests/node-compat/fixtures/nm-tmp*/
+tests/node-compat/fixtures/typed-array-offset*.tmp
 
 # Build outputs
 bin/
@@ -30,3 +39,6 @@ graphify-out/
 .env
 .env.*
 !.env.example
+
+# Agent-cycle driver local state (issue plans, locks)
+.agent-cycle/

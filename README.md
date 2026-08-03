@@ -54,11 +54,10 @@ Useful project commands:
 make help
 make bootstrap-windows-deps
 make check
-make test-all
 make check-jsc
 make check-native
 make test
-make test-node
+make test-lava
 make test-sqlite-node
 make test-sqlite-lava
 ```

@@ -34,7 +34,8 @@ assert.ok(
 );
 
 // writeFileSync must borrow exactly the visible view, not the ArrayBuffer base.
-const out = path.join(__dirname, '..', 'fixtures', 'typed-array-offset.tmp');
+// Pid suffix: parallel oracle runs must not share a fixed fixture path (agent-cycle F2).
+const out = path.join(__dirname, '..', 'fixtures', `typed-array-offset.${process.pid}.tmp`);
 try {
   fs.writeFileSync(out, Buffer.from('AAAAAAAABBBBBBBB').subarray(8));
   assert.equal(fs.readFileSync(out, 'utf8'), 'BBBBBBBB');

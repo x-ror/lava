@@ -2,7 +2,7 @@
   "$comment": [
     "Every entry names a test and the ONE-LINE change to production source that must",
     "make it go red. `make test-mutation` applies each change, runs the named gate,",
-    "and fails if the gate still passes — because a test that survives the deletion of",
+    "and fails if the gate still passes \u2014 because a test that survives the deletion of",
     "the code it claims to pin is asserting something else.",
     "",
     "This exists because three tests landed in #321 that passed for the wrong reason,",
@@ -18,7 +18,7 @@
     "  why     one sentence: the defect this catches if the mutation survives",
     "  source  production file to patch (never a test file)",
     "  find    exact string to replace; must appear EXACTLY once (the runner checks)",
-    "  replace what to put there — usually the pre-fix code, or a deleted guard",
+    "  replace what to put there \u2014 usually the pre-fix code, or a deleted guard",
     "  gate    how to observe red; see GATE KINDS in scripts/run-mutations.mjs",
     "  expect_detail  substring the RED output must contain; '' is a visible opt-out",
     "  (`rebuild` is gone: it was derivable from the gate kind, and a run filtered to",
@@ -73,7 +73,7 @@
     },
     {
       "name": "run_until_idle_waits_out_a_stale_wakeup dies when a no-progress tick ends the drive",
-      "why": "A surplus wakeup byte ends the drive with an off-loop completion still in flight, and it returns the did_work an earlier tick latched — so it reports success.",
+      "why": "A surplus wakeup byte ends the drive with an off-loop completion still in flight, and it returns the did_work an earlier tick latched \u2014 so it reports success.",
       "source": "pkg/runtime/eventloop/loop.odin",
       "find": "\t\t\tif loop.active_io_count == 0 && loop.active_async == 0 {\n\t\t\t\treturn did_work\n\t\t\t}\n\t\t\tcontinue",
       "replace": "\t\t\treturn did_work",
@@ -109,7 +109,7 @@
     },
     {
       "name": "the poisoned http-smoke phases die when a framing validator goes back to re.test",
-      "why": "Content-Length framing. With the check on a live regex, a poisoned exec answered 200 OK for `Content-Length: abc` — parseInt gives NaN and the body framing desyncs. The charCode form has no regex to poison at all.",
+      "why": "Content-Length framing. With the check on a live regex, a poisoned exec answered 200 OK for `Content-Length: abc` \u2014 parseInt gives NaN and the body framing desyncs. The charCode form has no regex to poison at all.",
       "source": "pkg/runtime/js/internal/http.js",
       "find": "        if (!allChars(contentLengthHeader, isAsciiDigit)) return sendErrorAndClose(400);",
       "replace": "        if (!/^\\d+$/.test(contentLengthHeader)) return sendErrorAndClose(400);",
@@ -163,7 +163,7 @@
     },
     {
       "name": "54-url-pollution X1 dies when endsInANumber goes back to a live re.test",
-      "why": "Steered true, '4x' reads as numeric and parseInt gives 4, so http://1.2.3.4x/ silently becomes http://1.2.3.4/ — a host substitution.",
+      "why": "Steered true, '4x' reads as numeric and parseInt gives 4, so http://1.2.3.4x/ silently becomes http://1.2.3.4/ \u2014 a host substitution.",
       "source": "pkg/runtime/js/internal/url.js",
       "find": "    if (allChars(last, isAsciiDigit)) return true;",
       "replace": "    if (last !== '' && /^[0-9]+$/.test(last)) return true;",
@@ -190,7 +190,7 @@
     },
     {
       "name": "the Lava-only regexp pollution test dies when the header trim goes back to a global replaceAll",
-      "why": "A global replace under a forged exec does not answer wrongly — it never returns, because lastIndex only advances on an empty match. The observable effect IS the hang, so the recorded reason is the timeout verdict: before capture() bounded it this entry ate 3m16s and multi-GB in CI and degraded to WRONG REASON on a memory-capped runner.",
+      "why": "A global replace under a forged exec does not answer wrongly \u2014 it never returns, because lastIndex only advances on an empty match. The observable effect IS the hang, so the recorded reason is the timeout verdict: before capture() bounded it this entry ate 3m16s and multi-GB in CI and degraded to WRONG REASON on a memory-capped runner.",
       "source": "pkg/runtime/js/internal/fetch.js",
       "find": "    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
       "replace": "    if (/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g.test(value)) value = value.replace(/^[\\r\\n\\t ]+|[\\r\\n\\t ]+$/g, '');\n    while (start < end && isHttpWhitespace(StringPrototypeCharCodeAt(value, start))) start++;",
@@ -209,7 +209,7 @@
     },
     {
       "name": "57-format-single-arg dies when console.js drops the single-argument guard",
-      "why": "console.js has its own formatter — it is the bootstrap prelude and has no require to delegate with — so removing util.js's guard leaves console.log correct and vice versa. This entry moves the raw console.log rows, a different line range from the util entry.",
+      "why": "console.js has its own formatter \u2014 it is the bootstrap prelude and has no require to delegate with \u2014 so removing util.js's guard leaves console.log correct and vice versa. This entry moves the raw console.log rows, a different line range from the util entry.",
       "source": "pkg/runtime/js/console.js",
       "find": "    if (args.length === 1 && typeof first === 'string') return first;\n",
       "replace": "",
@@ -240,7 +240,7 @@
     },
     {
       "name": "the Lava-only test dies when toUSVString goes back to the global regex",
-      "why": "The surrogate pre-scan is not a guard against this: a VALID pair — any emoji in a remote query — sets hasSurrogate too, and the global replace then spins (or throws RangeError from runaway growth). new URLSearchParams(remoteQuery) is on the network path. Hang vs throw is runner-dependent; expect_detail lists both.",
+      "why": "The surrogate pre-scan is not a guard against this: a VALID pair \u2014 any emoji in a remote query \u2014 sets hasSurrogate too, and the global replace then spins (or throws RangeError from runaway growth). new URLSearchParams(remoteQuery) is on the network path. Hang vs throw is runner-dependent; expect_detail lists both.",
       "source": "pkg/runtime/js/internal/url.js",
       "find": "    if (!hasSurrogate) return str;\n    var out = StringPrototypeSlice(str, 0, i);",
       "replace": "    if (!hasSurrogate) return str;\n    var SPOL = /([\\uD800-\\uDBFF])([\\uDC00-\\uDFFF])?|([\\uDC00-\\uDFFF])/g;\n    return StringPrototypeReplace(str, SPOL, function (m, h, l, lone) {\n      return lone !== undefined || l === undefined ? '\\uFFFD' : m;\n    });\n    var out = StringPrototypeSlice(str, 0, i);",
@@ -280,7 +280,7 @@
     },
     {
       "name": "58-esm-pollution targeted dies when the export-default name comes back through .match",
-      "why": "String.prototype.match re-reads R.exec off the receiver, so the declared name is attacker-chosen and the transform interpolates it into the emitted module body as an identifier — code injection, not a wrong answer.",
+      "why": "String.prototype.match re-reads R.exec off the receiver, so the declared name is attacker-chosen and the transform interpolates it into the emitted module body as an identifier \u2014 code injection, not a wrong answer.",
       "source": "pkg/runtime/js/internal/esm.js",
       "find": "        var fn = RegExpPrototypeExec(RE_DEFAULT_FUNCTION, expr);",
       "replace": "        var fn = expr.match(/^(?:async\\s+)?function\\b\\s*\\*?\\s*([A-Za-z_$][\\w$]*)/);",
@@ -316,7 +316,7 @@
     },
     {
       "name": "58-esm-pollution json dies when emitted literals go back through the live JSON.stringify",
-      "why": "Every string literal in the generated CommonJS — require specifiers, export keys, __filename/__dirname/import.meta.url — is produced here, so a replaced stringify writes the emitted source directly.",
+      "why": "Every string literal in the generated CommonJS \u2014 require specifiers, export keys, __filename/__dirname/import.meta.url \u2014 is produced here, so a replaced stringify writes the emitted source directly.",
       "source": "pkg/runtime/js/internal/esm.js",
       "find": "    return JSONStringify(StringG(value));",
       "replace": "    return JSON.stringify(String(value));",
@@ -334,7 +334,7 @@
     },
     {
       "name": "58-esm-pollution join dies when the wrapper is assembled with a live Array.prototype.join",
-      "why": "The joins assemble the emitted module, so a gadget lying only for the '\\n' separator replaces the WHOLE output rather than one interpolated identifier — a strictly larger win than the export-default carrier. Mutating the capture rather than one call site keeps esm.js syntactically valid, so the gate measures the carrier and not a bootstrap parse error.",
+      "why": "The joins assemble the emitted module, so a gadget lying only for the '\\n' separator replaces the WHOLE output rather than one interpolated identifier \u2014 a strictly larger win than the export-default carrier. Mutating the capture rather than one call site keeps esm.js syntactically valid, so the gate measures the carrier and not a bootstrap parse error.",
       "source": "pkg/runtime/js/internal/esm.js",
       "find": "  var ArrayPrototypeJoin = primordials.ArrayPrototypeJoin;",
       "replace": "  var ArrayPrototypeJoin = function (a, s) {\n    return a.join(s);\n  };",
@@ -515,7 +515,7 @@
     },
     {
       "name": "stdio-lifecycle dies when pipe() stops excluding the stdio singletons (pipe shape)",
-      "why": "Same defect as the compat entry, gated on the node:test so both fd shapes are covered — node's stdout is a different class on a pipe. The script counts 'finish' events rather than comparing bytes, because the recovery makes the bytes identical with the exclusion deleted; a byte-only version of this test SURVIVED this mutation.",
+      "why": "Same defect as the compat entry, gated on the node:test so both fd shapes are covered \u2014 node's stdout is a different class on a pipe. The script counts 'finish' events rather than comparing bytes, because the recovery makes the bytes identical with the exclusion deleted; a byte-only version of this test SURVIVED this mutation.",
       "source": "pkg/runtime/js/internal/stream.js",
       "find": "    var doEnd =\n      (!pipeOpts || pipeOpts.end !== false) &&\n      dest !== processRef.stdout &&\n      dest !== processRef.stderr;",
       "replace": "    var doEnd = !pipeOpts || pipeOpts.end !== false;",
@@ -541,7 +541,7 @@
     },
     {
       "name": "stdio-lifecycle dies when _undestroy stops clearing the ending flag",
-      "why": "The `writable` getter is `!destroyed && !ending`, so leaving `ending` set makes the stream report unwritable forever even though destroyed was cleared — the recovery looks applied and is not. Pins the individual field, not just the presence of the call.",
+      "why": "The `writable` getter is `!destroyed && !ending`, so leaving `ending` set makes the stream report unwritable forever even though destroyed was cleared \u2014 the recovery looks applied and is not. Pins the individual field, not just the presence of the call.",
       "source": "pkg/runtime/js/internal/stream.js",
       "find": "      w.ended = false;\n      w.ending = false;\n      w.finished = false;",
       "replace": "      w.ended = false;\n      w.finished = false;",
@@ -553,7 +553,7 @@
     },
     {
       "name": "stdio-lifecycle dies when the stdio stream pins autoDestroy/emitClose off",
-      "why": "The recovery is reached THROUGH autoDestroy (end() -> 'finish' -> destroy() -> _undestroy). Setting autoDestroy:false — as the first revision of this file did — leaves _destroy unreached, so end() is permanent even with the dummy in place, and 'close' never fires.",
+      "why": "The recovery is reached THROUGH autoDestroy (end() -> 'finish' -> destroy() -> _undestroy). Setting autoDestroy:false \u2014 as the first revision of this file did \u2014 leaves _destroy unreached, so end() is permanent even with the dummy in place, and 'close' never fires.",
       "source": "pkg/runtime/js/internal/stdio.js",
       "find": "    ReflectApply(Writable, this, [{ decodeStrings: false }]);",
       "replace": "    ReflectApply(Writable, this, [{ decodeStrings: false, autoDestroy: false, emitClose: false }]);",
@@ -577,7 +577,7 @@
     },
     {
       "name": "fs_write_payload dies when the buffer length is sampled before the window getters",
-      "why": "byteOffset/byteLength on a DataView may be OWN accessors, so reading them runs arbitrary JS that can resize the backing ArrayBuffer. Sampling the buffer's length first validates the window against a size that no longer exists, and the resolver hands back a slice past the allocation — 4088 bytes of out-of-bounds heap written into a caller-named file.",
+      "why": "byteOffset/byteLength on a DataView may be OWN accessors, so reading them runs arbitrary JS that can resize the backing ArrayBuffer. Sampling the buffer's length first validates the window against a size that no longer exists, and the resolver hands back a slice past the allocation \u2014 4088 bytes of out-of-bounds heap written into a caller-named file.",
       "source": "pkg/runtime/fs.odin",
       "find": "\t\t\t\toff_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteOffset\"), nil)\n\t\t\t\tlen_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteLength\"), nil)\n\t\t\t\t// Now that no further JS can run, sample the authoritative length and take\n\t\t\t\t// the base pointer back to back: the pointer is only valid until the next\n\t\t\t\t// JSC API call (a GC/realloc can move it), so nothing may come between them\n\t\t\t\t// but the pure-Odin validation below.\n\t\t\t\tab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))",
       "replace": "\t\t\t\tab_len := f64(jsc.JSObjectGetArrayBufferByteLength(ctx, ab, nil))\n\t\t\t\toff_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteOffset\"), nil)\n\t\t\t\tlen_f := jsc.JSValueToNumber(ctx, get_named(ctx, obj, \"byteLength\"), nil)",
@@ -588,7 +588,7 @@
     },
     {
       "name": "stdio_fd_guard dies when the fd is converted before it is compared",
-      "why": "`this.fd` is a plain writable property, so process.stdout.fd = 1.5 reaches this native. A float->int conversion is undefined in Odin for NaN, +/-Inf and out-of-range values, and truncation lands 1.5 and 2.9 squarely on fd 1 and 2 — so converting first turns the guard into a no-op for exactly the values it exists to catch. NaN and Infinity do NOT catch this on x86 (cvttsd2si yields INT_MIN, rejected either way), which is why the fractional cases are in the list.",
+      "why": "`this.fd` is a plain writable property, so process.stdout.fd = 1.5 reaches this native. A float->int conversion is undefined in Odin for NaN, +/-Inf and out-of-range values, and truncation lands 1.5 and 2.9 squarely on fd 1 and 2 \u2014 so converting first turns the guard into a no-op for exactly the values it exists to catch. NaN and Infinity do NOT catch this on x86 (cvttsd2si yields INT_MIN, rejected either way), which is why the fractional cases are in the list.",
       "source": "pkg/runtime/stdio.odin",
       "find": "\tswitch {\n\tcase fd_num == 1:\n\t\ttarget = os.stdout\n\tcase fd_num == 2:\n\t\ttarget = os.stderr",
       "replace": "\tfd_int := int(fd_num)\n\tswitch fd_int {\n\tcase 1:\n\t\ttarget = os.stdout\n\tcase 2:\n\t\ttarget = os.stderr",
@@ -599,7 +599,7 @@
     },
     {
       "name": "62-fs-read-buffer dies when the read result is not re-tagged as a Buffer",
-      "why": "The native returns a plain Uint8Array where node returns a Buffer. Without the re-tag, Buffer.isBuffer is false and `.toString('hex')` falls through to Uint8Array.prototype.toString — comma-joined decimals instead of hex, with no throw. That shipped for a year.",
+      "why": "The native returns a plain Uint8Array where node returns a Buffer. Without the re-tag, Buffer.isBuffer is false and `.toString('hex')` falls through to Uint8Array.prototype.toString \u2014 comma-joined decimals instead of hex, with no throw. That shipped for a year.",
       "source": "pkg/runtime/js/internal/fs.js",
       "find": "    return BufferFrom(\n      TypedArrayPrototypeGetBuffer(value),\n      TypedArrayPrototypeGetByteOffset(value),\n      TypedArrayPrototypeGetByteLength(value),\n    );",
       "replace": "    return value;",
@@ -610,7 +610,7 @@
     },
     {
       "name": "62-fs-read-buffer dies when the encoding is dropped instead of decoded in JS",
-      "why": "Reads must be decoded through Buffer's codecs here, because the native ignored the encoding argument entirely and decoded everything as UTF-8 — readFileSync(p,'hex') returned the file's text instead of its hex. expect_detail keys off a UNIQUE assertion message: an earlier version used ['strictEqual','string'], which appears in the red output of every failing assert.equal in the file and would have accepted a break of the Buffer re-tag instead.",
+      "why": "Reads must be decoded through Buffer's codecs here, because the native ignored the encoding argument entirely and decoded everything as UTF-8 \u2014 readFileSync(p,'hex') returned the file's text instead of its hex. expect_detail keys off a UNIQUE assertion message: an earlier version used ['strictEqual','string'], which appears in the red output of every failing assert.equal in the file and would have accepted a break of the Buffer re-tag instead.",
       "source": "pkg/runtime/js/internal/fs.js",
       "find": "    return encoding === null ? buf : BufferPrototypeToString(buf, encoding);",
       "replace": "    return buf;",
@@ -632,7 +632,7 @@
     },
     {
       "name": "57-format-single-arg dies when util.inspect stops quoting a top-level string",
-      "why": "node's util.inspect QUOTES a top-level string ('x' -> \"'x'\") while console.log/format print a string ARGUMENT raw — format goes through stringify(), which short-circuits strings before inspect is reached, so the depth-0 raw arm had no caller left and was deleted. Restoring it un-quotes every message built with util.inspect, which is how fs.js's ERR_INVALID_ARG_VALUE read `Received bogus`.",
+      "why": "node's util.inspect QUOTES a top-level string ('x' -> \"'x'\") while console.log/format print a string ARGUMENT raw \u2014 format goes through stringify(), which short-circuits strings before inspect is reached, so the depth-0 raw arm had no caller left and was deleted. Restoring it un-quotes every message built with util.inspect, which is how fs.js's ERR_INVALID_ARG_VALUE read `Received bogus`.",
       "source": "pkg/runtime/js/internal/util.js",
       "find": "    if (t === 'string') return quote(v);",
       "replace": "    if (t === 'string') return depth === 0 ? v : quote(v);",
@@ -643,7 +643,7 @@
     },
     {
       "name": "57-format-single-arg dies when inspect stops choosing the quote character",
-      "why": "node picks the delimiter to avoid escaping — a string containing a single quote is rendered with DOUBLE quotes (\"it's\", not 'it\\'s'). Always using single quotes escapes where node does not, so any inspected value containing an apostrophe differs.",
+      "why": "node picks the delimiter to avoid escaping \u2014 a string containing a single quote is rendered with DOUBLE quotes (\"it's\", not 'it\\'s'). Always using single quotes escapes where node does not, so any inspected value containing an apostrophe differs.",
       "source": "pkg/runtime/js/internal/util.js",
       "find": "    if (StringPrototypeIndexOf(s, \"'\") !== -1) {\n      if (StringPrototypeIndexOf(s, '\"') === -1) q = '\"';\n      else if (StringPrototypeIndexOf(s, '`') === -1 && StringPrototypeIndexOf(s, '${') === -1)\n        q = '`';\n    }\n",
       "replace": "",
@@ -654,7 +654,7 @@
     },
     {
       "name": "62-fs-read-buffer dies when the pristine Buffer capture moves back into fs.js",
-      "why": "fs.js is a LAZY module, so a `require('buffer').Buffer` capture at its module-eval reads whatever user code left there — a dependency's top-level `require('buffer').Buffer = shim` then steers and discloses every fs read. loader.js snapshots it right after buffer is instantiated, where the ordering is provable.",
+      "why": "fs.js is a LAZY module, so a `require('buffer').Buffer` capture at its module-eval reads whatever user code left there \u2014 a dependency's top-level `require('buffer').Buffer = shim` then steers and discloses every fs read. loader.js snapshots it right after buffer is instantiated, where the ordering is provable.",
       "source": "pkg/runtime/js/internal/fs.js",
       "find": "  var PristineBuffer = require.pristineBuffer;",
       "replace": "  var PristineBuffer = require('buffer').Buffer;",
@@ -677,7 +677,7 @@
     },
     {
       "name": "62-fs-read-buffer dies when 'buffer' is validated like an ordinary encoding",
-      "why": "node's getOptions skips assertEncoding for 'buffer' so it reaches Buffer#toString and throws ERR_UNKNOWN_ENCODING. Validating it yields ERR_INVALID_ARG_VALUE — a different code AND message on a documented fs option value.",
+      "why": "node's getOptions skips assertEncoding for 'buffer' so it reaches Buffer#toString and throws ERR_UNKNOWN_ENCODING. Validating it yields ERR_INVALID_ARG_VALUE \u2014 a different code AND message on a documented fs option value.",
       "source": "pkg/runtime/js/internal/fs.js",
       "find": "    if (encoding !== 'buffer' && !BufferIsEncoding(encoding)) {",
       "replace": "    if (!BufferIsEncoding(encoding)) {",
@@ -799,7 +799,7 @@
     },
     {
       "name": "57-format-single-arg dies when a lone surrogate is not escaped",
-      "why": "node escapes an unpaired surrogate as \\\\udXXX; Lava used to hand it to the string conversion, which replaced it with U+FFFD — the value came back LOSSY, not merely rendered differently.",
+      "why": "node escapes an unpaired surrogate as \\\\udXXX; Lava used to hand it to the string conversion, which replaced it with U+FFFD \u2014 the value came back LOSSY, not merely rendered differently.",
       "source": "pkg/runtime/js/internal/util.js",
       "find": "        if (next >= 0xdc00 && next <= 0xdfff)\n          i++; // consume the pair\n        else esc = escUnit(c);",
       "replace": "        if (next >= 0xdc00 && next <= 0xdfff) i++;",
@@ -810,7 +810,7 @@
     },
     {
       "name": "57-format-single-arg dies when Symbol.for is read off the captured Symbol object",
-      "why": "Capturing `Symbol` alone is not enough — `.for` is a writable property on it, so a lazily-evaluated module reading P.Symbol.for at its own module-eval still reads whatever user code left there. The primordials table must expose the METHOD. Pinned through a Buffer, whose util.inspect.custom hook is looked up with that symbol: without it a Buffer renders as a plain Uint8Array. An earlier version of this entry SURVIVED because case 57 inspected no Buffer at all.",
+      "why": "Capturing `Symbol` alone is not enough \u2014 `.for` is a writable property on it, so a lazily-evaluated module reading P.Symbol.for at its own module-eval still reads whatever user code left there. The primordials table must expose the METHOD. Pinned through a Buffer, whose util.inspect.custom hook is looked up with that symbol: without it a Buffer renders as a plain Uint8Array. An earlier version of this entry SURVIVED because case 57 inspected no Buffer at all.",
       "source": "pkg/runtime/js/internal/primordials.js",
       "find": "    SymbolFor: Symbol.for,",
       "replace": "    SymbolFor: undefined,",
@@ -855,9 +855,9 @@
     },
     {
       "name": "64-stream-write dies when Readable.push does not accept what write does",
-      "why": "Widening only the writable half makes a PassThrough take a view on one side and error on the other — which is how the first attempt shipped. The replacement KEEPS the normalization so the entry pins the brand widening alone — changing both at once would leave a kill ambiguous about which half the case detects.",
+      "why": "Widening only the writable half makes a PassThrough take a view on one side and error on the other \u2014 which is how the first attempt shipped. The replacement KEEPS the normalization so the entry pins the brand widening alone \u2014 changing both at once would leave a kill ambiguous about which half the case detects.",
       "source": "pkg/runtime/js/internal/stream.js",
-      "find": "      } else if (isBytesChunk(chunk)) {\n        // The readable half must accept exactly what the writable half does, or a\n        // PassThrough takes a view on one side and errors on the other — which is how the\n        // first attempt at this shipped.\n        chunk = bytesToBuffer(chunk);",
+      "find": "      } else if (isBytesChunk(chunk)) {\n        // The readable half must accept exactly what the writable half does, or a\n        // PassThrough takes a view on one side and errors on the other \u2014 which is how the\n        // first attempt at this shipped.\n        chunk = bytesToBuffer(chunk);",
       "replace": "      } else if (chunk instanceof Uint8Array) {\n        chunk = bytesToBuffer(chunk);",
       "gate": "compat:tests/node-compat/cases/64-stream-write-validation.js",
       "expect_detail": [
@@ -888,7 +888,7 @@
     },
     {
       "name": "65-lazy-buffer-capture dies when a module resolves Buffer itself instead of taking the loader's",
-      "why": "net.js is a LAZY module, so its own require('buffer') runs on the user's first require of net — after user code. Node is not steerable this way; measured, sock.write('PAYLOAD') delivered \"PAYLOAD\" on node and \"TAMPERED\" here.",
+      "why": "net.js is a LAZY module, so its own require('buffer') runs on the user's first require of net \u2014 after user code. Node is not steerable this way; measured, sock.write('PAYLOAD') delivered \"PAYLOAD\" on node and \"TAMPERED\" here.",
       "source": "pkg/runtime/js/internal/net.js",
       "find": "  var PristineBuffer = require.pristineBuffer;",
       "replace": "  var PristineBuffer = { Buffer: require('buffer').Buffer, from: require('buffer').Buffer.from, alloc: require('buffer').Buffer.alloc, concat: require('buffer').Buffer.concat, isBuffer: require('buffer').Buffer.isBuffer };",
@@ -899,7 +899,7 @@
     },
     {
       "name": "65-lazy-buffer-capture dies when Buffer.from is read off the constructor at call time",
-      "why": "Capturing the CONSTRUCTOR is not enough: `.from` is a writable member read off it at call time, so `Buffer.from = evil` steers a module holding a pristine constructor. This is the half the first version of the fix missed — the object is not the method, the same lesson as Symbol.for in util.js.",
+      "why": "Capturing the CONSTRUCTOR is not enough: `.from` is a writable member read off it at call time, so `Buffer.from = evil` steers a module holding a pristine constructor. This is the half the first version of the fix missed \u2014 the object is not the method, the same lesson as Symbol.for in util.js.",
       "source": "pkg/runtime/js/internal/net.js",
       "find": "  var BufferFrom = PristineBuffer.from;",
       "replace": "  var BufferFrom = function (v, a, b) { return PristineBuffer.Buffer.from(v, a, b); };",
@@ -910,7 +910,7 @@
     },
     {
       "name": "65-lazy-buffer-capture dies when os.userInfo reads Buffer.from at call time",
-      "why": "os.userInfo originally re-read the live export on EVERY call, so it was steerable at any time — a case that only swaps things before the first require cannot see it. This mutation restores a call-time read while leaving the module-eval capture intact, so it pins the call-time half alone.",
+      "why": "os.userInfo originally re-read the live export on EVERY call, so it was steerable at any time \u2014 a case that only swaps things before the first require cannot see it. This mutation restores a call-time read while leaving the module-eval capture intact, so it pins the call-time half alone.",
       "source": "pkg/runtime/js/internal/os.js",
       "find": "  var BufferFrom = PristineBuffer.from;",
       "replace": "  var BufferFrom = function (v, a, b) { return PristineBuffer.Buffer.from(v, a, b); };",
@@ -965,13 +965,89 @@
     },
     {
       "name": "65-lazy-buffer-capture dies when net's INBOUND wrap reads Buffer live",
-      "why": "net's asBuffer wraps every 'data' chunk — the DISCLOSURE direction. The write-side assertion alone leaves it green while a shim reads every inbound byte.",
+      "why": "net's asBuffer wraps every 'data' chunk \u2014 the DISCLOSURE direction. The write-side assertion alone leaves it green while a shim reads every inbound byte.",
       "source": "pkg/runtime/js/internal/net.js",
       "find": "  var BufferFrom = PristineBuffer.from;",
       "replace": "  var BufferFrom = function (v, a, b) { return require('buffer').Buffer.from(v, a, b); };",
       "gate": "compat:tests/node-compat/cases/65-lazy-buffer-capture.js",
       "expect_detail": [
         "net must not resolve Buffer through the shim"
+      ]
+    },
+    {
+      "name": "gate-integrity dies when the NODE_BIN rule is removed",
+      "why": "Without this rule agents set NODE_BIN=./bin/lava and every oracle becomes lava-vs-lava green.",
+      "source": "scripts/agent-cycle/gate-integrity.mjs",
+      "find": "    id: 'node-bin-override',\n    reason: 'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',\n    re: /\\bNODE_BIN\\s*=/,\n  },",
+      "replace": "    id: 'node-bin-override',\n    reason: 'NODE_BIN= turns oracle compares into lava-vs-lava or a fake oracle (scripts/lib/compare.sh)',\n    re: /(?!)/,\n  },",
+      "gate": "node-test:scripts/agent-cycle/gate-integrity.test.mjs",
+      "expect_detail": "blocks: node-bin-override"
+    },
+    {
+      "name": "gate-integrity dies when settings.json self-protect is dropped from PROTECTED_WRITE_PATHS",
+      "why": "An agent that can Edit settings.json deletes the deny list; that path must stay hard-blocked.",
+      "source": "scripts/agent-cycle/gate-integrity.mjs",
+      "find": "  '.claude/settings.json',\n  '.claude/settings.local.json',",
+      "replace": "  '.claude/settings.local.json',",
+      "gate": "node-test:scripts/agent-cycle/gate-integrity.test.mjs",
+      "expect_detail": "self-protect: blocks Edit of settings.json"
+    },
+    {
+      "name": "compare.sh dies when the lava-vs-lava refusal is gutted",
+      "why": "The check is the only runner-side stop for NODE_BIN pointing at lava; without it oracle suites lie.",
+      "source": "scripts/lib/compare.sh",
+      "find": "\tlava | lava.exe)\n\t\tprintf '%s\\n' \"GATE INTEGRITY: NODE_BIN must be the Node oracle, not Lava (got $NODE_BIN)\" >&2\n\t\treturn 2\n\t\t;;",
+      "replace": "\tlava | lava.exe)\n\t\treturn 0\n\t\t;;",
+      "gate": "node-test:scripts/agent-cycle/compare-integrity.test.mjs",
+      "expect_detail": "GATE INTEGRITY"
+    },
+    {
+      "name": "assert-case-counts dies when the min floor branch is disabled",
+      "why": "Silent case deletion must fail the count; if (false) makes every suite green at any size.",
+      "source": "scripts/agent-cycle/assert-case-counts.mjs",
+      "find": "  if (n < spec.min) {",
+      "replace": "  if (false && n < spec.min) {",
+      "gate": "node-test:scripts/agent-cycle/assert-case-counts.test.mjs",
+      "expect_detail": [
+        "if (n < spec.min)",
+        "min floor",
+        "false &&"
+      ]
+    },
+    {
+      "name": "bench-gate dies when --gate exits 0 without a runnable lava",
+      "why": "rm bin/lava used to make bench-gate exit 0; the GATE branch must fail closed.",
+      "source": "bench/run.mjs",
+      "find": "  if (GATE) {\n    console.error('benchmark gate FAILED \u2014 lava not runnable (LAVA_BIN must work under --gate)');\n    process.exit(1);\n  }\n  process.exit(0);",
+      "replace": "  if (GATE) {\n    // mutated: silent green\n  }\n  process.exit(0);",
+      "gate": "node-test:scripts/agent-cycle/bench-gate-integrity.test.mjs",
+      "expect_detail": "lava not runnable"
+    },
+    {
+      "name": "bench-gate dies when the uncapped-bench check is disabled",
+      "why": "Without this, a new micro bench ships with no cap and never fails the gate.",
+      "source": "bench/run.mjs",
+      "find": "  if (uncapped.length > 0) {",
+      "replace": "  if (false && uncapped.length > 0) {",
+      "gate": "node-test:scripts/agent-cycle/bench-gate-integrity.test.mjs",
+      "expect_detail": [
+        "if (uncapped.length > 0)",
+        "uncapped",
+        "false &&"
+      ]
+    },
+    {
+      "name": "check-global-replace dies when allowKey goes back to file:line",
+      "why": "#337: line keys break on every edit above the site and train false hang alarms.",
+      "source": "scripts/lib/global-replace-detect.mjs",
+      "find": "export function allowKey(hit) {\n  const m = typeof hit.what === 'string' ? hit.what.match(/^([A-Za-z_$][\\w$]*)\\s*=/) : null;\n  if (m) return `${hit.file}:${m[1]}`;\n  return `${hit.file}:${hit.how}:${hit.what}`;\n}",
+      "replace": "export function allowKey(hit) {\n  return `${hit.file}:${hit.line}`;\n}",
+      "gate": "node-test:scripts/check-global-replace.test.mjs",
+      "expect_detail": [
+        "allowKey prefers binding",
+        "must not be keyed by line number",
+        "internal/util.js:ansiRegex",
+        "Expected values to be strictly equal"
       ]
     }
   ]

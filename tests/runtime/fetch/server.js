@@ -11,6 +11,13 @@ const http = require('node:http');
 const port = Number(process.argv[2] || 8799);
 
 const handler = (req, res) => {
+  // Worktree isolation (agent-cycle F2): readiness probe matches FETCH_SMOKE_NONCE
+  // so a parallel smoke never green-passes against a foreign origin on the same port.
+  if (req.url === '/_lava_ready') {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end(process.env.FETCH_SMOKE_NONCE || 'no-nonce');
+    return;
+  }
   // Redirect / Set-Cookie routes are dispatched before the generic POST echo so
   // a POST can receive a 3xx response (the client then re-issues per the redirect
   // rules) rather than being echoed. Exercises HTTP correctness (issue #99).
