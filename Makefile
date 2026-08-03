@@ -87,7 +87,7 @@ help:
 	@printf '%s\n' ''
 	@printf '%s\n' 'Agent system'
 	@printf '%s\n' '  make agent-queue        Derived task DAG: order, tiers, blockers (ALL=1 ignores the label gate)'
-	@printf '%s\n' '  make agent-run          Drain one ready issue end-to-end (MAX=n PROVIDER=claude|grok)'
+	@printf '%s\n' '  make agent-run          Drain one ready issue end-to-end (MAX=n PROVIDER=grok|claude|codex|none|auto)'
 	@printf '%s\n' '  make agent-status       Last pipeline run and recent run ids'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Env knobs (oracle runners):'
