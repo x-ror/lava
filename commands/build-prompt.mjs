@@ -16,6 +16,33 @@ const FORBIDDEN = [
 ];
 
 /**
+ * The machine-readable half of a hard gate's output.
+ *
+ * The text report a human reads is not the verdict — `runtime/gates/
+ * aggregate-verdict.mjs` reads this file, and its ABSENCE is BLOCK. Stated in
+ * the prompt, with the shape, because the alternative is trusting that the
+ * playbook mentions it: pr-gate's did not, so every run reported "produced no
+ * verdict (exit 0)" and no pipeline ever reached a PR.
+ *
+ * @param {string} path absolute path in the worktree
+ */
+export function findingsContract(path) {
+  return [
+    `Verdict file (REQUIRED): ${path}`,
+    'Write it before you finish. No file means BLOCK — not "clean" — because a',
+    'gate that produced nothing is indistinguishable from one that crashed.',
+    'Shape (runtime/gates/findings-schema.json):',
+    '  {"agent": "pr-gate", "ran_commands": ["make check", ...], "findings": [',
+    '    {"id": "f1", "severity": "P0|P1|P2|nit", "class": "parity|safety|security|gate-weakening|style|other",',
+    '     "file": "pkg/runtime/x.odin", "line": 42, "what": "...", "failure": "...",',
+    '     "evidence": "...", "fix": "...", "confidence": "high|medium|low"}]}',
+    'An empty `findings` array is the correct way to say the diff is clean.',
+    'severity and class drive the verdict: parity/safety/security/gate-weakening',
+    'are floored at P1, and a P0 with an empty `fix` is BLOCK.',
+  ].join('\n');
+}
+
+/**
  * Render planner's DAG as prose the next agent can act on.
  *
  * Flattened deliberately: the full JSON is on disk at `planPath` for anything
@@ -94,7 +121,7 @@ Hard rules (CLAUDE.md + docs/agent-system/ARCHITECTURE.md):
     );
   }
   if (ctx.extra) task.push(ctx.extra);
-  if (ctx.findingsPath) task.push(`Findings file: ${ctx.findingsPath}`);
+  if (ctx.findingsPath) task.push(findingsContract(ctx.findingsPath));
   if (ctx.gateLog) task.push(`Gate log (tail):\n${String(ctx.gateLog).slice(-4000)}`);
   if (ctx.args?.length) task.push(`CLI args: ${ctx.args.join(' ')}`);
   // Mode flags the playbook documents (--design-only, --quick, --review-only …).

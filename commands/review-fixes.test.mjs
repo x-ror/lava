@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { renderPlan } from './build-prompt.mjs';
@@ -209,4 +209,87 @@ test('the permission label is what admits an issue, on its own', async () => {
   const { isAgentReady } = await import('../runtime/github.mjs');
   assert.equal(isAgentReady({ labels: [], body: '<!-- lava-task -->' }), false);
   assert.equal(isAgentReady({ labels: [{ name: 'agent-ready' }] }), true);
+});
+
+// ── the hard gate must be told where to put its verdict ─────────────────────
+
+test('a hard gate is told the exact path to write its verdict to', async () => {
+  // pr-gate exited 0 and wrote nothing, so every run ended BLOCK — "produced no
+  // verdict" — and the pipeline could not reach a PR at all. The playbook asked
+  // for a text report and never named .agent-findings.json.
+  const { buildAgentPrompt } = await import('./build-prompt.mjs');
+  const { getAgent } = await import('../agents/registry.mjs');
+  const p = buildAgentPrompt(getAgent('pr-gate'), {
+    issue: { number: 1, title: 't', body: '' },
+    wt: '/wt',
+    findingsPath: '/wt/.agent-findings.json',
+  });
+  assert.match(p, /\/wt\/\.agent-findings\.json/);
+  assert.match(p, /severity/, 'the shape the aggregator reads is not described');
+});
+
+test('invokeCommand hands a hard gate its findings path', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lava-fp-'));
+  try {
+    await invokeCommand('pr-gate', {
+      issue: { number: 1, title: 't', body: '' },
+      cwd: dir,
+      provider: 'none',
+      worktree: false,
+      source: 'human',
+    });
+    const prompt = readFileSync(join(dir, '.agent-prompt.txt'), 'utf8');
+    // The ABSOLUTE path, which only the injection can produce. Matching on
+    // ".agent-findings.json" alone passed without the injection, because the
+    // playbook now names the file too — the assertion was satisfied by the
+    // very text it was supposed to be independent of.
+    assert.match(
+      prompt,
+      new RegExp(`Verdict file \\(REQUIRED\\): ${dir}/\\.agent-findings\\.json`),
+      'the agent was never told which worktree to write into',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a non-gate agent is not asked for a verdict file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lava-fp-'));
+  try {
+    await invokeCommand('critic', {
+      issue: { number: 1, title: 't', body: '' },
+      cwd: dir,
+      provider: 'none',
+      worktree: false,
+      source: 'human',
+    });
+    const prompt = readFileSync(join(dir, '.agent-prompt.txt'), 'utf8');
+    assert.doesNotMatch(prompt, /\.agent-findings\.json/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the verdict example in the playbook is not fiction', async () => {
+  // A documented shape nobody executes drifts from the schema and from the
+  // aggregator that consumes it. This runs the example through both.
+  const { ROOT } = await import('../runtime/paths.mjs');
+  const { aggregate } = await import('../runtime/gates/aggregate-verdict.mjs');
+  const md = readFileSync(join(ROOT, 'agents/prompts/pr-gate.md'), 'utf8');
+  const block = md.match(/## Step 5b[\s\S]*?```json\n([\s\S]*?)```/);
+  assert.ok(block, 'the playbook no longer documents the verdict file');
+  const doc = JSON.parse(block[1]);
+
+  const schema = JSON.parse(readFileSync(join(ROOT, 'runtime/gates/findings-schema.json'), 'utf8'));
+  for (const k of schema.required) assert.ok(k in doc, `example lacks ${k}`);
+  const itemSchema = schema.properties.findings.items;
+  for (const f of doc.findings) {
+    for (const k of itemSchema.required) assert.ok(k in f, `finding lacks ${k}`);
+    assert.ok(itemSchema.properties.severity.enum.includes(f.severity));
+    assert.ok(itemSchema.properties.confidence.enum.includes(f.confidence));
+  }
+
+  // A P0 that carries a fix is the autonomous ceiling, not a block.
+  assert.equal(aggregate([doc]).verdict, 'SHIP-AFTER');
+  assert.equal(aggregate([{ agent: 'pr-gate', findings: [] }]).verdict, 'SHIP');
 });

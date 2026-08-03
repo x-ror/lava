@@ -107,6 +107,12 @@ export async function invokeCommand(commandName, opts = {}) {
     extra: opts.extra,
     findingsPath: opts.findingsPath,
     gateLog: opts.gateLog,
+    // A hard gate reports its verdict through a file. Telling it the absolute
+    // path here, rather than trusting the playbook to mention one, is what makes
+    // the contract survive a playbook edit — pr-gate shipped for a week writing
+    // only a text report, so every run ended "produced no verdict" and the
+    // pipeline could never reach a PR.
+    findingsPath: opts.findingsPath ?? (agent.hard_gate ? join(wt, FINDINGS_FILE) : undefined),
     args: opts.args,
     flags: opts.flags,
   });
