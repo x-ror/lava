@@ -13,7 +13,7 @@
     // Build outputs and the ignored Windows dependency cache.
     "bin",
     "build",
-    ".deps"
+    ".deps",
   ],
 
   "config": {
@@ -33,6 +33,6 @@
     // (verification checklist)" appears under both Slice 1b and Slice 2 in
     // docs/io-uring-proactor.md. Those are different checklists under different parents,
     // not a copy-paste slip, and flattening them would lose the parallel structure.
-    "MD024": { "siblings_only": true }
-  }
+    "MD024": { "siblings_only": true },
+  },
 }

@@ -22,8 +22,6 @@ import { join } from 'node:path';
 
 const WORKFLOW_DIR = join(import.meta.dirname, '..', '.github', 'workflows');
 
-const lint = await createLinter();
-
 const files = readdirSync(WORKFLOW_DIR)
   .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
   .sort();
@@ -33,6 +31,13 @@ let problems = 0;
 for (const name of files) {
   const path = join(WORKFLOW_DIR, name);
   const relative = `.github/workflows/${name}`;
+  // A linter per file, not one reused across all of them. The WASM instance does
+  // not survive several sizeable documents: with three workflows present it
+  // aborted with `RuntimeError: unreachable` partway through the second, and the
+  // gate then reported a crash rather than a lint result. Reused state failing
+  // on the SECOND file also means the failure moves as files are added or
+  // renamed, which is what makes it worth the extra instantiation.
+  const lint = await createLinter();
   for (const result of lint(readFileSync(path, 'utf8'), relative)) {
     console.error(
       `${relative}:${result.line}:${result.column}: ${result.message} [${result.kind}]`,

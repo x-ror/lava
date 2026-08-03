@@ -19,7 +19,7 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lava-fs-oracle.XXXXXX")
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 "$NODE_BIN" --version >/dev/null
-node "$ROOT_DIR/scripts/agent-cycle/assert-case-counts.mjs" tests/std/fs/cases
+node "$ROOT_DIR/runtime/gates/assert-case-counts.mjs" tests/std/fs/cases
 
 for case_file in "$ROOT_DIR"/tests/std/fs/cases/*.js; do
 	[ -f "$case_file" ] || continue

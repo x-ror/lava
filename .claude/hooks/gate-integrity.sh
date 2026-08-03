@@ -6,4 +6,4 @@ ROOT="${CLAUDE_PROJECT_DIR:-}"
 if [ -z "$ROOT" ]; then
   ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 fi
-exec node "$ROOT/scripts/agent-cycle/gate-integrity.mjs" --hook
+exec node "$ROOT/runtime/gates/integrity.mjs" --hook

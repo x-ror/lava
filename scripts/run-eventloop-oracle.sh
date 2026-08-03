@@ -12,7 +12,7 @@ KNOWN_GAPS_FILE="$ROOT_DIR/tests/runtime/eventloop/known-lava-gaps.txt"
 . "$ROOT_DIR/scripts/lib/compare.sh"
 
 "$NODE_BIN" --version >/dev/null
-node "$ROOT_DIR/scripts/agent-cycle/assert-case-counts.mjs" tests/runtime/eventloop/cases
+node "$ROOT_DIR/runtime/gates/assert-case-counts.mjs" tests/runtime/eventloop/cases
 
 trap 'rm -rf "$TMP_DIR"' EXIT
 

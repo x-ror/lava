@@ -40,5 +40,14 @@ graphify-out/
 .env.*
 !.env.example
 
-# Agent-cycle driver local state (issue plans, locks)
+# Agent system local state (run state, prompts, gate findings).
+# .agent-findings.json is the hard gate's verdict channel: an implementer running
+# `git add -A` would otherwise commit one, and a committed findings file is read
+# as the next round's verdict.
 .agent-cycle/
+.agent-state/
+.agent-prompt.txt
+.agent-prompt-*.txt
+.agent-findings.json
+.agent-plan.json
+.agent-env

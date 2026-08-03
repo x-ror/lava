@@ -28,7 +28,7 @@ was touched. -->
 
 ## Gates run
 
-<!-- Paste results. See .claude/skills/pr-gate/reference/gates.md for what the
+<!-- Paste results. See agents/prompts/pr-gate-reference/gates.md for what the
 changed paths require. Networking smokes run on both backends. -->
 
 - [ ] `make check`

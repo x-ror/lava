@@ -81,6 +81,58 @@ coupling.
       `JSObjectMakeDeferredPromise` binding is needed. _(passes `08-fetch`;
       end-to-end node-parity via `make test-fetch-smoke`)_
 
+### Architecture seams (five-subsystem review, 2026-07-27)
+
+Local quality is high in every subsystem; the structural problems are at the
+**seams** between them. Each of these is filed with its evidence — this list is
+the index, the issue is the detail. Ordered by what it unblocks.
+
+- [ ] **ESM is a source rewriter, not a loader**
+      ([#345](https://github.com/x-ror/lava/issues/345) · epic) — no live bindings,
+      no TLA (#65), no backing loader for `import()` (#64), no `"type": "module"`,
+      no `"exports"`; CJS and ESM duplicate the wrapper contract in two languages.
+- [ ] **HTTP framing is implemented twice with divergent limits**
+      ([#343](https://github.com/x-ror/lava/issues/343)) — `fetch.odin` caps the head
+      at 256 KiB, `http.js` at 64 KiB; chunk decoding exists in both. #226 is a
+      symptom of the split.
+- [ ] **No cross-thread work injection**
+      ([#346](https://github.com/x-ror/lava/issues/346)) — `async_begin` is
+      loop-thread-only, so no foreign thread can hand work to a loop. Blocks
+      `worker_threads`.
+- [ ] **The event-loop platform seam sits at the wrong altitude**
+      ([#347](https://github.com/x-ror/lava/issues/347)) — readiness and proactor are
+      coequal public APIs, the `Net_IO_Mode` ladder is pushed into consumers, and
+      Linux-only ops (`submit_send_zc`) are package API.
+- [ ] **`Runtime_State` is a god object**
+      ([#344](https://github.com/x-ror/lava/issues/344)) — every subsystem is a
+      field, init order is enforced by comments, and a bootstrap failure degrades
+      silently into `MODULE_NOT_FOUND`.
+- [ ] **`process.exit` calls `os.exit` from a `proc "c"`**
+      ([#348](https://github.com/x-ror/lava/issues/348)) — no teardown, no flush, and
+      in a multi-worker run it takes the siblings with it.
+- [ ] **No scoped-borrow type for slices that alias the JSC heap**
+      ([#350](https://github.com/x-ror/lava/issues/350)) — the GC-root half landed
+      (`js_root.odin`); the borrow rule that the write-into natives already broke once
+      is still review-only.
+- [ ] **URL parsing is ~13x node and structurally so**
+      ([#351](https://github.com/x-ror/lava/issues/351)) — the per-character WHATWG
+      state machine runs in JS, on the `fetch` hot path; #310 took the easy 2.8x.
+- [ ] **~22k lines of embedded JS are re-parsed per context**
+      ([#349](https://github.com/x-ror/lava/issues/349)) — paid once per CLI run and
+      N times per worker fleet; no snapshot or bytecode cache.
+- [ ] **`ARCHITECTURE.md` is stale**
+      ([#365](https://github.com/x-ror/lava/issues/365)) — §5.4 still lists `node:net`
+      and `node:http` as future work, and CLAUDE.md points contributors there first.
+- [ ] **The pure HTTP parsers cannot be unit-tested without JSC**
+      ([#363](https://github.com/x-ror/lava/issues/363)) — extract to a
+      `pkg/runtime/http` sub-package.
+- [ ] **Bench harness hygiene**
+      ([#364](https://github.com/x-ror/lava/issues/364)) — no RSS-over-time leak arm,
+      no shared loadgen/warmup across runtimes, and MSG_ZEROCOPY never measured on a
+      real NIC (loopback always copies).
+- [ ] **`fs_mkdir_recursive` hand-rolls `core:os` `make_directory_all`**
+      ([#366](https://github.com/x-ror/lava/issues/366)) — reuse-first violation.
+
 ### High priority (the Odin / native part)
 
 - [x] **`fs.writeFileSync(path, dataView)` could write out-of-bounds heap into a
@@ -118,16 +170,13 @@ coupling.
       ([#329](https://github.com/x-ror/lava/issues/329)) — fixed by adding
       `js/internal/fs.js` over `make_fs_bindings`, so `node:fs` is no longer the
       native-direct outlier ARCHITECTURE.md §3.4 named. All three were pre-existing and
-      none threw — each returned plausible-looking wrong output:
-      1. **Reads returned a bare `Uint8Array`, not a `Buffer`.** `Buffer.isBuffer` was
-         false and `.toString('hex')` fell through to `Uint8Array.prototype.toString`,
-         which ignores its argument: `"116,121"` where node gives `"7479"`. `.equals`,
-         `.compare`, `.readUInt32BE`, `.toString('base64')` and `.indexOf(string)` were
-         all wrong or missing on every file read.
-      2. **The encoding argument was ignored.** Every read decoded as UTF-8, so
-         `readFileSync(p, 'hex')` returned the file's text instead of its hex.
-      3. **Undecodable bytes produced `""`.** Invalid UTF-8 yielded an empty string where
-         node substitutes U+FFFD — the shape of bug that reads as an empty file.
+      none threw — each returned plausible-looking wrong output: 1. **Reads returned a bare `Uint8Array`, not a `Buffer`.** `Buffer.isBuffer` was
+      false and `.toString('hex')` fell through to `Uint8Array.prototype.toString`,
+      which ignores its argument: `"116,121"` where node gives `"7479"`. `.equals`,
+      `.compare`, `.readUInt32BE`, `.toString('base64')` and `.indexOf(string)` were
+      all wrong or missing on every file read. 2. **The encoding argument was ignored.** Every read decoded as UTF-8, so
+      `readFileSync(p, 'hex')` returned the file's text instead of its hex. 3. **Undecodable bytes produced `""`.** Invalid UTF-8 yielded an empty string where
+      node substitutes U+FFFD — the shape of bug that reads as an empty file.
       The layer fixes all three by never asking the native for a string: it takes bytes and
       decodes through `Buffer#toString`, reusing codecs the buffer oracle cases already
       cover instead of maintaining a second implementation. The re-tag is **zero copy**
@@ -237,7 +286,9 @@ coupling.
       write-callback err arg (`undefined` where node passes `null`); `end(cb)` running
       after `'finish'` instead of before; a swallowed EPIPE where node dies noisily; and
       `columns`/`rows`/`getWindowSize`/`hasColors` on a terminal, which need TIOCGWINSZ.
-- [ ] **`process.on` does not exist**, so `process.on('exit', …)` throws — found while
+- [ ] **`process.on` does not exist**
+      ([#355](https://github.com/x-ror/lava/issues/355)) — so `process.on('exit', …)`
+      throws; found while
       pinning the above, which had to use a timer instead. Also still missing:
       `process.hrtime` (`hrtime.bigint()` throws; `JSBigIntCreateWithUInt64` IS exported by
       the JSC we link, so the in-repo "no BigInt constructor" comment is stale), and
@@ -343,7 +394,8 @@ coupling.
       Latent rather than live when found: no committed case contained `%%`, so
       nothing was mis-comparing. A future one would have, silently, on both sides.
 - [ ] **`decode-utf16le` breaches its cap ~3 runs in 8, and `bench-gate` is not in
-      CI** — measured 2026-07-30 over 8 `--gate` runs: 11.07x, 14.01x, 14.44x,
+      CI** ([#362](https://github.com/x-ror/lava/issues/362)) — measured 2026-07-30
+      over 8 `--gate` runs: 11.07x, 14.01x, 14.44x,
       14.63x, 15.22x, 15.61x and two unrecorded passes, against a 14.5 cap. The cap
       was recalibrated 2026-07-28 to "~1.4x the fresh idle-box median-of-3" from a
       9.8x measurement; the median now reads ~14.3x. Either the box differs or
@@ -357,7 +409,8 @@ coupling.
       First step is deciding which of the two it is — rebuild at the 2026-07-28 tip
       and re-measure on the same box, rather than widening the cap and losing the
       detector.
-- [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector** —
+- [ ] **`Object.prototype.then` is an uncounted, easily-set pollution vector**
+      ([#353](https://github.com/x-ror/lava/issues/353)) —
       a plain data property, so an ordinary merge/`obj[a][b]=c` gadget sets it,
       no `defineProperty` needed. Verified under `bin/lava`: `await { plain: 1 }`
       and `Promise.resolve(obj)` both execute attacker code inside an internal
@@ -545,7 +598,8 @@ coupling.
       remaining variance by pinning: pinning shifts the ratio level 25-40% (it
       hurts node more than Lava) and would invalidate every cap in bench/thresholds.json.
 - [ ] **Host-native registry: consider moving `g_host_native_fns` onto
-      `Runtime_State`** — it is read only at registration and in the sweep, never
+      `Runtime_State`** ([#359](https://github.com/x-ror/lava/issues/359)) — it is
+      read only at registration and in the sweep, never
       on the dispatch path (only `g_host_native_cbs` is), so keying it by the
       context pointer buys nothing and it could die with the state, deleting the
       sweep entirely. Not done here for a measured reason: the cache-HIT path is
@@ -553,8 +607,16 @@ coupling.
       currently returns before any state lookup; moving the table would add
       `JSContextGetGlobalObject` + `JSObjectGetPrivate` to every hit. Needs a
       profile before committing to it.
-- [ ] **Stack-trace line numbers are off by one** — the CommonJS wrapper
+- [ ] **Stack-trace line numbers are off by one**
+      ([#357](https://github.com/x-ror/lava/issues/357)) — the CommonJS wrapper
       prepends a line but `JSEvaluateScript` starts at line 1.
+- [ ] **`make_uint8_array_uninit` leaks its allocation when the typed-array
+      creation fails** ([#358](https://github.com/x-ror/lava/issues/358)) —
+      `typed_array.odin:114-126` returns `nil, false` after
+      `mem.alloc_bytes_non_zeroed` succeeded but JSC declined to take ownership, so
+      `jsc_buffer_deallocator` never runs for it. Reachable from the buffer pool
+      refill path, i.e. under memory pressure. Testing it needs the fault-injection
+      seam above.
 - [ ] **Two native-function divergences, both declared and pinned, neither
       repairable from the public C API** — recorded so nobody re-derives them.
       (a) On the host path `new setTimeout(fn)` evaluates to the CALL result,
@@ -571,7 +633,8 @@ coupling.
       configuration. Fixing either needs a JS-level `defineProperty` during
       global installation; not worth it for a path taken only when the private
       ABI is missing.
-- [ ] **Each `JSGlobalContext` costs one leaked `timerfd`** — JavaScriptCore's
+- [ ] **Each `JSGlobalContext` costs one leaked `timerfd`**
+      ([#356](https://github.com/x-ror/lava/issues/356)) — JavaScriptCore's
       per-VM `WTF::RunLoop` timer. Measured 2026-07-29: +1 per context, strictly
       linear over 20 iterations, reproduced by a bare
       `JSGlobalContextCreate`/`Release` pair with no event loop, no script and no
@@ -611,7 +674,8 @@ coupling.
       `pkg/jsc/private_string.odin` is VM-independent and was never implicated,
       and the residual failure was not a separate defect in
       `pkg/runtime/eventloop/loop.odin`.)
-- [ ] **Prototype-pollution hardening of the embedded JS layer** — `primordials.js`
+- [ ] **Prototype-pollution hardening of the embedded JS layer**
+      ([#352](https://github.com/x-ror/lava/issues/352) · epic) — `primordials.js`
       plus the `make check-primordials` ratchet over
       `tests/node-compat/pollution-baseline.json`. Done in the `method` column:
       `events.js`, `dns_promises.js`, and the encoding-name path of `buffer.js`;
@@ -728,8 +792,9 @@ coupling.
 
 ### CI / tooling housekeeping
 
-- [ ] **Give the gates one honest runner** — `make <target> | tail` reports
-      **tail's** exit status, not make's, so a failing gate reads as a pass. This
+- [ ] **Give the gates one honest runner**
+      ([#360](https://github.com/x-ror/lava/issues/360)) — `make <target> | tail`
+      reports **tail's** exit status, not make's, so a failing gate reads as a pass. This
       is not hypothetical: during the #320 review it hid a real `make test-lava`
       failure (the oracle diff was in the output text while the status said 0),
       and it is how `test-odin-serial` stayed green for a whole session while
@@ -737,7 +802,8 @@ coupling.
       exit codes, stopping at the first failure, so neither a human nor an agent
       has to remember `set -o pipefail`. Until it exists, every gate claim in a
       PR body rests on the author having piped correctly.
-- [ ] **A test-only fault-injection seam for JSC-side failures** — three
+- [ ] **A test-only fault-injection seam for JSC-side failures**
+      ([#361](https://github.com/x-ror/lava/issues/361)) — three
       safety-critical branches are accepted-untested today because the fault has
       to happen _inside_ JSC: the paired `map_insert` rollback in
       `host_native_create`, the `fillRandom` identity check in `crypto.js`, and
@@ -746,13 +812,14 @@ coupling.
       to be exercised and most expensive to get wrong. One env-gated seam
       (`LAVA_HOSTFN_DISABLE` is the precedent) unlocks all three.
 - [ ] Pin a specific Odin release in CI (currently the `setup-odin` default) for
-      reproducibility, and bump `llvm-version` if a newer Odin needs it. Newly
+      reproducibility, and bump `llvm-version` if a newer Odin needs it
+      ([#35](https://github.com/x-ror/lava/issues/35)). Newly
       concrete: this session turned on the fact that `ODIN_TEST_THREADS` is a
       compile-time `#config`, not an environment variable — runner semantics we
       now depend on in two targets, and which a silent `setup-odin` bump could
       change under us.
 - [ ] Update `actions/checkout` / `actions/setup-node` past the Node 20
-      deprecation warning.
+      deprecation warning ([#35](https://github.com/x-ror/lava/issues/35)).
 - [x] Real `odin build` + run job for Windows: the CI Windows job links a
       JavaScriptCore-backed `lava.exe` (JSC from the Bun WebKit fork) and runs a
       runtime smoke, on top of type-check + codegen.
