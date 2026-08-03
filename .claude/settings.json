@@ -22,8 +22,6 @@
       "Bash(make bench-gate)",
       "Bash(make api-surface)",
       "Bash(make bun-buffer-tests)",
-      "Bash(make bun-buffer-report)",
-      "Bash(make vendor-bun-report)",
       "Bash(make help)",
       "Bash(odin check:*)",
       "Bash(odin test:*)",
