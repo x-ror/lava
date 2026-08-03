@@ -866,9 +866,14 @@ install_globals :: proc(ctx: jsc.JSContextRef, loop: ^eventloop.Loop) {
 	inject_native_function(ctx, global, "clearImmediate", clear_timer_cb)
 
 	install_console(ctx, global)
+	// process must exist before install_internal_modules so the loader can put the
+	// intrinsic into natives['process'] for the node:process factory. Console is
+	// already on the global (just above). Both factories export that captured
+	// reference — never a lazy global read — so a pre-first-require reassignment of
+	// globalThis.process / globalThis.console cannot poison the builtin (#247).
+	install_process(ctx, global)
 	install_internal_modules(ctx, global)
 
-	install_process(ctx, global)
 	install_performance(ctx, global)
 	// process.nextTick + queueMicrotask are a JS shim (needs `process` to exist).
 	install_microtasks(ctx, global)
@@ -1155,6 +1160,17 @@ install_internal_modules :: proc(ctx: jsc.JSContextRef, global: jsc.JSObjectRef)
 	set_named(ctx, natives, "tty", cast(jsc.JSValueRef)make_tty_bindings(ctx))
 	set_named(ctx, natives, "stdio", cast(jsc.JSValueRef)make_stdio_bindings(ctx))
 	set_named(ctx, natives, "fs", cast(jsc.JSValueRef)make_fs_bindings(ctx))
+	// Intrinsic process/console objects. Captured here (context init, before user
+	// code) and handed to the factories so require('node:process') /
+	// require('node:console') never re-read the globals — node returns the
+	// intrinsic even when a dependency reassigned globalThis.process / console
+	// before the first require (#247). install_process runs before this proc.
+	if process_val := get_named(ctx, global, "process"); process_val != nil {
+		set_named(ctx, natives, "process", process_val)
+	}
+	if console_val := get_named(ctx, global, "console"); console_val != nil {
+		set_named(ctx, natives, "console", console_val)
+	}
 
 	args := [2]jsc.JSValueRef{cast(jsc.JSValueRef)factories, cast(jsc.JSValueRef)natives}
 	exception: jsc.JSValueRef

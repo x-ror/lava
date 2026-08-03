@@ -15,13 +15,7 @@
 // Never merges to master. Never self-waives P1. Human-only paths skip.
 
 import { spawnSync, execFileSync } from 'node:child_process';
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  appendFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { routePaths } from './route-gates.mjs';
@@ -151,7 +145,10 @@ function selectQueue(opts) {
   const open = listOpenIssues();
   if (opts.issues && opts.issues.length) {
     return opts.issues
-      .map((n) => open.find((i) => i.number === n) || { number: n, title: `(#${n})`, body: '', labels: [] })
+      .map(
+        (n) =>
+          open.find((i) => i.number === n) || { number: n, title: `(#${n})`, body: '', labels: [] },
+      )
       .filter((i) => !isHumanOnly(i));
   }
   const scored = [];
@@ -288,13 +285,7 @@ function runAgent(agent, prompt, cwd, opts) {
     ];
     cmd = agent.bin;
   } else if (agent.kind === 'claude') {
-    args = [
-      '--cwd',
-      cwd,
-      '--dangerously-skip-permissions',
-      '-p',
-      prompt,
-    ];
+    args = ['--cwd', cwd, '--dangerously-skip-permissions', '-p', prompt];
     cmd = agent.bin;
   } else {
     throw new Error(`unsupported agent ${agent.kind}`);
@@ -395,7 +386,19 @@ Merge is human-only.
 `;
   r = spawnSync(
     'gh',
-    ['pr', 'create', '--base', 'master', '--head', branch, '--draft', '--title', title, '--body', body],
+    [
+      'pr',
+      'create',
+      '--base',
+      'master',
+      '--head',
+      branch,
+      '--draft',
+      '--title',
+      title,
+      '--body',
+      body,
+    ],
     { encoding: 'utf8', cwd: wt, timeout: 120_000 },
   );
   if (r.status !== 0) {
@@ -466,7 +469,10 @@ function processIssue(issue, agent, opts) {
 
   if (opts.dryRun) {
     log('dry-run: stop after bootstrap');
-    writeFileSync(join(wt, '.agent-cycle-prompt.txt'), buildPrompt('implement', issue, { wt, branch, env }));
+    writeFileSync(
+      join(wt, '.agent-cycle-prompt.txt'),
+      buildPrompt('implement', issue, { wt, branch, env }),
+    );
     return { status: 'dry-run', wt, branch };
   }
 
@@ -501,7 +507,9 @@ function processIssue(issue, agent, opts) {
   if (!opts.skipReview && agent.kind !== 'none') {
     runAgent(agent, buildPrompt('review', issue, { wt, branch, env }), wt, opts);
     findings = loadFindings(wt);
-    const openP = (findings.findings || []).filter((f) => f.severity === 'P0' || f.severity === 'P1');
+    const openP = (findings.findings || []).filter(
+      (f) => f.severity === 'P0' || f.severity === 'P1',
+    );
     round = 0;
     while (openP.length && round < MAX_FIX_ROUNDS) {
       round++;

@@ -3,7 +3,7 @@
   "suites": {
     "tests/node-compat/cases": {
       "globs": ["*.js", "*.mjs"],
-      "min": 68
+      "min": 70
     },
     "tests/runtime/eventloop/cases": {
       "globs": ["*.js"],
