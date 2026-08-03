@@ -10,7 +10,7 @@ export function run(prompt, ctx) {
   console.log(`[llm:codex] spawning in ${ctx.cwd}`);
   const r = spawnSync('codex', args, {
     cwd: ctx.cwd,
-    env: { ...process.env, ...(ctx.env || {}) },
+    env: { ...process.env, ...ctx.env },
     timeout: 0,
     stdio: 'inherit',
   });

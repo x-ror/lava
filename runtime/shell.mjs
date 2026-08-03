@@ -9,7 +9,7 @@ export function sh(cmd, opts = {}) {
   return spawnSync('bash', ['-lc', cmd], {
     encoding: 'utf8',
     cwd: opts.cwd || ROOT,
-    env: { ...process.env, ...(opts.env || {}) },
+    env: { ...process.env, ...opts.env },
     timeout: opts.timeout ?? 0,
     maxBuffer: 20 * 1024 * 1024,
   });

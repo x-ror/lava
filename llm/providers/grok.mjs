@@ -20,7 +20,7 @@ export function run(prompt, ctx) {
   console.log(`[llm:grok] spawning in ${ctx.cwd} max-turns=${ctx.maxTurns ?? 100}`);
   const r = spawnSync('grok', args, {
     cwd: ctx.cwd,
-    env: { ...process.env, ...(ctx.env || {}) },
+    env: { ...process.env, ...ctx.env },
     timeout: 0,
     stdio: 'inherit',
   });
