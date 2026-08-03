@@ -7,7 +7,7 @@
  * Parses the first slash command and routes through the Command Layer.
  */
 import { invokeCommand } from '../../commands/invoke.mjs';
-import { ghJson } from '../../runtime/github.mjs';
+import { gh } from '../../runtime/github.mjs';
 
 const COMMANDS = new Set(['odin-feature', 'pr-gate', 'planner', 'fixer', 'critic', 'run-pipeline']);
 
@@ -23,6 +23,22 @@ export function parseSlashCommand(body) {
   if (!COMMANDS.has(command)) return null;
   const args = (m[2] || '').trim().split(/\s+/).filter(Boolean);
   return { command, args };
+}
+
+/**
+ * Body of the most recent comment on an issue or PR.
+ *
+ * `gh api --jq '.body'` prints the STRING, unquoted — it is not JSON, so the
+ * JSON-decoding helper threw on every ordinary comment and the `--pr` path
+ * never worked. Raw text, trailing newline removed.
+ *
+ * @param {number|string} number issue or PR number
+ * @param {{ gh?: Function }} [deps]
+ */
+export function latestCommentBody(number, deps = {}) {
+  const run = deps.gh || gh;
+  const out = run(['api', `repos/{owner}/{repo}/issues/${number}/comments`, '--jq', '.[-1].body']);
+  return String(out).replace(/\n$/, '');
 }
 
 export async function handleComment({ body, pr, issue, provider }) {
@@ -52,15 +68,7 @@ async function main() {
     else if (args[i] === '--issue') issue = args[++i];
     else if (args[i] === '--provider') provider = args[++i];
   }
-  if (!body && pr) {
-    const comments = ghJson([
-      'api',
-      `repos/{owner}/{repo}/issues/${pr}/comments`,
-      '--jq',
-      '.[-1].body',
-    ]);
-    body = typeof comments === 'string' ? comments : String(comments);
-  }
+  if (!body && pr) body = latestCommentBody(pr);
   if (!body) {
     console.error('usage: pr-comments.mjs --comment-body "/pr-gate" [--pr N]');
     process.exit(2);

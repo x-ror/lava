@@ -5,6 +5,21 @@ import { join } from 'node:path';
 export const kind = 'claude';
 
 /**
+ * Whether the stdin attempt never reached the CLI and is safe to repeat.
+ *
+ * Only a spawn failure qualifies. `spawnSync` reports `status: null` for a
+ * SIGKILL/SIGTERM too, and a killed agent may already have edited the worktree
+ * and burned its budget — repeating that is neither free nor idempotent. A plain
+ * non-zero exit is the agent having failed, which a rerun does not change.
+ *
+ * @param {{error?: Error, status: number|null, signal: string|null}} r spawnSync result
+ */
+export function shouldRetryOnStdin(r) {
+  if (r.error) return true;
+  return r.status === null && !r.signal;
+}
+
+/**
  * Claude Code CLI (claude): no --cwd flag — working dir is process cwd.
  * Headless: -p/--print + prompt. Permissions: --dangerously-skip-permissions.
  *
@@ -38,12 +53,7 @@ export function run(prompt, ctx) {
     maxBuffer: 20 * 1024 * 1024,
   });
 
-  // Retry ONLY when the CLI never got the prompt — a spawn error, or an exit
-  // with no signal that looks like a usage rejection. A plain non-zero exit is
-  // the agent having failed, and re-running the whole thing on that doubles the
-  // cost of every genuine failure without changing the outcome.
-  const spawnFailed = !!r.error || r.status === null;
-  if (!useInline && spawnFailed) {
+  if (!useInline && shouldRetryOnStdin(r)) {
     console.log(
       `[llm:claude] stdin path did not start (${r.error?.code || 'no exit'}); retrying with -p from file`,
     );

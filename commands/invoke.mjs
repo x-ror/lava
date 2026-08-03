@@ -14,6 +14,28 @@ import { STATE_DIR, FINDINGS_FILE, PLAN_FILE } from '../runtime/paths.mjs';
 import { ghJson } from '../runtime/github.mjs';
 
 /**
+ * Did this invocation succeed?
+ *
+ * For a hard gate, `ok` means the gate PASSED — not that the process exited 0.
+ * Callers outside the workflow graph read `ok` and nothing else: the CLI's exit
+ * code, the gate-failure trigger, the PR-comment handler. A BLOCK reporting
+ * ok:true reads as success to every one of them, and `--provider none` exits 0
+ * by construction.
+ *
+ * Reported, never thrown: the engine routes BLOCK to `fixer`, and an exception
+ * would land in runPipeline's catch as `status: 'error'`, ending the very fix
+ * loop that exists to handle it.
+ *
+ * @param {{hard_gate?: boolean}} agent
+ * @param {{verdict?: string}|null} verdict
+ * @param {{status: number|null, skipped?: boolean}} result
+ */
+export function invocationOk(agent, verdict, result) {
+  if (!agent.hard_gate) return result.status === 0 || !!result.skipped;
+  return verdict?.verdict === 'SHIP' || verdict?.verdict === 'SHIP-AFTER';
+}
+
+/**
  * @param {string} commandName e.g. 'odin-feature' | 'pr-gate'
  * @param {object} opts
  */
@@ -86,6 +108,7 @@ export async function invokeCommand(commandName, opts = {}) {
     findingsPath: opts.findingsPath,
     gateLog: opts.gateLog,
     args: opts.args,
+    flags: opts.flags,
   });
 
   mkdirSync(STATE_DIR, { recursive: true });
@@ -150,7 +173,7 @@ export async function invokeCommand(commandName, opts = {}) {
   }
 
   return {
-    ok: result.status === 0 || result.skipped,
+    ok: invocationOk(agent, verdict, result),
     status: result.status,
     skipped: !!result.skipped,
     provider: result.provider,

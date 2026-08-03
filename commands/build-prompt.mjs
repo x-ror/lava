@@ -32,14 +32,31 @@ export function renderPlan(plan, planPath) {
   if (plan.needs_human) lines.push(`NEEDS HUMAN: ${plan.needs_human}`);
   const tasks = Array.isArray(plan.tasks) ? plan.tasks : [];
   if (!tasks.length && !plan.terminal) lines.push('(planner produced no tasks)');
-  for (const t of tasks) {
-    const deps = (t.depends_on || []).length ? ` after ${t.depends_on.join(', ')}` : '';
-    const human = t.human_only ? ' [HUMAN ONLY — do not attempt]' : '';
-    lines.push(`- ${t.id || '?'}: ${t.title || '(untitled)'}${deps}${human}`);
-    for (const a of t.acceptance || []) lines.push(`    accept: ${a}`);
-    if ((t.paths_hint || []).length) lines.push(`    paths: ${t.paths_hint.join(', ')}`);
+  for (const t of tasks || []) {
+    const deps = list(t?.depends_on);
+    const human = t?.human_only ? ' [HUMAN ONLY — do not attempt]' : '';
+    lines.push(
+      `- ${t?.id || '?'}: ${t?.title || '(untitled)'}${deps.length ? ` after ${deps.join(', ')}` : ''}${human}`,
+    );
+    for (const a of list(t?.acceptance)) lines.push(`    accept: ${a}`);
+    const paths = list(t?.paths_hint);
+    if (paths.length) lines.push(`    paths: ${paths.join(', ')}`);
   }
   return lines.join('\n');
+}
+
+/**
+ * Coerce a field the schema declares as an array.
+ *
+ * The plan is JSON an LLM wrote, and `JSON.parse` is happy with
+ * `"depends_on": "t1"` — a string has `.length`, so the old truthiness check
+ * passed and `.join` then threw, taking down an invocation that had already
+ * agreed a malformed plan is context rather than a gate.
+ */
+function list(v) {
+  if (Array.isArray(v)) return v.filter((x) => x != null);
+  if (v == null || v === '') return [];
+  return [v];
 }
 
 /**
@@ -80,6 +97,15 @@ Hard rules (CLAUDE.md + docs/agent-system/ARCHITECTURE.md):
   if (ctx.findingsPath) task.push(`Findings file: ${ctx.findingsPath}`);
   if (ctx.gateLog) task.push(`Gate log (tail):\n${String(ctx.gateLog).slice(-4000)}`);
   if (ctx.args?.length) task.push(`CLI args: ${ctx.args.join(' ')}`);
+  // Mode flags the playbook documents (--design-only, --quick, --review-only …).
+  // The command layer consumes the ones it knows and forwards the rest here;
+  // before that they were parsed and dropped, so every documented mode was dead.
+  const flags = Object.entries(ctx.flags || {});
+  if (flags.length) {
+    task.push(
+      `Mode flags: ${flags.map(([k, v]) => (v === true ? `--${k}` : `--${k}=${v}`)).join(' ')}`,
+    );
+  }
 
   // The playbook is passed through verbatim. It used to be rewritten here by six
   // regexes that repaired paths left over from the previous layout — which meant
