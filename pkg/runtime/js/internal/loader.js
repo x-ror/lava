@@ -166,10 +166,11 @@
   // function through Runtime_State.builtin_require and returns only module exports.
   publicReq.primordials = req('primordials');
 
-  // stdio installs process.stdout/process.stderr. It cannot be eager-required here: the
-  // loader runs BEFORE install_process puts `process` on the global, and stdio pulls in
-  // `stream`, which reaches for it. Exposed as a closure so globals.odin can call it at
-  // the right moment, after the process object exists.
+  // stdio installs process.stdout/process.stderr. It cannot be eager-required here:
+  // install_process runs before the loader (so natives['process'] can capture the
+  // intrinsic for node:process — #247), but process.nextTick is installed only AFTER
+  // the loader returns, and stdio/stream need nextTick. Exposed as a closure so
+  // globals.odin can call it at the right moment, after microtasks are wired.
   publicReq.installStdio = function (proc) {
     req('stdio').install(proc);
   };
