@@ -16,6 +16,8 @@
 //   node scripts/agent-cycle/driver.mjs select
 //   node scripts/agent-cycle/driver.mjs plan <issue-number>
 //   node scripts/agent-cycle/driver.mjs route --from-git
+//   node scripts/agent-cycle/driver.mjs run [--once|--max N|--issues a,b|--agent grok]
+//     → delegates to run-loop.mjs (full drain: worktree → agent → gates → PR → next)
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -23,6 +25,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { routePaths } from './route-gates.mjs';
 import { aggregate } from './aggregate-verdict.mjs';
+// spawnSync used by `run` → run-loop.mjs
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const STATE_DIR = join(ROOT, '.agent-cycle');
@@ -240,9 +243,21 @@ switch (cmd) {
   case 'aggregate':
     cmdAggregate(rest);
     break;
+  case 'run':
+  case 'drain':
+  case 'loop': {
+    // Full automation: select → worktree → agent → gates → PR → next
+    const r = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'run-loop.mjs'), ...rest], {
+      cwd: ROOT,
+      stdio: 'inherit',
+      env: process.env,
+    });
+    process.exit(r.status ?? 1);
+    break;
+  }
   default:
     console.error(
-      'usage: driver.mjs status|select|plan <n>|route [--from-git|paths...]|aggregate <files>',
+      'usage: driver.mjs status|select|plan <n>|route|aggregate|run [--once|--max N|--issues a,b|--agent grok]',
     );
     process.exit(2);
 }
