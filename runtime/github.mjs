@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { ROOT } from './paths.mjs';
 import { buildDag, readyQueue, compareByRank } from './dag.mjs';
+import { issuesInFlight } from './runs.mjs';
 
 export function gh(args, opts = {}) {
   const r = spawnSync('gh', args, {
@@ -108,11 +109,20 @@ export function isAgentReady(issue) {
  * ordering source for the same issues, no issue in the tracker sets it, and tier
  * already says it. `blocked-by` from that block is still honoured, by dag.mjs.
  *
- * @param {{ issues?: number[], includeUnlabeled?: boolean, queueIssue?: number }} [opts]
+ * An issue with a run already in flight is skipped. The trigger path had this
+ * guard from the start; the DRAIN path did not, and `make agent-run` therefore
+ * picked the top of the queue every time it was invoked — six concurrent runs on
+ * one issue, six worktrees, six agents doing the same work. A guard on one of
+ * two entry points is not a guard.
+ *
+ * @param {{ issues?: number[], includeUnlabeled?: boolean, queueIssue?: number,
+ *           force?: boolean, stateRoot?: string }} [opts]
  *   `issues` is an explicit manual override and bypasses the label gate.
+ *   `force` additionally ignores runs in flight.
  */
 export function selectReadyIssues(opts = {}) {
   const open = listOpenIssues();
+  const busy = opts.force ? new Set() : issuesInFlight(opts.stateRoot);
 
   if (opts.issues?.length) {
     const dag = buildDag(open, opts);
@@ -137,12 +147,27 @@ export function selectReadyIssues(opts = {}) {
         );
       }
     }
-    return picked.sort(compareByRank(dag));
+    // A run in flight is refused even here. Naming an issue says "this one", not
+    // "twice at once", and a second run would open a second PR for one issue.
+    const free = picked.filter((i) => {
+      if (!busy.has(i.number)) return true;
+      console.warn(`[queue] #${i.number} skipped — a run is already in flight (--force overrides)`);
+      return false;
+    });
+    return free.sort(compareByRank(dag));
   }
 
   return readyQueue(open, {
     queueIssue: opts.queueIssue,
-    isReady: (issue) => !isHumanOnly(issue) && (opts.includeUnlabeled || isAgentReady(issue)),
+    isReady: (issue) => {
+      if (isHumanOnly(issue)) return false;
+      if (!opts.includeUnlabeled && !isAgentReady(issue)) return false;
+      if (busy.has(issue.number)) {
+        console.warn(`[queue] #${issue.number} skipped — a run is already in flight`);
+        return false;
+      }
+      return true;
+    },
   });
 }
 
