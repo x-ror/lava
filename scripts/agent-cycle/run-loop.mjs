@@ -266,40 +266,52 @@ function runAgent(agent, prompt, cwd, opts) {
   }
 
   const maxTurns = opts.maxTurns;
+  // Write prompt to a file — long -p strings are brittle; also leaves an audit trail.
+  const promptPath = join(cwd, `.agent-cycle-prompt-${Date.now()}.txt`);
+  writeFileSync(promptPath, prompt);
+  writeFileSync(join(cwd, '.agent-cycle-prompt.txt'), prompt);
+
   let cmd;
+  let args;
   if (agent.kind === 'grok') {
-    // headless + always-approve; cwd isolates the worktree
-    cmd = [
-      agent.bin,
-      '-p',
-      prompt,
+    // Flags BEFORE -p/--prompt-file so the CLI never treats them as prompt text.
+    // Stream stdio: inherit so the parent terminal shows live progress (spawnSync
+    // with pipes looked "hung" for 10+ minutes while the agent was working).
+    args = [
       '--cwd',
       cwd,
       '--always-approve',
       '--max-turns',
       String(maxTurns),
+      '--prompt-file',
+      promptPath,
     ];
+    cmd = agent.bin;
   } else if (agent.kind === 'claude') {
-    // Claude Code headless variants differ; -p is common
-    cmd = [agent.bin, '-p', prompt, '--cwd', cwd, '--dangerously-skip-permissions'];
+    args = [
+      '--cwd',
+      cwd,
+      '--dangerously-skip-permissions',
+      '-p',
+      prompt,
+    ];
+    cmd = agent.bin;
   } else {
     throw new Error(`unsupported agent ${agent.kind}`);
   }
 
   log(`spawning ${agent.kind} in ${cwd} (max-turns=${maxTurns})`);
-  const r = spawnSync(cmd[0], cmd.slice(1), {
-    encoding: 'utf8',
+  log(`prompt file: ${promptPath}`);
+  log(`(agent output streams below; this can take many minutes)`);
+  const r = spawnSync(cmd, args, {
     cwd,
     env: process.env,
     timeout: 0,
-    maxBuffer: 50 * 1024 * 1024,
+    stdio: 'inherit', // live progress — do not buffer
   });
-  if (r.stdout) writeFileSync(join(cwd, `.agent-cycle-${Date.now()}.out.txt`), r.stdout);
-  if (r.stderr) writeFileSync(join(cwd, `.agent-cycle-${Date.now()}.err.txt`), r.stderr);
   log(`agent exit ${r.status}`);
   return r;
 }
-
 function changedFiles(wt) {
   try {
     const base = execFileSync('git', ['merge-base', 'HEAD', 'origin/master'], {

@@ -81,6 +81,22 @@ Env: `AGENT_CYCLE_AGENT`, `AGENT_CYCLE_MAX_TURNS`.
 
 Logs: `.agent-cycle/run-loop.log`, `.agent-cycle/last-run.json`.
 
+### Looks hung?
+
+After `spawning grok in …` the agent can run **10–40+ minutes** (build, tests,
+many tool turns). Older run-loop versions buffered all output until exit, so the
+terminal stayed quiet while the agent worked.
+
+**How to check it is alive:**
+
+```bash
+ps aux | grep 'grok -p\|grok --prompt' | grep -v grep
+# worktree should gain modified files:
+git -C /home/tymch/lava-wt-agent-cycle-*-* status -sb
+```
+
+Current run-loop streams agent stdout/stderr live (`stdio: inherit`) and uses
+`--prompt-file` so you see progress.
 ---
 
 ## What happens per issue
