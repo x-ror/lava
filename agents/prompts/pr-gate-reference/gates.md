@@ -16,9 +16,9 @@ and cannot fail.) (`make test-scripts` runs in CI inside `make check-js`;
 `make test-mutation` is its own CI step because it rebuilds `bin/lava` once per
 embedded-JS mutation.)
 
-**Machine-readable routing:** `node scripts/agent-cycle/route-gates.mjs <paths>`
+**Machine-readable routing:** `node runtime/gates/route-gates.mjs <paths>`
 (or `--from-git`). Prefer that over hand-parsing this table; if Makefile/ci.yml
-disagree with this file, they win — fix this file (agent-cycle F4).
+disagree with this file, they win — fix this file.
 
 ## Always
 

@@ -41,7 +41,7 @@ can be guessed. Grep the SDK, then read the specific procedure.
    `pkg/runtime/picohttpparser`. Duplicating an existing Lava helper is the most
    frequent defect here. Grep for the _concept_, not the name the diff chose
    (`ascii`, `utf8`, `alloc8`, `host_`, `probe`, `sweep`, `parse`).
-2. **`core:`** — see `.claude/skills/odin-feature/reference/odin-sdk-map.md` for the
+2. **`core:`** — see `agents/prompts/odin-feature-reference/odin-sdk-map.md` for the
    index, then read the source.
 3. **`vendor:`** — `$SDK/vendor/*`.
 4. **Already-linked C** — JavaScriptCore, OpenSSL (`libssl`/`libcrypto`), SQLite,

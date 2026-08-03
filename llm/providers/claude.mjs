@@ -38,20 +38,22 @@ export function run(prompt, ctx) {
     maxBuffer: 20 * 1024 * 1024,
   });
 
-  // If stdin path: some CLIs ignore stdin without explicit flag — fall back to -p file content.
-  if (!useInline && (r.status ?? 1) !== 0) {
-    console.log('[llm:claude] stdin path failed; retrying with -p from file');
-    const body = readFileSync(promptPath, 'utf8');
-    const r2 = spawnSync(
-      'claude',
-      ['--dangerously-skip-permissions', '-p', body],
-      {
-        cwd: ctx.cwd,
-        env: { ...process.env, ...(ctx.env || {}) },
-        timeout: 0,
-        stdio: 'inherit',
-      },
+  // Retry ONLY when the CLI never got the prompt — a spawn error, or an exit
+  // with no signal that looks like a usage rejection. A plain non-zero exit is
+  // the agent having failed, and re-running the whole thing on that doubles the
+  // cost of every genuine failure without changing the outcome.
+  const spawnFailed = !!r.error || r.status === null;
+  if (!useInline && spawnFailed) {
+    console.log(
+      `[llm:claude] stdin path did not start (${r.error?.code || 'no exit'}); retrying with -p from file`,
     );
+    const body = readFileSync(promptPath, 'utf8');
+    const r2 = spawnSync('claude', ['--dangerously-skip-permissions', '-p', body], {
+      cwd: ctx.cwd,
+      env: { ...process.env, ...(ctx.env || {}) },
+      timeout: 0,
+      stdio: 'inherit',
+    });
     return { status: r2.status ?? 1, provider: 'claude' };
   }
 

@@ -78,7 +78,7 @@ the runner's default thread-per-core.
 ## Before reporting done
 
 Run the gates your paths map to
-(`.claude/skills/pr-gate/reference/gates.md`) — at minimum `make check`, plus
+(`agents/prompts/pr-gate-reference/gates.md`) — at minimum `make check`, plus
 `make check-js` for JS, plus the subsystem smoke. `make fmt` for Odin. Report the
 actual command output. If a gate fails and you cannot fix it, say so plainly with
 the output rather than describing the change as complete.

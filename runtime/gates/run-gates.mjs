@@ -1,13 +1,20 @@
 /** Run routed mechanical gates in a worktree. */
-import { join } from 'node:path';
 import { sh } from '../shell.mjs';
 import { changedFiles } from '../worktree.mjs';
 import { routePaths } from './route-gates.mjs';
 
 /**
+ * Run the routed mechanical gates in a worktree.
+ *
  * @param {string} wt
  * @param {object} env
- * @param {{ skipMutation?: boolean }} [opts]
+ * @param {{ runMutation?: boolean }} [opts]
+ *   runMutation defaults to FALSE: `make test-mutation` re-applies every entry in
+ *   the manifest and is minutes of work, too slow for the fix→verify loop. The
+ *   final pre-PR gate passes true — skipping it there would be gate-weakening
+ *   (CLAUDE.md §6), which is exactly what the previous `skipMutation !== false`
+ *   spelling did: no caller passed the flag, so mutation never ran at all.
+ * @returns {{ ok: boolean, log: string, files: string[], targets: string[], failed?: string }}
  */
 export function runGates(wt, env, opts = {}) {
   const files = changedFiles(wt);
@@ -35,8 +42,8 @@ export function runGates(wt, env, opts = {}) {
   }
   for (const t of routed.targets) {
     if (t === 'make build') continue;
-    if (opts.skipMutation !== false && t === 'make test-mutation') {
-      logs.push('skip test-mutation in tight loop');
+    if (t === 'make test-mutation' && !opts.runMutation) {
+      logs.push('skip test-mutation (tight loop; the pre-PR gate runs it)');
       continue;
     }
     r = sh(t, { cwd: wt, env, timeout: 1_800_000 });

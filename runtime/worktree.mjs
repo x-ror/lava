@@ -1,18 +1,30 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { sh } from './shell.mjs';
-import { WORKTREE_BOOTSTRAP } from './paths.mjs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { ROOT, WORKTREE_BOOTSTRAP } from './paths.mjs';
 
 /**
  * Bootstrap an isolated git worktree for one task.
+ *
+ * The branch the script actually created is read back from `.agent-env`, not
+ * assumed: a retry for the same issue gets a suffixed branch, and the PR head
+ * has to be the branch that exists rather than the one we asked for.
+ *
  * @param {string|number} taskId issue number or task id
  * @param {string} [baseRef]
+ * @returns {{ wt: string, branch: string, env: Record<string,string> }}
  */
 export function bootstrapWorktree(taskId, baseRef = 'HEAD') {
-  const branch = `agent/${taskId}`;
-  const r = sh(`"${WORKTREE_BOOTSTRAP}" "${branch}" "${baseRef}"`, {
+  const id = String(taskId);
+  // Reaches `git branch` as an identifier; `--issues` takes arbitrary CLI input.
+  if (!/^[\w.][\w.-]*$/.test(id)) {
+    throw new Error(`unsafe task id for a branch name: ${JSON.stringify(id)}`);
+  }
+  const r = spawnSync(WORKTREE_BOOTSTRAP, [`agent/${id}`, baseRef], {
+    encoding: 'utf8',
+    cwd: ROOT,
     timeout: 600_000,
+    maxBuffer: 20 * 1024 * 1024,
   });
   if (r.status !== 0) {
     throw new Error(`worktree bootstrap failed:\n${r.stderr || r.stdout}`);
@@ -31,6 +43,7 @@ export function bootstrapWorktree(taskId, baseRef = 'HEAD') {
   }
   env.LAVA_WORKTREE = wt;
   env.LAVA_BIN = env.LAVA_BIN || join(wt, 'bin/lava');
+  const branch = env.LAVA_BRANCH || `agent/${id}`;
   return { wt, branch, env };
 }
 

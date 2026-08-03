@@ -4,13 +4,13 @@
  *  2. Workflow engine (automatic pipeline)
  *  3. Triggers (issue webhook, schedule, PR comment, gate failure)
  */
-import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { getAgent, loadRegistry } from '../agents/registry.mjs';
 import { buildAgentPrompt } from './build-prompt.mjs';
 import { runLlm } from '../llm/router.mjs';
 import { bootstrapWorktree } from '../runtime/worktree.mjs';
-import { STATE_DIR } from '../runtime/paths.mjs';
+import { STATE_DIR, FINDINGS_FILE, PLAN_FILE } from '../runtime/paths.mjs';
 import { ghJson } from '../runtime/github.mjs';
 
 /**
@@ -61,11 +61,27 @@ export async function invokeCommand(commandName, opts = {}) {
   const providerName = opts.provider || process.env.AGENT_PROVIDER || agent.provider || 'auto';
   const avoid = preferAlt && opts.implementProvider ? opts.implementProvider : undefined;
 
+  // The plan travels with the worktree, so every later agent in the run sees the
+  // acceptance criteria planner decomposed the issue into. Read from disk rather
+  // than only from the caller: a resumed run has the file and not the state.
+  const planPath = join(wt, PLAN_FILE);
+  let plan = opts.plan || null;
+  if (!plan && existsSync(planPath)) {
+    try {
+      plan = JSON.parse(readFileSync(planPath, 'utf8'));
+    } catch {
+      // A malformed plan is context, not a gate — proceed without it.
+      plan = null;
+    }
+  }
+
   const prompt = buildAgentPrompt(agent, {
     issue,
     wt,
     branch,
     env,
+    plan,
+    planPath,
     extra: opts.extra,
     findingsPath: opts.findingsPath,
     gateLog: opts.gateLog,
@@ -90,6 +106,12 @@ export async function invokeCommand(commandName, opts = {}) {
     return { ok: true, dryRun: true, promptPath: join(wt, '.agent-prompt.txt'), ...audit };
   }
 
+  // A hard gate reads its verdict from a file the agent writes. A file left by
+  // the previous fixer round would be read as THIS round's verdict, so the loop
+  // could exit on a stale SHIP. Delete before, and only trust what reappears.
+  const findingsPath = join(wt, FINDINGS_FILE);
+  if (agent.hard_gate) rmSync(findingsPath, { force: true });
+
   const result = runLlm(prompt, {
     cwd: wt,
     maxTurns,
@@ -99,8 +121,8 @@ export async function invokeCommand(commandName, opts = {}) {
   });
 
   let verdict = null;
-  const findingsPath = join(wt, '.agent-findings.json');
-  if (existsSync(findingsPath) && agent.hard_gate) {
+  let verdictError = null;
+  if (agent.hard_gate && existsSync(findingsPath)) {
     try {
       const { aggregate } = await import('../runtime/gates/aggregate-verdict.mjs');
       const report = JSON.parse(readFileSync(findingsPath, 'utf8'));
@@ -109,8 +131,21 @@ export async function invokeCommand(commandName, opts = {}) {
         gateRed: opts.gateRed === true,
         gateUnrun: opts.gateUnrun === true,
       });
+    } catch (e) {
+      // An unreadable findings file is not "no findings" — say so, and leave
+      // verdict null so the caller fails closed rather than reading it as clean.
+      verdictError = `unreadable ${findingsPath}: ${e.message}`;
+    }
+  }
+
+  // Re-read after the run: planner writes the plan, and anything downstream may
+  // legitimately refine it (a task turning out to be already done, say).
+  let planOut = plan;
+  if (existsSync(planPath)) {
+    try {
+      planOut = JSON.parse(readFileSync(planPath, 'utf8'));
     } catch {
-      /* ignore parse errors */
+      planOut = plan;
     }
   }
 
@@ -120,6 +155,9 @@ export async function invokeCommand(commandName, opts = {}) {
     skipped: !!result.skipped,
     provider: result.provider,
     verdict,
+    verdictError,
+    plan: planOut,
+    planPath,
     wt,
     branch,
     env,

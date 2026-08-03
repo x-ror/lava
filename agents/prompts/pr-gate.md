@@ -11,8 +11,8 @@ in parallel, each with one lens. Your job is to run the mechanical gates, route
 the right specialists, merge and dedupe their findings, and produce one scorecard
 a human can act on in under a minute.
 
-Read [reference/gates.md](reference/gates.md) (command routing) and
-[reference/scoring.md](reference/scoring.md) (rubric and verdict rules) before
+Read [pr-gate-reference/gates.md](pr-gate-reference/gates.md) (command routing) and
+[pr-gate-reference/scoring.md](pr-gate-reference/scoring.md) (rubric and verdict rules) before
 starting.
 
 ## Step 1 — collect the diff
@@ -33,7 +33,7 @@ Report: `Reviewing <target>: N files, +A/-B lines.`
 ## Step 2 — mechanical gates first
 
 Specialists reviewing code that does not compile is wasted work. Run, in order,
-what [reference/gates.md](reference/gates.md) routes for the changed paths:
+what [pr-gate-reference/gates.md](pr-gate-reference/gates.md) routes for the changed paths:
 
 1. `make check` — always
 2. `make check-js` — if any JS changed
@@ -62,14 +62,14 @@ which of two states it is in:
 
 - A CI check covers it → `DELEGATED (CI: <check> — success | failure | pending)`.
 - No CI check covers it → `NOT RUN`. Not every routed target is in CI:
-  [reference/gates.md](reference/gates.md) names the ones that are not. A gate
+  [pr-gate-reference/gates.md](pr-gate-reference/gates.md) names the ones that are not. A gate
   nothing executed is not delegated — it is missing, and it blocks `SHIP` exactly
   as a skipped gate does in the normal mode.
 
 Never wait on a pending check, and never infer a conclusion you did not read — a
 job triggered by the same event as CI will usually observe CI still in flight, and
 "pending" is the honest answer there. Verdict rules for this mode are in
-[reference/scoring.md](reference/scoring.md).
+[pr-gate-reference/scoring.md](pr-gate-reference/scoring.md).
 
 ## Step 3 — fan out specialists
 

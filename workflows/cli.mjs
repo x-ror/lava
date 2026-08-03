@@ -12,6 +12,8 @@ import { join } from 'node:path';
 import { runPipeline } from './pipeline.mjs';
 import { pollAndDispatch } from './triggers/issues.mjs';
 import { STATE_DIR } from '../runtime/paths.mjs';
+import { listOpenIssues, selectReadyIssues, isAgentReady } from '../runtime/github.mjs';
+import { buildDag, explain, UNTIERED } from '../runtime/dag.mjs';
 
 function parseFlags(argv) {
   const flags = {};
@@ -35,8 +37,47 @@ async function main() {
   const { flags, rest } = parseFlags(argv);
 
   if (!cmd || cmd === 'help') {
-    console.log(`usage: workflows/cli.mjs run|trigger|status|resume`);
+    console.log(`usage: workflows/cli.mjs run|trigger|status|queue
+
+  queue [--all]   show the derived task DAG: order, tiers, what blocks what.
+                  Without --all, only issues labelled agent-ready (what would
+                  actually run). With --all, the full derived order.`);
     process.exit(0);
+  }
+
+  if (cmd === 'queue') {
+    const open = listOpenIssues();
+    const dag = buildDag(open);
+    const shown = selectReadyIssues({ includeUnlabeled: !!flags.all });
+    const gated = selectReadyIssues();
+    console.log(
+      `${open.length} open · ${shown.length} shown · ${gated.length} agent-ready` +
+        (flags.all ? '  (--all: ignoring the agent-ready gate)' : ''),
+    );
+    for (const i of shown) {
+      const t = dag.tierOf(i.number);
+      const e = explain(dag, i);
+      const tag = [
+        e.epics.length ? `epic ${e.epics.map((n) => '#' + n).join(',')}` : null,
+        isAgentReady(i) ? 'READY' : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      console.log(
+        `  T${t === UNTIERED ? '?' : t}  #${String(i.number).padEnd(4)} ${i.title.slice(0, 64)}${tag ? `   [${tag}]` : ''}`,
+      );
+    }
+    const held = open
+      .map((i) => [i, dag.blockers(i.number)])
+      .filter(([, b]) => b.length)
+      .sort((a, b) => a[0].number - b[0].number);
+    if (held.length) {
+      console.log(`\nheld back by open dependencies (${held.length}):`);
+      for (const [i, b] of held) {
+        console.log(`  #${String(i.number).padEnd(4)} ← ${b.map((n) => '#' + n).join(', ')}`);
+      }
+    }
+    return;
   }
 
   if (cmd === 'run') {

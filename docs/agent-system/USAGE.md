@@ -21,6 +21,33 @@ Equivalent:
 node workflows/cli.mjs run --once --provider grok
 ```
 
+## Filling the queue
+
+The task DAG is not maintained separately — it is read out of the tracker
+(tiers and `- [ ] #N` task lists; see
+[ARCHITECTURE.md](ARCHITECTURE.md#where-the-task-dag-comes-from)). Look at it
+before running anything:
+
+```bash
+node workflows/cli.mjs queue --all   # full derived order + what blocks what
+node workflows/cli.mjs queue         # only what is cleared to run
+```
+
+`queue` is empty until issues carry `agent-ready`. That is the whole opt-in:
+
+```bash
+gh issue edit 91 --add-label agent-ready     # one issue
+gh issue edit 348 355 357 --add-label agent-ready
+```
+
+Order and blocking then come from the tracker automatically — no `priority:` or
+`blocked-by` needs writing into the issue body. To drain regardless of the label
+(a deliberate override), `--issues` names them explicitly:
+
+```bash
+node commands/index.mjs run-pipeline --issues 91 --provider claude
+```
+
 ## Let the system start itself
 
 ```bash
@@ -60,21 +87,40 @@ In Claude Code / Grok Build TUI the same names are slash commands:
 3. **planner** → task DAG.
 4. **odin-feature** → implement (TDD).
 5. **critic** → adversarial findings.
-6. **pr-gate** → mechanical gates + specialists → SHIP / SHIP-AFTER / BLOCK.
-7. On BLOCK → **fixer** (≤3) → back to pr-gate.
-8. On SHIP / SHIP-AFTER → **draft PR** (`gh pr create --draft`).
-9. Human merges.
+6. **gates** → the pipeline runs the routed mechanical gates itself. Red → fixer.
+7. **pr-gate** → specialists + verdict → SHIP / SHIP-AFTER / BLOCK.
+8. On BLOCK → **fixer** (≤3) → back to gates.
+9. On SHIP / SHIP-AFTER → **draft PR** (`gh pr create --draft`).
+10. Human merges.
+
+Anything other than SHIP / SHIP-AFTER is BLOCK, including a pr-gate that
+produced no verdict at all. See "The gate fails closed" in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Retries
+
+A trigger run records each issue in `.agent-state/trigger-issues-seen.json` with
+its attempt count. A failed pipeline is retried on the next poll up to
+`AGENT_TRIGGER_MAX_ATTEMPTS` (default 3); editing or re-labelling the issue
+resets it to fresh work regardless of prior status. A completed issue is not
+re-run.
+
+A second run for one issue gets its own worktree and its own branch
+(`agent/335`, then `agent/335-<pid>`), so a retry never collides with the
+worktree or branch left by the previous attempt.
 
 ## State & logs
 
-| Path                                  | Content                             |
-| ------------------------------------- | ----------------------------------- |
-| `.agent-state/last-run.json`          | Last pipeline summary               |
-| `.agent-state/runs/<id>/state.json`   | Durable DAG state (resume)          |
-| `.agent-state/runs/<id>/events.jsonl` | Step audit                          |
-| `.agent-state/invoke-*.json`          | Per-command invoke audit            |
-| `<worktree>/.agent-prompt.txt`        | Last prompt sent to the LLM         |
-| `<worktree>/.agent-env`               | Ports / `LAVA_BIN` for the worktree |
+| Path                                    | Content                                |
+| --------------------------------------- | -------------------------------------- |
+| `.agent-state/last-run.json`            | Last pipeline summary                  |
+| `.agent-state/runs/<id>/state.json`     | Durable DAG state (resume)             |
+| `.agent-state/runs/<id>/events.jsonl`   | Step audit                             |
+| `.agent-state/invoke-*.json`            | Per-command invoke audit               |
+| `.agent-state/trigger-issues-seen.json` | Dispatch ledger (status, attempts)     |
+| `<worktree>/.agent-prompt.txt`          | Last prompt sent to the LLM            |
+| `<worktree>/.agent-env`                 | Ports / branch / `LAVA_BIN`            |
+| `<worktree>/.agent-findings.json`       | Hard-gate verdict channel (gitignored) |
 
 ## Requirements
 

@@ -55,7 +55,7 @@ this order and stop at the first real fit:
    needs (`core:net`, `core:crypto/*`, `core:encoding/*`, `core:sys/linux/uring`,
    `core:sys/posix`, `core:mem`, `core:sync`, `core:thread`, `core:simd`,
    `core:text/regex`, `core:container/*`, `core:time`, `core:strconv`). Index:
-   [.claude/skills/odin-feature/reference/odin-sdk-map.md](.claude/skills/odin-feature/reference/odin-sdk-map.md).
+   [agents/prompts/odin-feature-reference/odin-sdk-map.md](agents/prompts/odin-feature-reference/odin-sdk-map.md).
 3. **Odin `vendor:`** — vendored third-party bindings shipped with the SDK.
 4. **C libraries already linked** — JavaScriptCore, OpenSSL, SQLite, libc/POSIX,
    `picohttpparser`. Extending an existing link costs nothing.
@@ -91,7 +91,7 @@ make bench            # node-vs-Lava ratio table (report-only)
 ```
 
 Full per-subsystem routing (which smoke/bench a given path requires) lives in
-[.claude/skills/pr-gate/reference/gates.md](.claude/skills/pr-gate/reference/gates.md).
+[agents/prompts/pr-gate-reference/gates.md](agents/prompts/pr-gate-reference/gates.md).
 Never claim a change works without running the gates its paths map to.
 
 **Linux-first.** darwin/windows native code is stubs; CI runs Linux only. But

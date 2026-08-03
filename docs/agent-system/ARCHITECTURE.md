@@ -50,9 +50,9 @@ both slash-commands and machine-callable entry points.
 ## Default pipeline DAG
 
 ```text
-select → planner → odin-feature → critic → pr-gate ─┬→ create-pr → done
-                              ▲              │
-                              └── fixer (≤3)─┘  (on BLOCK / red gates)
+select → planner → odin-feature → critic → gates → pr-gate ─┬→ create-pr → done
+                              ▲                      │
+                              └──── fixer (≤3) ──────┘  (on BLOCK / red gates)
 ```
 
 Rules:
@@ -62,6 +62,72 @@ Rules:
 3. Draft PR is created **only** after `pr-gate` returns SHIP or SHIP-AFTER.
 4. Merge to `master` is **never** automatic.
 5. P1 findings are not self-waived.
+
+### Where the task DAG comes from
+
+Nothing authors it. The graph is **derived** from the tracker by
+`runtime/dag.mjs`:
+
+| Signal in the tracker                   | Meaning in the DAG                    |
+| --------------------------------------- | ------------------------------------- |
+| `### Tier N` in the master queue issue  | priority — lower tier drains first    |
+| `- [ ] #N` under a tier                 | queue membership                      |
+| `- [x] #N`                              | done, even if the issue is still open |
+| `- [ ] #N` in any epic                  | edge: the epic waits on that child    |
+| `#A … (do before #B)`                   | edge: B waits on A                    |
+| an edge pointing outside the open set   | dependency already satisfied          |
+| `<!-- lava-task blocked-by: [...] -->`  | edge, still honoured where one exists |
+
+Set `AGENT_QUEUE_ISSUE` to point at a different index issue.
+
+The consequence worth stating: an epic with open children is blocked **by them**,
+so epics never enter the implementable queue and the `epic` label needs no
+special case. And because a closed issue simply drops out of the open set, the
+graph shrinks as work lands with no checkbox bookkeeping — which is also why
+`listOpenIssues` refuses a truncated page rather than returning it. A dropped
+issue would not read as missing; it would read as *finished*, and unblock
+everything waiting on it.
+
+A second copy of this data — priority in issue bodies, or a backlog file — is the
+thing to avoid. planner.md rule 1 says as much, and `planner` therefore
+decomposes one issue into steps and does not author edges between issues.
+
+**Ordering is derived; permission is not.** An issue is only drained once a human
+labels it `agent-ready` (or `lava-ready`). The tracker states what the work is
+worth; the label states that an agent may do it unattended.
+
+```bash
+node workflows/cli.mjs queue        # what would run now
+node workflows/cli.mjs queue --all  # full derived order, ignoring the gate
+```
+
+### Planner output
+
+`planner` writes `.agent-plan.json` into the worktree. `commands/invoke.mjs`
+reads it back and renders it into the prompt of every later agent in the run, so
+`acceptance` and `human_only` actually reach the agent implementing against them;
+the engine copies it to `.agent-state/runs/<id>/plan.json`, which outlives the
+worktree. A plan printed only to stdout is discarded.
+
+### The gate fails closed
+
+`pr-gate` reports through a file (`.agent-findings.json`), aggregated by
+`runtime/gates/aggregate-verdict.mjs`. Only a machine-readable **SHIP** or
+**SHIP-AFTER** advances to `create-pr`. Everything else — BLOCK, a crash, a
+turn-limit exit, a provider auth failure, or a run under provider `none` — is
+BLOCK and routes to `fixer`.
+
+This is not defensive styling. An earlier version read "exited 0 but wrote no
+findings file" as SHIP-AFTER, so any pr-gate that died early opened a draft PR
+with zero mechanical gates run. The agent's claim of success is not evidence;
+the findings file is. Pinned by `workflows/engine.test.mjs`.
+
+The `gates` node exists for the same reason: `pr-gate` runs the mechanical gates
+too, but that run is self-reported. The pipeline's own `runGates()` is the trust
+boundary, and it is what sets `gateRed` for the aggregator — which turns a red
+gate into BLOCK regardless of what the findings say. A stale findings file from a
+previous fixer round is deleted before each hard-gate run, so a round cannot exit
+on the previous round's verdict.
 
 ## Automatic start (system initiates)
 

@@ -11,8 +11,8 @@ already-linked C library already implements is the failure mode this pipeline
 exists to prevent.
 
 Read `CLAUDE.md` first. Reuse index:
-[reference/odin-sdk-map.md](reference/odin-sdk-map.md). Gate routing:
-[../pr-gate/reference/gates.md](../pr-gate/reference/gates.md).
+[odin-feature-reference/odin-sdk-map.md](odin-feature-reference/odin-sdk-map.md). Gate routing:
+[pr-gate-reference/gates.md](pr-gate-reference/gates.md).
 
 ## Phase 1 — Node contract + reuse scout (parallel)
 
@@ -93,7 +93,7 @@ Two traps worth naming, both real:
 
 1. `make fmt` (Odin), `make check`, `make check-js`, `make build`.
 2. The routed suites and smokes from
-   [../pr-gate/reference/gates.md](../pr-gate/reference/gates.md) — networking
+   [pr-gate-reference/gates.md](pr-gate-reference/gates.md) — networking
    smokes run on **both** backends.
 3. Node-vs-Lava diff on your own probe script for every surface you touched.
 4. `make bench` if the change touches a hot path, and always for a `perf(...)`

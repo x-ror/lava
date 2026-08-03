@@ -1,0 +1,208 @@
+/**
+ * Verdict routing in the workflow engine.
+ *
+ * This is the safety-critical logic of the whole agent system: it decides
+ * whether a run reaches `create-pr`. It shipped with no tests, and with a branch
+ * that turned "the agent exited 0 but wrote no findings file" into SHIP-AFTER —
+ * so a pr-gate that crashed, timed out, or ran under provider `none` opened a
+ * draft PR with zero mechanical gates run. Every case below exists to keep that
+ * branch from coming back.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { runGraph } from './engine.mjs';
+
+/** Minimal graph with the same shape as config/pipeline.json around the gate. */
+const GRAPH = {
+  entry: 'pr-gate',
+  nodes: {
+    'pr-gate': {
+      type: 'command',
+      command: 'pr-gate',
+      hard_gate: true,
+      on_ship: 'create-pr',
+      on_ship_after: 'create-pr',
+      on_block: 'fixer',
+    },
+    fixer: {
+      type: 'command',
+      command: 'fixer',
+      max_rounds: 2,
+      next: 'pr-gate',
+      on_stall: 'terminal.needs-human',
+    },
+    'create-pr': { type: 'system', action: 'draft_pr', next: 'terminal.done' },
+    'terminal.done': { type: 'terminal', status: 'done' },
+    'terminal.needs-human': { type: 'terminal', status: 'needs-human-decision' },
+  },
+};
+
+/** Runs the graph with a scripted sequence of pr-gate results. */
+async function run(results, { handlers = {}, state = {} } = {}) {
+  const queue = [...results];
+  const calls = [];
+  const prCalls = [];
+  const final = await runGraph({
+    graph: GRAPH,
+    state: { issue: { number: 1, title: 't' }, wt: '/tmp/wt', ...state },
+    maxSteps: 20,
+    invoke: async (command) => {
+      calls.push(command);
+      if (command !== 'pr-gate') return { ok: true, status: 0 };
+      // The last scripted result repeats: a gate that stays red stays red, so a
+      // test asserting on the final verdict sees the condition it set up rather
+      // than a default that leaked in once the queue drained.
+      if (queue.length > 1) return queue.shift();
+      return queue[0] ?? { ok: true, status: 0 };
+    },
+    handlers: {
+      draft_pr: async () => {
+        prCalls.push(true);
+        return { pr: 'https://example.invalid/pr/1' };
+      },
+      ...handlers,
+    },
+  });
+  return { final, calls, prs: prCalls.length };
+}
+
+test('SHIP reaches the PR node', async () => {
+  const { final, prs } = await run([{ ok: true, status: 0, verdict: { verdict: 'SHIP' } }]);
+  assert.equal(final.status, 'done');
+  assert.equal(prs, 1);
+});
+
+test('SHIP-AFTER reaches the PR node — the autonomous ceiling, not a block', async () => {
+  const { final, prs } = await run([{ ok: true, status: 0, verdict: { verdict: 'SHIP-AFTER' } }]);
+  assert.equal(final.status, 'done');
+  assert.equal(prs, 1);
+});
+
+test('BLOCK routes to fixer and never opens a PR', async () => {
+  const { calls, prs } = await run([
+    { ok: true, status: 0, verdict: { verdict: 'BLOCK', reason: 'P0' } },
+    { ok: true, status: 0, verdict: { verdict: 'BLOCK', reason: 'P0' } },
+    { ok: true, status: 0, verdict: { verdict: 'BLOCK', reason: 'P0' } },
+  ]);
+  assert.ok(calls.includes('fixer'));
+  assert.equal(prs, 0);
+});
+
+test('a missing verdict is BLOCK, not SHIP-AFTER', async () => {
+  // The regression: exit 0 with no findings file. The agent claiming success is
+  // not evidence that the gate ran.
+  const { final, calls, prs } = await run([{ ok: true, status: 0 }]);
+  assert.equal(prs, 0, 'a PR was opened without a verdict');
+  assert.ok(calls.includes('fixer'));
+  assert.equal(final.verdict.verdict, 'BLOCK');
+  assert.match(final.verdict.reason, /no verdict/);
+});
+
+test('a skipped provider is BLOCK and says so', async () => {
+  const { final, prs } = await run([{ ok: true, status: 0, skipped: true }]);
+  assert.equal(prs, 0);
+  assert.equal(final.verdict.verdict, 'BLOCK');
+  assert.match(final.verdict.reason, /did not run/);
+});
+
+test('a crashed gate is BLOCK', async () => {
+  const { final, prs } = await run([{ ok: false, status: 137 }]);
+  assert.equal(prs, 0);
+  assert.equal(final.verdict.verdict, 'BLOCK');
+  assert.match(final.verdict.reason, /exit 137/);
+});
+
+test('an unreadable findings file does not read as clean', async () => {
+  const { final, prs } = await run([
+    { ok: true, status: 0, verdictError: 'unreadable .agent-findings.json: Unexpected token' },
+  ]);
+  assert.equal(prs, 0);
+  assert.equal(final.verdict.verdict, 'BLOCK');
+});
+
+test('the fixer loop stalls to needs-human instead of looping forever', async () => {
+  const block = { ok: true, status: 0, verdict: { verdict: 'BLOCK', reason: 'P0' } };
+  const { final, prs } = await run([block, block, block, block, block]);
+  assert.equal(final.status, 'needs-human-decision');
+  assert.equal(prs, 0);
+});
+
+test('a recovered gate ships after a fix round', async () => {
+  const { final, prs, calls } = await run([
+    { ok: true, status: 0, verdict: { verdict: 'BLOCK', reason: 'P0' } },
+    { ok: true, status: 0, verdict: { verdict: 'SHIP', reason: 'clean' } },
+  ]);
+  assert.equal(calls.filter((c) => c === 'fixer').length, 1);
+  assert.equal(final.status, 'done');
+  assert.equal(prs, 1);
+});
+
+test('gateRed from the pipeline reaches the command layer', async () => {
+  // The aggregator turns gateRed into BLOCK regardless of findings; if the flag
+  // never arrives, empty findings read as clean.
+  let seen = null;
+  await runGraph({
+    graph: GRAPH,
+    state: { issue: { number: 1 }, wt: '/tmp/wt', gateRed: true },
+    maxSteps: 3,
+    invoke: async (_cmd, opts) => {
+      seen = opts;
+      return { ok: true, status: 0, verdict: { verdict: 'SHIP' } };
+    },
+    handlers: { draft_pr: async () => ({}) },
+  });
+  assert.equal(seen.gateRed, true);
+});
+
+test('a plan produced by one node is forwarded to the next', async () => {
+  // planner's DAG used to stop at planner. Without this the acceptance criteria
+  // never reach the agent that implements against them.
+  const seen = [];
+  const plan = { tasks: [{ id: 't1', title: 'x', acceptance: ['y'] }] };
+  await runGraph({
+    graph: {
+      entry: 'planner',
+      nodes: {
+        planner: { type: 'command', command: 'planner', next: 'odin-feature' },
+        'odin-feature': { type: 'command', command: 'odin-feature', next: 'terminal.done' },
+        'terminal.done': { type: 'terminal', status: 'done' },
+      },
+    },
+    state: { issue: { number: 1 }, wt: '/tmp/wt' },
+    invoke: async (command, opts) => {
+      seen.push({ command, plan: opts.plan });
+      return command === 'planner' ? { ok: true, status: 0, plan } : { ok: true, status: 0 };
+    },
+  });
+  assert.equal(seen[0].plan, undefined, 'planner runs before there is a plan');
+  assert.deepEqual(seen[1].plan, plan, 'odin-feature did not receive the plan');
+});
+
+test('a system handler can divert the graph with forceNext', async () => {
+  const { final } = await run([{ ok: true, status: 0, verdict: { verdict: 'SHIP' } }], {
+    handlers: {
+      draft_pr: async () => ({ forceNext: 'terminal.needs-human', prBlocked: 'no' }),
+    },
+  });
+  assert.equal(final.status, 'needs-human-decision');
+});
+
+test('an unknown node is an error, not a silent stop', async () => {
+  const final = await runGraph({
+    graph: { entry: 'nope', nodes: {} },
+    state: {},
+    invoke: async () => ({ ok: true }),
+  });
+  assert.equal(final.status, 'error');
+  assert.match(final.error, /unknown node/);
+});
+
+test('a cycle without a terminal is capped by maxSteps', async () => {
+  const final = await runGraph({
+    graph: { entry: 'a', nodes: { a: { type: 'command', command: 'x', next: 'a' } } },
+    state: {},
+    maxSteps: 5,
+    invoke: async () => ({ ok: true, status: 0 }),
+  });
+  assert.equal(final.status, 'max-steps');
+});
