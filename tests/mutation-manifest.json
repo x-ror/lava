@@ -1015,6 +1015,65 @@
         "above the first tier heading",
         "pre-tier item leaked"
       ]
+    },
+    {
+      "name": "the hard gate dies when a BLOCK verdict still reports success",
+      "why": "ok for a hard gate means the gate passed. The CLI exit code, the gate-failure trigger and the comment handler read ok and nothing else, and provider none exits 0 by construction, so a BLOCK reporting ok:true reads as success to all of them.",
+      "source": "commands/invoke.mjs",
+      "find": "  return verdict?.verdict === 'SHIP' || verdict?.verdict === 'SHIP-AFTER';",
+      "replace": "  return result.status === 0 || !!result.skipped;",
+      "gate": "node-test:commands/review-fixes.test.mjs",
+      "expect_detail": [
+        "the verdict, not the exit code",
+        "BLOCK"
+      ]
+    },
+    {
+      "name": "trigger permission dies when an issue body can grant itself a run",
+      "why": "The repository is public and an issue body is written by whoever opened it. Treating a lava-task marker as permission let a stranger enqueue an agent, and the dispatch path passes explicit issue numbers, which is the manual override that skips the label check.",
+      "source": "workflows/triggers/issues.mjs",
+      "find": "  return listOpenIssues().filter(isAgentReady);",
+      "replace": "  return listOpenIssues().filter((i) => isAgentReady(i) || /lava-task/.test(i.body || \"\"));",
+      "gate": "node-test:commands/review-fixes.test.mjs",
+      "expect_detail": [
+        "an issue body granted itself a run",
+        "lava-task marker"
+      ]
+    },
+    {
+      "name": "the in-flight guard dies when a running issue can be dispatched twice",
+      "why": "bootstrapWorktree gives each attempt its own worktree and suffixed branch, so a second dispatch does not collide loudly — it silently runs the same issue twice and opens two PRs. The agent touching its own issue changes updatedAt, which is exactly when this fires.",
+      "source": "workflows/triggers/issues.mjs",
+      "find": "  if (record.status === 'running') {",
+      "replace": "  if (false) {",
+      "gate": "node-test:commands/review-fixes.test.mjs",
+      "expect_detail": [
+        "already running",
+        "not restarted by the issue being touched"
+      ]
+    },
+    {
+      "name": "the ledger lock dies when the critical section stops being exclusive",
+      "why": "The dispatch ledger is a read-modify-write of one whole JSON file. Two pollers interleaving load and save lose an attempt count or a completion, and the in-flight guard only helps if the claim that sets it is atomic with the check that reads it.",
+      "source": "runtime/lock.mjs",
+      "find": "      mkdirSync(lockPath);\n      break;",
+      "replace": "      break;",
+      "gate": "node-test:runtime/lock.test.mjs",
+      "expect_detail": [
+        "an increment was lost",
+        "timed out"
+      ]
+    },
+    {
+      "name": "the claude retry dies when a signal-killed run is retried",
+      "why": "spawnSync reports status null for a SIGKILL as well as for a spawn failure. A killed agent may already have edited the worktree and spent its budget, so repeating it is neither free nor idempotent.",
+      "source": "llm/providers/claude.mjs",
+      "find": "  return r.status === null && !r.signal;",
+      "replace": "  return r.status === null;",
+      "gate": "node-test:commands/review-fixes.test.mjs",
+      "expect_detail": [
+        "killed by a signal is NOT retried"
+      ]
     }
   ]
 }

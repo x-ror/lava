@@ -4,15 +4,22 @@ name: Agent system
 # `triggers` block in config/pipeline.json — before this file existed, that block
 # was documentation and nothing ever fired it.
 #
-# INERT BY DEFAULT. Every job is gated on the repository variable
-# AGENT_AUTOSTART == 'true' (Settings → Secrets and variables → Actions →
-# Variables). Until you set it, this workflow costs nothing and does nothing.
-# It also needs ANTHROPIC_API_KEY as a repository secret; without it the CLI has
-# no credentials and the run fails fast rather than opening an empty PR.
+# INERT BY DEFAULT. The real job runs only when the repository secret
+# AGENT_AUTOSTART is exactly `true` (Settings → Secrets and variables → Actions
+# → Secrets). Until you set it, every event costs one ~5s gate job and stops.
+# It also needs ANTHROPIC_API_KEY; without it the run fails fast rather than
+# opening an empty PR.
+#
+# A secret rather than a variable, and a separate gate job rather than a
+# job-level `if`, for one reason: the pinned actionlint (npm actionlint 2.0.6,
+# a WASM build) predates the `vars` context and rejects the workflow outright.
+# `secrets` is not allowed in any `if:`, so the switch is read into a step `env`
+# and re-exported as a job output — `needs` IS allowed in a job-level `if`, and
+# the linter knows it.
 #
 # Cost warning: a single drain runs planner + odin-feature + critic + pr-gate
 # (+ up to 3 fixer rounds) per issue, each a full agent session. Start with
-# --max 1 and workflow_dispatch before enabling the schedule.
+# workflow_dispatch and max 1 before enabling the schedule.
 
 on:
   issues:
@@ -46,15 +53,40 @@ permissions:
   pull-requests: write
 
 jobs:
+  gate:
+    name: Autostart gate
+    runs-on: ubuntu-latest
+    # This repository is PUBLIC, so a comment is untrusted input from anyone.
+    # author_association is the authorization: OWNER / MEMBER / COLLABORATOR all
+    # imply write access, the same bar as applying the `agent-ready` label.
+    # Without it, any stranger commenting "/pr-gate" starts a job that runs an
+    # agent with --dangerously-skip-permissions, GH_TOKEN and the API key —
+    # remote code execution by drive-by comment.
+    if: |
+      github.event_name != 'issue_comment' ||
+      (startsWith(github.event.comment.body, '/') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                github.event.comment.author_association))
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          AUTOSTART: ${{ secrets.AGENT_AUTOSTART }}
+        run: |
+          set -euo pipefail
+          if [ "${AUTOSTART:-}" = "true" ]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::AGENT_AUTOSTART is not set to true - nothing will run.'
+          fi
+
   dispatch:
     name: Run agent pipeline
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
     runs-on: ubuntu-latest
-    # `github.event.issue.pull_request` is set only on PR comments; a comment on
-    # a plain issue is not a PR command. The comment body check keeps the job
-    # from booting a full toolchain for every "thanks".
-    if: |
-      vars.AGENT_AUTOSTART == 'true' &&
-      (github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/'))
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7
@@ -102,6 +134,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGENT_PROVIDER: claude
           EVENT: ${{ github.event_name }}
+          # Through env, never interpolated into `run:` — a comment body is
+          # attacker-controlled text and would otherwise close the quoting.
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_ISSUE: ${{ github.event.issue.number }}
           INPUT_ISSUES: ${{ inputs.issues }}

@@ -39,6 +39,29 @@ function parseArgs(argv) {
   return out;
 }
 
+/**
+ * Flags this layer consumes. Anything else belongs to the invoked command —
+ * --design-only, --quick, --review-only and the rest that the SKILL.md
+ * argument-hints advertise. parseArgs swallowed every `--` token and main
+ * forwarded only the fixed fields, so those documented modes were dead on
+ * arrival: the flag was parsed, then dropped before the prompt was built.
+ */
+const KNOWN_FLAGS = new Set([
+  'issue',
+  'provider',
+  'agent',
+  'max-turns',
+  'cwd',
+  'worktree',
+  'no-worktree',
+  'dry-run',
+  'source',
+  'once',
+  'max',
+  'issues',
+  'no-pr',
+]);
+
 function printHelp() {
   console.log(`Lava agent commands — human + autonomous entrypoint
 
@@ -119,6 +142,7 @@ async function main() {
           .map((s) => Number(s.trim()))
       : undefined,
     createPr: flags['no-pr'] ? false : true,
+    flags: Object.fromEntries(Object.entries(flags).filter(([k]) => !KNOWN_FLAGS.has(k))),
   };
 
   const result = await invokeCommand(cmd, opts);
