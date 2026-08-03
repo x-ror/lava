@@ -25,7 +25,7 @@ endif
 SOURCE ?= console.log('hello from Lava')
 FILE ?=
 
-.PHONY: test-stdio help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property test-mutation check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean
+.PHONY: test-stdio help bootstrap-windows-deps build-sqlite-windows build run eval check check-cli check-runtime check-js fix-js check-md fix-md check-actions check-primordials test-scripts test-property test-mutation check-jsc check-native native-deps test test-all test-lava test-lava-nohostfn test-odin-serial api-surface bun-buffer-tests test-compat test-compat-lava test-compat-lava-strict test-odin test-eventloop-odin test-runtime-odin test-sqlite-odin test-sqlite-node test-sqlite-lava test-fs-node test-fs-lava test-eventloop-node test-eventloop-lava test-fetch-smoke test-net-smoke test-http-smoke test-https-smoke test-multicore-smoke test-zerocopy-smoke bench bench-gate bench-http fmt clean agent-queue agent-run agent-status
 
 help:
 	@printf '%s\n' 'Lava commands'
@@ -84,6 +84,11 @@ help:
 	@printf '%s\n' '  make bench-gate         Fail if any ratio exceeds bench/thresholds.json'
 	@printf '%s\n' '  make bench-http         HTTP throughput/latency report (not in CI)'
 	@printf '%s\n' '  make api-surface        Buffer/Crypto surface diff vs Node (report-only)'
+	@printf '%s\n' ''
+	@printf '%s\n' 'Agent system'
+	@printf '%s\n' '  make agent-queue        Derived task DAG: order, tiers, blockers (ALL=1 ignores the label gate)'
+	@printf '%s\n' '  make agent-run          Drain one ready issue end-to-end (MAX=n PROVIDER=claude|grok)'
+	@printf '%s\n' '  make agent-status       Last pipeline run and recent run ids'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Env knobs (oracle runners):'
 	@printf '%s\n' '  RUN_LAVA=1              Compare each case Node-vs-Lava instead of Node-only'
@@ -355,3 +360,21 @@ fmt:
 # /bin/sh on Unix, and the quotes force make to route through it instead of direct-exec.
 clean:
 	"$(SHELL)" -c "rm -rf bin build pkg/runtime/picohttpparser/*.a pkg/runtime/picohttpparser/*.o"
+
+# Agent system entry points. An issue is drained only once a human labels it
+# `agent-ready` — `agent-queue` shows what that currently admits, and ALL=1
+# shows the full derived order the tracker implies, gate ignored.
+#
+# agent-run goes through scripts/agent-loop.sh rather than calling node here:
+# the wrapper pins PATH (cron has almost none, and node/claude live under $HOME)
+# and holds a lock, so a scheduled tick cannot stack a second drain onto a run
+# that takes hours. Same script from a crontab line and from this target, so
+# what you test by hand is what the schedule executes.
+agent-queue:
+	node workflows/cli.mjs queue $(if $(ALL),--all,)
+
+agent-run:
+	$(RUNSCRIPT) ./scripts/agent-loop.sh --max $(or $(MAX),1) --provider $(or $(PROVIDER),claude)
+
+agent-status:
+	node workflows/cli.mjs status

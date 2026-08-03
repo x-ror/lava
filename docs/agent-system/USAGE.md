@@ -2,7 +2,17 @@
 
 ## Quick start (autonomous)
 
-From the repo root:
+Through make, which is where the rest of this repo's entry points live:
+
+```bash
+make agent-queue            # what is cleared to run
+make agent-queue ALL=1      # the full derived order, label gate ignored
+make agent-run              # drain one issue end-to-end
+make agent-run MAX=3 PROVIDER=grok
+make agent-status           # verdict, PR and node history of the last run
+```
+
+The underlying commands, for anything the targets do not cover:
 
 ```bash
 # Process one ready GitHub issue end-to-end
