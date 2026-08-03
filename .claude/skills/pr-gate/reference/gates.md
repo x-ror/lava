@@ -7,13 +7,18 @@ disagree with this table, they win — and fix this table.
 every routed smoke, on both I/O backends. Nothing else runs them: `/pr-gate` is
 invoked by a human, locally, and `--review-only` (which executes no `make`
 target and reads CI's conclusions instead) is for reviewing from a machine
-without the toolchain. Four routed targets are **not** in CI — `make bun-buffer-tests`,
-`make api-surface`, `make test-compat-lava-strict` and `make bench-gate` — so a
-diff that routes to one of those needs a local run, or a new CI step if it should
-be enforced. (`make test-scripts` runs in CI inside `make check-js`;
+without the toolchain. **Five** routed targets are **not** in CI — `make bun-buffer-tests`,
+`make api-surface`, `make test-compat-lava-strict`, `make bench-gate`, and
+`make bench-http` — so a diff that routes to one of those needs a local run, or a
+new CI step if it should be enforced. (`make bench` is in CI but **report-only**
+and cannot fail.) (`make test-scripts` runs in CI inside `make check-js`;
 `make test-property` is its own CI step since batching took it from 64s to ~1s;
 `make test-mutation` is its own CI step because it rebuilds `bin/lava` once per
 embedded-JS mutation.)
+
+**Machine-readable routing:** `node scripts/agent-cycle/route-gates.mjs <paths>`
+(or `--from-git`). Prefer that over hand-parsing this table; if Makefile/ci.yml
+disagree with this file, they win — fix this file (agent-cycle F4).
 
 ## Always
 
@@ -55,14 +60,15 @@ catches what a YAML parse cannot: a context used where it is not available, a ba
 | `js/internal/stream.js` | `make test-http-smoke`, `make test-net-smoke`, `make test-stdio` — nothing else routes here, and this is the base layer `net`/`http`/`stdio` compose on. Added after #326: a change to the `write()` accept set passed `check-js` and `test-compat-lava` while stalling `pipe()` forever, because a DataView made `writableLength` NaN and `'drain'` could never fire. The suites that would have caught it were not on anyone's list |
 | `require.odin`, `module_resolution.odin`, `js/internal/{loader,esm}.js` | `make test-compat-lava-strict`; for `loader.js` ALSO `make test-fs-lava`, `make test-http-smoke`, `make test-net-smoke`, `make test-https-smoke`, `make test-stdio` — since #333 it hands `require.pristineBuffer` to every lazy module, so a wrong snapshot breaks framing in suites `test-compat-lava-strict` never runs |
 | `crypto.odin`, `js/internal/crypto.js` | `make test-odin`, `make test-compat-lava`, `make api-surface` |
-| `pkg/runtime/js/**.js` (any — the scan root is the whole tree, `console.js` included) | `make check-js`, `make check-primordials`, `make test-compat-lava` |
+| `pkg/runtime/js/**/*.js` (any under the scan root, `console.js` included; use `**/*` not bare `**.js`) | `make check-js`, `make check-primordials`, `make test-compat-lava` |
 | `js/internal/url.js` | `make bench` — `bench/micro/url.js` exists since 2026-07-30; before it, a +6% to +20% `new URL` regression passed every gate and was found by hand in review |
 | `js/internal/{encoding,url,buffer}.js`, `pkg/runtime/buffer*.odin` | `make test-property` — differential property tests (fast-check generates the corpus; hand-picked oracle cases missed edge cases here twice, and the batched suite found a utf-16le divergence at 5000 inputs). `PROPERTY_RUNS=N` for a deeper local sweep |
 | `scripts/**` | `make test-scripts` — node:test over the build tooling |
 | any file named in `tests/mutation-manifest.json` as a `source` | `make test-mutation` — re-applies the recorded break and requires the named test to go red. Changing one of these files without running it means the recorded mutation may no longer describe the code, which the runner reports as STALE rather than skipping |
 | `pkg/runtime/globals.odin`, `runtime.odin`, `errors.odin` | `make test-odin`, `make test-compat-lava` |
 | `bench/**`, `bench/thresholds.json` | `make bench-gate` — and a stated reason if a cap was loosened |
-| `Makefile`, `scripts/**`, `.github/workflows/**` | run the targets the change touches, end to end |
+| `Makefile`, `scripts/**`, `.github/workflows/**` | `__ALL__` fallback via `route-gates.mjs` — run L0+L1 (and L2 if mutation/CI surface touched), end to end |
+| `pkg/runtime/*_test.odin` / eventloop Odin tests | `make test-runtime-odin` when present in Makefile — not every Odin unit path is covered by `make test-odin` alone |
 
 ## Perf claims
 

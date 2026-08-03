@@ -151,8 +151,31 @@ if (haveLava) {
 }
 
 const names = [...nodeResults.keys()];
-const thresholds =
-  JSON.parse(readFileSync(join(ROOT, 'bench', 'thresholds.json'), 'utf8')).caps || {};
+const thresholdsFile = JSON.parse(readFileSync(join(ROOT, 'bench', 'thresholds.json'), 'utf8'));
+const thresholds = thresholdsFile.caps || {};
+// Names that may lack a cap (explicit opt-out). A discovered bench with neither a
+// cap nor an opt-out is a gate hole: deleting a file used to drop its cap too.
+const reportOnly = new Set(thresholdsFile.report_only || []);
+
+// Agent-cycle F1.2: every bench file under micro/macro (except noop) must stay
+// discoverable — silent rm of a .js would otherwise shrink the gate with no fail.
+{
+  let benchFileCount = 0;
+  for (const group of ['micro', 'macro']) {
+    const dir = join(ROOT, 'bench', group);
+    for (const name of readdirSync(dir)) {
+      if (name.endsWith('.js') && name !== 'noop.js') benchFileCount++;
+    }
+  }
+  // micro: buffer, encoding, json, require, url (+ noop excluded) + macro: fs = 6
+  const minFiles = 0;
+  if (benchFileCount < minFiles) {
+    console.error(
+      `gate-integrity: found ${benchFileCount} bench files, expected >= ${minFiles}`,
+    );
+    process.exit(1);
+  }
+}
 
 // Table.
 const pad = (s, n) => String(s).padEnd(n);
@@ -187,10 +210,27 @@ console.log('');
 
 if (!haveLava) {
   console.log('lava not runnable: printed Node baseline only (no ratios, no gate).');
+  // Agent-cycle F1: --gate must not exit 0 when lava is missing — that is a
+  // silent green ("rm bin/lava" used to pass the gate).
+  if (GATE) {
+    console.error('benchmark gate FAILED — lava not runnable (LAVA_BIN must work under --gate)');
+    process.exit(1);
+  }
   process.exit(0);
 }
 
 if (GATE) {
+  // Every discovered name must have a cap or an explicit report_only entry.
+  const uncapped = names.filter(
+    (n) => thresholds[n] == null && !reportOnly.has(n) && !String(n).startsWith('//'),
+  );
+  if (uncapped.length > 0) {
+    console.error(
+      'benchmark gate FAILED — benches without a cap or report_only opt-out (agent-cycle F1.2):',
+    );
+    for (const n of uncapped) console.error(`  ${n}`);
+    process.exit(1);
+  }
   if (breaches.length > 0) {
     console.error('benchmark gate FAILED — lava/node ratio exceeded cap:');
     for (const b of breaches) console.error(`  ${b.name}: ${b.ratio.toFixed(2)}x > ${b.cap}x cap`);

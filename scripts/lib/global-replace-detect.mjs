@@ -33,15 +33,27 @@ const PRIMORDIAL_RE = /^StringPrototype(Replace|ReplaceAll|Match|MatchAll|Split|
 // Sites that are known, declared, and deliberately still open. Each needs a reason and
 // an owner entry in ROADMAP.md; the point of listing them here rather than deleting the
 // check is that the count is enforced — a NEW site cannot hide behind an old one.
+//
+// Keys are stable: `file:bindingName` (or `file:how:what` for literals). Keying by
+// line number (#337) broke the gate on every edit above the site and taught reviewers
+// to ignore a hang alarm — three moves in one PR (#330: 572→607→609→660).
 const ALLOWED = new Map([
   [
-    'internal/util.js:660',
+    'internal/util.js:ansiRegex',
     'stripVTControlCharacters: the ANSI pattern is two alternations (OSC terminated by ' +
       'BEL/ST, CSI terminated by a final byte), not a character class, so it has no ' +
       'code-unit rewrite. node hangs on it identically, so Lava is not diverging. ' +
       'Guarded by an indexOf short-circuit, so only input containing ESC/CSI reaches it.',
   ],
 ]);
+
+// Stable allowlist identity for a hit. Prefer the binding name when the pattern is
+// `name = …`; fall back to how+what so literal sites stay uniquely addressable.
+export function allowKey(hit) {
+  const m = typeof hit.what === 'string' ? hit.what.match(/^([A-Za-z_$][\w$]*)\s*=/) : null;
+  if (m) return `${hit.file}:${m[1]}`;
+  return `${hit.file}:${hit.how}:${hit.what}`;
+}
 
 function walk(dir, out = []) {
   for (const entry of readdirSync(dir)) {

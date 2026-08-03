@@ -8,7 +8,12 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 NODE_BIN=${NODE_BIN:-node}
 LAVA_BIN=${LAVA_BIN:-"$ROOT_DIR/bin/lava"}
+# Default port is stable for single-run use. Parallel worktrees must set
+# FETCH_TEST_PORT per agent (agent-cycle F2) so two smokes never share a listener.
 PORT=${FETCH_TEST_PORT:-8799}
+# Nonce baked into readiness so a second process that connected to a *foreign*
+# server on the same port fails instead of green-passing (F2).
+FETCH_SMOKE_NONCE=${FETCH_SMOKE_NONCE:-$$-$(date +%s)}
 
 SERVER="$ROOT_DIR/tests/runtime/fetch/server.js"
 CASE="$ROOT_DIR/tests/runtime/fetch/cases.js"
@@ -76,16 +81,31 @@ if command -v openssl >/dev/null 2>&1; then
 	fi
 fi
 
+# Export nonce before starting the server so server.js can echo it on /_lava_ready
+# when present; readiness still falls back to TCP connect for older server.js.
+export FETCH_SMOKE_NONCE
 "$NODE_BIN" "$SERVER" "$PORT" &
 SRV_PID=$!
 
 # Wait for the origin to accept connections. A server that never binds (e.g.
 # `listen EPERM` in a sandbox, or the port already in use) must FAIL the run, not
 # silently fall through to a comparison of two empty outputs.
+# When the readiness path supports the nonce, require it so we never green-pass
+# against another worktree's server on a co-bound or stolen port (agent-cycle F2).
 i=0
 SERVER_UP=0
 while [ "$i" -lt 50 ]; do
-	if "$NODE_BIN" -e "require('net').connect($PORT,'127.0.0.1').on('connect',function(){process.exit(0)}).on('error',function(){process.exit(1)})" 2>/dev/null; then
+	if "$NODE_BIN" -e "
+const http=require('http');
+const port=$PORT;
+const nonce=process.env.FETCH_SMOKE_NONCE||'';
+const req=http.get({host:'127.0.0.1',port,path:'/_lava_ready',timeout:500},res=>{
+  let b=''; res.on('data',d=>b+=d); res.on('end',()=>{
+    process.exit(res.statusCode===200 && b.trim()===nonce ? 0 : 1);
+  });
+});
+req.on('error',()=>process.exit(1));
+" 2>/dev/null; then
 		SERVER_UP=1
 		break
 	fi

@@ -14,7 +14,8 @@ const path = require('node:path');
 // there contains backslashes (the separator), which is the same escaping hazard;
 // an apostrophe adds a quote character that is legal on Windows.
 const weird = process.platform === 'win32' ? "weird'name" : 'we"ird\nname';
-const base = path.join(__dirname, '..', 'fixtures', 'wrapper-escape-tmp');
+// Pid suffix: parallel runs must not clobber each other (agent-cycle F2).
+const base = path.join(__dirname, '..', 'fixtures', `wrapper-escape-tmp-${process.pid}`);
 const dir = path.join(base, weird);
 fs.mkdirSync(dir, { recursive: true });
 

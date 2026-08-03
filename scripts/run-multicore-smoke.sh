@@ -30,7 +30,15 @@ fail() {
 	exit 1
 }
 
-PORT=$((20000 + $$ % 20000))
+# Prefer an exclusive high port. Avoid SO_REUSEPORT co-bind with another agent's
+# smoke (agent-cycle F2): two LAVA_WORKERS groups on the same port make
+# `distinct >= 2` pass for the wrong reason. MULTICORE_TEST_PORT overrides.
+if [ -n "${MULTICORE_TEST_PORT:-}" ]; then
+	PORT=$MULTICORE_TEST_PORT
+else
+	# Ephemeral range, process-unique, still below typical dynamic max.
+	PORT=$((40000 + ($$ % 20000)))
+fi
 
 # --- 1) worker-count validation fails fast (exit 2) on invalid values --------------------------------
 cat >"$TMP_DIR/noop.js" <<'EOF'

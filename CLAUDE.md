@@ -358,6 +358,13 @@ if perf is claimed. Run `/pr-gate` before asking for review.
 
 - `/odin-feature <task>` — implement: reuse scout → design → implement → gates.
 - `/pr-gate` — merge gate: mechanical gates + parallel specialist review + scorecard.
+- `/agent-cycle [status|f1–f7|min-slice|pilot]` — integrate the autonomous
+  agent loop (gate integrity → worktree safety → groom → routing → structured
+  review I/O → driver → pilot). **Do not build the driver first.** Canonical
+  plan: [docs/agent-cycle-plan.md](docs/agent-cycle-plan.md). Skill ships in
+  both [`.claude/skills/agent-cycle/`](.claude/skills/agent-cycle/) (Claude Code)
+  and [`.grok/skills/agent-cycle/`](.grok/skills/agent-cycle/) (Grok Build);
+  same procedure, one plan file.
 - Agents in [.claude/agents/](.claude/agents/) are specialists (`odin-sdk-scout`,
   `odin-implementer`, `regression-hunter`, `odin-safety-auditor`,
   `node-parity-auditor`, `perf-memory-auditor`, `security-auditor`,

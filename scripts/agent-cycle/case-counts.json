@@ -1,0 +1,26 @@
+{
+  "$comment": "Minimum case/bench counts for gate integrity (agent-cycle F1.2). Runners fail if a glob finds fewer files than expected — silent case deletion cannot go green. Re-measure and raise when adding cases; never lower without a written reason.",
+  "suites": {
+    "tests/node-compat/cases": {
+      "globs": ["*.js", "*.mjs"],
+      "min": 68
+    },
+    "tests/runtime/eventloop/cases": {
+      "globs": ["*.js"],
+      "min": 12
+    },
+    "tests/std/fs/cases": {
+      "globs": ["*.js"],
+      "min": 4
+    },
+    "tests/std/sqlite/cases": {
+      "globs": ["*.js"],
+      "min": 8
+    }
+  },
+  "bench": {
+    "dirs": ["bench/micro", "bench/macro"],
+    "exclude": ["noop.js"],
+    "min_files": 6
+  }
+}

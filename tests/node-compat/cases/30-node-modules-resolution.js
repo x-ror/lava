@@ -7,7 +7,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const root = path.join(__dirname, '..', 'fixtures', 'nm-tmp');
+// Pid suffix: parallel runs must not clobber each other (agent-cycle F2).
+const root = path.join(__dirname, '..', 'fixtures', `nm-tmp-${process.pid}`);
 const app = path.join(root, 'app');
 const nm = path.join(app, 'node_modules');
 
