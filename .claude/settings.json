@@ -89,22 +89,7 @@
       "Edit(tests/runtime/eventloop/known-lava-gaps.txt)",
       "Edit(Makefile)",
       "Edit(package.json)",
-      "Write(.claude/settings.json)",
-      "Write(.claude/settings.local.json)",
-      "Write(.claude/hooks/**)",
-      "Write(.grok/hooks/**)",
-      "Write(runtime/gates/integrity.mjs)",
-      "Write(runtime/gates/case-counts.json)",
-      "Write(scripts/lib/compare.sh)",
-      "Write(scripts/run-mutations.mjs)",
-      "Write(bench/run.mjs)",
-      "Write(bench/thresholds.json)",
-      "Write(tests/mutation-manifest.json)",
-      "Write(tests/node-compat/pollution-baseline.json)",
-      "Write(tests/node-compat/known-lava-gaps.txt)",
-      "Write(Makefile)",
-      "Write(.env)",
-      "Write(.env.*)"
+      "Edit(.env)"
     ]
   },
   "hooks": {
