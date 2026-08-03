@@ -45,8 +45,10 @@ globalThis.console = { fake2: true };
 assert.strictEqual(require('node:process'), realProcess);
 assert.strictEqual(require('node:console'), realConsole);
 
-// Delete is the other mutation shape (issue text). Cache still returns the
-// intrinsic; free-var `process` may be gone, so print through the captured real.
+// Delete, but note what this can and cannot prove: both modules are already
+// cached above, so this pins only that the cache survives a later delete. It is
+// NOT the delete-before-first-require shape — that needs a fresh module cache,
+// i.e. its own process, and lives in 67-process-console-deleted-global.js.
 delete globalThis.process;
 delete globalThis.console;
 assert.strictEqual(require('node:process'), realProcess);

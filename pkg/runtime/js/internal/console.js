@@ -15,8 +15,12 @@
 // natives channel did not hand us the object.
 (function (require, module, exports, intrinsic) {
   'use strict';
+  // Through primordials, not a bare `new Error(...)` — same reason as process.js:
+  // a lazy factory body is call-time code, so the global it reads is whatever user
+  // code left there before the first require.
+  var ErrorG = require('primordials').Error;
   if (intrinsic == null) {
-    throw new Error('node:console intrinsic missing at context init');
+    throw new ErrorG('node:console intrinsic missing at context init');
   }
   module.exports = intrinsic;
 });
