@@ -406,7 +406,7 @@ Track progress here (edit in place; do not open a second tracker):
 | F1.1 hooks / command filter | **done** | `scripts/agent-cycle/gate-integrity.mjs`, `.claude/hooks/`, `.grok/hooks/`, settings deny+hooks; runner refuse lava-vs-lava |
 | F1.2 case/bench counters | **done** | `case-counts.json` + assert in oracle runners; bench min files + `report_only` + fail if lava missing under `--gate` |
 | F2 worktree fixes | **done** | fetch nonce/port, multicore port, fixture pid suffix, gitignore, `worktree-bootstrap.sh` |
-| F3 issue groom | proposal | `docs/agent-cycle/groom-report.md` — human confirms closes |
+| F3 issue groom | proposal (refreshed 2026-08-03) | `docs/agent-cycle/groom-report.md` re-verified vs 61 open issues + git; `node-compat.json` marked stale; human confirms closes/body edits |
 | F4 routing generator | **done** | `scripts/agent-cycle/route-gates.mjs`; gates.md notes 5 non-CI + invalid glob fixed |
 | F5 structured I/O wrapper | **done** | `findings-schema.json` + `aggregate-verdict.mjs` |
 | F6 driver | **skeleton** | `scripts/agent-cycle/driver.mjs` — select/plan/route/aggregate; no LLM spawn |

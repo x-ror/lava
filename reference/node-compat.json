@@ -1,4 +1,7 @@
 {
+  "$comment": "STALE (agent-cycle F3, 2026-08-03): generated_against.lava_rev is ancient (3de9128). Modules marked missing here (os/net/http/https/dns/stream/…) exist on master. Do NOT use as a groom or backlog map until regenerated against current master. See docs/agent-cycle/groom-report.md.",
+  "stale": true,
+  "stale_reason": "Generated against 3de9128; lists shipped modules as missing. Regenerate before trusting status fields.",
   "generated_against": {
     "lava_rev": "3de9128",
     "node_doc_sha": "463e56fb000f3e2943d68973bfb4fde9378c942a",
