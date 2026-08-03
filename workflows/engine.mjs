@@ -114,6 +114,25 @@ export async function runGraph(opts) {
       } else if (!result.ok) {
         next = node.on_fail || node.next;
       }
+
+      // A planner that concludes the work already exists ends the run.
+      //
+      // planner.md rule 4 promises exactly this ("do not re-queue
+      // implementation") and nothing read it: for #91 the plan came back
+      // `terminal: "already-done"` with zero tasks, and the graph went on to
+      // spend odin-feature, critic, gates and pr-gate rediscovering that.
+      //
+      // It lands on needs-human, NOT done, and that is the whole point. The
+      // planner was WRONG about #91 — the work was needed and odin-feature did
+      // it. A wrong "already-done" that closed the run silently would bury the
+      // issue; one that stops and asks costs a human thirty seconds.
+      //
+      // Applied after the routing above so a hard gate's verdict still wins:
+      // a BLOCK is a stronger statement than a plan's opinion.
+      if (!node.hard_gate && result.ok && result.plan?.terminal) {
+        state.terminalReason = `${node.command}: plan says ${result.plan.terminal}`;
+        next = node.on_terminal || 'terminal.needs-human';
+      }
     } else if (node.type === 'system') {
       const h = handlers[node.action || nodeName];
       if (h) {
