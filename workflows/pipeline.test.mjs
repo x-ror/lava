@@ -206,7 +206,11 @@ test('a gate only a human can clear stops the run instead of feeding the fixer',
   const handlers = makeHandlers(ISSUE, {
     runGates: () => ({
       ...RED,
-      humanOnly: { id: 'primordials-raise', path: 'tests/node-compat/pollution-baseline.json', reason: 'needs --allow-raise' },
+      humanOnly: {
+        id: 'primordials-raise',
+        path: 'tests/node-compat/pollution-baseline.json',
+        reason: 'needs --allow-raise',
+      },
     }),
     createDraftPr: () => ({ ok: true }),
   });
