@@ -6,7 +6,10 @@
 const assert = require('node:assert/strict');
 const { DatabaseSync } = require('node:sqlite');
 
-function throwsWithCode(fn, code, label) {
+// The message is part of the conformance surface (CLAUDE.md §1), so it is asserted
+// alongside the code: with only `err.code` checked, any message drift on these
+// paths stayed invisible because nothing derived from the message was printed.
+function throwsWithCode(fn, code, message, label) {
   let err;
   try {
     fn();
@@ -15,11 +18,21 @@ function throwsWithCode(fn, code, label) {
   }
   assert.ok(err, label + ': expected a throw');
   assert.equal(err.code, code, label + ': code');
+  assert.equal(err.message, message, label + ': message');
 }
 
+const PATH_TYPE_MSG =
+  'The "path" argument must be a string, Uint8Array, or URL without null bytes.';
+const UNBINDABLE_MSG = 'Provided value cannot be bound to SQLite parameter 1.';
+
 // --- constructor requires a real path (no silent "undefined" file) ---
-throwsWithCode(() => new DatabaseSync(), 'ERR_INVALID_ARG_TYPE', 'no-arg ctor');
-throwsWithCode(() => new DatabaseSync(undefined), 'ERR_INVALID_ARG_TYPE', 'undefined ctor');
+throwsWithCode(() => new DatabaseSync(), 'ERR_INVALID_ARG_TYPE', PATH_TYPE_MSG, 'no-arg ctor');
+throwsWithCode(
+  () => new DatabaseSync(undefined),
+  'ERR_INVALID_ARG_TYPE',
+  PATH_TYPE_MSG,
+  'undefined ctor',
+);
 
 const db = new DatabaseSync(':memory:');
 db.exec('CREATE TABLE t (x)');
@@ -46,12 +59,22 @@ big.setReadBigInts(true);
 assert.equal(big.get().x, 9223372036854775807n);
 
 // A BigInt outside i64 range cannot be bound — Node throws, no lossy/wrapped write.
-throwsWithCode(() => insertOne(2n ** 64n), 'ERR_INVALID_ARG_VALUE', 'bigint overflow');
+throwsWithCode(
+  () => insertOne(2n ** 64n),
+  'ERR_INVALID_ARG_VALUE',
+  'BigInt value is too large to bind.',
+  'bigint overflow',
+);
 
 // --- unbindable types throw instead of coercing ---
-throwsWithCode(() => insertOne(undefined), 'ERR_INVALID_ARG_TYPE', 'bind undefined');
-throwsWithCode(() => insertOne(true), 'ERR_INVALID_ARG_TYPE', 'bind true');
-throwsWithCode(() => insertOne(false), 'ERR_INVALID_ARG_TYPE', 'bind false');
+throwsWithCode(
+  () => insertOne(undefined),
+  'ERR_INVALID_ARG_TYPE',
+  UNBINDABLE_MSG,
+  'bind undefined',
+);
+throwsWithCode(() => insertOne(true), 'ERR_INVALID_ARG_TYPE', UNBINDABLE_MSG, 'bind true');
+throwsWithCode(() => insertOne(false), 'ERR_INVALID_ARG_TYPE', UNBINDABLE_MSG, 'bind false');
 
 // --- null is a valid bind (-> SQL NULL) ---
 insertOne(null);
@@ -78,6 +101,7 @@ assert.equal(pair.b, null);
 throwsWithCode(
   () => db.prepare('INSERT INTO t VALUES (?)').run(1, 2),
   'ERR_SQLITE_ERROR',
+  'column index out of range',
   'extra positional param',
 );
 

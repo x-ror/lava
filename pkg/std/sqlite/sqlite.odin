@@ -415,6 +415,19 @@ bind_text :: proc(stmt: ^Statement, index: int, value: string) -> Result {
 	}
 }
 
+// bind_blob binds `value` as a BLOB, including a zero-length one.
+//
+// Node:
+//   node:sqlite binds an empty Uint8Array as an empty BLOB — `typeof(x)` reads
+//   "blob" and `length(x)` 0, verified against node 24.
+//
+// sqlite3_bind_blob() with a NULL pointer is documented to behave exactly like
+// sqlite3_bind_null(), so an empty slice (whose raw_data is nil) silently bound
+// SQL NULL: an empty buffer round-tripped as null, satisfied `IS NULL` and broke
+// NOT NULL constraints. SQLite reads no bytes when n is 0, so any non-NULL address
+// serves — `empty` is a zeroed local whose address is only needed for the duration
+// of the call (SQLITE_TRANSIENT copies before returning). Pinned by
+// tests/std/sqlite/cases/08-coercion-parity.js.
 bind_blob :: proc(stmt: ^Statement, index: int, value: []byte) -> Result {
 	when !SQLITE_AVAILABLE {
 		return unavailable()
@@ -422,7 +435,8 @@ bind_blob :: proc(stmt: ^Statement, index: int, value: []byte) -> Result {
 		if stmt == nil || stmt.handle == nil {
 			return Result{status = .Invalid_Input, message = "statement is not prepared"}
 		}
-		ptr := len(value) > 0 ? raw_data(value) : nil
+		empty: byte
+		ptr := len(value) > 0 ? rawptr(raw_data(value)) : rawptr(&empty)
 		return bind_result(
 			sqlite3_bind_blob(stmt.handle, c.int(index), ptr, c.int(len(value)), sqlite_transient()),
 		)
