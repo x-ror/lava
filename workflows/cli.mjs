@@ -14,7 +14,14 @@ import { pollAndDispatch } from './triggers/issues.mjs';
 import { STATE_DIR } from '../runtime/paths.mjs';
 import { listOpenIssues, selectReadyIssues, isAgentReady } from '../runtime/github.mjs';
 import { buildDag, explain, UNTIERED } from '../runtime/dag.mjs';
-import { listRuns, isTerminal, findResumable, checkResumable } from '../runtime/runs.mjs';
+import {
+  listRuns,
+  isTerminal,
+  findResumable,
+  checkResumable,
+  reopenState,
+} from '../runtime/runs.mjs';
+import { saveState } from './durable.mjs';
 
 function parseFlags(argv) {
   const flags = {};
@@ -46,7 +53,8 @@ async function main() {
   status          In-flight runs (node, age, worktree) and the last completed one.
   resume [runId]  Continue a run that stopped before a terminal node, in the
                   worktree it was already building in. Newest one by default;
-                  --issue N picks that issue's.`);
+                  --issue N picks that issue's. --force reopens a run that
+                  already reached a terminal node and resets the fix budget.`);
     process.exit(0);
   }
 
@@ -157,19 +165,35 @@ async function main() {
   }
 
   if (cmd === 'resume') {
+    // --force also widens the search: a terminal run is not "resumable", so
+    // findResumable would not offer the very run the operator wants back.
     const target = rest[0]
       ? { runId: rest[0] }
-      : findResumable(flags.issue ? { issue: Number(flags.issue) } : {});
+      : findResumable(flags.issue ? { issue: Number(flags.issue) } : {}) ||
+        (flags.force
+          ? listRuns().find((r) => r.state && (!flags.issue || r.issue === Number(flags.issue)))
+          : null);
     if (!target) {
       console.log('nothing to resume — no run stopped before a terminal node');
       return;
     }
-    const check = checkResumable(target.runId);
+    const check = checkResumable(target.runId, undefined, { force: !!flags.force });
     if (!check.ok) {
       console.error(`cannot resume ${target.runId}: ${check.reason}`);
       process.exit(1);
     }
     const { state } = check;
+    if (flags.force && isTerminal(state)) {
+      const reopened = reopenState(state);
+      if (!reopened.ok) {
+        console.error(`cannot reopen ${target.runId}: ${reopened.reason}`);
+        process.exit(1);
+      }
+      console.log(`reopening (--force): ${reopened.from} → ${reopened.to}`);
+      // Persisted, not just changed in memory: runIssuePipeline re-reads the
+      // state from disk, so an in-memory reopen is silently discarded.
+      saveState(target.runId, state);
+    }
     console.log(
       `resuming ${target.runId} — issue #${state.issue?.number}, node ${state.node}, worktree ${state.wt}`,
     );

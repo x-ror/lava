@@ -20,6 +20,7 @@ import {
   checkResumable,
   saveState,
   loadState,
+  reopenState,
 } from './durable.mjs';
 
 function scratch() {
@@ -198,4 +199,78 @@ test('a truncated state file loads as null instead of throwing', () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ── reopening a terminal run ────────────────────────────────────────────────
+
+test('a finished run is refused by default and offered with force', () => {
+  // #91 closed as needs-human-decision because the provider was down, not
+  // because the code was unfixable. The only way back was to bypass the graph.
+  const root = scratch();
+  const wt = mkdtempSync(join(tmpdir(), 'lava-wt-'));
+  try {
+    seed(root, '91-1000', { issue: { number: 91 }, status: 'needs-human-decision', wt });
+    const refused = checkResumable('91-1000', root);
+    assert.equal(refused.ok, false);
+    assert.match(refused.reason, /--force reopens it/);
+
+    const forced = checkResumable('91-1000', root, { force: true });
+    assert.equal(forced.ok, true);
+    assert.equal(forced.state.wt, wt);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test('force does not excuse a missing worktree', () => {
+  // There is still nothing to resume into; force reopens a decision, not a hole.
+  const root = scratch();
+  try {
+    seed(root, '91-1000', { issue: { number: 91 }, status: 'done', wt: '/nonexistent/wt' });
+    const r = checkResumable('91-1000', root, { force: true });
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /worktree is gone/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('reopening rewinds off the terminal node, not just clears the status', () => {
+  // Clearing `status` alone left `node` pointing at terminal.needs-human, so the
+  // graph restarted inside the terminal and ended immediately — --force reported
+  // success and did nothing. Shipped exactly that once.
+  const state = {
+    node: 'terminal.needs-human',
+    status: 'needs-human-decision',
+    stallReason: 'provider did not run',
+    fixRound: 3,
+    providerMisses: 2,
+    history: [
+      { node: 'pr-gate', next: 'fixer' },
+      { node: 'fixer', next: 'gates' },
+      { node: 'gates', next: 'fixer' },
+      { node: 'fixer', next: 'gates' },
+    ],
+  };
+  const r = reopenState(state);
+  assert.equal(r.ok, true);
+  assert.equal(r.to, 'gates');
+  assert.equal(state.node, 'gates', 'the run would have restarted in the terminal node');
+  assert.equal(state.status, undefined);
+  assert.equal(state.stallReason, undefined);
+  assert.equal(state.fixRound, 0);
+  assert.equal(state.providerMisses, 0);
+});
+
+test('reopening refuses when history offers nowhere to go', () => {
+  const state = {
+    node: 'terminal.done',
+    status: 'done',
+    history: [{ node: 'x', next: 'terminal.done' }],
+  };
+  const r = reopenState(state);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /nowhere|no non-terminal/);
+  assert.equal(state.status, 'done', 'a refused reopen must not half-clear the state');
 });

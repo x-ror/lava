@@ -8,9 +8,9 @@ import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync } from 'node
 import { join } from 'node:path';
 import { getAgent, loadRegistry } from '../agents/registry.mjs';
 import { buildAgentPrompt } from './build-prompt.mjs';
-import { runLlm } from '../llm/router.mjs';
+import { runLlm, providerDidNotRun } from '../llm/router.mjs';
 import { bootstrapWorktree } from '../runtime/worktree.mjs';
-import { STATE_DIR, FINDINGS_FILE, PLAN_FILE } from '../runtime/paths.mjs';
+import { STATE_DIR, FINDINGS_FILE, findingsFileFor, PLAN_FILE } from '../runtime/paths.mjs';
 import { ghJson } from '../runtime/github.mjs';
 
 /**
@@ -102,7 +102,11 @@ export async function invokeCommand(commandName, opts = {}) {
   // other two used the default, so a caller passing a path would have had the
   // gate write to one file and the aggregator read another — reported as "no
   // verdict", or worse, silently answered by a stale file at the default.
-  const findingsPath = opts.findingsPath ?? join(wt, FINDINGS_FILE);
+  const findingsPath = opts.findingsPath ?? join(wt, findingsFileFor(agent.name));
+  // The unsuffixed name is still read, so a worktree written before the naming
+  // was settled is not orphaned. Both are cleared before a hard gate, or a
+  // stale legacy file could answer for this round.
+  const legacyFindingsPath = join(wt, FINDINGS_FILE);
 
   const prompt = buildAgentPrompt(agent, {
     issue,
@@ -144,7 +148,10 @@ export async function invokeCommand(commandName, opts = {}) {
   // A hard gate reads its verdict from a file the agent writes. A file left by
   // the previous fixer round would be read as THIS round's verdict, so the loop
   // could exit on a stale SHIP. Delete before, and only trust what reappears.
-  if (agent.hard_gate) rmSync(findingsPath, { force: true });
+  if (agent.hard_gate) {
+    rmSync(findingsPath, { force: true });
+    rmSync(legacyFindingsPath, { force: true });
+  }
 
   const result = runLlm(prompt, {
     cwd: wt,
@@ -156,10 +163,11 @@ export async function invokeCommand(commandName, opts = {}) {
 
   let verdict = null;
   let verdictError = null;
-  if (agent.hard_gate && existsSync(findingsPath)) {
+  const writtenTo = [findingsPath, legacyFindingsPath].find(existsSync);
+  if (agent.hard_gate && writtenTo) {
     try {
       const { aggregate } = await import('../runtime/gates/aggregate-verdict.mjs');
-      const report = JSON.parse(readFileSync(findingsPath, 'utf8'));
+      const report = JSON.parse(readFileSync(writtenTo, 'utf8'));
       const reports = Array.isArray(report) ? report : [report];
       verdict = aggregate(reports, {
         gateRed: opts.gateRed === true,
@@ -168,7 +176,7 @@ export async function invokeCommand(commandName, opts = {}) {
     } catch (e) {
       // An unreadable findings file is not "no findings" — say so, and leave
       // verdict null so the caller fails closed rather than reading it as clean.
-      verdictError = `unreadable ${findingsPath}: ${e.message}`;
+      verdictError = `unreadable ${writtenTo}: ${e.message}`;
     }
   }
 
@@ -190,7 +198,11 @@ export async function invokeCommand(commandName, opts = {}) {
     provider: result.provider,
     verdict,
     verdictError,
-    findingsPath,
+    // Carried so the caller can tell "the agent tried and failed" from "the
+    // provider never started" — a distinction the fixer budget depends on.
+    durationMs: result.durationMs,
+    didNotRun: providerDidNotRun(result),
+    findingsPath: writtenTo ?? findingsPath,
     plan: planOut,
     planPath,
     wt,

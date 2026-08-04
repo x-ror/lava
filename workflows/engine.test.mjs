@@ -302,3 +302,67 @@ test('a hard gate verdict outranks a plan opinion', async () => {
   });
   assert.ok(calls.includes('fixer'), 'a plan opinion diverted a BLOCK');
 });
+
+// ── a provider outage must not spend the fix budget ─────────────────────────
+
+/** Drives the fixer loop with a scripted pr-gate + fixer pair. */
+async function fixLoop(fixerResult, rounds = 12) {
+  const calls = [];
+  const final = await runGraph({
+    graph: GRAPH,
+    state: { issue: { number: 91 }, wt: '/tmp/wt' },
+    maxSteps: rounds,
+    invoke: async (command) => {
+      calls.push(command);
+      return command === 'pr-gate'
+        ? { ok: true, status: 0, verdict: { verdict: 'BLOCK', reason: 'P0' } }
+        : fixerResult();
+    },
+  });
+  return { final, fixes: calls.filter((c) => c === 'fixer').length };
+}
+
+test('a fixer the provider never ran does not burn a round', async () => {
+  // #91: three "fix rounds" in ninety seconds against a CLI that exited 1
+  // without doing a turn, then needs-human — reporting a code problem when
+  // nothing had been tried.
+  const { final } = await fixLoop(() => ({
+    ok: false,
+    status: 1,
+    durationMs: 2000,
+    didNotRun: true,
+  }));
+  assert.equal(final.fixRound || 0, 0, 'an outage consumed the fix budget');
+  assert.match(final.stallReason, /provider did not run/);
+  assert.match(final.stallReason, /no fix was attempted/);
+});
+
+test('but consecutive outages still stop the run', async () => {
+  // Not counting them must not mean spinning forever against a dead provider.
+  const { final, fixes } = await fixLoop(() => ({
+    ok: false,
+    status: 1,
+    durationMs: 2000,
+    didNotRun: true,
+  }));
+  assert.equal(final.status, 'needs-human-decision');
+  assert.ok(fixes <= 3, `stalled after ${fixes} attempts, expected to stop early`);
+});
+
+test('a fixer that really ran and failed still burns a round', async () => {
+  const { final } = await fixLoop(() => ({ ok: false, status: 1, durationMs: 400_000 }));
+  assert.ok(final.fixRound >= 2, 'real attempts stopped being counted');
+  assert.match(final.stallReason, /without clearing the gate/);
+});
+
+test('one outage between real attempts does not reset the budget', async () => {
+  // The miss counter resets on a real run; the round counter must not.
+  let n = 0;
+  const { final } = await fixLoop(() => {
+    n++;
+    return n === 2
+      ? { ok: false, status: 1, durationMs: 2000, didNotRun: true }
+      : { ok: false, status: 1, durationMs: 400_000 };
+  });
+  assert.match(final.stallReason, /without clearing the gate/);
+});

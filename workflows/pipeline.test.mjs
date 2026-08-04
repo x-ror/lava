@@ -198,3 +198,34 @@ test('a full run over the shipped graph opens no PR when pr-gate stays silent', 
   assert.equal(prCalls.length, 0, 'a PR was opened with no verdict anywhere in the run');
   assert.equal(final.status, 'needs-human-decision');
 });
+
+test('a gate only a human can clear stops the run instead of feeding the fixer', async () => {
+  // #91: the ratchet asked for a baseline the hook forbids the fixer to write.
+  // Sending it to the fix loop burned the budget and then reported "fixer ran 3
+  // times without clearing the gate" — which was never what happened.
+  const handlers = makeHandlers(ISSUE, {
+    runGates: () => ({
+      ...RED,
+      humanOnly: {
+        id: 'primordials-raise',
+        path: 'tests/node-compat/pollution-baseline.json',
+        reason: 'needs --allow-raise',
+      },
+    }),
+    createDraftPr: () => ({ ok: true }),
+  });
+  const out = await handlers.gates({ wt: '/tmp/wt', env: {} });
+  assert.equal(out.forceNext, 'terminal.needs-human', 'a human-only gate went to the fixer');
+  assert.match(out.stallReason, /allow-raise/);
+  assert.equal(out.humanOnly.path, 'tests/node-compat/pollution-baseline.json');
+});
+
+test('an ordinary red gate still goes to the fixer', async () => {
+  const handlers = makeHandlers(ISSUE, {
+    runGates: () => RED,
+    createDraftPr: () => ({ ok: true }),
+  });
+  const out = await handlers.gates({ wt: '/tmp/wt', env: {} });
+  assert.equal(out.forceNext, 'fixer');
+  assert.equal(out.humanOnly, undefined);
+});

@@ -48,6 +48,24 @@ export function makeHandlers(issue, deps = {}) {
       const g = gates(s.wt, s.env || {});
       if (!g.ok) {
         console.log(`[pipeline #${issue.number}] gates RED at ${g.failed}`);
+        // Some failures the fixer is forbidden to clear — the only correct fix
+        // is a file in PROTECTED_WRITE_PATHS. Sending it to the fix loop burns
+        // the budget and then misreports the outcome as "fixer ran N times
+        // without clearing the gate", when nothing was ever permitted to try.
+        if (g.humanOnly) {
+          console.log(
+            `[pipeline #${issue.number}] human-only: ${g.humanOnly.reason} (${g.humanOnly.path})`,
+          );
+          return {
+            forceNext: 'terminal.needs-human',
+            gateRed: true,
+            gateUnrun: false,
+            gateLog: g.log,
+            gateFailed: g.failed,
+            humanOnly: g.humanOnly,
+            stallReason: `${g.failed}: ${g.humanOnly.reason}`,
+          };
+        }
         return {
           forceNext: 'fixer',
           gateRed: true,

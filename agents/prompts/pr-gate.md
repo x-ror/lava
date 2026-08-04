@@ -146,8 +146,10 @@ The report above is for a human. The **verdict** is a file, and the pipeline
 reads only the file: `runtime/gates/aggregate-verdict.mjs` turns it into
 SHIP / SHIP-AFTER / BLOCK, and `workflows/engine.mjs` routes on that.
 
-Write `.agent-findings.json` in the worktree root before finishing. The exact
-path is given in the task section above when the system invoked you.
+Write `.agent-findings-pr-gate.json` in the worktree root before finishing —
+per-agent, because critic and fixer write their own alongside yours. The exact
+absolute path is given in the task section above when the system invoked you;
+use it verbatim rather than a name you infer.
 
 ```json
 {
