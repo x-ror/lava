@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findRecovery } from './run-gates.mjs';
+import { findRecovery, findHumanOnly, failedGate } from './run-gates.mjs';
 
 const IMPROVED = `
 internal/sqlite.js: global 20 < baseline 22 — hardened by 2.
@@ -74,4 +74,88 @@ test('the recovery never passes --allow-raise', () => {
   const r = findRecovery(IMPROVED);
   assert.doesNotMatch(r.command, /allow-raise/);
   assert.doesNotMatch(r.command, /RAISE=/);
+});
+
+// ── failures no agent is allowed to fix ─────────────────────────────────────
+
+const RAISE = `
+Refusing to RAISE the baseline. These entries would go up:
+
+  internal/url.js: method 29 -> 31 (+2)
+
+The ratchet only moves down. Harden the sites, add \`// primordials-ok\` where
+the receiver genuinely is not a built-in.
+`;
+
+const UNCAPPED = `
+benchmark gate FAILED — benches without a cap or report_only opt-out:
+  micro/decode-new.js
+`;
+
+const CAP_EXCEEDED = `
+benchmark gate FAILED — lava/node ratio exceeded cap:
+  micro/url-parse.js  2.9x > 2.2x
+`;
+
+const CASE_FLOOR = `
+gate-integrity case-count: tests/node-compat/cases has 68 cases, expected >= 70 (see runtime/gates/case-counts.json)
+`;
+
+test('a raise the ratchet refuses is human-only', () => {
+  const h = findHumanOnly(RAISE);
+  assert.ok(h);
+  assert.equal(h.path, 'tests/node-compat/pollution-baseline.json');
+  assert.match(h.reason, /allow-raise/);
+});
+
+test('a bench with no cap is human-only', () => {
+  const h = findHumanOnly(UNCAPPED);
+  assert.ok(h);
+  assert.equal(h.path, 'bench/thresholds.json');
+});
+
+test('a bench that BLEW its cap is not — make it faster', () => {
+  // Loosening the cap is not the fix, so this belongs to the fixer. Classifying
+  // it human-only would stop a run the agent could finish.
+  assert.equal(findHumanOnly(CAP_EXCEEDED), null);
+});
+
+test('a case-count floor is not — add cases', () => {
+  assert.equal(findHumanOnly(CASE_FLOOR), null);
+});
+
+test('an ordinary failure is not human-only', () => {
+  assert.equal(findHumanOnly('make check → 1\nsyntax error'), null);
+  assert.equal(findHumanOnly(''), null);
+  assert.equal(findHumanOnly(undefined), null);
+});
+
+test('a recoverable improvement is not human-only', () => {
+  // The two classifications must not both claim the same failure: one clears
+  // it, the other stops the run.
+  assert.equal(findHumanOnly(IMPROVED), null);
+  assert.ok(findRecovery(IMPROVED));
+});
+
+test('a human-only failure is not recoverable', () => {
+  assert.equal(findRecovery(RAISE), null);
+  assert.equal(findRecovery(UNCAPPED), null);
+});
+
+test('a failed gate carries its classification, not just computes it', () => {
+  // The wiring, not the predicate. A version that classified correctly and
+  // forgot to attach the answer passed every test above.
+  const ctx = { logs: ['make check-js → 2'], files: ['a.js'], targets: ['make check-js'] };
+  const r = failedGate('make check-js', RAISE, ctx);
+  assert.equal(r.ok, false);
+  assert.equal(r.failed, 'make check-js');
+  assert.equal(r.humanOnly?.id, 'primordials-raise');
+  assert.match(r.log, /human-only: primordials-raise/);
+});
+
+test('an ordinary failure carries no classification', () => {
+  const ctx = { logs: ['make check → 1'], files: [], targets: ['make check'] };
+  const r = failedGate('make check', 'syntax error', ctx);
+  assert.equal(r.humanOnly, null);
+  assert.doesNotMatch(r.log, /human-only/);
 });

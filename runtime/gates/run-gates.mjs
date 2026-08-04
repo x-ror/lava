@@ -40,6 +40,72 @@ export function findRecovery(log) {
 }
 
 /**
+ * Failures whose ONLY correct fix is a human-only path.
+ *
+ * Handing these to `fixer` wastes its budget and then lies about the outcome:
+ * the run ends "fixer ran 3 times without clearing the gate" when the truth is
+ * that the hook forbids it to touch the file at all.
+ *
+ * Deliberately just two. Most gate failures look protected and are not, and
+ * over-classifying stops runs the fixer could have finished:
+ *   - a bench cap EXCEEDED → make it faster; loosening the cap is not the fix
+ *   - a case-count floor   → add cases; lowering the floor is not the fix
+ *   - a mutation surviving → fix the test; rewriting the manifest is not the fix
+ * In each of those the agent-writable answer is the right one. Only these two
+ * have no such answer.
+ */
+const HUMAN_ONLY = [
+  {
+    id: 'primordials-raise',
+    detect: (log) => log.includes('Refusing to RAISE the baseline'),
+    path: 'tests/node-compat/pollution-baseline.json',
+    reason:
+      'the ratchet would have to RAISE, which needs --allow-raise and a written reason ' +
+      '(CLAUDE.md §5) — a deliberate human decision, not a fix',
+  },
+  {
+    id: 'bench-uncapped',
+    detect: (log) => log.includes('benches without a cap or report_only opt-out'),
+    path: 'bench/thresholds.json',
+    reason: 'a new bench needs a cap or a report_only opt-out, and that file is human-only',
+  },
+];
+
+/**
+ * @param {string} log combined output of the failed target
+ * @returns {{id: string, path: string, reason: string} | null}
+ */
+export function findHumanOnly(log) {
+  return HUMAN_ONLY.find((h) => h.detect(log || '')) || null;
+}
+
+/**
+ * The result a failed target produces, classification included.
+ *
+ * Extracted so the WIRING is testable and not just the predicate: a version
+ * that classified correctly and forgot to attach the answer passed every
+ * predicate test, because those never went through runGates. runGates itself
+ * shells out to `make`, so this is the seam.
+ *
+ * @param {string} target the make target that failed
+ * @param {string} out its combined stdout+stderr
+ * @param {{logs: string[], files: string[], targets: string[]}} ctx
+ */
+export function failedGate(target, out, ctx) {
+  const humanOnly = findHumanOnly(out);
+  const logs = [...ctx.logs];
+  if (humanOnly) logs.push(`human-only: ${humanOnly.id} — ${humanOnly.reason}`);
+  return {
+    ok: false,
+    log: logs.join('\n'),
+    files: ctx.files,
+    targets: ctx.targets,
+    failed: target,
+    humanOnly,
+  };
+}
+
+/**
  * Run the routed mechanical gates in a worktree.
  *
  * @param {string} wt
@@ -104,7 +170,11 @@ export function runGates(wt, env, opts = {}) {
     }
 
     if (r.status !== 0) {
-      return { ok: false, log: logs.join('\n'), files, targets: routed.targets, failed: t };
+      return failedGate(t, (r.stdout || '') + (r.stderr || ''), {
+        logs,
+        files,
+        targets: routed.targets,
+      });
     }
   }
   return { ok: true, log: logs.join('\n'), files, targets: routed.targets };
