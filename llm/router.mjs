@@ -16,6 +16,10 @@ const PROVIDERS = { none, grok, claude, codex };
  */
 export function resolveProvider(name = 'auto', opts = {}) {
   const order = ['grok', 'claude', 'codex'];
+  // An object with `.run` is used as-is. The seam exists so the timing contract
+  // can be tested against a provider that reports its own durationMs; no real
+  // provider does today, which is exactly why the spread order went unnoticed.
+  if (name && typeof name === 'object' && typeof name.run === 'function') return name;
   if (name && name !== 'auto') {
     if (!PROVIDERS[name]) throw new Error(`unknown provider: ${name}`);
     if (name === 'none') return PROVIDERS.none;
@@ -73,7 +77,11 @@ export function runLlm(prompt, ctx) {
   // forgets to report leaves `durationMs` correct instead of missing.
   const started = Date.now();
   const result = provider.run(prompt, ctx);
-  return { durationMs: Date.now() - started, ...result };
+  // Spread FIRST so the measurement wins. The other order let a provider's own
+  // `durationMs` overwrite the wrapper's — which is exactly what the comment
+  // above claims cannot happen, and would feed providerDidNotRun a number the
+  // provider chose rather than the elapsed time.
+  return { ...result, durationMs: Date.now() - started };
 }
 
 export function listProviders() {
