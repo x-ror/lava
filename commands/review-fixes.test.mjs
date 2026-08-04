@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { renderPlan } from './build-prompt.mjs';
@@ -245,7 +245,7 @@ test('invokeCommand hands a hard gate its findings path', async () => {
     // very text it was supposed to be independent of.
     assert.match(
       prompt,
-      new RegExp(`Verdict file \\(REQUIRED\\): ${dir}/\\.agent-findings\\.json`),
+      new RegExp(`Verdict file \\(REQUIRED\\): ${dir}/\\.agent-findings-pr-gate\\.json`),
       'the agent was never told which worktree to write into',
     );
   } finally {
@@ -341,4 +341,36 @@ test('the documented example uses a class the schema allows', async () => {
   const schema = JSON.parse(readFileSync(join(ROOT, 'runtime/gates/findings-schema.json'), 'utf8'));
   const allowed = schema.properties.findings.items.properties.class.enum;
   for (const f of doc.findings) assert.ok(allowed.includes(f.class), `bad class ${f.class}`);
+});
+
+test('findings are named per agent, and the old bare name is still read', async () => {
+  // Several agents write findings into one worktree: critic's playbook already
+  // said `.agent-findings-critic.json` while pr-gate's said the bare name. A
+  // live run resolved that the sensible way and wrote `-pr-gate`, which nothing
+  // looked for — so a real SHIP-AFTER was reported as "produced no verdict".
+  const { findingsFileFor, FINDINGS_FILE } = await import('../runtime/paths.mjs');
+  assert.equal(findingsFileFor('pr-gate'), '.agent-findings-pr-gate.json');
+  assert.equal(findingsFileFor('critic'), '.agent-findings-critic.json');
+  assert.equal(FINDINGS_FILE, '.agent-findings.json');
+
+  // A worktree written before the naming settled must still be readable.
+  const dir = mkdtempSync(join(tmpdir(), 'lava-legacy-'));
+  try {
+    writeFileSync(
+      join(dir, '.agent-findings.json'),
+      JSON.stringify({ agent: 'pr-gate', findings: [] }),
+    );
+    const r = await invokeCommand('critic', {
+      issue: { number: 1, title: 't', body: '' },
+      cwd: dir,
+      provider: 'none',
+      worktree: false,
+      source: 'human',
+    });
+    // critic is not a hard gate, so nothing is deleted and the file survives.
+    assert.equal(r.ok, true);
+    assert.ok(existsSync(join(dir, '.agent-findings.json')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
