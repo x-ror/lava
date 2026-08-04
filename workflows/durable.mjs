@@ -20,6 +20,7 @@ export {
   issuesInFlight,
   findResumable,
   checkResumable,
+  reopenState,
 } from '../runtime/runs.mjs';
 
 export function saveState(runId, state, root = STATE_DIR) {

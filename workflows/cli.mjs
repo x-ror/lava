@@ -14,7 +14,13 @@ import { pollAndDispatch } from './triggers/issues.mjs';
 import { STATE_DIR } from '../runtime/paths.mjs';
 import { listOpenIssues, selectReadyIssues, isAgentReady } from '../runtime/github.mjs';
 import { buildDag, explain, UNTIERED } from '../runtime/dag.mjs';
-import { listRuns, isTerminal, findResumable, checkResumable } from '../runtime/runs.mjs';
+import {
+  listRuns,
+  isTerminal,
+  findResumable,
+  checkResumable,
+  reopenState,
+} from '../runtime/runs.mjs';
 import { saveState } from './durable.mjs';
 
 function parseFlags(argv) {
@@ -178,18 +184,14 @@ async function main() {
     }
     const { state } = check;
     if (flags.force && isTerminal(state)) {
-      // Reopen: clear the terminal marks so the graph runs instead of stopping
-      // at the node that closed it. The history is kept — it is the record of
-      // why this run needed forcing.
-      console.log(`reopening a ${state.status} run (--force)`);
-      delete state.status;
-      delete state.terminal;
-      delete state.stallReason;
-      state.fixRound = 0;
-      state.providerMisses = 0;
-      // Persisted, not just cleared in memory: runIssuePipeline re-reads the
-      // state from disk, so an in-memory reopen would be silently discarded and
-      // --force would appear to work while changing nothing.
+      const reopened = reopenState(state);
+      if (!reopened.ok) {
+        console.error(`cannot reopen ${target.runId}: ${reopened.reason}`);
+        process.exit(1);
+      }
+      console.log(`reopening (--force): ${reopened.from} → ${reopened.to}`);
+      // Persisted, not just changed in memory: runIssuePipeline re-reads the
+      // state from disk, so an in-memory reopen is silently discarded.
       saveState(target.runId, state);
     }
     console.log(

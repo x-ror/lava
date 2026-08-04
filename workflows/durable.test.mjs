@@ -20,6 +20,7 @@ import {
   checkResumable,
   saveState,
   loadState,
+  reopenState,
 } from './durable.mjs';
 
 function scratch() {
@@ -233,4 +234,43 @@ test('force does not excuse a missing worktree', () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('reopening rewinds off the terminal node, not just clears the status', () => {
+  // Clearing `status` alone left `node` pointing at terminal.needs-human, so the
+  // graph restarted inside the terminal and ended immediately — --force reported
+  // success and did nothing. Shipped exactly that once.
+  const state = {
+    node: 'terminal.needs-human',
+    status: 'needs-human-decision',
+    stallReason: 'provider did not run',
+    fixRound: 3,
+    providerMisses: 2,
+    history: [
+      { node: 'pr-gate', next: 'fixer' },
+      { node: 'fixer', next: 'gates' },
+      { node: 'gates', next: 'fixer' },
+      { node: 'fixer', next: 'gates' },
+    ],
+  };
+  const r = reopenState(state);
+  assert.equal(r.ok, true);
+  assert.equal(r.to, 'gates');
+  assert.equal(state.node, 'gates', 'the run would have restarted in the terminal node');
+  assert.equal(state.status, undefined);
+  assert.equal(state.stallReason, undefined);
+  assert.equal(state.fixRound, 0);
+  assert.equal(state.providerMisses, 0);
+});
+
+test('reopening refuses when history offers nowhere to go', () => {
+  const state = {
+    node: 'terminal.done',
+    status: 'done',
+    history: [{ node: 'x', next: 'terminal.done' }],
+  };
+  const r = reopenState(state);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /nowhere|no non-terminal/);
+  assert.equal(state.status, 'done', 'a refused reopen must not half-clear the state');
 });
