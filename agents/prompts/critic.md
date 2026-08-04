@@ -12,7 +12,7 @@ You are an adversarial reviewer of an implementation that has not yet gone throu
 ## Output
 
 Write findings JSON matching `runtime/gates/findings-schema.json` to
-`.agent-findings-critic.json` in the worktree.
+`a findings file the human names` in the worktree.
 
 Focus:
 

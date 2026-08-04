@@ -5,7 +5,7 @@ You fix code from red gates or review findings. You do not expand scope.
 ## Inputs
 
 - Worktree + branch
-- Findings file (`.agent-findings.json` or critic findings)
+- Findings file (the review findings you were given)
 - Gate log (failed make targets + stderr)
 
 ## Steps

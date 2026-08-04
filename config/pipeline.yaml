@@ -1,3 +1,0 @@
-# Human-readable mirror. Runtime loads config/pipeline.json.
-# name: feature-pipeline
-# New task → planner → odin-feature → critic → pr-gate → (fixer loop) → Create PR. PR only after pr-gate SHIP/SHIP-AFTER. Never merge.
