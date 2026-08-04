@@ -156,11 +156,33 @@ export async function runGraph(opts) {
     });
     if (onStep) onStep({ node: nodeName, next, result, state });
 
+    // A round the fixer never got to attempt is not a round.
+    //
+    // Observed on #91: the claude CLI exited 1 without doing a turn, three
+    // "fix rounds" burned in ninety seconds, and the run closed as
+    // needs-human-decision — reporting a code problem when the truth was that
+    // nothing had been tried. The budget exists to stop a fixer that cannot
+    // solve something, not to count outages.
+    //
+    // Still bounded: consecutive no-runs stall too, on their own counter, so an
+    // unavailable provider ends the run instead of spinning against the graph.
     if (nodeName === 'fixer') {
-      state.fixRound = (state.fixRound || 0) + 1;
       const maxR = node.max_rounds || state.maxFixRounds || 3;
-      if (state.fixRound > maxR) {
-        next = node.on_stall || 'terminal.needs-human';
+      if (result?.didNotRun) {
+        state.providerMisses = (state.providerMisses || 0) + 1;
+        if (state.providerMisses >= (node.max_provider_misses || 2)) {
+          state.stallReason =
+            `provider did not run ${state.providerMisses} times in a row ` +
+            `(last exit ${result.status}, ${result.durationMs}ms) — no fix was attempted`;
+          next = node.on_stall || 'terminal.needs-human';
+        }
+      } else {
+        state.providerMisses = 0;
+        state.fixRound = (state.fixRound || 0) + 1;
+        if (state.fixRound > maxR) {
+          state.stallReason = `fixer ran ${state.fixRound - 1} times without clearing the gate`;
+          next = node.on_stall || 'terminal.needs-human';
+        }
       }
     }
 

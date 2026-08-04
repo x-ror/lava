@@ -8,7 +8,7 @@ import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync } from 'node
 import { join } from 'node:path';
 import { getAgent, loadRegistry } from '../agents/registry.mjs';
 import { buildAgentPrompt } from './build-prompt.mjs';
-import { runLlm } from '../llm/router.mjs';
+import { runLlm, providerDidNotRun } from '../llm/router.mjs';
 import { bootstrapWorktree } from '../runtime/worktree.mjs';
 import { STATE_DIR, FINDINGS_FILE, PLAN_FILE } from '../runtime/paths.mjs';
 import { ghJson } from '../runtime/github.mjs';
@@ -190,6 +190,10 @@ export async function invokeCommand(commandName, opts = {}) {
     provider: result.provider,
     verdict,
     verdictError,
+    // Carried so the caller can tell "the agent tried and failed" from "the
+    // provider never started" — a distinction the fixer budget depends on.
+    durationMs: result.durationMs,
+    didNotRun: providerDidNotRun(result),
     findingsPath,
     plan: planOut,
     planPath,

@@ -115,11 +115,17 @@ export function findResumable(opts = {}) {
  * @param {string} [root]
  * @returns {{ok: true, state: object} | {ok: false, reason: string}}
  */
-export function checkResumable(runId, root = STATE_DIR) {
+export function checkResumable(runId, root = STATE_DIR, opts = {}) {
   const state = loadState(runId, root);
   if (!state) return { ok: false, reason: `no run ${runId} in ${join(root, 'runs')}` };
-  if (isTerminal(state)) {
-    return { ok: false, reason: `run ${runId} already finished (${state.status})` };
+  if (isTerminal(state) && !opts.force) {
+    // Reopenable with force. `needs-human-decision` is a common terminal, and
+    // the human decision is often "the provider was down, try again" — #91 hit
+    // exactly that and the only way back was to bypass the graph entirely.
+    return {
+      ok: false,
+      reason: `run ${runId} already finished (${state.status}) — --force reopens it`,
+    };
   }
   if (!state.wt) return { ok: false, reason: `run ${runId} recorded no worktree` };
   if (!existsSync(state.wt)) {

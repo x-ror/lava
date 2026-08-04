@@ -199,3 +199,38 @@ test('a truncated state file loads as null instead of throwing', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ── reopening a terminal run ────────────────────────────────────────────────
+
+test('a finished run is refused by default and offered with force', () => {
+  // #91 closed as needs-human-decision because the provider was down, not
+  // because the code was unfixable. The only way back was to bypass the graph.
+  const root = scratch();
+  const wt = mkdtempSync(join(tmpdir(), 'lava-wt-'));
+  try {
+    seed(root, '91-1000', { issue: { number: 91 }, status: 'needs-human-decision', wt });
+    const refused = checkResumable('91-1000', root);
+    assert.equal(refused.ok, false);
+    assert.match(refused.reason, /--force reopens it/);
+
+    const forced = checkResumable('91-1000', root, { force: true });
+    assert.equal(forced.ok, true);
+    assert.equal(forced.state.wt, wt);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test('force does not excuse a missing worktree', () => {
+  // There is still nothing to resume into; force reopens a decision, not a hole.
+  const root = scratch();
+  try {
+    seed(root, '91-1000', { issue: { number: 91 }, status: 'done', wt: '/nonexistent/wt' });
+    const r = checkResumable('91-1000', root, { force: true });
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /worktree is gone/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
