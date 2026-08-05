@@ -109,13 +109,22 @@
     StatementSync.prototype[disposeSymbol] = StatementSync.prototype._finalize;
   }
 
-  // A leading plain object supplies named parameters (:id / @id / $id); any
-  // trailing values fill the statement's anonymous "?" placeholders positionally.
-  // A Uint8Array (blob) or null is a value, not a named-parameter bag.
+  // A leading object supplies named parameters (:id / @id / $id); any trailing
+  // values fill the statement's anonymous "?" placeholders positionally.
+  // Node's test is "is this a bindable VALUE?" — only null, number, string,
+  // BigInt and an ArrayBuffer view are values, so everything else is a bag,
+  // Arrays and functions included. An array's index keys are simply read as
+  // parameter names ("0", "1", …) and match nothing, which is why Node reports
+  // stmt.get([1]) as ERR_INVALID_STATE "Unknown named parameter '0'" rather than
+  // as an unbindable type. Pinned by tests/std/sqlite/cases/08-coercion-parity.js.
   function isNamedParams(arg) {
-    return (
-      typeof arg === 'object' && arg !== null && !ArrayBuffer.isView(arg) && !Array.isArray(arg)
-    );
+    if (arg === null || ArrayBuffer.isView(arg)) return false;
+    var t = typeof arg;
+    return t === 'object' || t === 'function';
+  }
+
+  function hasOwn(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
   }
 
   // The signed 64-bit range SQLite INTEGER (and thus a bound BigInt) can hold.
@@ -170,18 +179,28 @@
 
     var count = native.bindParameterCount(this._stmtId);
     var pos = posStart;
-    // Names the statement actually declares (sigil stripped), so we can reject any
-    // extra key on the named-parameter object below.
+    // Key forms the statement actually declares, so we can reject any extra key on
+    // the named-parameter object below.
     var known = named ? Object.create(null) : null;
     for (var i = 0; i < count; i++) {
       var name = native.bindParameterName(this._stmtId, i + 1);
       if (name) {
-        // Strip the leading sigil (":" / "@" / "$") to get the object key.
+        // Node accepts EITHER key form for a named placeholder: the bare name or
+        // the exact sigil-prefixed one ({ $a: 1 } and { a: 1 } both fill "$a"),
+        // and the bare key wins when a bag carries both. Registering only the
+        // bare form made the documented prefixed style throw as an unknown key.
         var key = name.slice(1);
-        if (known) known[key] = true;
+        if (known) {
+          known[key] = true;
+          known[name] = true;
+        }
         // An unmatched named parameter binds as NULL, matching node:sqlite (an
         // unbound parameter defaults to NULL rather than raising).
-        var value = named && Object.prototype.hasOwnProperty.call(named, key) ? named[key] : null;
+        var value = null;
+        if (named) {
+          if (hasOwn(named, key)) value = named[key];
+          else if (hasOwn(named, name)) value = named[name];
+        }
         bindOne(this._stmtId, i + 1, value);
       } else if (pos < args.length) {
         // Anonymous "?" parameter — take the next positional argument. An
@@ -313,14 +332,28 @@
     }
   };
 
+  // assertSql type-checks rather than coerces, matching node:sqlite: String(sql)
+  // ran the literal text "undefined" / "5" through SQLite (reporting a syntax
+  // error instead of a type error) and invoked a caller-supplied toString() on
+  // the way. The open check stays first — Node reports a closed database before
+  // it looks at the argument.
+  function assertSql(sql) {
+    if (typeof sql !== 'string') {
+      var err = new TypeError('The "sql" argument must be a string.');
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    return sql;
+  }
+
   DatabaseSync.prototype.exec = function (sql) {
     this._assertOpen();
-    native.exec(this._id, String(sql));
+    native.exec(this._id, assertSql(sql));
   };
 
   DatabaseSync.prototype.prepare = function (sql) {
     this._assertOpen();
-    return new StatementSync(this, native.prepare(this._id, String(sql)));
+    return new StatementSync(this, native.prepare(this._id, assertSql(sql)));
   };
 
   DatabaseSync.prototype.close = function () {
