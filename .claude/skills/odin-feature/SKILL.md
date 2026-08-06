@@ -8,12 +8,8 @@ argument-hint: '<what to build> [--no-scout] [--design-only] [--issue N]'
 
 # /odin-feature
 
-**Command layer:** this skill is the human interface. The system invokes the same
-agent via:
-
 Canonical playbook: [agents/prompts/odin-feature.md](../../../agents/prompts/odin-feature.md)
 SDK map: [agents/prompts/odin-feature-reference/odin-sdk-map.md](../../../agents/prompts/odin-feature-reference/odin-sdk-map.md)
-Registry: [config/agents.yaml](../../../config/agents.yaml)
 
 ## When you run interactively
 

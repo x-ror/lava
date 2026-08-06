@@ -354,10 +354,10 @@ Every PR body states: what changed, the reuse verdict (§2), which gates were ru
 with results, Node-parity evidence (or the justified deviation), and bench numbers
 if perf is claimed. Run `/pr-gate` before asking for review.
 
-## 8. AI pipeline in this repo
+## 8. Agents in this repo
 
-Autonomous agent system — human slash commands and system automation share the
-same named commands (`node commands/index.mjs <cmd>`).
+Playbooks a human invokes as slash commands. There is no orchestration layer —
+nothing here self-starts, and every command runs only because someone typed it.
 
 | Command         | Role                                                             |
 | --------------- | ---------------------------------------------------------------- |
@@ -366,11 +366,10 @@ same named commands (`node commands/index.mjs <cmd>`).
 | `/planner`      | Build task DAG from GitHub issues                                |
 | `/critic`       | Adversarial critique before pr-gate                              |
 | `/fixer`        | Fix from pr-gate findings or red gates                           |
-| `/run-pipeline` | Full autonomous DAG → draft PR (never merge)                     |
 
-- **Auto-start:** `node workflows/triggers/issues.mjs`, `schedule.mjs`, PR comments, gate-failure.
-- **Registry:** [config/agents.yaml](config/agents.yaml) · [config/agents.json](config/agents.json)
-- **Architecture:** [docs/agent-system/ARCHITECTURE.md](docs/agent-system/ARCHITECTURE.md)
-- **Usage:** [docs/agent-system/USAGE.md](docs/agent-system/USAGE.md)
+- **Playbooks:** [agents/prompts/](agents/prompts/) — the canonical text each command follows.
 - **Specialists:** [agents/specialists/](agents/specialists/) (mirrored under `.claude/agents/` for harness discovery)
+- **Gate integrity:** `runtime/gates/integrity.mjs` is Lava's own machinery, not the
+  agent system's — a PreToolUse hook blocks env/flag bypasses that turn a gate green
+  without a fix, and `runtime/gates/assert-case-counts.mjs` backs four oracle runners.
 - **PR only after successful `pr-gate`.** Merge to master is always human.
