@@ -73,8 +73,8 @@ throwsWithCode(
   UNBINDABLE_MSG,
   'bind undefined',
 );
-throwsWithCode(() => insertOne(true), 'ERR_INVALID_ARG_TYPE', UNBINDABLE_MSG, 'bind true');
-throwsWithCode(() => insertOne(false), 'ERR_INVALID_ARG_TYPE', UNBINDABLE_MSG, 'bind false');
+throwsWithCode(() => insertOne(Symbol('s')), 'ERR_INVALID_ARG_TYPE', UNBINDABLE_MSG, 'bind symbol');
+// (A boolean is bindable since node 24.x — INTEGER 1/0, pinned in 08-coercion-parity.js.)
 
 // --- null is a valid bind (-> SQL NULL) ---
 insertOne(null);

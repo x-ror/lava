@@ -12,6 +12,10 @@
 //     throwing ERR_INVALID_ARG_TYPE (and so invoking a caller-supplied toString),
 //   * Arrays and functions not being treated as named-parameter bags.
 //
+// node 24.21 then moved the oracle twice more, pinned at the end: a boolean binds
+// as INTEGER 1/0, and an ArrayBuffer/SharedArrayBuffer binds as a BLOB (NULL when
+// it is empty) — node 22 threw on the first and read the second as a named bag.
+//
 // Run under Node as the oracle and compared byte-for-byte against Lava.
 const assert = require('node:assert/strict');
 const { DatabaseSync } = require('node:sqlite');
@@ -124,6 +128,58 @@ throwsWith(
 // An empty array (or a function) carries no keys: the anonymous "?" binds NULL.
 assert.equal(db.prepare('SELECT ? AS v').get([]).v, null);
 assert.equal(db.prepare('SELECT ? AS v').get(function () {}).v, null);
+
+// --- a boolean binds as INTEGER 1/0 (node 24.x) ---
+const typed1 = db.prepare('SELECT ? AS v, typeof(?) AS t');
+assert.deepEqual({ ...typed1.get(true, true) }, { v: 1, t: 'integer' });
+assert.deepEqual({ ...typed1.get(false, false) }, { v: 0, t: 'integer' });
+assert.equal(db.prepare('SELECT :a AS v').get({ a: true }).v, 1, 'named boolean');
+// A leading boolean is a value, not a bag: it fills "?" and the extra arg overflows.
+throwsWith(
+  () => db.prepare('SELECT ? AS v').get(true, 1),
+  'ERR_SQLITE_ERROR',
+  'column index out of range',
+  'boolean is not a bag',
+);
+
+// --- an ArrayBuffer / SharedArrayBuffer binds its bytes as a BLOB (node 24.x) ---
+const blobOf = (v) => {
+  const row = db.prepare('SELECT ? AS v, typeof(?) AS t').get(v, v);
+  return row.t + ':' + (row.v === null ? 'null' : Array.from(row.v).join(','));
+};
+assert.equal(blobOf(new Uint8Array([1, 2, 3]).buffer), 'blob:1,2,3');
+// Lava's JSC build has no SharedArrayBuffer global; the lines still pin node here and
+// hold Lava to the same answer the day it gains one.
+const hasSAB = typeof SharedArrayBuffer === 'function';
+if (hasSAB) {
+  const sab = new SharedArrayBuffer(2);
+  new Uint8Array(sab)[1] = 5;
+  assert.equal(blobOf(sab), 'blob:0,5');
+}
+class SubBuffer extends ArrayBuffer {}
+assert.equal(blobOf(new SubBuffer(1)), 'blob:0', 'subclass');
+// Unlike an empty Uint8Array, an EMPTY buffer binds NULL — and so does a detached one.
+assert.equal(blobOf(new ArrayBuffer(0)), 'null:null');
+if (hasSAB) assert.equal(blobOf(new SharedArrayBuffer(0)), 'null:null');
+const detached = new ArrayBuffer(2);
+detached.transfer();
+assert.equal(blobOf(detached), 'null:null', 'detached');
+assert.deepEqual(
+  Array.from(db.prepare('SELECT :a AS v').get({ a: new ArrayBuffer(1) }).v),
+  [0],
+  'named buffer',
+);
+// The test is the real brand, not the tag: a look-alike is still a bag. (Its tag
+// sits on a non-plain prototype, as a class instance's would.)
+const lookAlike = Object.create({ [Symbol.toStringTag]: 'ArrayBuffer' });
+lookAlike.byteLength = 2;
+throwsWith(
+  () => db.prepare('SELECT ? AS v').get(lookAlike),
+  'ERR_INVALID_STATE',
+  "Unknown named parameter 'byteLength'",
+  'spoofed tag',
+);
+assert.equal(db.prepare('SELECT ? AS v').get(Object.create(ArrayBuffer.prototype)).v, null);
 
 db.close();
 console.log('ok');

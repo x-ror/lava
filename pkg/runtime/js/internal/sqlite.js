@@ -10,6 +10,17 @@
     throw new Error('node:sqlite is unavailable: Lava was built without libsqlite3');
   }
 
+  // Handles for the code added with the node 24 buffer binding. The rest of the file
+  // still reads its globals live — see its pollution baseline.
+  var P = require('primordials');
+  var ArrayBufferGetByteLength = P.ArrayBufferPrototypeGetByteLength;
+  var SharedArrayBufferGetByteLength = P.SharedArrayBufferPrototypeGetByteLength;
+  var ObjectGetPrototypeOf = P.ObjectGetPrototypeOf;
+  var ArrayIsArray = P.ArrayIsArray;
+  var Uint8ArrayCtor = P.Uint8Array;
+  // A literal's prototype is the intrinsic, whatever user code did to Object.
+  var ObjectPrototype = ObjectGetPrototypeOf({});
+
   // This JSC build exposes neither `Symbol.dispose` nor `using` declarations.
   // Define a stable well-known `Symbol.dispose` if it is absent so the dispose
   // methods below are reachable for manual cleanup now (`obj[Symbol.dispose]()`)
@@ -109,18 +120,48 @@
     StatementSync.prototype[disposeSymbol] = StatementSync.prototype._finalize;
   }
 
+  // bufferByteLength returns the byteLength of a real ArrayBuffer or SharedArrayBuffer
+  // (0 once detached), or -1 for anything else. The captured getters are the brand
+  // check, as node's IsArrayBuffer is: a Symbol.toStringTag look-alike or an object
+  // that merely inherits ArrayBuffer.prototype makes them throw.
+  //
+  // A plain object or array — every ordinary named-params bag — answers -1 before
+  // either getter runs, so the common _prime call never pays for a thrown exception;
+  // only an exotic object with some other prototype does. Without that early answer
+  // `stmt.get({ a: i })` on `SELECT :a` cost 3288 ns vs 1909 ns per call (medians of
+  // 7 interleaved launches per arm, 200k calls each); with it, 1956 ns vs 1969 ns for
+  // the same loop before buffers were bindable at all.
+  function bufferByteLength(v) {
+    if (v === null || typeof v !== 'object' || ArrayIsArray(v)) return -1;
+    if (ObjectGetPrototypeOf(v) === ObjectPrototype) return -1;
+    try {
+      return ArrayBufferGetByteLength(v);
+    } catch {
+      // not an ArrayBuffer; try the shared kind
+    }
+    if (SharedArrayBufferGetByteLength !== undefined) {
+      try {
+        return SharedArrayBufferGetByteLength(v);
+      } catch {
+        // neither kind
+      }
+    }
+    return -1;
+  }
+
   // A leading object supplies named parameters (:id / @id / $id); any trailing
   // values fill the statement's anonymous "?" placeholders positionally.
   // Node's test is "is this a bindable VALUE?" — only null, number, string,
-  // BigInt and an ArrayBuffer view are values, so everything else is a bag,
-  // Arrays and functions included. An array's index keys are simply read as
-  // parameter names ("0", "1", …) and match nothing, which is why Node reports
-  // stmt.get([1]) as ERR_INVALID_STATE "Unknown named parameter '0'" rather than
-  // as an unbindable type. Pinned by tests/std/sqlite/cases/08-coercion-parity.js.
+  // BigInt, boolean, an ArrayBuffer view and an ArrayBuffer/SharedArrayBuffer are
+  // values, so everything else is a bag, Arrays and functions included. An array's
+  // index keys are simply read as parameter names ("0", "1", …) and match nothing,
+  // which is why Node reports stmt.get([1]) as ERR_INVALID_STATE "Unknown named
+  // parameter '0'" rather than as an unbindable type. Pinned by
+  // tests/std/sqlite/cases/08-coercion-parity.js.
   function isNamedParams(arg) {
     if (arg === null || ArrayBuffer.isView(arg)) return false;
     var t = typeof arg;
-    return t === 'object' || t === 'function';
+    return (t === 'object' || t === 'function') && bufferByteLength(arg) === -1;
   }
 
   function hasOwn(obj, key) {
@@ -132,14 +173,26 @@
   var I64_MAX = 2n ** 63n - 1n;
 
   // bindOne binds a single value, enforcing node:sqlite's accepted types. Only
-  // null, number, string, BigInt, and TypedArray/DataView (blob) are bindable;
-  // anything else (undefined, boolean, plain object, symbol, function) throws
-  // instead of being silently coerced. BigInt binds as INTEGER when it fits in
-  // i64, otherwise throws — Node accepts neither a lossy nor an overflowing bind.
+  // null, number, string, BigInt, boolean, TypedArray/DataView and
+  // ArrayBuffer/SharedArrayBuffer are bindable; anything else (undefined, plain
+  // object, symbol, function) throws instead of being silently coerced. BigInt
+  // binds as INTEGER when it fits in i64, otherwise throws — Node accepts neither a
+  // lossy nor an overflowing bind.
+  //
+  // Node:
+  //   node 24.21 binds a boolean as INTEGER 1/0 and a (Shared)ArrayBuffer as a BLOB
+  //   of its bytes — NULL when its byteLength is 0, empty or detached, unlike an
+  //   empty Uint8Array, which stays an empty BLOB. Probed against node 24.21 with
+  //   `SELECT ?, typeof(?)`; node 22 threw on the boolean and took the buffer for a
+  //   named bag. Pinned by tests/std/sqlite/cases/08-coercion-parity.js.
   function bindOne(stmtId, index, value) {
     var t = typeof value;
+    var n;
     if (value === null || t === 'number' || t === 'string') {
       native.bind(stmtId, index, value);
+    } else if (t === 'boolean') {
+      // The BigInt path is the existing INTEGER bind; a number would bind REAL.
+      native.bindBigInt(stmtId, index, value ? '1' : '0');
     } else if (t === 'bigint') {
       if (value < I64_MIN || value > I64_MAX) {
         var ov = new TypeError('BigInt value is too large to bind.');
@@ -157,6 +210,8 @@
           ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
           : value;
       native.bind(stmtId, index, view);
+    } else if ((n = bufferByteLength(value)) !== -1) {
+      native.bind(stmtId, index, n === 0 ? null : new Uint8ArrayCtor(value));
     } else {
       var err = new TypeError('Provided value cannot be bound to SQLite parameter ' + index + '.');
       err.code = 'ERR_INVALID_ARG_TYPE';
