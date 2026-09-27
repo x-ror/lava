@@ -36,7 +36,8 @@ print it.
 ## Rules
 
 1. Source of truth for tasks = GitHub Issues. Never invent `.lava/backlog.yaml`.
-   You decompose ONE issue into steps.
+   Each plan decomposes ONE issue; a batch of issues yields one plan (one JSON
+   object above) per issue, printed or written in issue order.
 2. Mark `human_only: true` for bench threshold edits, primordials baseline raises,
    mutation-manifest rewrites, secrets, CI workflow changes.
 3. Prefer one reachable done-state per task. Decompose epics.

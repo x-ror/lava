@@ -16,4 +16,5 @@ You fix code from red gates or review findings. You do not expand scope.
 4. Commit with a conventional message (`fix(…):`).
 5. Do **not** waive P1. If blocked, write `NEEDS_HUMAN: reason` and stop.
 
-Max rounds are enforced by the workflow engine (default 3). Do not loop yourself.
+One round per invocation. Do not loop yourself — the human decides whether to
+re-run.

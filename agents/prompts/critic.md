@@ -11,8 +11,31 @@ You are an adversarial reviewer of an implementation that has not yet gone throu
 
 ## Output
 
-Write findings JSON matching `runtime/gates/findings-schema.json` to
-`a findings file the human names` in the worktree.
+Findings JSON, in the shape `/fixer` takes as input. Write it to the file the
+human names; with no file named, print it inline. Either way it is the same JSON,
+so the next playbook never has to re-derive it from prose.
+
+```json
+{
+  "agent": "critic",
+  "findings": [
+    {
+      "id": "c1",
+      "severity": "P1",
+      "class": "parity",
+      "file": "pkg/runtime/js/internal/…",
+      "line": 42,
+      "what": "…",
+      "failure": "concrete input → wrong output",
+      "fix": "…",
+      "confidence": "high"
+    }
+  ]
+}
+```
+
+`severity` is one of `P0`/`P1`/`P2`/`nit`; `class` is one of `parity`, `safety`,
+`security`, `gate-weakening`, `memory-safety`, `perf`, `style`, `other`.
 
 Focus:
 
