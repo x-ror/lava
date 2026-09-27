@@ -1133,8 +1133,12 @@
         }
       }
       if (ArrayBuffer.isView(value)) {
-        var copy = allocate(value.length);
-        copy.set(value);
+        // An out-of-bounds view (a fixed window its resizable buffer shrank
+        // below) reads as length 0, but %TypedArray%.prototype.set still
+        // throws on it as a SOURCE; node returns an empty Buffer.
+        var viewLength = value.length;
+        var copy = allocate(viewLength);
+        if (viewLength > 0) copy.set(value);
         return copy;
       }
       if (Array.isArray(value) || typeof value.length === 'number') {
