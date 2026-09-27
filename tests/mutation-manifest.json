@@ -1099,8 +1099,8 @@
       "name": "46-util-mimetype dies when a type/subtype error index is reported relative to the whole input",
       "why": "node reports the offending code point's index within the subtype (`text/p@in` is invalid at 1); an input-relative index says 6.",
       "source": "pkg/runtime/js/internal/mime.js",
-      "find": "validateToken('subtype', subtype, input);",
-      "replace": "validateToken('subtype', subtype, input);\n    if (subtype.search(NotHTTPTokenCodePoint) !== -1) throw mimeError('subtype', input, str.indexOf('/') + 1 + subtype.search(NotHTTPTokenCodePoint));",
+      "find": "if (bad !== -1) throw mimeError(production, input, bad);",
+      "replace": "if (bad !== -1) throw mimeError(production, input, input.indexOf(value) + bad);",
       "gate": "compat:tests/node-compat/cases/46-util-mimetype.js",
       "expect_detail": "is invalid at 6"
     },
