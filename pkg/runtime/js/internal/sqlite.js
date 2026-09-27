@@ -211,7 +211,8 @@
           : value;
       native.bind(stmtId, index, view);
     } else if ((n = bufferByteLength(value)) !== -1) {
-      native.bind(stmtId, index, n === 0 ? null : new Uint8ArrayCtor(value));
+      // `native` is the factory's private binding table, not a Function: not .bind().
+      native.bind(stmtId, index, n === 0 ? null : new Uint8ArrayCtor(value)); // primordials-ok: method
     } else {
       var err = new TypeError('Provided value cannot be bound to SQLite parameter ' + index + '.');
       err.code = 'ERR_INVALID_ARG_TYPE';
