@@ -35,6 +35,18 @@ g_bytes_ptr_mode: BytesPtr_Mode // written once per thread after first offset vi
 
 // typed_array_view borrows the backing store of a TypedArray or DataView as an
 // Odin byte slice. Valid only for the duration of the native call.
+//
+// Returns:
+//   The view's CURRENT bytes and true for any TypedArray or DataView (nil for an
+//   empty, detached or out-of-bounds view); false for anything else.
+// Node:
+//   A view over a resizable ArrayBuffer has no fixed length: a length-tracking
+//   one follows the buffer's current size, and a fixed window the buffer has
+//   shrunk below reads as length 0 — so `decode(new Uint8Array(rab))` sees every
+//   byte and a stale window sees none (node 24.21, verified by
+//   tests/node-compat/cases/68-resizable-view-bytes.js). The cell fast path
+//   declines those views and the C API below answers for them; its byteLength
+//   applies the spec's rules for every view mode.
 typed_array_view :: proc(ctx: jsc.JSContextRef, value: jsc.JSValueRef) -> ([]byte, bool) {
 	// Direct cell read (Uint8Array of any Structure, byteOffset pre-applied) —
 	// zero C-API calls. Other view types and DataView fall through.

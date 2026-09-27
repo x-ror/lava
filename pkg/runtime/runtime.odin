@@ -187,6 +187,10 @@ eval :: proc(
 	// intercept or reshape a native error (matches Node, whose internal errors never
 	// route through user-patched globals). See errors.odin.
 	capture_error_intrinsics(cast(jsc.JSContextRef)ctx, state)
+	// Same window, same reason: the typed-array cell probe learns which view modes
+	// have a fixed length by constructing views through the global Uint8Array and
+	// ArrayBuffer, so it must run before user code can replace them.
+	jsc.prime_view_probe(cast(jsc.JSContextRef)ctx)
 
 	// eval owns the loop's teardown (see the OWNERSHIP note above). A deferred
 	// destroy — not a tail call after eventloop.run — so that EVERY return once the
