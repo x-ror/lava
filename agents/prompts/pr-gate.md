@@ -140,47 +140,6 @@ Specialists: <n> run, <failed: …>
 Then offer: fix the P0/P1 list, or re-run after fixes. Fixing is a **new task**,
 not part of this skill.
 
-## Step 5b — write the verdict file
-
-The report above is for a human. The **verdict** is a file, and the pipeline
-reads only the file: `runtime/gates/aggregate-verdict.mjs` turns it into
-SHIP / SHIP-AFTER / BLOCK, and `workflows/engine.mjs` routes on that.
-
-Write `.agent-findings-pr-gate.json` in the worktree root before finishing —
-per-agent, because critic and fixer write their own alongside yours. The exact
-absolute path is given in the task section above when the system invoked you;
-use it verbatim rather than a name you infer.
-
-```json
-{
-  "agent": "pr-gate",
-  "ran_commands": ["make check", "make check-js", "make test"],
-  "findings": [
-    {
-      "id": "f1",
-      "severity": "P0",
-      "class": "parity",
-      "file": "pkg/runtime/sqlite.odin",
-      "line": 367,
-      "what": "INTEGER beyond 2^53 silently loses precision",
-      "failure": "db.prepare('select ?').get(2n**60n) returns a rounded number",
-      "evidence": "node throws ERR_OUT_OF_RANGE; lava returns 1152921504606846980",
-      "fix": "read via sqlite3_column_int64 and range-check before the f64 cast",
-      "confidence": "high"
-    }
-  ]
-}
-```
-
-Schema: `runtime/gates/findings-schema.json`. `severity` and `class` decide the
-verdict — parity, safety, security and gate-weakening are floored at P1 and can
-never be P2, and a P0 with an empty `fix` is BLOCK regardless of count.
-
-**An empty `findings` array is how you say the diff is clean.** Omitting the file
-is not: no file reads as BLOCK, because a gate that produced nothing cannot be
-told apart from one that crashed, timed out, or never ran. That failing open is
-what would let a draft PR be opened on an unreviewed diff.
-
 ## Step 6 — optional PENDING GitHub review
 
 Only with `--pr` **and** `--post-pending` **and** at least one actionable finding.
