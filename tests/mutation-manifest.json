@@ -1085,6 +1085,33 @@
         "internal/util.js:ansiRegex",
         "Expected values to be strictly equal"
       ]
+    },
+    {
+      "name": "68-resizable-view-bytes dies when typed_array_bytes trusts m_length for every view mode",
+      "why": "A length-tracking view stores 0 in m_length, so every native borrowing its bytes (TextDecoder, Buffer.compare, fs writes, sqlite binds) saw an empty view.",
+      "source": "pkg/jsc/private_view.odin",
+      "find": "\t\tif mode != g_mode_fixed[0] && mode != g_mode_fixed[1] && mode != g_mode_fixed[2] do return nil, false\n",
+      "replace": "\t\t_ = mode\n",
+      "gate": "compat:tests/node-compat/cases/68-resizable-view-bytes.js",
+      "expect_detail": "auto: TextDecoder#decode"
+    },
+    {
+      "name": "68-resizable-view-bytes dies when Buffer.from copies an out-of-bounds view with set()",
+      "why": "%TypedArray%.prototype.set throws on an out-of-bounds SOURCE even at length 0, where node returns an empty Buffer.",
+      "source": "pkg/runtime/js/internal/buffer.js",
+      "find": "        if (viewLength > 0) copy.set(value);\n",
+      "replace": "        copy.set(value);\n",
+      "gate": "compat:tests/node-compat/cases/68-resizable-view-bytes.js",
+      "expect_detail": "out-of-bounds"
+    },
+    {
+      "name": "69-view-probe-pollution dies when the runtime stops priming the typed-array cell probe",
+      "why": "Probed lazily, the mode probe learns from a user-replaced Uint8Array and whitelists the resizable-fixed mode, so natives read stale bytes past a shrunk buffer's end.",
+      "source": "pkg/runtime/runtime.odin",
+      "find": "\tjsc.prime_view_probe(cast(jsc.JSContextRef)ctx)\n",
+      "replace": "",
+      "gate": "compat:tests/node-compat/cases/69-view-probe-pollution.js",
+      "expect_detail": "\"abc\""
     }
   ]
 }

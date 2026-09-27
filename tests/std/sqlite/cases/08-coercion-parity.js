@@ -69,6 +69,27 @@ db.prepare('INSERT INTO blobs VALUES (?)').run(new Uint8Array([9]));
 const one = db.prepare('SELECT typeof(x) AS ty, x FROM blobs').get();
 assert.equal(one.ty, 'blob');
 assert.deepEqual(Array.from(one.x), [9]);
+// A view over a RESIZABLE buffer binds its current bytes. A length-tracking view
+// used to store an empty BLOB, and a fixed one the buffer shrank below bound its
+// stale bytes: the shared typed-array helper read the view's stored length field.
+{
+  const rab = new ArrayBuffer(3, { maxByteLength: 8 });
+  new Uint8Array(rab).set([1, 2, 3]);
+  const blob = (v) => {
+    const row = db.prepare('SELECT typeof(?) AS t, ? AS v').get(v, v);
+    return row.t + ':' + Array.from(row.v).join(',');
+  };
+  const tracking = new Uint8Array(rab);
+  const window = new Uint8Array(rab, 1, 2);
+  assert.equal(blob(tracking), 'blob:1,2,3', 'length-tracking view');
+  assert.equal(blob(new Uint8Array(rab, 1)), 'blob:2,3', 'length-tracking view at an offset');
+  assert.equal(blob(window), 'blob:2,3', 'fixed view in bounds');
+  rab.resize(5);
+  assert.equal(blob(tracking), 'blob:1,2,3,0,0', 'length-tracking view after grow');
+  rab.resize(2);
+  assert.equal(blob(tracking), 'blob:1,2', 'length-tracking view after shrink');
+  assert.equal(blob(window), 'blob:', 'fixed view out of bounds is empty');
+}
 
 // --- every SQLite-originated error carries code ERR_SQLITE_ERROR ---
 throwsWith(() => db.exec('NOT SQL'), 'ERR_SQLITE_ERROR', 'near "NOT": syntax error', 'exec syntax');

@@ -17,6 +17,17 @@ import "core:c"
 // indexingType u8, type u8 — is the one fixed assumption, unchanged in JSC for
 // many years). All three cells must agree or the fast path stays disabled and
 // callers keep using the C API.
+//
+// m_length is only the length for a view whose length is FIXED at construction.
+// A view over a resizable ArrayBuffer (ES2024) is not: a length-tracking one
+// (`new Uint8Array(rab)`) stores 0 and derives its length from the buffer on
+// every access, and a fixed-length one keeps its constructed length after the
+// buffer shrinks below it, where the spec reads it as out of bounds (length 0).
+// Trusting the field handed natives an empty view for the first and bytes past
+// the buffer's end for the second. JSC tells the kinds apart by the view's mode
+// byte (m_mode), so the probe also locates that byte and records the values it
+// takes on plain fixed-length views; any other value falls back to the C API,
+// whose byteLength follows the spec for every mode.
 
 // JSCell header: [structureID u32][indexingTypeAndMisc u8][type u8][flags u8][cellState u8].
 JSCELL_TYPE_OFFSET :: 5
@@ -45,6 +56,11 @@ when ODIN_OS == .Linux {
 	@(private = "file", thread_local) g_vec_off: uintptr
 	@(private = "file", thread_local) g_len_off: uintptr
 	@(private = "file", thread_local) g_len_u64: bool
+	// m_mode byte offset and the three values it takes on a fixed-length view
+	// over a non-resizable buffer (JSC: Fast, Oversize, Wasteful). Values are
+	// recorded from probe views rather than hardcoded, like the offsets above.
+	@(private = "file", thread_local) g_mode_off: uintptr
+	@(private = "file", thread_local) g_mode_fixed: [3]u8
 
 	// Immortal backing stores for the probe views (nil deallocator): distinct
 	// addresses and lengths so field offsets are identified by value. The `_off`
@@ -184,26 +200,187 @@ when ODIN_OS == .Linux {
 			}
 		}
 
+		mode_off, mode_fixed, mode_state := probe_view_mode(ctx, ty, vec_off, len_off, {pa, pb, pc})
+		switch mode_state {
+		case .Soft:
+			return
+		case .Mismatch:
+			g_view_checked = true
+			return
+		case .Found:
+		}
+
 		g_view_type = ty
 		g_vec_off = vec_off
 		g_len_off = len_off
 		g_len_u64 = len_u64
+		g_mode_off = mode_off
+		g_mode_fixed = mode_fixed
 		g_view_ok = true
 		g_view_checked = true
 	}
 
+	@(private = "file")
+	Mode_Probe :: enum u8 {
+		Found,
+		Soft,     // an allocation or constructor call failed; retry on a later call
+		Mismatch, // layout did not discriminate; latch the fast path closed
+	}
+
+	// probe_view_mode finds the byte that separates a fixed-length Uint8Array
+	// from one over a resizable buffer. The fixed-length side covers every
+	// allocation mode a plain Uint8Array can be in: `wasteful` holds the NoCopy
+	// probes from ensure_view (external or ArrayBuffer-backed storage), and
+	// `new Uint8Array(4)` / `new Uint8Array(4096)` are the small (GC-inline) and
+	// large (out-of-line, above JSC's 1000-byte fast-size limit) kinds that
+	// Buffer.alloc and friends produce. Those two must come from the JS
+	// constructor: JSObjectMakeTypedArray backs every view with an ArrayBuffer,
+	// so it only ever yields the wasteful mode (measured on gtk 6.0/2.52.6: all
+	// three read 88 at m_mode, where the JS-made small and large views read 16
+	// and 48). The resizable side — a length-tracking view and a fixed-length
+	// view over a resizable buffer — has no C API at all (no maxByteLength).
+	//
+	// The candidate byte must agree across the four wasteful views and read a
+	// value on both resizable views that none of the fixed kinds uses. Scanning
+	// starts past m_vector and m_length; the first match wins, which is m_mode
+	// in every layout that has one (it follows m_byteOffset, which the offset
+	// probe's 16 rules out). Nothing else in the cell varies with resizability.
+	//
+	// Fails closed on an engine without resizable buffers: it ignores
+	// maxByteLength, the "resizable" views are plain, no byte discriminates, and
+	// the fast path stays off — slower, never wrong. The constructors are read
+	// off the global object, so prime_view_probe runs this before any user code
+	// can replace them (a soft failure there retries lazily, unprimed).
+	@(private = "file")
+	probe_view_mode :: proc(
+		ctx: JSContextRef,
+		ty: u8,
+		vec_off, len_off: uintptr,
+		wasteful: [3]uintptr,
+	) -> (
+		off: uintptr,
+		fixed: [3]u8,
+		state: Mode_Probe,
+	) {
+		global := JSContextGetGlobalObject(ctx)
+		u8_name := JSStringCreateWithUTF8CString("Uint8Array")
+		defer JSStringRelease(u8_name)
+		ab_name := JSStringCreateWithUTF8CString("ArrayBuffer")
+		defer JSStringRelease(ab_name)
+		max_name := JSStringCreateWithUTF8CString("maxByteLength")
+		defer JSStringRelease(max_name)
+		u8_ctor := JSObjectGetProperty(ctx, global, u8_name, nil)
+		ab_ctor := JSObjectGetProperty(ctx, global, ab_name, nil)
+		if u8_ctor == nil || !JSValueIsObject(ctx, u8_ctor) || ab_ctor == nil || !JSValueIsObject(ctx, ab_ctor) {
+			return 0, {}, .Mismatch
+		}
+		// Rooted by the global object only while nobody reassigns it; protect.
+		JSValueProtect(ctx, u8_ctor)
+		defer JSValueUnprotect(ctx, u8_ctor)
+		JSValueProtect(ctx, ab_ctor)
+		defer JSValueUnprotect(ctx, ab_ctor)
+
+		fast_args := [1]JSValueRef{JSValueMakeNumber(ctx, 4)}
+		fast := JSObjectCallAsConstructor(ctx, JSObjectRef(u8_ctor), 1, &fast_args[0], nil)
+		if fast == nil do return 0, {}, .Soft
+		JSValueProtect(ctx, JSValueRef(fast))
+		defer JSValueUnprotect(ctx, JSValueRef(fast))
+		big_args := [1]JSValueRef{JSValueMakeNumber(ctx, 4096)}
+		big := JSObjectCallAsConstructor(ctx, JSObjectRef(u8_ctor), 1, &big_args[0], nil)
+		if big == nil do return 0, {}, .Soft
+		JSValueProtect(ctx, JSValueRef(big))
+		defer JSValueUnprotect(ctx, JSValueRef(big))
+		// The NoCopy offset view from ensure_view is gone by now; one more
+		// ArrayBuffer-backed wasteful view stands in for it.
+		ab := JSObjectMakeArrayBufferWithBytesNoCopy(ctx, &g_probe_d[0], len(g_probe_d), nil, nil, nil)
+		if ab == nil do return 0, {}, .Soft
+		JSValueProtect(ctx, JSValueRef(ab))
+		defer JSValueUnprotect(ctx, JSValueRef(ab))
+		wv_args := [1]JSValueRef{JSValueRef(ab)}
+		wv := JSObjectCallAsConstructor(ctx, JSObjectRef(u8_ctor), 1, &wv_args[0], nil)
+		if wv == nil do return 0, {}, .Soft
+		JSValueProtect(ctx, JSValueRef(wv))
+		defer JSValueUnprotect(ctx, JSValueRef(wv))
+
+		opts := JSObjectMake(ctx, nil, nil)
+		if opts == nil do return 0, {}, .Soft
+		JSValueProtect(ctx, JSValueRef(opts))
+		defer JSValueUnprotect(ctx, JSValueRef(opts))
+		JSObjectSetProperty(ctx, opts, max_name, JSValueMakeNumber(ctx, 16), {}, nil)
+		rab_args := [2]JSValueRef{JSValueMakeNumber(ctx, 8), JSValueRef(opts)}
+		rab := JSObjectCallAsConstructor(ctx, JSObjectRef(ab_ctor), 2, &rab_args[0], nil)
+		if rab == nil do return 0, {}, .Soft
+		JSValueProtect(ctx, JSValueRef(rab))
+		defer JSValueUnprotect(ctx, JSValueRef(rab))
+		tracking_args := [1]JSValueRef{JSValueRef(rab)}
+		tracking := JSObjectCallAsConstructor(ctx, JSObjectRef(u8_ctor), 1, &tracking_args[0], nil)
+		if tracking == nil do return 0, {}, .Soft
+		JSValueProtect(ctx, JSValueRef(tracking))
+		defer JSValueUnprotect(ctx, JSValueRef(tracking))
+		fixed_args := [3]JSValueRef{JSValueRef(rab), JSValueMakeNumber(ctx, 0), JSValueMakeNumber(ctx, 4)}
+		bounded := JSObjectCallAsConstructor(ctx, JSObjectRef(u8_ctor), 3, &fixed_args[0], nil)
+		if bounded == nil do return 0, {}, .Soft
+		JSValueProtect(ctx, JSValueRef(bounded))
+		defer JSValueUnprotect(ctx, JSValueRef(bounded))
+
+		pf, pg, pw := uintptr(rawptr(fast)), uintptr(rawptr(big)), uintptr(rawptr(wv))
+		pt, pr := uintptr(rawptr(tracking)), uintptr(rawptr(bounded))
+		for p in ([5]uintptr{pf, pg, pw, pt, pr}) {
+			if (^u8)(p + JSCELL_TYPE_OFFSET)^ != ty do return 0, {}, .Mismatch
+		}
+
+		byte_at :: #force_inline proc(p, off: uintptr) -> u8 {return (^u8)(p + off)^}
+		for cand := max(vec_off, len_off) + 8; cand <= 120; cand += 1 {
+			w := byte_at(wasteful[0], cand)
+			if byte_at(wasteful[1], cand) != w || byte_at(wasteful[2], cand) != w || byte_at(pw, cand) != w {
+				continue
+			}
+			set := [3]u8{byte_at(pf, cand), byte_at(pg, cand), w}
+			t, r := byte_at(pt, cand), byte_at(pr, cand)
+			if t == set[0] || t == set[1] || t == set[2] do continue
+			if r == set[0] || r == set[1] || r == set[2] do continue
+			return cand, set, .Found
+		}
+		return 0, {}, .Mismatch
+	}
+
+	// prime_view_probe runs the layout probe for this thread now. The runtime
+	// calls it right after creating a context, before any script runs, because
+	// the mode probe constructs views through the global Uint8Array/ArrayBuffer
+	// — which user code may later replace — and a probe that learned its
+	// "fixed-length" modes from a steered constructor would whitelist a
+	// resizable view's mode. Idempotent per thread.
+	prime_view_probe :: proc(ctx: JSContextRef) {
+		ensure_view(ctx)
+	}
+
 	// typed_array_bytes borrows a Uint8Array's bytes straight from the view
 	// cell — any Structure (Buffer subclass views included), byteOffset already
-	// folded into the pointer. ok=false for non-Uint8Array values (other view
-	// types, DataView, non-cells) and when the probe is unavailable; callers
-	// fall back to the C API. The slice is valid only while the value is alive,
-	// i.e. for the duration of the native call.
+	// folded into the pointer.
+	//
+	// Returns:
+	//   ok=true with the view's current bytes (nil for an empty or detached
+	//   view) only for a Uint8Array of FIXED length over a non-resizable buffer.
+	//   ok=false for everything else — other view types, DataView, non-cells,
+	//   any view over a resizable or growable buffer, and whenever the probe is
+	//   unavailable — and the caller must use the C API.
+	// Node:
+	//   A length-tracking view's length follows its buffer, and a fixed view
+	//   the buffer has shrunk under reads as length 0 (node 24.21, verified by
+	//   tests/node-compat/cases/68-resizable-view-bytes.js). Declining those
+	//   views is what keeps this path from answering either wrongly.
+	//
+	// The slice is valid only while the value is alive, i.e. for the duration
+	// of the native call.
 	typed_array_bytes :: proc(ctx: JSContextRef, value: JSValueRef) -> (data: []byte, ok: bool) {
 		ensure_view(ctx)
 		if !g_view_ok do return nil, false
 		p := uintptr(value)
 		if p == 0 || (u64(p) & VALUE_NOT_CELL_MASK) != 0 do return nil, false
 		if (^u8)(p + JSCELL_TYPE_OFFSET)^ != g_view_type do return nil, false
+		// A resizable- or growable-backed view: m_length is not its length.
+		mode := (^u8)(p + g_mode_off)^
+		if mode != g_mode_fixed[0] && mode != g_mode_fixed[1] && mode != g_mode_fixed[2] do return nil, false
 		vec := (^rawptr)(p + g_vec_off)^
 		n := g_len_u64 ? int((^u64)(p + g_len_off)^) : int((^u32)(p + g_len_off)^)
 		if vec == nil || n < 0 {
@@ -218,6 +395,8 @@ when ODIN_OS == .Linux {
 		return ([^]byte)(vec)[:n], true
 	}
 } else {
+	prime_view_probe :: proc(_: JSContextRef) {}
+
 	typed_array_bytes :: proc(_: JSContextRef, _: JSValueRef) -> (data: []byte, ok: bool) {
 		return nil, false
 	}
