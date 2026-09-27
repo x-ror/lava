@@ -96,7 +96,7 @@ sqlite_open_cb :: proc "c" (
 	db^, result = sqlite.open(path)
 	if result.status != .Ok {
 		free(db)
-		if exception != nil do exception^ = make_js_error(ctx, result.message)
+		if exception != nil do exception^ = sqlite_error(ctx, result.message)
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
@@ -152,7 +152,7 @@ sqlite_exec_cb :: proc "c" (
 
 	result := sqlite.exec(db, sql)
 	if result.status != .Ok && exception != nil {
-		exception^ = make_js_error(ctx, sqlite_error_text(db, result))
+		exception^ = sqlite_error(ctx, sqlite_error_text(db, result))
 	}
 	return jsc.JSValueMakeUndefined(ctx)
 }
@@ -185,7 +185,7 @@ sqlite_prepare_cb :: proc "c" (
 	stmt^, result = sqlite.prepare(db, sql)
 	if result.status != .Ok {
 		free(stmt)
-		if exception != nil do exception^ = make_js_error(ctx, sqlite_error_text(db, result))
+		if exception != nil do exception^ = sqlite_error(ctx, sqlite_error_text(db, result))
 		return jsc.JSValueMakeUndefined(ctx)
 	}
 
@@ -303,13 +303,16 @@ sqlite_bind_cb :: proc "c" (
 	case .Null:
 		res = sqlite.bind_null(stmt, index)
 	case .Number:
-		n := jsc.JSValueToNumber(ctx, value, nil)
-		// Whole numbers within the safe-integer range bind as INTEGER, else REAL.
-		if n == f64(i64(n)) && n >= -9007199254740992.0 && n <= 9007199254740992.0 {
-			res = sqlite.bind_int(stmt, index, i64(n))
-		} else {
-			res = sqlite.bind_double(stmt, index, n)
-		}
+		// Node binds EVERY JS number with sqlite3_bind_double, whole ones included
+		// (verified against node 24: `SELECT typeof(?)` with 42 reports "real").
+		// Binding a whole number as INTEGER changed results, not just the type tag:
+		// SQLite divides integers with integer division, so `SELECT ? / 2` with 5
+		// returned 2 instead of 2.5, and a value written into a typeless column came
+		// back with a different storage class than the same script produces under
+		// Node. A column with INTEGER affinity still converts the REAL losslessly on
+		// the way in; asking for an INTEGER bind explicitly is what BigInt is for
+		// (sqlite_bind_bigint_cb). Pinned by tests/std/sqlite/cases/08-coercion-parity.js.
+		res = sqlite.bind_double(stmt, index, jsc.JSValueToNumber(ctx, value, nil))
 	case .String:
 		s, alloc := jsc_value_to_string_or_default(ctx, value)
 		defer if alloc do delete(s, context.allocator)
@@ -367,6 +370,27 @@ sqlite_bind_bigint_cb :: proc "c" (
 	return jsc.JSValueMakeUndefined(ctx)
 }
 
+// sqlite_error builds the JS Error for a failure that came out of libsqlite3.
+//
+// Params:
+//   message  SQLite's own text (errmsg/errstr), used verbatim as in Node.
+// Returns:
+//   An `Error` instance carrying `code` "ERR_SQLITE_ERROR".
+// Node:
+//   node:sqlite stamps ERR_SQLITE_ERROR on EVERY library-originated error — a bad
+//   path in the constructor, a syntax error from exec/prepare, a constraint
+//   violation surfaced from step, a rejected bind — verified against node 24
+//   (`new DatabaseSync('/nonexistent/x.db')`, `db.exec('NOT SQL')`, a UNIQUE
+//   violation). Only the bind path used to set it here, so the documented
+//   `err.code === 'ERR_SQLITE_ERROR'` branch silently missed every other error.
+//   Pinned by tests/std/sqlite/cases/08-coercion-parity.js.
+//
+// The plain "Error" constructor is the captured intrinsic (make_native_error), not
+// globalThis.Error, so user code that patches the global cannot intercept it.
+sqlite_error :: proc(ctx: jsc.JSContextRef, message: string) -> jsc.JSValueRef {
+	return make_native_error(ctx, "Error", message, "ERR_SQLITE_ERROR")
+}
+
 // sqlite_throw_bind_error surfaces a failed bind (e.g. SQLITE_RANGE from an
 // out-of-range index — how node:sqlite reports too many positional params) as a
 // JS Error carrying SQLite's text and the ERR_SQLITE_ERROR code, instead of
@@ -381,11 +405,7 @@ sqlite_throw_bind_error :: proc(
 	// Don't clobber a more specific exception already set by the caller.
 	if exception^ != nil do return
 	msg := len(res.message) > 0 ? res.message : "sqlite bind failed"
-	err := make_js_error(ctx, msg)
-	if jsc.JSValueIsObject(ctx, err) {
-		set_named(ctx, cast(jsc.JSObjectRef)err, "code", js_string_value(ctx, "ERR_SQLITE_ERROR"))
-	}
-	exception^ = err
+	exception^ = sqlite_error(ctx, msg)
 }
 
 // sqlite_step_cb(stmtId) -> 0 (row available) | 1 (done). Throws on error.
@@ -417,7 +437,7 @@ sqlite_step_cb :: proc "c" (
 		if exception != nil {
 			msg := db != nil ? sqlite.errmsg(db, context.temp_allocator) : "sqlite step failed"
 			if len(msg) == 0 do msg = "sqlite step failed"
-			exception^ = make_js_error(ctx, msg)
+			exception^ = sqlite_error(ctx, msg)
 		}
 		return jsc.JSValueMakeNumber(ctx, 1)
 	}

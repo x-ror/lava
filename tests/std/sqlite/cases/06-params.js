@@ -36,11 +36,11 @@ db.exec('CREATE TABLE b (v BLOB)');
 db.prepare('INSERT INTO b VALUES (?)').run(new DataView(new Uint8Array([4, 5, 6]).buffer));
 assert.deepEqual(Array.from(db.prepare('SELECT v FROM b').get().v), [4, 5, 6]);
 
-// A bare ArrayBuffer is not an ArrayBuffer view, so (like node:sqlite) it is
-// consumed as an empty named-params bag and the bound parameter becomes NULL.
+// A bare ArrayBuffer binds as a BLOB of its bytes too (node 24.x; node 22 took it
+// for an empty named-params bag and bound NULL). The edges are in 08-coercion-parity.js.
 db.exec('DELETE FROM b');
-db.prepare('INSERT INTO b VALUES (?)').run(new ArrayBuffer(3));
-assert.equal(db.prepare('SELECT v FROM b').get().v, null);
+db.prepare('INSERT INTO b VALUES (?)').run(new Uint8Array([7, 8]).buffer);
+assert.deepEqual(Array.from(db.prepare('SELECT v FROM b').get().v), [7, 8]);
 
 // --- named parameters: unknown keys are rejected, missing keys bind NULL ---
 const sel = db.prepare('SELECT :a AS a');

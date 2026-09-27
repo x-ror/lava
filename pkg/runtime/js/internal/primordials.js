@@ -441,6 +441,16 @@
     DataViewPrototypeGetByteLength: safeGetter(
       Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get,
     ),
+    // As much brand checks as lengths: each getter throws on any receiver that is not
+    // a real buffer of its kind, which a Symbol.toStringTag look-alike cannot fake.
+    // SharedArrayBuffer is absent from some JSC builds, hence the undefined arm.
+    ArrayBufferPrototypeGetByteLength: safeGetter(
+      Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get,
+    ),
+    SharedArrayBufferPrototypeGetByteLength:
+      typeof SharedArrayBuffer === 'function'
+        ? safeGetter(Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get)
+        : undefined,
 
     // RegExp.prototype.exec is a writable DATA property — an ordinary assignment
     // replaces it, no defineProperty needed. Every framing validator in http.js and

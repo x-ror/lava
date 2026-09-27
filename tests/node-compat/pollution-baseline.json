@@ -183,7 +183,7 @@
     "method": 10,
     "invoke": 1,
     "accessor": 3,
-    "global": 22
+    "global": 20
   },
   "internal/stdio.js": {
     "method": 0,
