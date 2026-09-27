@@ -243,8 +243,9 @@ when ODIN_OS == .Linux {
 	// The candidate byte must agree across the four wasteful views and read a
 	// value on both resizable views that none of the fixed kinds uses. Scanning
 	// starts past m_vector and m_length; the first match wins, which is m_mode
-	// in every layout that has one (it follows m_byteOffset, which the offset
-	// probe's 16 rules out). Nothing else in the cell varies with resizability.
+	// in every layout that has one (it follows m_byteOffset, which reads 0 on
+	// every probe here and so never discriminates). Nothing else in the cell
+	// varies with resizability.
 	//
 	// Fails closed on an engine without resizable buffers: it ignores
 	// maxByteLength, the "resizable" views are plain, no byte discriminates, and
