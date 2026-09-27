@@ -1085,6 +1085,33 @@
         "internal/util.js:ansiRegex",
         "Expected values to be strictly equal"
       ]
+    },
+    {
+      "name": "46-util-mimetype dies when parsed parameter names fold with String#toLowerCase",
+      "why": "toLowerCase folds KELVIN SIGN (U+212A) to 'k', turning an invalid parameter name into a valid one that node drops.",
+      "source": "pkg/runtime/js/internal/mime.js",
+      "find": "var name = asciiLower(str.slice(nameStart, position));",
+      "replace": "var name = str.slice(nameStart, position).toLowerCase();",
+      "gate": "compat:tests/node-compat/cases/46-util-mimetype.js",
+      "expect_detail": "a/b;k=1"
+    },
+    {
+      "name": "46-util-mimetype dies when a type/subtype error index is reported relative to the whole input",
+      "why": "node reports the offending code point's index within the subtype (`text/p@in` is invalid at 1); an input-relative index says 6.",
+      "source": "pkg/runtime/js/internal/mime.js",
+      "find": "validateToken('subtype', subtype, input);",
+      "replace": "validateToken('subtype', subtype, input);\n    if (subtype.search(NotHTTPTokenCodePoint) !== -1) throw mimeError('subtype', input, str.indexOf('/') + 1 + subtype.search(NotHTTPTokenCodePoint));",
+      "gate": "compat:tests/node-compat/cases/46-util-mimetype.js",
+      "expect_detail": "is invalid at 6"
+    },
+    {
+      "name": "46-util-mimetype dies when a MIME syntax error quotes the whitespace-trimmed input",
+      "why": "node quotes the input as given, leading whitespace included; quoting the trimmed string changes the message.",
+      "source": "pkg/runtime/js/internal/mime.js",
+      "find": "if (slash === -1) throw mimeError('type', input, -1);",
+      "replace": "if (slash === -1) throw mimeError('type', str, -1);",
+      "gate": "compat:tests/node-compat/cases/46-util-mimetype.js",
+      "expect_detail": "\"garbage\" is invalid"
     }
   ]
 }

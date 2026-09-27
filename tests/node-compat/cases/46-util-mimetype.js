@@ -79,6 +79,27 @@ assert.throws(() => new MIMEType('text/'), { code: 'ERR_INVALID_MIME_SYNTAX' });
 assert.throws(() => new MIMEType('/plain'), { code: 'ERR_INVALID_MIME_SYNTAX' });
 assert.throws(() => p.set('bad name', 'v'), { code: 'ERR_INVALID_MIME_SYNTAX' });
 assert.throws(() => p.set('a', 'bad\x01'), { code: 'ERR_INVALID_MIME_SYNTAX' });
+// a type/subtype error's index is relative to that component, not the whole input, and
+// the message quotes the input as given — leading whitespace included (node 24)
+assert.throws(() => new MIMEType('text/p@in;a=b'), {
+  message: 'The MIME syntax for a subtype in "text/p@in;a=b" is invalid at 1',
+});
+assert.throws(() => new MIMEType('a/' + KELVIN), {
+  message: 'The MIME syntax for a subtype in "a/' + KELVIN + '" is invalid at 0',
+});
+assert.throws(() => new MIMEType('  text/p@in  '), {
+  message: 'The MIME syntax for a subtype in "  text/p@in  " is invalid at 1',
+});
+assert.throws(() => new MIMEType('  t@xt/plain'), {
+  message: 'The MIME syntax for a type in "  t@xt/plain" is invalid at 1',
+});
+assert.throws(() => new MIMEType('  garbage'), {
+  message: 'The MIME syntax for a type in "  garbage" is invalid',
+});
+// parsing folds parameter names ASCII-only too: a KELVIN SIGN name is not "k", so the
+// parameter is invalid and dropped rather than kept as k=1
+assert.equal(new MIMEType('a/b;' + KELVIN + '=1').toString(), 'a/b');
+assert.equal(new MIMEType('a/b;' + KELVIN + '=1').params.has('k'), false);
 
 // form-feed (U+000C) is NOT HTTP whitespace: it is not trimmed and invalidates the type
 const FF = String.fromCharCode(0x0c);

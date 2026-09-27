@@ -68,31 +68,34 @@
   }
 
   // Validate a token production (type/subtype/parameter name). `input` is the string shown
-  // in the error; `offset` shifts the reported index into that string.
-  function validateToken(production, value, input, offset) {
+  // in the error. The reported index is relative to `value`, not to `input`: node 24 says
+  // `The MIME syntax for a subtype in "text/p@in" is invalid at 1`.
+  function validateToken(production, value, input) {
     if (value.length === 0) throw mimeError(production, input, -1);
     var bad = value.search(NotHTTPTokenCodePoint);
-    if (bad !== -1) throw mimeError(production, input, offset + bad);
+    if (bad !== -1) throw mimeError(production, input, bad);
   }
 
   function parse(str) {
     // Only leading whitespace is trimmed from the whole input; trailing whitespace is
     // removed per-component (subtype, unquoted value) so it cannot eat characters inside a
-    // quoted value (e.g. an unterminated `a="b\t` keeps the tab).
+    // quoted value (e.g. an unterminated `a="b\t` keeps the tab). Errors quote the input
+    // as given, leading whitespace included, as node does.
+    var input = str;
     str = str.replace(LEADING_HTTP_WS, '');
     var slash = str.indexOf('/');
-    if (slash === -1) throw mimeError('type', str, -1);
+    if (slash === -1) throw mimeError('type', input, -1);
     var type = str.slice(0, slash);
-    validateToken('type', type, str, 0);
+    validateToken('type', type, input);
 
     var rest = str.slice(slash + 1);
     var semi = rest.indexOf(';');
     var subtype = (semi === -1 ? rest : rest.slice(0, semi)).replace(TRAILING_HTTP_WS, '');
-    validateToken('subtype', subtype, str, slash + 1);
+    validateToken('subtype', subtype, input);
 
     var params = new Map();
     if (semi !== -1) parseParameters(rest.slice(semi + 1), params);
-    return { type: type.toLowerCase(), subtype: subtype.toLowerCase(), params: params };
+    return { type: asciiLower(type), subtype: asciiLower(subtype), params: params };
   }
 
   // WHATWG "parse a MIME type"'s parameters loop, over the text after the first ';'.
@@ -103,7 +106,7 @@
       while (position < len && isHTTPWhitespace(str[position])) position++;
       var nameStart = position;
       while (position < len && str[position] !== ';' && str[position] !== '=') position++;
-      var name = str.slice(nameStart, position).toLowerCase();
+      var name = asciiLower(str.slice(nameStart, position));
 
       if (position < len && str[position] === ';') {
         position++;
@@ -277,7 +280,7 @@
       },
       set: function (value) {
         value = `${value}`;
-        validateToken('type', value, value, 0);
+        validateToken('type', value, value);
         this[kType] = value.toLowerCase();
       },
     },
@@ -289,7 +292,7 @@
       },
       set: function (value) {
         value = `${value}`;
-        validateToken('subtype', value, value, 0);
+        validateToken('subtype', value, value);
         this[kSubtype] = value.toLowerCase();
       },
     },
