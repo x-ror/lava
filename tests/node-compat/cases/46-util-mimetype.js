@@ -10,7 +10,10 @@ assert.equal(m.essence, 'text/html');
 assert.equal(m.toString(), 'text/html;charset=utf-8;foo=Bar');
 assert.equal(m.params.get('charset'), 'utf-8');
 assert.equal(m.params.get('foo'), 'Bar');
-assert.equal(m.params.get('Foo'), null); // names are lowercased on parse
+// names are lowercased on parse, and (node 24.x) every MIMEParams lookup lowercases
+// its argument too, so the original spelling still finds the parameter
+assert.equal(m.params.get('Foo'), 'Bar');
+assert.equal(m.params.has('FOO'), true);
 
 // leading/trailing whitespace is trimmed; a quoted value drops its quotes when it is a token
 assert.equal(new MIMEType('  text/plain  ').toString(), 'text/plain');
@@ -46,11 +49,29 @@ assert.deepEqual([...new MIMEType('text/x; a=1; b=2').params.keys()], ['a', 'b']
 const e = new MIMEType('text/x');
 e.params.set('k', 'q"and\\bs');
 assert.equal(e.toString(), 'text/x;k="q\\"and\\\\bs"');
-// set() does NOT lowercase the name (parse does)
-const cs = new MIMEType('text/x');
+// set()/get()/has()/delete() lowercase the name like parse does (node 24.x; node 22
+// kept set()'s spelling), so two spellings of one name are one parameter
+const cs = new MIMEType('text/x;mixedcase=a');
 cs.params.set('MixedCase', 'V');
-assert.equal(cs.params.has('MixedCase'), true);
-assert.equal(cs.params.has('mixedcase'), false);
+assert.equal(cs.toString(), 'text/x;mixedcase=V');
+assert.deepEqual([...cs.params.keys()], ['mixedcase']);
+assert.equal(cs.params.get('MIXEDCASE'), 'V');
+cs.params.delete('mIxEdCaSe');
+assert.equal(cs.toString(), 'text/x');
+// the fold is ASCII-only: KELVIN SIGN (U+212A) is not "k" — it stays an invalid name
+// and is reported in its original spelling
+const KELVIN = String.fromCharCode(0x212a);
+cs.params.set('k', 'v');
+assert.equal(cs.params.get(KELVIN), null);
+assert.throws(() => cs.params.set(KELVIN, 'v'), {
+  code: 'ERR_INVALID_MIME_SYNTAX',
+  message: 'The MIME syntax for a parameter name in "' + KELVIN + '" is invalid at 0',
+});
+// the syntax error reports the name after folding
+assert.throws(() => cs.params.set('A B', 'v'), {
+  code: 'ERR_INVALID_MIME_SYNTAX',
+  message: 'The MIME syntax for a parameter name in "a b" is invalid at 1',
+});
 
 // invalid syntax throws ERR_INVALID_MIME_SYNTAX
 assert.throws(() => new MIMEType('garbage'), { code: 'ERR_INVALID_MIME_SYNTAX' });
