@@ -40,6 +40,25 @@
     return c === '\t' || c === '\n' || c === '\r' || c === ' ';
   }
 
+  // asciiLower folds A-Z only, as Node's MIME code does; String#toLowerCase would also
+  // fold non-ASCII (KELVIN SIGN U+212A -> "k"), turning an invalid name into a valid one.
+  // Returns the input itself when nothing needs folding, the common case. The lowercase
+  // letter is sliced from a literal rather than built with String.fromCharCode, which a
+  // lazily loaded module like this one could only read live (CLAUDE.md §5).
+  var ASCII_LOWER = 'abcdefghijklmnopqrstuvwxyz';
+  function asciiLower(str) {
+    var out = '';
+    var from = 0;
+    for (var i = 0; i < str.length; i++) {
+      var c = StringPrototypeCharCodeAt(str, i);
+      if (c < 0x41 || c > 0x5a) continue;
+      out +=
+        StringPrototypeSlice(str, from, i) + StringPrototypeSlice(ASCII_LOWER, c - 0x41, c - 0x40);
+      from = i + 1;
+    }
+    return from === 0 ? str : out + StringPrototypeSlice(str, from);
+  }
+
   function mimeError(production, input, index) {
     var msg = 'The MIME syntax for a ' + production + ' in "' + input + '" is invalid';
     if (index !== undefined && index !== -1) msg += ' at ' + index;
@@ -195,17 +214,21 @@
     this[kData] = new Map();
   }
 
+  // Every name-taking method folds the name the way parse does, so a parsed `charset`
+  // is reachable as get('Charset') and set('Charset') replaces it rather than adding a
+  // second parameter (node 24.21, verified; node 22 compared names as given). The fold
+  // happens before validation, so a syntax error quotes the folded name.
   MIMEParams.prototype.get = function get(name) {
     var data = this[kData];
-    name = `${name}`;
+    name = asciiLower(`${name}`);
     return data.has(name) ? data.get(name) : null;
   };
   MIMEParams.prototype.has = function has(name) {
-    return this[kData].has(`${name}`);
+    return this[kData].has(asciiLower(`${name}`));
   };
   MIMEParams.prototype.set = function set(name, value) {
     var data = this[kData];
-    name = `${name}`;
+    name = asciiLower(`${name}`);
     value = `${value}`;
     if (name.length === 0) throw mimeError('parameter name', name, -1);
     var badName = name.search(NotHTTPTokenCodePoint);
@@ -216,7 +239,7 @@
     // Node's MIMEParams#set returns undefined (like URLSearchParams#set), not `this`.
   };
   MIMEParams.prototype.delete = function del(name) {
-    this[kData].delete(`${name}`);
+    this[kData].delete(asciiLower(`${name}`));
   };
   MIMEParams.prototype.entries = function entries() {
     return this[kData].entries();
